@@ -9,7 +9,7 @@ use log::info;
 use nostr_sdk::Keys;
 use oracle::{
     oracle::get_winning_bytes, AddEventEntry, CreateEvent, Event, EventStatus, Forecast,
-    Observation, WeatherChoices,
+    Observation, TemperatureUnit, WeatherChoices,
 };
 use serde_json::from_slice;
 use std::{cmp, sync::Arc};
@@ -286,22 +286,25 @@ async fn can_get_event_run_etl_and_see_it_signed() {
         .iter()
         .find(|entry| entry.id == entry_1.id)
         .unwrap();
-    assert_eq!(entry_1_res.score.unwrap(), 409899);
-    let entry_2_res = entries_scores_order
-        .iter()
-        .find(|entry| entry.id == entry_2.id)
-        .unwrap();
-    assert_eq!(entry_2_res.score.unwrap(), 309799);
+    assert_eq!(entry_1_res.score.unwrap(), 399900);
+
     let entry_3_res = entries_scores_order
         .iter()
         .find(|entry| entry.id == entry_3.id)
         .unwrap();
-    assert_eq!(entry_3_res.score.unwrap(), 409699);
+    assert_eq!(entry_3_res.score.unwrap(), 399700);
+
+    let entry_2_res = entries_scores_order
+        .iter()
+        .find(|entry| entry.id == entry_2.id)
+        .unwrap();
+    assert_eq!(entry_2_res.score.unwrap(), 299800);
+
     let entry_4_res = entries_scores_order
         .iter()
         .find(|entry| entry.id == entry_4.id)
         .unwrap();
-    assert_eq!(entry_4_res.score.unwrap(), 109599);
+    assert_eq!(entry_4_res.score.unwrap(), 99600);
 
     let mut entry_outcome_order = res.entries.clone();
     entry_outcome_order.sort_by_key(|entry| entry.id);
@@ -343,6 +346,7 @@ fn mock_forecast_data() -> Vec<Forecast> {
             temp_low: 9,
             temp_high: 35,
             wind_speed: 8,
+            temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
         },
         Forecast {
             station_id: String::from("KSAW"),
@@ -352,6 +356,7 @@ fn mock_forecast_data() -> Vec<Forecast> {
             temp_low: 17,
             temp_high: 25,
             wind_speed: 3,
+            temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
         },
         Forecast {
             station_id: String::from("PAPG"),
@@ -361,6 +366,7 @@ fn mock_forecast_data() -> Vec<Forecast> {
             temp_low: 14,
             temp_high: 17,
             wind_speed: 6,
+            temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
         },
         Forecast {
             station_id: String::from("KWMC"),
@@ -370,6 +376,7 @@ fn mock_forecast_data() -> Vec<Forecast> {
             temp_low: 31,
             temp_high: 33,
             wind_speed: 11,
+            temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
         },
     ]
 }
@@ -383,6 +390,7 @@ fn mock_observation_data() -> Vec<Observation> {
             temp_low: 9.4,
             temp_high: 35 as f64,
             wind_speed: 11,
+            temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
         },
         Observation {
             station_id: String::from("KSAW"),
@@ -391,6 +399,7 @@ fn mock_observation_data() -> Vec<Observation> {
             temp_low: 22 as f64,
             temp_high: 25 as f64,
             wind_speed: 10,
+            temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
         },
         Observation {
             station_id: String::from("PAPG"),
@@ -399,6 +408,7 @@ fn mock_observation_data() -> Vec<Observation> {
             temp_low: 15 as f64,
             temp_high: 16 as f64,
             wind_speed: 6,
+            temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
         },
         Observation {
             station_id: String::from("KWMC"),
@@ -407,6 +417,7 @@ fn mock_observation_data() -> Vec<Observation> {
             temp_low: 32.8,
             temp_high: 34.4,
             wind_speed: 11,
+            temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
         },
     ]
 }

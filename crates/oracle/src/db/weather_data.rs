@@ -1,4 +1,7 @@
-use crate::{file_access, FileAccess, FileData, FileParams, ForecastRequest, ObservationRequest};
+use crate::{
+    file_access, FileAccess, FileData, FileParams, ForecastRequest, ObservationRequest,
+    TemperatureUnit,
+};
 use async_trait::async_trait;
 use duckdb::{
     arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray},
@@ -40,6 +43,14 @@ pub trait WeatherData: Sync + Send {
         station_ids: Vec<String>,
     ) -> Result<Vec<Observation>, Error>;
     async fn stations(&self) -> Result<Vec<Station>, Error>;
+}
+
+pub fn convert_temperature(value: f64, from_unit: &str, to_unit: &TemperatureUnit) -> f64 {
+    match (from_unit.to_lowercase().as_str(), to_unit) {
+        ("celsius", TemperatureUnit::Fahrenheit) => (value * 9.0 / 5.0) + 32.0,
+        ("fahrenheit", TemperatureUnit::Celsius) => (value - 32.0) * 5.0 / 9.0,
+        _ => value, // No conversion needed
+    }
 }
 
 impl WeatherAccess {
@@ -97,6 +108,7 @@ impl WeatherData for WeatherAccess {
             "MIN(min_temp)".as_("temp_low"),
             "MAX(max_temp)".as_("temp_high"),
             "MAX(wind_speed)".as_("wind_speed"),
+            "MAX(temperature_unit_code)".as_("temperature_unit_code"), // assumes consistent units per grouping
         ))
         .from(format!(
             "read_parquet(['{}'], union_by_name = true)",
@@ -141,19 +153,19 @@ impl WeatherData for WeatherAccess {
                 "MIN(temp_low)".as_("temp_low"),
                 "MAX(temp_high)".as_("temp_high"),
                 "MAX(wind_speed)".as_("wind_speed"),
+                "MAX(temperature_unit_code)".as_("temperature_unit_code"), // assumes consistent units per grouping
             ))
             .from("daily_forecasts")
             .group_by(("station_id", "date"));
 
         let records = self.query(query, values).await?;
-        let forecasts: Forecasts =
-            records
-                .iter()
-                .map(|record| record.into())
-                .fold(Forecasts::new(), |mut acc, obs| {
-                    acc.merge(obs);
-                    acc
-                });
+        let forecasts: Forecasts = records
+            .iter()
+            .map(|record| Forecasts::from_with_temp_unit(record, &req.temperature_unit))
+            .fold(Forecasts::new(), |mut acc, forecast| {
+                acc.merge(forecast);
+                acc
+            });
 
         Ok(forecasts.values)
     }
@@ -176,6 +188,7 @@ impl WeatherData for WeatherAccess {
             "min(temperature_value)".as_("temp_low"),
             "max(temperature_value)".as_("temp_high"),
             "max(wind_speed)".as_("wind_speed"),
+            "MAX(temperature_unit_code)".as_("temperature_unit_code"), // assumes consistent units per grouping
         ))
         .from(format!(
             "read_parquet(['{}'], union_by_name = true)",
@@ -210,14 +223,13 @@ impl WeatherData for WeatherAccess {
         }
         query = query.group_by("station_id");
         let records = self.query(query, values).await?;
-        let observations: Observations =
-            records
-                .iter()
-                .map(|record| record.into())
-                .fold(Observations::new(), |mut acc, obs| {
-                    acc.merge(obs);
-                    acc
-                });
+        let observations: Observations = records
+            .iter()
+            .map(|record| Observations::from_with_temp_unit(record, &req.temperature_unit))
+            .fold(Observations::new(), |mut acc, obs| {
+                acc.merge(obs);
+                acc
+            });
         Ok(observations.values)
     }
 
@@ -272,21 +284,8 @@ impl Forecasts {
         self.values.extend(forecasts.values);
         self
     }
-}
 
-#[derive(Serialize, Deserialize, Debug, ToSchema)]
-pub struct Forecast {
-    pub station_id: String,
-    pub date: String,
-    pub start_time: String,
-    pub end_time: String,
-    pub temp_low: i64,
-    pub temp_high: i64,
-    pub wind_speed: i64,
-}
-
-impl From<&RecordBatch> for Forecasts {
-    fn from(record_batch: &RecordBatch) -> Self {
+    fn from_with_temp_unit(record_batch: &RecordBatch, target_unit: &TemperatureUnit) -> Self {
         let mut forecasts = Vec::new();
         let station_id_arr = record_batch
             .column(0)
@@ -324,6 +323,12 @@ impl From<&RecordBatch> for Forecasts {
             .downcast_ref::<Int64Array>()
             .expect("Expected Int64Array in column 6");
 
+        let temperature_unit_code_arr = record_batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Expected StringArray in column 7");
+
         for row_index in 0..record_batch.num_rows() {
             let station_id = station_id_arr.value(row_index).to_owned();
             let date = date_arr.value(row_index).to_owned();
@@ -332,8 +337,9 @@ impl From<&RecordBatch> for Forecasts {
             let temp_low = temp_low_arr.value(row_index);
             let temp_high = temp_high_arr.value(row_index);
             let wind_speed = wind_speed_arr.value(row_index);
+            let temp_unit_code = temperature_unit_code_arr.value(row_index).to_owned();
 
-            forecasts.push(Forecast {
+            let mut forecast = Forecast {
                 station_id,
                 date,
                 start_time,
@@ -341,10 +347,48 @@ impl From<&RecordBatch> for Forecasts {
                 temp_low,
                 temp_high,
                 wind_speed,
-            });
+                temp_unit_code,
+            };
+            forecast.convert_temperature(target_unit);
+            forecasts.push(forecast);
         }
 
         Self { values: forecasts }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, ToSchema)]
+pub struct Forecast {
+    pub station_id: String,
+    pub date: String,
+    pub start_time: String,
+    pub end_time: String,
+    pub temp_low: i64,
+    pub temp_high: i64,
+    pub wind_speed: i64,
+    pub temp_unit_code: String,
+}
+
+impl Forecast {
+    pub fn convert_temperature(&mut self, target_unit: &TemperatureUnit) {
+        // Skip if already in the target unit
+        if self.temp_unit_code.to_lowercase() == target_unit.to_string() {
+            return;
+        }
+
+        match (self.temp_unit_code.to_lowercase().as_str(), target_unit) {
+            ("celsius", TemperatureUnit::Fahrenheit) => {
+                self.temp_low = ((self.temp_low as f64) * 9.0 / 5.0 + 32.0) as i64;
+                self.temp_high = ((self.temp_high as f64) * 9.0 / 5.0 + 32.0) as i64;
+                self.temp_unit_code = TemperatureUnit::Fahrenheit.to_string();
+            }
+            ("fahrenheit", TemperatureUnit::Celsius) => {
+                self.temp_low = ((self.temp_low as f64 - 32.0) * 5.0 / 9.0) as i64;
+                self.temp_high = ((self.temp_high as f64 - 32.0) * 5.0 / 9.0) as i64;
+                self.temp_unit_code = TemperatureUnit::Celsius.to_string();
+            }
+            _ => (), // No conversion needed or unknown unit
+        }
     }
 }
 
@@ -361,20 +405,8 @@ impl Observations {
         self.values.extend(observations.values);
         self
     }
-}
 
-#[derive(Serialize, Deserialize, Debug, ToSchema)]
-pub struct Observation {
-    pub station_id: String,
-    pub start_time: String,
-    pub end_time: String,
-    pub temp_low: f64,
-    pub temp_high: f64,
-    pub wind_speed: i64,
-}
-
-impl From<&RecordBatch> for Observations {
-    fn from(record_batch: &RecordBatch) -> Self {
+    pub fn from_with_temp_unit(record_batch: &RecordBatch, target_unit: &TemperatureUnit) -> Self {
         let mut observations = Vec::new();
         let station_id_arr = record_batch
             .column(0)
@@ -405,7 +437,13 @@ impl From<&RecordBatch> for Observations {
             .column(5)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .expect("Expected Int64Array in column 4");
+            .expect("Expected Int64Array in column 5");
+
+        let temperature_unit_code_arr = record_batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Expected StringArray in column 6");
 
         for row_index in 0..record_batch.num_rows() {
             let station_id = station_id_arr.value(row_index).to_owned();
@@ -414,19 +452,57 @@ impl From<&RecordBatch> for Observations {
             let temp_low = temp_low_arr.value(row_index);
             let temp_high = temp_high_arr.value(row_index);
             let wind_speed = wind_speed_arr.value(row_index);
+            let temp_unit_code = temperature_unit_code_arr.value(row_index).to_owned();
 
-            observations.push(Observation {
+            let mut observation = Observation {
                 station_id,
                 start_time,
                 end_time,
                 temp_low,
                 temp_high,
                 wind_speed,
-            });
+                temp_unit_code,
+            };
+            observation.convert_temperature(target_unit);
+            observations.push(observation);
         }
 
         Self {
             values: observations,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, ToSchema)]
+pub struct Observation {
+    pub station_id: String,
+    pub start_time: String,
+    pub end_time: String,
+    pub temp_low: f64,
+    pub temp_high: f64,
+    pub wind_speed: i64,
+    pub temp_unit_code: String,
+}
+
+impl Observation {
+    pub fn convert_temperature(&mut self, target_unit: &TemperatureUnit) {
+        // Skip if already in the target unit
+        if self.temp_unit_code.to_lowercase() == target_unit.to_string() {
+            return;
+        }
+
+        match (self.temp_unit_code.to_lowercase().as_str(), target_unit) {
+            ("celsius", TemperatureUnit::Fahrenheit) => {
+                self.temp_low = (self.temp_low * 9.0) / 5.0 + 32.0;
+                self.temp_high = (self.temp_high * 9.0) / 5.0 + 32.0;
+                self.temp_unit_code = TemperatureUnit::Fahrenheit.to_string();
+            }
+            ("fahrenheit", TemperatureUnit::Celsius) => {
+                self.temp_low = (self.temp_low - 32.0) * 5.0 / 9.0;
+                self.temp_high = (self.temp_high - 32.0) * 5.0 / 9.0;
+                self.temp_unit_code = TemperatureUnit::Celsius.to_string();
+            }
+            _ => (), // No conversion needed or unknown unit
         }
     }
 }

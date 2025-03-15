@@ -1,13 +1,13 @@
-use std::sync::Arc;
-
 use ::serde::Deserialize;
 use axum::{
     extract::{Query, State},
     Json,
 };
+use core::fmt;
 use serde::Serialize;
+use std::sync::Arc;
 use time::OffsetDateTime;
-use utoipa::IntoParams;
+use utoipa::{IntoParams, ToSchema};
 
 use crate::{AppError, AppState, FileParams, Forecast, Observation, Station};
 
@@ -43,6 +43,8 @@ pub struct ForecastRequest {
     #[serde(default)]
     pub end: Option<OffsetDateTime>,
     pub station_ids: String,
+    #[serde(default)]
+    pub temperature_unit: TemperatureUnit,
 }
 
 impl ForecastRequest {
@@ -74,6 +76,8 @@ pub struct ObservationRequest {
     #[serde(default)]
     pub end: Option<OffsetDateTime>,
     pub station_ids: String,
+    #[serde(default)]
+    pub temperature_unit: TemperatureUnit,
 }
 
 impl ObservationRequest {
@@ -92,6 +96,22 @@ impl From<&ObservationRequest> for FileParams {
             end: value.end,
             observations: Some(true),
             forecasts: Some(false),
+        }
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, ToSchema)]
+pub enum TemperatureUnit {
+    Celsius,
+    #[default]
+    Fahrenheit,
+}
+
+impl fmt::Display for TemperatureUnit {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            TemperatureUnit::Celsius => write!(f, "celsius"),
+            TemperatureUnit::Fahrenheit => write!(f, "fahrenheit"),
         }
     }
 }
