@@ -220,7 +220,7 @@ impl EventData {
             .flat_map(|(a, b, c)| vec![a, b.to_string(), c])
             .collect();
 
-        info!("insert values: {:?}", insert_values);
+        debug!("insert values: {:?}", insert_values);
 
         let conn = self.new_write_connection_retry().await?;
         let mut weather_stmt = conn.prepare(&query_str)?;

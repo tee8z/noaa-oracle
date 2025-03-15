@@ -404,11 +404,9 @@ impl Oracle {
                 add_only_forecast_data(&event, forecast_data).await?
             } else {
                 let observation_data = self.event_observation_data(&event).await?;
-                info!("above update ksks");
                 add_forecast_data_and_observation_data(&event, forecast_data, observation_data)
                     .await?
             };
-            info!("above update");
             self.event_data
                 .update_weather_station_data(event.id, weather)
                 .await?;

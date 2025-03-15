@@ -108,7 +108,7 @@ impl WeatherData for WeatherAccess {
             "MIN(min_temp)".as_("temp_low"),
             "MAX(max_temp)".as_("temp_high"),
             "MAX(wind_speed)".as_("wind_speed"),
-            "FIRST(temperature_unit_code)".as_("temperature_unit_code"), // assumes consistent units per grouping
+            "MAX(temperature_unit_code)".as_("temperature_unit_code"), // assumes consistent units per grouping
         ))
         .from(format!(
             "read_parquet(['{}'], union_by_name = true)",
@@ -153,7 +153,7 @@ impl WeatherData for WeatherAccess {
                 "MIN(temp_low)".as_("temp_low"),
                 "MAX(temp_high)".as_("temp_high"),
                 "MAX(wind_speed)".as_("wind_speed"),
-                "FIRST(temperature_unit_code)".as_("temperature_unit_code"), // assumes consistent units per grouping
+                "MAX(temperature_unit_code)".as_("temperature_unit_code"), // assumes consistent units per grouping
             ))
             .from("daily_forecasts")
             .group_by(("station_id", "date"));
@@ -188,7 +188,7 @@ impl WeatherData for WeatherAccess {
             "min(temperature_value)".as_("temp_low"),
             "max(temperature_value)".as_("temp_high"),
             "max(wind_speed)".as_("wind_speed"),
-            "FIRST(temperature_unit_code)".as_("temperature_unit_code"), // assumes consistent units per grouping
+            "MAX(temperature_unit_code)".as_("temperature_unit_code"), // assumes consistent units per grouping
         ))
         .from(format!(
             "read_parquet(['{}'], union_by_name = true)",
