@@ -1,7 +1,8 @@
 use crate::{
     weather_data, ActiveEvent, AddEventEntry, CreateEvent, CreateEventData, Event, EventData,
     EventFilter, EventStatus, EventSummary, Forecast, ForecastRequest, Observation,
-    ObservationRequest, SignEvent, ValueOptions, Weather, WeatherData, WeatherEntry,
+    ObservationRequest, SignEvent, TemperatureUnit, ValueOptions, Weather, WeatherData,
+    WeatherEntry,
 };
 use anyhow::anyhow;
 use base64::{engine::general_purpose, Engine};
@@ -556,23 +557,23 @@ impl Oracle {
                 .expect("UUIDv7 should have timestamp")
                 .to_unix();
             let time_millis = (created_at_secs * 1000) + (created_at_nano as u64 / 1_000_000);
-            let time_part = 9999 - (time_millis % 10000) as u64;
 
-            /* By adding the time element we are able to make competitions that have 1mil unique possible scores
-            meaning no ties under the following constraints:
+            // Scoring logic: score * 10^4 - timestamp
+            // Using 4 digits for timestamp (keeping within the 10000 range as before)
+            // Limit timestamp to last 4 digits (mod 10000) to maintain consistency with old code
+            let timestamp_part = time_millis % 10000;
+            let total_score = ((base_score * 10000) - timestamp_part) as i64;
 
-            With queue for entries (serialized creation):
-            - Up to 10,000 entries over 24h: negligible collision risk
-            - Max burst: ~40 entries/second with millisecond precision
+            /* With our formula score * 10^4 - timestamp:
+            - Higher base scores will still dominate (primary sorting criterion)
+            - For equal scores, earlier entries (smaller timestamps) will result in higher total scores
+              which means they'll rank higher when sorting in descending order
 
-            Without queue for entries (concurrent creation):
-            - Up to 1,300 entries over 24h: negligible collision risk
-            - Burst limit: ~30 entries/second for < 0.01% collision risk
-
-            This is important for keeping the amount of possible outcomes for the DLC as low as possible
-            but able to scale to as many entries as possible
+            This maintains the original constraints:
+            - Up to 10,000 entries over 24h with negligible collision risk
+            - Scales well for concurrent entry creation
+            - Keeps the amount of possible outcomes for the DLC as low as possible
             */
-            let total_score = ((base_score * 10000) + time_part) as i64;
 
             info!(
                 "updating entry {} for event {} to score {} in etl process {}",
@@ -667,6 +668,7 @@ impl Oracle {
             start: Some(start_date),
             end: Some(end_date),
             station_ids: station_ids.clone(),
+            temperature_unit: TemperatureUnit::Fahrenheit,
         };
         self.weather_data
             .forecasts_data(&forecast_requests, event.locations.clone())
@@ -682,6 +684,7 @@ impl Oracle {
             start: Some(start_date),
             end: Some(end_date),
             station_ids: event.locations.join(","),
+            temperature_unit: TemperatureUnit::Fahrenheit,
         };
         self.weather_data
             .observation_data(&observation_requests, event.locations.clone())
