@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
     let socket_addr = SocketAddr::from_str(&format!(
         "{}:{}",
         cli.domain.unwrap_or(String::from("127.0.0.1")),
-        cli.port.unwrap_or(String::from("9100"))
+        cli.port.unwrap_or(String::from("9800"))
     ))
     .unwrap();
 

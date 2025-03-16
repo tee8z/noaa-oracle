@@ -203,8 +203,13 @@ impl Oracle {
                 event.number_of_places_win
             )));
         }
-        let oracle_event = CreateEventData::new(self.raw_public_key(), coordinator_pubkey, event)
-            .map_err(Error::BadEvent)?;
+
+        let oracle_event = CreateEventData::new(
+            Point::from(self.raw_public_key()),
+            coordinator_pubkey,
+            event,
+        )
+        .map_err(Error::BadEvent)?;
         self.event_data
             .add_event(oracle_event)
             .await
