@@ -281,20 +281,30 @@ impl EventData {
         stmt.query_row(sql_params, |row| row.get(0))
     }
 
-    pub async fn add_event_entry(
-        &self,
-        entry: WeatherEntry,
-    ) -> Result<WeatherEntry, duckdb::Error> {
-        //TODO: have these transactions happen in the same transaction
-        self.add_entry(entry.clone()).await?;
-        self.add_entry_choices(entry.clone()).await?;
-        Ok(entry)
+    pub async fn add_event_entries(&self, entries: Vec<WeatherEntry>) -> Result<(), duckdb::Error> {
+        // Do to the constraints of the dlctix contracts, it's highly unlikely we get anywhere near 1000 entries in a single event
+        // Thus, we should be fine to do this in a single transaction and not in batches
+        let mut conn = self.new_write_connection_retry().await?;
+        let tx = conn.transaction()?;
+        for entry in entries {
+            self.add_entry_with_tx(&tx, entry.clone())?;
+            self.add_entry_choices_with_tx(&tx, entry.clone())?;
+        }
+
+        tx.commit()?;
+        Ok(())
     }
 
     pub async fn add_entry(&self, entry: WeatherEntry) -> Result<(), duckdb::Error> {
         let conn = self.new_write_connection_retry().await?;
-        // TODO: add check on the INSERT transaction to verify we never go over number of allowed entries in an event
-        // (current worse case is just a couple of extra entries made it into the event, doesn't change how we sign the result)
+        self.add_entry_with_tx(&conn, entry)
+    }
+
+    fn add_entry_with_tx(
+        &self,
+        conn: &Connection,
+        entry: WeatherEntry,
+    ) -> Result<(), duckdb::Error> {
         let insert_query = "INSERT INTO events_entries (id, event_id) VALUES(?,?)";
         let mut event_stmt = conn.prepare(insert_query)?;
 
@@ -306,6 +316,15 @@ impl EventData {
     }
 
     pub async fn add_entry_choices(&self, entry: WeatherEntry) -> Result<(), duckdb::Error> {
+        let conn = self.new_write_connection_retry().await?;
+        self.add_entry_choices_with_tx(&conn, entry)
+    }
+
+    fn add_entry_choices_with_tx(
+        &self,
+        conn: &Connection,
+        entry: WeatherEntry,
+    ) -> Result<(), duckdb::Error> {
         #[allow(clippy::type_complexity)]
         let params: Vec<(
             Uuid,
@@ -373,15 +392,15 @@ impl EventData {
 
         info!("insert values: {:?}", insert_values);
         if insert_values.is_empty() {
-            debug!("entry values were emtpy, skipping creating entry");
+            debug!("entry values were empty, skipping creating entry");
             return Ok(());
         }
 
-        let conn = self.new_write_connection_retry().await?;
         let mut weather_stmt = conn.prepare(&query_str)?;
         weather_stmt.execute(params_from_iter(insert_values.iter()))?;
         Ok(())
     }
+
     pub async fn update_event_attestation(&self, event: &SignEvent) -> Result<(), duckdb::Error> {
         let entry_score_update_query = update("events")
             .set("attestation_signature", "$1")

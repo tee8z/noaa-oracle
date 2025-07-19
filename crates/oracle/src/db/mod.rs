@@ -1213,6 +1213,12 @@ impl ToSql for Forecasted {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AddEventEntries {
+    pub event_id: Uuid,
+    pub entries: Vec<AddEventEntry>,
+}
+
 // Once submitted for now don't allow changes
 // Decide if we want to add a pubkey for who submitted the entry?
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

@@ -5,12 +5,12 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use hyper::{header, Method};
-use log::info;
+use log::{debug, info};
 use nostr_sdk::{
     hashes::{sha256::Hash as Sha256Hash, Hash},
     Keys,
 };
-use oracle::{AddEventEntry, CreateEvent, WeatherChoices, WeatherEntry};
+use oracle::{AddEventEntries, AddEventEntry, CreateEvent, WeatherChoices, WeatherEntry};
 use serde_json::{from_slice, to_string};
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -32,7 +32,7 @@ async fn can_create_entry_into_event() {
             String::from("PAPG"),
             String::from("KWMC"),
         ],
-        total_allowed_entries: 5,
+        total_allowed_entries: 1,
         number_of_values_per_entry: 6,
         number_of_places_win: 1,
     };
@@ -61,7 +61,11 @@ async fn can_create_entry_into_event() {
             },
         ],
     };
-    let body_json = to_string(&new_entry).unwrap();
+    let entries = AddEventEntries {
+        event_id: new_event.id,
+        entries: vec![new_entry.clone()],
+    };
+    let body_json = to_string(&entries).unwrap();
     let payload_hash = Sha256Hash::hash(body_json.as_bytes());
 
     let oracle_event = test_app
@@ -71,7 +75,7 @@ async fn can_create_entry_into_event() {
         .unwrap();
 
     let base_url = "http://localhost:3000";
-    let path = format!("/oracle/events/{}/entry", oracle_event.id);
+    let path = format!("/oracle/events/{}/entries", oracle_event.id);
     let event = create_auth_event(
         "POST",
         &format!("{}{}", base_url, path),
@@ -101,10 +105,14 @@ async fn can_create_entry_into_event() {
     info!("response status: {}", response.status());
     assert!(response.status().is_success());
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let res: WeatherEntry = from_slice(&body).unwrap();
-    assert_eq!(res.event_id, new_entry.event_id);
-    assert_eq!(res.id, new_entry.id);
-    assert_eq!(res.expected_observations, new_entry.expected_observations);
+    debug!("body: {:?}", body);
+    let res: Vec<WeatherEntry> = from_slice(&body).unwrap();
+    assert_eq!(res[0].event_id, new_entry.event_id);
+    assert_eq!(res[0].id, new_entry.id);
+    assert_eq!(
+        res[0].expected_observations,
+        new_entry.expected_observations
+    );
 }
 
 #[tokio::test]
@@ -121,7 +129,7 @@ async fn can_create_and_get_event_entry() {
             String::from("PAPG"),
             String::from("KWMC"),
         ],
-        total_allowed_entries: 10,
+        total_allowed_entries: 1,
         number_of_places_win: 1,
         number_of_values_per_entry: 6,
     };
@@ -149,10 +157,14 @@ async fn can_create_and_get_event_entry() {
             },
         ],
     };
-    let body_json = to_string(&new_entry).unwrap();
+    let entries = AddEventEntries {
+        event_id: new_entry.event_id,
+        entries: vec![new_entry],
+    };
+    let body_json = to_string(&entries).unwrap();
     let payload_hash = Sha256Hash::hash(body_json.as_bytes());
     let base_url = "http://localhost:3000";
-    let path = format!("/oracle/events/{}/entry", new_event.id);
+    let path = format!("/oracle/events/{}/entries", new_event.id);
     let event = create_auth_event(
         "POST",
         &format!("{}{}", base_url, path),
@@ -188,13 +200,13 @@ async fn can_create_and_get_event_entry() {
     info!("response status: {:?}", response);
     assert!(response.status().is_success());
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let res_post: WeatherEntry = from_slice(&body).unwrap();
+    let res_post: Vec<WeatherEntry> = from_slice(&body).unwrap();
 
     let request_get = Request::builder()
         .method(Method::GET)
         .uri(format!(
-            "/oracle/events/{}/entry/{}",
-            oracle_event.id, res_post.id
+            "/oracle/events/{}/entries/{}",
+            oracle_event.id, res_post[0].id
         ))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::empty())
@@ -211,8 +223,8 @@ async fn can_create_and_get_event_entry() {
         .await
         .unwrap();
     let res: WeatherEntry = from_slice(&body).unwrap();
-    assert_eq!(res_post.id, res.id);
-    assert_eq!(res_post.event_id, res.event_id);
-    assert_eq!(res_post.score, res.score);
-    assert_eq!(res_post.expected_observations, res.expected_observations);
+    assert_eq!(res_post[0].id, res.id);
+    assert_eq!(res_post[0].event_id, res.event_id);
+    assert_eq!(res_post[0].score, res.score);
+    assert_eq!(res_post[0].expected_observations, res.expected_observations);
 }

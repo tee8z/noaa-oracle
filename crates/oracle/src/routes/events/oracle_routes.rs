@@ -1,5 +1,5 @@
 use crate::{
-    oracle, AddEventEntry, AppState, CreateEvent, Event, EventFilter, EventSummary, NostrAuth,
+    oracle, AddEventEntries, AppState, CreateEvent, Event, EventFilter, EventSummary, NostrAuth,
     WeatherEntry,
 };
 use axum::{
@@ -131,34 +131,34 @@ pub async fn get_event(
 
 #[utoipa::path(
     post,
-    path = "/oracle/events/{event_id}/entry",
-    request_body = AddEventEntry,
+    path = "/oracle/events/{event_id}/entries",
+    request_body = AddEventEntries,
     responses(
-        (status = OK, description = "Successfully add entry into oracle weather event", body = WeatherEntry),
-        (status = BAD_REQUEST, description = "Invalid entry to be created"),
+        (status = OK, description = "Successfully add entries into oracle weather event", body = Vec<WeatherEntry>),
+        (status = BAD_REQUEST, description = "Invalid entries to be created"),
         (status = FORBIDDEN, description = "Invalid signature from coordinator in nostr authorization header"),
         (status = UNAUTHORIZED, description = "Invalid nostr authorization header nip-98 using coordinator keys"),
     ))]
-pub async fn add_event_entry(
+pub async fn add_event_entries(
     NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
     Path(_event_id): Path<Uuid>,
-    Json(body): Json<AddEventEntry>,
-) -> Result<Json<WeatherEntry>, ErrorResponse> {
+    Json(body): Json<AddEventEntries>,
+) -> Result<Json<Vec<WeatherEntry>>, ErrorResponse> {
     state
         .oracle
-        .add_event_entry(pubkey, body)
+        .add_event_entries(pubkey, body.event_id, body.entries)
         .await
         .map(Json)
         .map_err(|e| {
-            error!("error adding entry to event: {}", e);
+            error!("error adding entries to event: {}", e);
             e.into()
         })
 }
 
 #[utoipa::path(
     get,
-    path = "/oracle/events/{event_id}/entry/{entry_id}",
+    path = "/oracle/events/{event_id}/entries/{entry_id}",
     params(
         ("event_id" = Uuid, Path, description = "ID of a weather event the oracle is tracking"),
         ("entry_id" = Uuid, Path, description = "ID of a entry into weather event the oracle is tracking"),

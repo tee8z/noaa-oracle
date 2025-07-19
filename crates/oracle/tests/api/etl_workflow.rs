@@ -8,8 +8,8 @@ use hyper::{header, Method};
 use log::info;
 use nostr_sdk::Keys;
 use oracle::{
-    oracle::get_winning_bytes, AddEventEntry, CreateEvent, Event, EventStatus, Forecast,
-    Observation, TemperatureUnit, WeatherChoices,
+    oracle::get_winning_bytes, AddEventEntries, AddEventEntry, CreateEvent, Event, EventStatus,
+    Forecast, Observation, TemperatureUnit, WeatherChoices,
 };
 use serde_json::from_slice;
 use std::{cmp, sync::Arc};
@@ -196,24 +196,22 @@ async fn can_get_event_run_etl_and_see_it_signed() {
             },
         ],
     };
+    let event_entries = AddEventEntries {
+        event_id: entry_1.event_id,
+        entries: vec![
+            entry_1.clone(),
+            entry_2.clone(),
+            entry_3.clone(),
+            entry_4.clone(),
+        ],
+    };
     test_app
         .oracle
-        .add_event_entry(keys.public_key, entry_1.clone())
-        .await
-        .unwrap();
-    test_app
-        .oracle
-        .add_event_entry(keys.public_key, entry_2.clone())
-        .await
-        .unwrap();
-    test_app
-        .oracle
-        .add_event_entry(keys.public_key, entry_3.clone())
-        .await
-        .unwrap();
-    test_app
-        .oracle
-        .add_event_entry(keys.public_key, entry_4.clone())
+        .add_event_entries(
+            keys.public_key,
+            event_entries.event_id,
+            event_entries.entries,
+        )
         .await
         .unwrap();
 

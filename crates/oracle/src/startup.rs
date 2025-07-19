@@ -1,5 +1,5 @@
 use crate::{
-    add_event_entry, create_event, db, download, files, forecasts, get_event, get_event_entry,
+    add_event_entries, create_event, db, download, files, forecasts, get_event, get_event_entry,
     get_npub, get_pubkey, get_stations, index_handler, list_events, observations,
     oracle::{self, Oracle},
     routes, update_data, upload,
@@ -45,7 +45,7 @@ pub struct AppState {
         routes::events::oracle_routes::list_events,
         routes::events::oracle_routes::create_event,
         routes::events::oracle_routes::get_event,
-        routes::events::oracle_routes::add_event_entry,
+        routes::events::oracle_routes::add_event_entries,
         routes::events::oracle_routes::get_event_entry,
         routes::events::oracle_routes::update_data,
         routes::stations::weather_routes::forecasts,
@@ -123,9 +123,9 @@ pub fn app(app_state: AppState) -> Router {
         .route("/oracle/events", get(list_events))
         .route("/oracle/events", post(create_event))
         .route("/oracle/events/{event_id}", get(get_event))
-        .route("/oracle/events/{event_id}/entry", post(add_event_entry))
+        .route("/oracle/events/{event_id}/entries", post(add_event_entries))
         .route(
-            "/oracle/events/{event_id}/entry/{entry_id}",
+            "/oracle/events/{event_id}/entries/{entry_id}",
             get(get_event_entry),
         )
         .layer(middleware::from_fn(log_request))
