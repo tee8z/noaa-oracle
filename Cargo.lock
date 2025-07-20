@@ -1272,7 +1272,7 @@ dependencies = [
 
 [[package]]
 name = "daemon"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "anyhow",
  "arrow 54.0.0",
@@ -1363,8 +1363,8 @@ dependencies = [
 
 [[package]]
 name = "dlctix"
-version = "0.0.6"
-source = "git+https://github.com/tee8z/dlctix?branch=main#22aa58a261548c79fc1e6bc94a82c130fd12ed01"
+version = "0.0.7"
+source = "git+https://github.com/tee8z/dlctix?rev=a02c800a586538bbf8d6ccc82c964a5bf0b49d93#a02c800a586538bbf8d6ccc82c964a5bf0b49d93"
 dependencies = [
  "bitcoin",
  "hex",
@@ -2277,9 +2277,9 @@ dependencies = [
 
 [[package]]
 name = "musig2"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd55e6cfd1ddd92698a3e456432e16310f0810faad83ac732e2466ed0961b46d"
+checksum = "d89eb08ce8778538f84198774795f418358360a29841cfea8dbbb28c04d777e2"
 dependencies = [
  "base16ct",
  "hmac",
@@ -2569,7 +2569,7 @@ dependencies = [
 
 [[package]]
 name = "oracle"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3402,9 +3402,9 @@ checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
 name = "secp"
-version = "0.4.2"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3a566e69f272e267e2dea55181ec5155bf454fa923c555e4f10a0a1aeefca8f"
+checksum = "d7ac68feda6cce08c5091b4e87cf93d4b7fa04b4afd9988d4b36121d949f79ec"
 dependencies = [
  "base16ct",
  "once_cell",
