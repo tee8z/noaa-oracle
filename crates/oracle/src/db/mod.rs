@@ -1,6 +1,5 @@
 use anyhow::anyhow;
-use dlctix::musig2::secp256k1::PublicKey;
-use dlctix::secp::{MaybeScalar, Scalar};
+use dlctix::secp::{MaybeScalar, Point, Scalar};
 use dlctix::{attestation_locking_point, EventLockingConditions};
 use duckdb::arrow::datatypes::ToByteSlice;
 use duckdb::types::{OrderedMap, ToSqlOutput, Type, Value};
@@ -72,7 +71,7 @@ pub struct CreateEventData {
 
 impl CreateEventData {
     pub fn new(
-        oracle_pubkey: PublicKey,
+        oracle_pubkey: Point,
         coordinator_pubkey: NostrPublicKey,
         event: CreateEvent,
     ) -> Result<Self, anyhow::Error> {
@@ -1212,6 +1211,12 @@ impl ToSql for Forecasted {
         ]);
         Ok(ToSqlOutput::Owned(Value::Struct(ordered_struct)))
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AddEventEntries {
+    pub event_id: Uuid,
+    pub entries: Vec<AddEventEntry>,
 }
 
 // Once submitted for now don't allow changes

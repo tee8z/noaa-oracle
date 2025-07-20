@@ -11,6 +11,7 @@ use dlctix::{
     musig2::secp256k1::{rand, PublicKey, Secp256k1, SecretKey},
     secp::{MaybePoint, Point},
 };
+use duckdb::arrow::datatypes::ArrowNativeType;
 use log::{debug, error, info, warn};
 use nostr_sdk::{key::Keys, nips::nip19::ToBech32, PublicKey as NostrPublicKey};
 use pem_rfc7468::{decode_vec, encode_string};
@@ -203,48 +204,83 @@ impl Oracle {
                 event.number_of_places_win
             )));
         }
-        let oracle_event = CreateEventData::new(self.raw_public_key(), coordinator_pubkey, event)
-            .map_err(Error::BadEvent)?;
+
+        let oracle_event = CreateEventData::new(
+            Point::from(self.raw_public_key()),
+            coordinator_pubkey,
+            event,
+        )
+        .map_err(Error::BadEvent)?;
         self.event_data
             .add_event(oracle_event)
             .await
             .map_err(Error::DataQuery)
     }
 
-    pub async fn add_event_entry(
+    pub async fn add_event_entries(
         &self,
         nostr_pubkey: NostrPublicKey,
-        entry: AddEventEntry,
-    ) -> Result<WeatherEntry, Error> {
+        event_id: Uuid,
+        entries: Vec<AddEventEntry>,
+    ) -> Result<Vec<WeatherEntry>, Error> {
+        let nostr_pubkey = nostr_pubkey.to_bech32()?;
+        if event_id.get_version_num() != 7 {
+            return Err(Error::BadEntry(format!(
+                "Client needs to provide a valid Uuidv7 for event id {}",
+                event_id
+            )));
+        }
+        let event = match self.event_data.get_event(&event_id).await {
+            Ok(event_data) => Ok(event_data),
+            Err(duckdb::Error::QueryReturnedNoRows) => Err(Error::NotFound(format!(
+                "event with id {} not found",
+                &event_id
+            ))),
+            Err(e) => Err(Error::DataQuery(e)),
+        }?;
+        if event.entries.len() > 0 {
+            return Err(Error::BadEntry(format!(
+                "event {} already has entries, no more entries are allowed",
+                event.id
+            )));
+        }
+        if event.total_allowed_entries.as_usize() != entries.len() {
+            return Err(Error::BadEntry(format!(
+                "Client needs to provide {} entries for this event {}",
+                event.total_allowed_entries, event_id
+            )));
+        }
+        if event.coordinator_pubkey != nostr_pubkey {
+            return Err(Error::BadEntry(format!(
+                "Client needs to the valid coordinator signature in header for this event {}",
+                event_id
+            )));
+        }
+        let mut weather_entry: Vec<WeatherEntry> = vec![];
+        for entry in entries {
+            if entry.event_id != event_id {
+                return Err(Error::BadEntry(format!(
+                    "Client add entries to be for this event {}, entry {} has the wrong event id {}",
+                    event_id, entry.id, entry.event_id
+                )));
+            }
+            self.validate_event_entry(entry.clone(), event.clone())
+                .await?;
+            weather_entry.push(entry.into());
+        }
+        self.event_data
+            .add_event_entries(weather_entry.clone())
+            .await
+            .map_err(Error::DataQuery)?;
+
+        Ok(weather_entry)
+    }
+
+    async fn validate_event_entry(&self, entry: AddEventEntry, event: Event) -> Result<(), Error> {
         if entry.id.get_version_num() != 7 {
             return Err(Error::BadEntry(format!(
                 "Client needs to provide a valid Uuidv7 for entry id {}",
                 entry.id
-            )));
-        }
-        let event = match self.event_data.get_event(&entry.event_id).await {
-            Ok(event_data) => Ok(event_data),
-            Err(duckdb::Error::QueryReturnedNoRows) => Err(Error::NotFound(format!(
-                "event with id {} not found",
-                &entry.event_id
-            ))),
-            Err(e) => Err(Error::DataQuery(e)),
-        }?;
-        info!("event: {:?}", event);
-
-        let nostr_pubkey = nostr_pubkey.to_bech32()?;
-        if event.coordinator_pubkey != nostr_pubkey {
-            return Err(Error::BadEntry(format!(
-                "Client needs to the valid coordinator signature in header for this event {}",
-                entry.id
-            )));
-        }
-        // NOTE: It's not the end of the world if we do go over the allowed number of entries,
-        // worse case just means more people in the event, doesn't change our score mechanism
-        if event.total_allowed_entries < event.entry_ids.len() as i64 {
-            return Err(Error::BadEntry(format!(
-                "event {} is full, no more entries are allowed",
-                event.id
             )));
         }
 
@@ -283,10 +319,7 @@ impl Oracle {
                 entry.id
             )));
         }
-        self.event_data
-            .add_event_entry(entry.into())
-            .await
-            .map_err(Error::DataQuery)
+        Ok(())
     }
 
     pub async fn get_running_events(&self) -> Result<Vec<ActiveEvent>, Error> {

@@ -1,8 +1,8 @@
 [package]
 name = "daemon"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2021"
-repository = "https://github.com/tee8z/noaa-data-pipeline"
+repository = "https://github.com/tee8z/noaa-oracle"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
