@@ -101,6 +101,7 @@ impl From<&ObservationRequest> for FileParams {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, ToSchema)]
+#[serde(rename_all = "lowercase")]
 pub enum TemperatureUnit {
     Celsius,
     #[default]

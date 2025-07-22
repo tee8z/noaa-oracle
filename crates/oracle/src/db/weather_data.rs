@@ -371,21 +371,28 @@ pub struct Forecast {
 
 impl Forecast {
     pub fn convert_temperature(&mut self, target_unit: &TemperatureUnit) {
+        // Normalize the current unit code to handle the "celcius" spelling in data
+        // The spelling error comes from NOAA data directly
+        let current_unit = match self.temp_unit_code.to_lowercase().as_str() {
+            "celcius" => "celsius".to_string(),
+            _ => self.temp_unit_code.to_lowercase(),
+        };
+
         // Skip if already in the target unit
-        if self.temp_unit_code.to_lowercase() == target_unit.to_string() {
+        if current_unit == target_unit.to_string() {
             return;
         }
 
-        match (self.temp_unit_code.to_lowercase().as_str(), target_unit) {
+        match (current_unit.as_str(), target_unit) {
             ("celsius", TemperatureUnit::Fahrenheit) => {
-                self.temp_low = ((self.temp_low as f64) * 9.0 / 5.0 + 32.0) as i64;
-                self.temp_high = ((self.temp_high as f64) * 9.0 / 5.0 + 32.0) as i64;
-                self.temp_unit_code = TemperatureUnit::Fahrenheit.to_string();
+                self.temp_low = ((self.temp_low as f64) * 9.0 / 5.0 + 32.0).round() as i64;
+                self.temp_high = ((self.temp_high as f64) * 9.0 / 5.0 + 32.0).round() as i64;
+                self.temp_unit_code = target_unit.to_string();
             }
             ("fahrenheit", TemperatureUnit::Celsius) => {
-                self.temp_low = ((self.temp_low as f64 - 32.0) * 5.0 / 9.0) as i64;
-                self.temp_high = ((self.temp_high as f64 - 32.0) * 5.0 / 9.0) as i64;
-                self.temp_unit_code = TemperatureUnit::Celsius.to_string();
+                self.temp_low = ((self.temp_low as f64 - 32.0) * 5.0 / 9.0).round() as i64;
+                self.temp_high = ((self.temp_high as f64 - 32.0) * 5.0 / 9.0).round() as i64;
+                self.temp_unit_code = target_unit.to_string();
             }
             _ => (), // No conversion needed or unknown unit
         }
@@ -486,21 +493,28 @@ pub struct Observation {
 
 impl Observation {
     pub fn convert_temperature(&mut self, target_unit: &TemperatureUnit) {
+        // Normalize the current unit code to handle the "celcius" spelling in data
+        // The spelling error comes from NOAA data directly
+        let current_unit = match self.temp_unit_code.to_lowercase().as_str() {
+            "celcius" => "celsius".to_string(),
+            _ => self.temp_unit_code.to_lowercase(),
+        };
+
         // Skip if already in the target unit
-        if self.temp_unit_code.to_lowercase() == target_unit.to_string() {
+        if current_unit == target_unit.to_string() {
             return;
         }
 
-        match (self.temp_unit_code.to_lowercase().as_str(), target_unit) {
+        match (current_unit.as_str(), target_unit) {
             ("celsius", TemperatureUnit::Fahrenheit) => {
-                self.temp_low = (self.temp_low * 9.0) / 5.0 + 32.0;
-                self.temp_high = (self.temp_high * 9.0) / 5.0 + 32.0;
-                self.temp_unit_code = TemperatureUnit::Fahrenheit.to_string();
+                self.temp_low = (self.temp_low as f64) * 9.0 / 5.0 + 32.0;
+                self.temp_high = (self.temp_high as f64) * 9.0 / 5.0 + 32.0;
+                self.temp_unit_code = target_unit.to_string();
             }
             ("fahrenheit", TemperatureUnit::Celsius) => {
-                self.temp_low = (self.temp_low - 32.0) * 5.0 / 9.0;
-                self.temp_high = (self.temp_high - 32.0) * 5.0 / 9.0;
-                self.temp_unit_code = TemperatureUnit::Celsius.to_string();
+                self.temp_low = (self.temp_low as f64 - 32.0) * 5.0 / 9.0;
+                self.temp_high = (self.temp_high as f64 - 32.0) * 5.0 / 9.0;
+                self.temp_unit_code = target_unit.to_string();
             }
             _ => (), // No conversion needed or unknown unit
         }
