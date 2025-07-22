@@ -1272,7 +1272,7 @@ dependencies = [
 
 [[package]]
 name = "daemon"
-version = "1.6.1"
+version = "1.6.2"
 dependencies = [
  "anyhow",
  "arrow 54.0.0",
@@ -1363,8 +1363,9 @@ dependencies = [
 
 [[package]]
 name = "dlctix"
-version = "0.0.7"
-source = "git+https://github.com/tee8z/dlctix?rev=a02c800a586538bbf8d6ccc82c964a5bf0b49d93#a02c800a586538bbf8d6ccc82c964a5bf0b49d93"
+version = "0.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47c6767515570d7a8d354647054c7d178e48b9913e4edec417f941ee73a9ccce"
 dependencies = [
  "bitcoin",
  "hex",
@@ -2569,7 +2570,7 @@ dependencies = [
 
 [[package]]
 name = "oracle"
-version = "1.6.1"
+version = "1.6.2"
 dependencies = [
  "anyhow",
  "async-trait",
