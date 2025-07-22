@@ -1272,7 +1272,7 @@ dependencies = [
 
 [[package]]
 name = "daemon"
-version = "1.6.2"
+version = "1.6.3"
 dependencies = [
  "anyhow",
  "arrow 54.0.0",
@@ -2570,7 +2570,7 @@ dependencies = [
 
 [[package]]
 name = "oracle"
-version = "1.6.2"
+version = "1.6.3"
 dependencies = [
  "anyhow",
  "async-trait",
