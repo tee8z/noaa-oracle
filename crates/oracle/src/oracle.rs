@@ -593,7 +593,8 @@ impl Oracle {
             // Using 4 digits for timestamp (keeping within the 10000 range as before)
             // Limit timestamp to last 4 digits (mod 10000) to maintain consistency with old code
             let timestamp_part = time_millis % 10000;
-            let total_score = std::cmp::max(0, ((base_score * 10000) - timestamp_part) as i64);
+            // Use this to ensure uniqueness:
+            let total_score = (std::cmp::max(10000, base_score * 10000) - timestamp_part) as i64;
 
             /* With our formula score * 10^4 - timestamp:
             - Higher base scores will still dominate (primary sorting criterion)
