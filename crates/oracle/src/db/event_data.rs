@@ -487,7 +487,7 @@ impl EventData {
             let data: Weather = row.try_into()?;
             event_weather.push(data);
         }
-        Ok(vec![])
+        Ok(event_weather)
     }
 
     pub async fn get_event_weather_entries(

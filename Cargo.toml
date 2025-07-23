@@ -27,6 +27,14 @@ cargo-dist-version = "0.28.0"
 ci = "github"
 # The installers to generate for each app
 installers = ["shell"]
+# Path that installers should place binaries in
+install-path = "$HOME/.oracle"
+# Artifacts to include
+artifacts = ["bin"]
+# Additional files/directories to include
+include = [
+    "crates/oracle/ui",
+]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["x86_64-unknown-linux-gnu"]
 # Which actions to run on pull requests
@@ -34,8 +42,6 @@ pr-run-mode = "plan"
 # Whether to install an updater program
 install-updater = true
 github-build-setup = "../../git_duckdb/build-setup.yml"
-# Path that installers should place binaries in
-install-path = "CARGO_HOME"
 
 [workspace.metadata.dist.github-custom-runners]
 global = "ubuntu-22.04"
