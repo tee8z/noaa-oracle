@@ -511,21 +511,12 @@ impl<'a> TryFrom<&Row<'a>> for EventSummary {
             total_entries: row.get::<usize, i64>(5)?,
             number_of_places_win: row.get::<usize, i64>(6)?,
             number_of_values_per_entry: row.get::<usize, i64>(7)?,
-            attestation: row
-                .get::<usize, Value>(8)
-                .map(|v| {
-                    let blob_attestation = match v {
-                        Value::Blob(raw) => raw,
-                        _ => vec![],
-                    };
-                    if !blob_attestation.is_empty() {
-                        //TODO: handle the conversion more gracefully than unwrap
-                        Some(MaybeScalar::from_slice(blob_attestation.to_byte_slice()).unwrap())
-                    } else {
-                        None
-                    }
+            attestation: row.get::<usize, Option<Value>>(18).map(|opt| {
+                opt.and_then(|raw| match raw {
+                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
+                    _ => None,
                 })
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(8, Type::Any, Box::new(e)))?,
+            })?,
             nonce: row
                 .get::<usize, Value>(9)
                 .map(|raw| {
