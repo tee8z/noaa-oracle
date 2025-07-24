@@ -633,12 +633,16 @@ impl Oracle {
             // very important, the sort index of the entry should always be the same when getting the outcome
             entry_indices.sort_by_key(|entry| entry.id);
 
-            // Sort by score descending for top 3
-            let mut top_entries = entries.clone();
+            // Sort by score descending for winners
+            let mut top_entries: Vec<_> = entries
+                .iter()
+                .filter(|entry| entry.score.is_some())
+                .cloned()
+                .collect();
             top_entries.sort_by_key(|entry| cmp::Reverse(entry.score));
-            top_entries.truncate(3);
+            top_entries.truncate(event.number_of_places_win.clone().as_usize());
 
-            // Get indices of top 3 in original entry_indices order
+            // Get indices of winners in original entry_indices order
             let winners: Vec<usize> = top_entries
                 .iter()
                 .map(|top_entry| {
