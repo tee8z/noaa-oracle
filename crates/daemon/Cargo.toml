@@ -1,6 +1,6 @@
 [package]
 name = "daemon"
-version = "1.6.6"
+version = "1.6.7"
 edition = "2021"
 repository = "https://github.com/tee8z/noaa-oracle"
 

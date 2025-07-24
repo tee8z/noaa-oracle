@@ -511,7 +511,7 @@ impl<'a> TryFrom<&Row<'a>> for EventSummary {
             total_entries: row.get::<usize, i64>(5)?,
             number_of_places_win: row.get::<usize, i64>(6)?,
             number_of_values_per_entry: row.get::<usize, i64>(7)?,
-            attestation: row.get::<usize, Option<Value>>(18).map(|opt| {
+            attestation: row.get::<usize, Option<Value>>(8).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
