@@ -1,7 +1,6 @@
 use anyhow::anyhow;
 use dlctix::secp::{MaybeScalar, Point, Scalar};
 use dlctix::{attestation_locking_point, EventLockingConditions};
-use duckdb::arrow::datatypes::ToByteSlice;
 use duckdb::types::{OrderedMap, ToSqlOutput, Type, Value};
 use duckdb::{ffi, ErrorCode, Row, ToSql};
 use log::{debug, info};
@@ -227,21 +226,12 @@ impl<'a> TryFrom<&Row<'a>> for SignEvent {
             status: EventStatus::default(),
             number_of_places_win: row.get::<usize, i64>(3)?,
             number_of_values_per_entry: row.get::<usize, i64>(4)?,
-            attestation: row
-                .get::<usize, Value>(5)
-                .map(|v| {
-                    let blob_attestation = match v {
-                        Value::Blob(raw) => raw,
-                        _ => vec![],
-                    };
-                    if !blob_attestation.is_empty() {
-                        //TODO: handle the conversion more gracefully than unwrap
-                        Some(MaybeScalar::from_slice(blob_attestation.to_byte_slice()).unwrap())
-                    } else {
-                        None
-                    }
+            attestation: row.get::<usize, Option<Value>>(5).map(|opt| {
+                opt.and_then(|raw| match raw {
+                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
+                    _ => None,
                 })
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(5, Type::Any, Box::new(e)))?,
+            })?,
             nonce: row
                 .get::<usize, Value>(6)
                 .map(|raw| {
@@ -385,21 +375,12 @@ impl<'a> TryFrom<&Row<'a>> for ActiveEvent {
             total_entries: row.get::<usize, i64>(5)?,
             number_of_places_win: row.get::<usize, i64>(6)?,
             number_of_values_per_entry: row.get::<usize, i64>(7)?,
-            attestation: row
-                .get::<usize, Value>(8)
-                .map(|v| {
-                    let blob_attestation = match v {
-                        Value::Blob(raw) => raw,
-                        _ => vec![],
-                    };
-                    if !blob_attestation.is_empty() {
-                        //TODO: handle the conversion more gracefully than unwrap
-                        Some(MaybeScalar::from_slice(blob_attestation.to_byte_slice()).unwrap())
-                    } else {
-                        None
-                    }
+            attestation: row.get::<usize, Option<Value>>(8).map(|opt| {
+                opt.and_then(|raw| match raw {
+                    Value::Blob(val) => serde_json::from_slice(&val).ok(),
+                    _ => None,
                 })
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(8, Type::Any, Box::new(e)))?,
+            })?,
         };
         active_events.update_status();
         Ok(active_events)

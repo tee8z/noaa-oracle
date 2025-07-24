@@ -634,7 +634,7 @@ impl EventData {
                 "COALESCE(event_entries.total_entries,0) as total_entries",
                 "number_of_places_win",
                 "number_of_values_per_entry",
-                "attestation_signature",
+                "attestation_signature as attestation",
                 "nonce",
             ))
             .from(
@@ -704,7 +704,11 @@ impl EventData {
             "number_of_places_win",
             "number_of_values_per_entry",
         ))
-        .and_select(("attestation_signature", "nonce", "coordinator_pubkey"))
+        .and_select((
+            "attestation_signature as attestation",
+            "nonce",
+            "coordinator_pubkey",
+        ))
         .from("events")
         .where_("id = $1");
 
@@ -732,7 +736,7 @@ impl EventData {
                 "COALESCE(event_entries.total_entries, 0) as total_entries",
                 "number_of_places_win",
                 "number_of_values_per_entry",
-                "attestation_signature",
+                "attestation_signature as attestation",
             ))
             .from(
                 "events"
@@ -780,7 +784,7 @@ impl EventData {
             "observation_date::TEXT",
             "number_of_places_win",
             "number_of_values_per_entry",
-            "attestation_signature",
+            "attestation_signature as attestation",
             "nonce",
             "event_announcement",
         ))
