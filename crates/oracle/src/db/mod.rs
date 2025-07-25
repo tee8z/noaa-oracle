@@ -104,10 +104,11 @@ impl CreateEventData {
         let mut rng = rand::thread_rng();
         let nonce = Scalar::random(&mut rng);
         let nonce_point = nonce.base_point_mul();
-        // Manually set expiry to 7 days after the signature should have been provided so users can get their funds back
+
+        // Manually set expiry to 1 day after the signature should have been provided so users can get their funds back
         let expiry = event
             .signing_date
-            .saturating_add(Duration::DAY * 7)
+            .saturating_add(Duration::DAY * 1)
             .unix_timestamp() as u32;
 
         let locking_points = outcome_messages
@@ -131,7 +132,7 @@ impl CreateEventData {
             signing_date: event.signing_date,
             nonce,
             total_allowed_entries: event.total_allowed_entries as i64,
-            number_of_places_win: 1_i64, // Default to 1 winning score to simplify possible outcomes
+            number_of_places_win: event.number_of_places_win,
             number_of_values_per_entry: event.number_of_values_per_entry as i64,
             locations: event.clone().locations,
             event_announcement,
@@ -198,7 +199,7 @@ pub struct SignEvent {
 
 impl SignEvent {
     pub fn update_status(&mut self) {
-        self.status = get_status(self.observation_date, self.attestation)
+        self.status = get_status(self.attestation, self.observation_date, self.signing_date);
     }
 }
 
@@ -277,7 +278,7 @@ pub struct ActiveEvent {
 
 impl ActiveEvent {
     pub fn update_status(&mut self) {
-        self.status = get_status(self.observation_date, self.attestation)
+        self.status = get_status(self.attestation, self.observation_date, self.signing_date);
     }
 }
 
@@ -420,34 +421,31 @@ pub struct EventSummary {
 
 impl EventSummary {
     pub fn update_status(&mut self) {
-        self.status = get_status(self.observation_date, self.attestation)
+        self.status = get_status(self.attestation, self.observation_date, self.signing_date)
     }
 }
 
 pub fn get_status(
-    observation_date: OffsetDateTime,
     attestation: Option<MaybeScalar>,
+    observation_date: OffsetDateTime,
+    signing_date: OffsetDateTime,
 ) -> EventStatus {
-    //always have the events run for a single day for now
-    if observation_date < OffsetDateTime::now_utc()
-        && observation_date.saturating_sub(Duration::days(1)) > OffsetDateTime::now_utc()
-        && attestation.is_none()
-    {
-        return EventStatus::Running;
-    }
-
-    if observation_date < OffsetDateTime::now_utc()
-        && observation_date.saturating_sub(Duration::days(1)) < OffsetDateTime::now_utc()
-        && attestation.is_none()
-    {
-        return EventStatus::Completed;
-    }
-
     if attestation.is_some() {
         return EventStatus::Signed;
     }
-    //default to live
-    EventStatus::Live
+
+    let now = OffsetDateTime::now_utc();
+
+    if now < observation_date {
+        return EventStatus::Live;
+    }
+
+    if now < signing_date {
+        return EventStatus::Running;
+    }
+
+    // Past signing date and not signed
+    EventStatus::Completed
 }
 
 impl<'a> TryFrom<&Row<'a>> for EventSummary {
@@ -555,7 +553,7 @@ pub struct Event {
 
 impl Event {
     pub fn update_status(&mut self) {
-        self.status = get_status(self.observation_date, self.attestation)
+        self.status = get_status(self.attestation, self.observation_date, self.signing_date);
     }
 }
 
