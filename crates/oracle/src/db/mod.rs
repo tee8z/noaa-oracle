@@ -1206,6 +1206,7 @@ impl From<AddEventEntry> for WeatherEntry {
             event_id: value.event_id,
             expected_observations: value.expected_observations,
             score: None,
+            base_score: None,
         }
     }
 }
@@ -1217,6 +1218,7 @@ pub struct WeatherEntry {
     pub expected_observations: Vec<WeatherChoices>,
     /// A score wont appear until the observation_date has begun
     pub score: Option<i64>,
+    pub base_score: Option<i64>,
 }
 
 impl TryInto<WeatherEntry> for &OrderedMap<String, Value> {
@@ -1286,10 +1288,16 @@ impl TryInto<WeatherEntry> for &OrderedMap<String, Value> {
             _ => None,
         });
 
+        let base_score = values.get(4).and_then(|raw_id| match raw_id {
+            Value::Int(id) => Some(*id as i64),
+            _ => None,
+        });
+
         Ok(WeatherEntry {
             id,
             event_id,
             score,
+            base_score,
             expected_observations,
         })
     }
@@ -1310,6 +1318,9 @@ impl<'a> TryFrom<&Row<'a>> for WeatherEntry {
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(1, Type::Any, Box::new(e)))?,
             score: row
                 .get::<usize, Option<i64>>(2)
+                .map(|val| val.filter(|&val| val != 0))?,
+            base_score: row
+                .get::<usize, Option<i64>>(3)
                 .map(|val| val.filter(|&val| val != 0))?,
             expected_observations: vec![],
         })

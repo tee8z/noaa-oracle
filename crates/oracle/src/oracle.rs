@@ -484,7 +484,7 @@ impl Oracle {
 
         let observation_data = self.event_observation_data(&event).await?;
         let forecast_data = self.event_forecast_data(&event).await?;
-        let mut entry_scores: Vec<(Uuid, i64)> = vec![];
+        let mut entry_scores: Vec<(Uuid, i64, i64)> = vec![];
 
         for entry in entries {
             if entry.event_id != event.id {
@@ -612,7 +612,7 @@ impl Oracle {
                 entry.id, event.id, total_score, etl_process_id
             );
 
-            entry_scores.push((entry.id, total_score));
+            entry_scores.push((entry.id, total_score, base_score as i64));
         }
 
         self.event_data.update_entry_scores(entry_scores).await?;
@@ -633,30 +633,41 @@ impl Oracle {
             // very important, the sort index of the entry should always be the same when getting the outcome
             entry_indices.sort_by_key(|entry| entry.id);
 
-            // Sort by score descending for winners
-            let mut top_entries: Vec<_> = entries
-                .iter()
-                .filter(|entry| entry.score.is_some())
-                .cloned()
-                .collect();
-            top_entries.sort_by_key(|entry| cmp::Reverse(entry.score));
-            top_entries.truncate(event.number_of_places_win.clone().as_usize());
-
-            // Get indices of winners in original entry_indices order
-            let winners: Vec<usize> = top_entries
-                .iter()
-                .map(|top_entry| {
-                    entry_indices
-                        .iter()
-                        .position(|entry| entry.id == top_entry.id)
-                        .expect("Entry should exist")
-                })
-                .collect();
-
             if event.signing_date < OffsetDateTime::now_utc() {
-                let winner_bytes: Vec<u8> = get_winning_bytes(winners.clone());
+                let all_zero_scores = entries
+                    .iter()
+                    .all(|entry| entry.base_score.is_none() || entry.base_score == Some(0));
+
+                let winners = if all_zero_scores && !entries.is_empty() {
+                    let all_indices: Vec<usize> = (0..entry_indices.len()).collect();
+
+                    all_indices.clone()
+                } else {
+                    // Sort by score descending for winners
+                    let mut top_entries: Vec<_> = entries
+                        .iter()
+                        .filter(|entry| entry.score.is_some())
+                        .cloned()
+                        .collect();
+                    top_entries.sort_by_key(|entry| cmp::Reverse(entry.score));
+                    top_entries.truncate(event.number_of_places_win.clone().as_usize());
+
+                    // Get indices of winners in original entry_indices order
+                    let winners: Vec<usize> = top_entries
+                        .iter()
+                        .map(|top_entry| {
+                            entry_indices
+                                .iter()
+                                .position(|entry| entry.id == top_entry.id)
+                                .expect("Entry should exist")
+                        })
+                        .collect();
+
+                    winners
+                };
 
                 let nonce_point = event.nonce.base_point_mul();
+                let winner_bytes = get_winning_bytes(winners.clone());
 
                 let locking_point =
                     attestation_locking_point(self.public_key, nonce_point, &winner_bytes);
@@ -671,7 +682,7 @@ impl Oracle {
                     .join(", ");
 
                 let MaybePoint::Valid(_) = locking_point else {
-                    // Something went horribly wrong, use the info from this log line to track refunding users based on DLC expiry (we set to 1 week)
+                    // Something went horribly wrong, use the info from this log line to track refunding users based on DLC expiry
                     error!("final result doesn't match any of the possible outcomes: event_id {} winners {} expiry {:?}", event.id, winners_str, event.event_announcement.expiry);
 
                     return Err(Error::OutcomeNotFound(format!(

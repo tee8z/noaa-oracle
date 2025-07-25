@@ -423,7 +423,7 @@ impl EventData {
     ///Danger: a raw SQL query is used, input is not escaped with '?'
     pub async fn update_entry_scores(
         &self,
-        entry_scores: Vec<(Uuid, i64)>,
+        entry_scores: Vec<(Uuid, i64, i64)>,
     ) -> Result<(), duckdb::Error> {
         let number_entry_scores = entry_scores.len();
         info!("number_entry_scores: {:?}", number_entry_scores);
@@ -431,7 +431,7 @@ impl EventData {
         let mut entry_score_values = String::new();
         entry_score_values.push_str("VALUES");
         for (index, val) in entry_scores.iter().enumerate() {
-            entry_score_values.push_str(&format!("('{}',{})", val.0, val.1));
+            entry_score_values.push_str(&format!("('{}',{},{}),", val.0, val.1, val.2));
             if index + 1 < number_entry_scores {
                 entry_score_values.push(',');
             }
@@ -449,12 +449,26 @@ impl EventData {
         }
         entry_ids.push(')');
         info!("entry_ids: {}", entry_ids);
+        // Create subquery for score
         let scores_temp_select = select("score")
-            .from((entry_score_values).as_("scores(entry_id, score)"))
+            .from(
+                entry_score_values
+                    .clone()
+                    .as_("scores(entry_id, score, base_score)"),
+            )
             .where_("scores.entry_id = events_entries.id::TEXT")
             .to_string();
+
+        // Create subquery for base_score
+        let base_scores_temp_select = select("base_score")
+            .from(entry_score_values.as_("scores(entry_id, score, base_score)"))
+            .where_("scores.entry_id = events_entries.id::TEXT")
+            .to_string();
+
+        // Update both columns in a single query
         let entry_score_update_query = update("events_entries")
             .set("score", format!("({})", scores_temp_select))
+            .set("base_score", format!("({})", base_scores_temp_select))
             .where_(format!("events_entries.id::TEXT IN {}", entry_ids));
 
         let query_str = entry_score_update_query.to_string();
@@ -495,15 +509,24 @@ impl EventData {
         event_id: &Uuid,
     ) -> Result<Vec<WeatherEntry>, duckdb::Error> {
         // Query 1
-        let event_entries_select =
-            select(("events_entries.id", "events_entries.event_id", "score"))
-                .from(
-                    "events_entries"
-                        .join("events")
-                        .on("events_entries.event_id = events.id"),
-                )
-                .where_("events_entries.event_id = ?")
-                .group_by(("events_entries.id", "events_entries.event_id", "score"));
+        let event_entries_select = select((
+            "events_entries.id",
+            "events_entries.event_id",
+            "score",
+            "base_score",
+        ))
+        .from(
+            "events_entries"
+                .join("events")
+                .on("events_entries.event_id = events.id"),
+        )
+        .where_("events_entries.event_id = ?")
+        .group_by((
+            "events_entries.id",
+            "events_entries.event_id",
+            "score",
+            "base_score",
+        ));
 
         let query_str = event_entries_select.to_string();
         debug!("query_str: {}", query_str);
@@ -566,6 +589,7 @@ impl EventData {
             "events_entries.id as id",
             "events_entries.event_id as event_id",
             "score",
+            "base_score",
         ))
         .from("events_entries")
         .where_("events_entries.id = $1 AND events_entries.event_id = $2");
