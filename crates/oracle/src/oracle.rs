@@ -24,7 +24,7 @@ use std::{
     sync::Arc,
 };
 use thiserror::Error;
-use time::{Duration, OffsetDateTime};
+use time::OffsetDateTime;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -433,7 +433,7 @@ impl Oracle {
                 event.id, event.status, etl_process_id
             );
             let forecast_data = self.event_forecast_data(&event).await?;
-            let weather = if event.observation_date > OffsetDateTime::now_utc() {
+            let weather = if event.start_observation_date > OffsetDateTime::now_utc() {
                 add_only_forecast_data(&event, forecast_data).await?
             } else {
                 let observation_data = self.event_observation_data(&event).await?;
@@ -706,14 +706,11 @@ impl Oracle {
     }
 
     async fn event_forecast_data(&self, event: &ActiveEvent) -> Result<Vec<Forecast>, Error> {
-        let start_date = event.observation_date;
-        // Assumes all events are only a day long, may change in the future
-        let end_date = event.observation_date.saturating_add(Duration::days(1));
         // Assumes locations have been sanitized when the event was created
         let station_ids = event.locations.join(",");
         let forecast_requests = ForecastRequest {
-            start: Some(start_date),
-            end: Some(end_date),
+            start: Some(event.start_observation_date),
+            end: Some(event.end_observation_date),
             station_ids: station_ids.clone(),
             temperature_unit: TemperatureUnit::Fahrenheit,
         };
@@ -724,12 +721,9 @@ impl Oracle {
     }
 
     async fn event_observation_data(&self, event: &ActiveEvent) -> Result<Vec<Observation>, Error> {
-        let start_date = event.observation_date;
-        // Assumes all events are only a day long, may change in the future
-        let end_date = event.observation_date.saturating_add(Duration::days(1));
         let observation_requests = ObservationRequest {
-            start: Some(start_date),
-            end: Some(end_date),
+            start: Some(event.start_observation_date),
+            end: Some(event.end_observation_date),
             station_ids: event.locations.join(","),
             temperature_unit: TemperatureUnit::Fahrenheit,
         };

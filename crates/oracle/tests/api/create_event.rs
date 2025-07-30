@@ -25,7 +25,8 @@ async fn can_create_oracle_event() {
     let keys = Keys::generate();
     let new_event = CreateEvent {
         id: Uuid::now_v7(),
-        observation_date: OffsetDateTime::now_utc(),
+        start_observation_date: OffsetDateTime::now_utc(),
+        end_observation_date: OffsetDateTime::now_utc(),
         signing_date: OffsetDateTime::now_utc(),
         locations: vec![
             String::from("PFNO"),
@@ -100,7 +101,8 @@ async fn can_create_and_get_oracle_event() {
 
     let new_event = CreateEvent {
         id: Uuid::now_v7(),
-        observation_date: OffsetDateTime::now_utc(),
+        start_observation_date: OffsetDateTime::now_utc(),
+        end_observation_date: OffsetDateTime::now_utc(),
         signing_date: OffsetDateTime::now_utc(),
         locations: vec![
             String::from("PFNO"),
@@ -175,10 +177,10 @@ async fn can_create_and_get_oracle_event() {
             .unwrap()
     );
     assert_eq!(
-        res.observation_date,
+        res.start_observation_date,
         new_event
-            .observation_date
-            .replace_nanosecond(new_event.observation_date.nanosecond() / 1_000 * 1_000)
+            .start_observation_date
+            .replace_nanosecond(new_event.start_observation_date.nanosecond() / 1_000 * 1_000)
             .unwrap()
     );
     assert_eq!(res.locations, new_event.locations);

@@ -24,7 +24,8 @@ async fn can_create_entry_into_event() {
     let oracle_event_id = Uuid::now_v7();
     let new_event = CreateEvent {
         id: oracle_event_id,
-        observation_date: OffsetDateTime::now_utc(),
+        start_observation_date: OffsetDateTime::now_utc(),
+        end_observation_date: OffsetDateTime::now_utc(),
         signing_date: OffsetDateTime::now_utc(),
         locations: vec![
             String::from("PFNO"),
@@ -121,7 +122,8 @@ async fn can_create_and_get_event_entry() {
     let keys = Keys::generate();
     let new_event = CreateEvent {
         id: Uuid::now_v7(),
-        observation_date: OffsetDateTime::now_utc(),
+        start_observation_date: OffsetDateTime::now_utc(),
+        end_observation_date: OffsetDateTime::now_utc(),
         signing_date: OffsetDateTime::now_utc(),
         locations: vec![
             String::from("PFNO"),

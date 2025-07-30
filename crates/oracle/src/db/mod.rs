@@ -27,11 +27,14 @@ pub struct CreateEvent {
     /// Client needs to provide a valid Uuidv7
     pub id: Uuid,
     #[serde(with = "time::serde::rfc3339")]
-    /// Time at which the attestation will be added to the event, needs to be after the observation date
+    /// Time at which the attestation will be added to the event, needs to be after the end observation date
     pub signing_date: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
-    /// Date of when the weather observations occured (midnight UTC), all entries must be made before this time
-    pub observation_date: OffsetDateTime,
+    /// Time when the weather observations start, all entries must be made before this time, must be before the end observation date
+    pub start_observation_date: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    /// Time when the weather observations ends, must be before the signing date
+    pub end_observation_date: OffsetDateTime,
     /// NOAA observation stations used in this event
     pub locations: Vec<String>,
     /// The number of values that can be selected per entry in the event (default to number_of_locations * 3, (temp_low, temp_high, wind_speed))
@@ -47,11 +50,14 @@ pub struct CreateEventData {
     /// Provide UUIDv7 to use for looking up the event
     pub id: Uuid,
     #[serde(with = "time::serde::rfc3339")]
-    /// Time at which the attestation will be added to the event
+    /// Time at which the attestation will be added to the event, needs to be after the end observation date
     pub signing_date: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
-    /// Date of when the weather observations occured (midnight UTC), all entries must be made before this time
-    pub observation_date: OffsetDateTime,
+    /// Time when the weather observations start, all entries must be made before this time, must be before the end observation date
+    pub start_observation_date: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    /// Time when the weather observations ends, must be before the signing date
+    pub end_observation_date: OffsetDateTime,
     // NOAA observation stations used in this event
     pub locations: Vec<String>,
     /// The number of values that can be selected per entry in the event (default to number_of_locations * 3, (temp_low, temp_high, wind_speed))
@@ -80,11 +86,18 @@ impl CreateEventData {
                 event.id
             ));
         }
-        if event.observation_date > event.signing_date {
+        if event.start_observation_date > event.start_observation_date {
             return Err(anyhow::anyhow!(
-                "Signing date {} needs to be after observation date {}",
+                "Start observation date {} needs to be after end observation date {}",
                 event.signing_date.format(&Rfc3339).unwrap(),
-                event.observation_date.format(&Rfc3339).unwrap()
+                event.end_observation_date.format(&Rfc3339).unwrap()
+            ));
+        }
+        if event.end_observation_date > event.signing_date {
+            return Err(anyhow::anyhow!(
+                "Signing date {} needs to be after end observation date {}",
+                event.signing_date.format(&Rfc3339).unwrap(),
+                event.end_observation_date.format(&Rfc3339).unwrap()
             ));
         }
         if event.number_of_places_win > 5 {
@@ -128,7 +141,8 @@ impl CreateEventData {
 
         Ok(Self {
             id: event.id,
-            observation_date: event.observation_date,
+            start_observation_date: event.start_observation_date,
+            end_observation_date: event.end_observation_date,
             signing_date: event.signing_date,
             nonce,
             total_allowed_entries: event.total_allowed_entries as i64,
@@ -146,7 +160,8 @@ impl From<CreateEventData> for Event {
         Self {
             id: value.id,
             signing_date: value.signing_date,
-            observation_date: value.observation_date,
+            start_observation_date: value.start_observation_date,
+            end_observation_date: value.end_observation_date,
             locations: value.locations,
             total_allowed_entries: value.total_allowed_entries,
             number_of_places_win: value.number_of_places_win,
@@ -182,10 +197,11 @@ impl Default for EventFilter {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct SignEvent {
     pub id: Uuid,
-    #[serde(with = "time::serde::rfc3339")]
     pub signing_date: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
-    pub observation_date: OffsetDateTime,
+    pub start_observation_date: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub end_observation_date: OffsetDateTime,
     pub status: EventStatus,
     #[schema(value_type = String)]
     pub nonce: Scalar,
@@ -199,7 +215,11 @@ pub struct SignEvent {
 
 impl SignEvent {
     pub fn update_status(&mut self) {
-        self.status = get_status(self.attestation, self.observation_date, self.signing_date);
+        self.status = get_status(
+            self.attestation,
+            self.start_observation_date,
+            self.end_observation_date,
+        );
     }
 }
 
@@ -220,30 +240,26 @@ impl<'a> TryFrom<&Row<'a>> for SignEvent {
                 .get::<usize, String>(1)
                 .map(|val| OffsetDateTime::parse(&val, &sql_time_format))?
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(1, Type::Any, Box::new(e)))?,
-            observation_date: row
+            start_observation_date: row
                 .get::<usize, String>(2)
                 .map(|val| OffsetDateTime::parse(&val, &sql_time_format))?
+                .map(|val| val.to_offset(UtcOffset::UTC))
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(2, Type::Any, Box::new(e)))?,
+            end_observation_date: row
+                .get::<usize, String>(3)
+                .map(|val| OffsetDateTime::parse(&val, &sql_time_format))?
+                .map(|val| val.to_offset(UtcOffset::UTC))
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(3, Type::Any, Box::new(e)))?,
             status: EventStatus::default(),
-            number_of_places_win: row.get::<usize, i64>(3)?,
-            number_of_values_per_entry: row.get::<usize, i64>(4)?,
-            attestation: row.get::<usize, Option<Value>>(5).map(|opt| {
+            number_of_places_win: row.get::<usize, i64>(4)?,
+            number_of_values_per_entry: row.get::<usize, i64>(5)?,
+            attestation: row.get::<usize, Option<Value>>(6).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
             nonce: row
-                .get::<usize, Value>(6)
-                .map(|raw| {
-                    let blob = match raw {
-                        Value::Blob(val) => val,
-                        _ => vec![],
-                    };
-                    serde_json::from_slice(&blob)
-                })?
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(6, Type::Any, Box::new(e)))?,
-            event_announcement: row
                 .get::<usize, Value>(7)
                 .map(|raw| {
                     let blob = match raw {
@@ -253,6 +269,16 @@ impl<'a> TryFrom<&Row<'a>> for SignEvent {
                     serde_json::from_slice(&blob)
                 })?
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(7, Type::Any, Box::new(e)))?,
+            event_announcement: row
+                .get::<usize, Value>(8)
+                .map(|raw| {
+                    let blob = match raw {
+                        Value::Blob(val) => val,
+                        _ => vec![],
+                    };
+                    serde_json::from_slice(&blob)
+                })?
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(8, Type::Any, Box::new(e)))?,
         };
         sign_events.update_status();
         Ok(sign_events)
@@ -263,10 +289,11 @@ impl<'a> TryFrom<&Row<'a>> for SignEvent {
 pub struct ActiveEvent {
     pub id: Uuid,
     pub locations: Vec<String>,
-    #[serde(with = "time::serde::rfc3339")]
     pub signing_date: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
-    pub observation_date: OffsetDateTime,
+    pub start_observation_date: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub end_observation_date: OffsetDateTime,
     pub status: EventStatus,
     pub total_allowed_entries: i64,
     pub total_entries: i64,
@@ -278,7 +305,11 @@ pub struct ActiveEvent {
 
 impl ActiveEvent {
     pub fn update_status(&mut self) {
-        self.status = get_status(self.attestation, self.observation_date, self.signing_date);
+        self.status = get_status(
+            self.attestation,
+            self.start_observation_date,
+            self.end_observation_date,
+        );
     }
 }
 
@@ -351,12 +382,16 @@ impl<'a> TryFrom<&Row<'a>> for ActiveEvent {
                 .get::<usize, String>(1)
                 .map(|val| OffsetDateTime::parse(&val, &sql_time_format))?
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(1, Type::Any, Box::new(e)))?,
-            observation_date: row
+            start_observation_date: row
                 .get::<usize, String>(2)
                 .map(|val| OffsetDateTime::parse(&val, &sql_time_format))?
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(2, Type::Any, Box::new(e)))?,
+            end_observation_date: row
+                .get::<usize, String>(3)
+                .map(|val| OffsetDateTime::parse(&val, &sql_time_format))?
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(3, Type::Any, Box::new(e)))?,
             locations: row
-                .get::<usize, Value>(3)
+                .get::<usize, Value>(4)
                 .map(|locations| {
                     let list_locations = match locations {
                         Value::List(list) => list,
@@ -370,13 +405,13 @@ impl<'a> TryFrom<&Row<'a>> for ActiveEvent {
                     }
                     locations_conv
                 })
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(3, Type::Any, Box::new(e)))?,
-            total_allowed_entries: row.get::<usize, i64>(4)?,
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(4, Type::Any, Box::new(e)))?,
+            total_allowed_entries: row.get::<usize, i64>(5)?,
             status: EventStatus::default(),
-            total_entries: row.get::<usize, i64>(5)?,
-            number_of_places_win: row.get::<usize, i64>(6)?,
-            number_of_values_per_entry: row.get::<usize, i64>(7)?,
-            attestation: row.get::<usize, Option<Value>>(8).map(|opt| {
+            total_entries: row.get::<usize, i64>(6)?,
+            number_of_places_win: row.get::<usize, i64>(7)?,
+            number_of_values_per_entry: row.get::<usize, i64>(8)?,
+            attestation: row.get::<usize, Option<Value>>(9).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
@@ -392,11 +427,14 @@ impl<'a> TryFrom<&Row<'a>> for ActiveEvent {
 pub struct EventSummary {
     pub id: Uuid,
     #[serde(with = "time::serde::rfc3339")]
-    /// Time at which the attestation will be added to the event
+    /// Time at which the attestation will be added to the event, needs to be after the end observation date
     pub signing_date: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
-    /// Date of when the weather observations occured
-    pub observation_date: OffsetDateTime,
+    /// Time when the weather observations start, all entries must be made before this time, must be before the end observation date
+    pub start_observation_date: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    /// Time when the weather observations ends, must be before the signing date
+    pub end_observation_date: OffsetDateTime,
     /// NOAA observation stations used in this event
     pub locations: Vec<String>,
     /// The number of values that can be selected per entry in the event (default to number_of_locations * 3, (temp_low, temp_high, wind_speed))
@@ -421,14 +459,18 @@ pub struct EventSummary {
 
 impl EventSummary {
     pub fn update_status(&mut self) {
-        self.status = get_status(self.attestation, self.observation_date, self.signing_date)
+        self.status = get_status(
+            self.attestation,
+            self.start_observation_date,
+            self.end_observation_date,
+        )
     }
 }
 
 pub fn get_status(
     attestation: Option<MaybeScalar>,
-    observation_date: OffsetDateTime,
-    signing_date: OffsetDateTime,
+    start_observation_date: OffsetDateTime,
+    end_observation_date: OffsetDateTime,
 ) -> EventStatus {
     if attestation.is_some() {
         return EventStatus::Signed;
@@ -436,15 +478,14 @@ pub fn get_status(
 
     let now = OffsetDateTime::now_utc();
 
-    if now < observation_date {
+    if now < start_observation_date {
         return EventStatus::Live;
     }
 
-    if now < signing_date {
+    if now < end_observation_date {
         return EventStatus::Running;
     }
 
-    // Past signing date and not signed
     EventStatus::Completed
 }
 
@@ -465,13 +506,17 @@ impl<'a> TryFrom<&Row<'a>> for EventSummary {
                 .get::<usize, String>(1)
                 .map(|val| OffsetDateTime::parse(&val, &sql_time_format))?
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(1, Type::Any, Box::new(e)))?,
-            observation_date: row
+            start_observation_date: row
                 .get::<usize, String>(2)
                 .map(|val| OffsetDateTime::parse(&val, &sql_time_format))?
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(2, Type::Any, Box::new(e)))?,
+            end_observation_date: row
+                .get::<usize, String>(3)
+                .map(|val| OffsetDateTime::parse(&val, &sql_time_format))?
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(3, Type::Any, Box::new(e)))?,
             status: EventStatus::default(),
             locations: row
-                .get::<usize, Value>(3)
+                .get::<usize, Value>(4)
                 .map(|locations| {
                     let list_locations = match locations {
                         Value::List(list) => list,
@@ -485,19 +530,19 @@ impl<'a> TryFrom<&Row<'a>> for EventSummary {
                     }
                     locations_conv
                 })
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(3, Type::Any, Box::new(e)))?,
-            total_allowed_entries: row.get::<usize, i64>(4)?,
-            total_entries: row.get::<usize, i64>(5)?,
-            number_of_places_win: row.get::<usize, i64>(6)?,
-            number_of_values_per_entry: row.get::<usize, i64>(7)?,
-            attestation: row.get::<usize, Option<Value>>(8).map(|opt| {
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(4, Type::Any, Box::new(e)))?,
+            total_allowed_entries: row.get::<usize, i64>(5)?,
+            total_entries: row.get::<usize, i64>(6)?,
+            number_of_places_win: row.get::<usize, i64>(7)?,
+            number_of_values_per_entry: row.get::<usize, i64>(8)?,
+            attestation: row.get::<usize, Option<Value>>(9).map(|opt| {
                 opt.and_then(|raw| match raw {
                     Value::Blob(val) => serde_json::from_slice(&val).ok(),
                     _ => None,
                 })
             })?,
             nonce: row
-                .get::<usize, Value>(9)
+                .get::<usize, Value>(10)
                 .map(|raw| {
                     let blob = match raw {
                         Value::Blob(val) => val,
@@ -505,7 +550,7 @@ impl<'a> TryFrom<&Row<'a>> for EventSummary {
                     };
                     serde_json::from_slice(&blob)
                 })?
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(9, Type::Any, Box::new(e)))?,
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(10, Type::Any, Box::new(e)))?,
             weather: vec![],
         };
         event_summary.update_status();
@@ -517,11 +562,14 @@ impl<'a> TryFrom<&Row<'a>> for EventSummary {
 pub struct Event {
     pub id: Uuid,
     #[serde(with = "time::serde::rfc3339")]
-    /// Time at which the attestation will be added to the event
+    /// Time at which the attestation will be added to the event, needs to be after the end observation date
     pub signing_date: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
-    /// Date of when the weather observations occured
-    pub observation_date: OffsetDateTime,
+    /// Time when the weather observations start, all entries must be made before this time, must be before the end observation date
+    pub start_observation_date: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    /// Time when the weather observations ends, must be before the signing date
+    pub end_observation_date: OffsetDateTime,
     /// NOAA observation stations used in this event
     pub locations: Vec<String>,
     /// The number of values that can be selected per entry in the event (default to number_of_locations * 3, (temp_low, temp_high, wind_speed))
@@ -553,7 +601,11 @@ pub struct Event {
 
 impl Event {
     pub fn update_status(&mut self) {
-        self.status = get_status(self.attestation, self.observation_date, self.signing_date);
+        self.status = get_status(
+            self.attestation,
+            self.start_observation_date,
+            self.end_observation_date,
+        );
     }
 }
 
@@ -584,13 +636,18 @@ impl<'a> TryFrom<&Row<'a>> for Event {
                     val.to_offset(UtcOffset::UTC)
                 })
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(1, Type::Any, Box::new(e)))?,
-            observation_date: row
+            start_observation_date: row
                 .get::<usize, String>(2)
                 .map(|val| OffsetDateTime::parse(&val, &sql_time_format))?
                 .map(|val| val.to_offset(UtcOffset::UTC))
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(2, Type::Any, Box::new(e)))?,
+            end_observation_date: row
+                .get::<usize, String>(3)
+                .map(|val| OffsetDateTime::parse(&val, &sql_time_format))?
+                .map(|val| val.to_offset(UtcOffset::UTC))
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(3, Type::Any, Box::new(e)))?,
             event_announcement: row
-                .get::<usize, Value>(3)
+                .get::<usize, Value>(4)
                 .map(|raw| {
                     let blob = match raw {
                         Value::Blob(val) => val,
@@ -598,9 +655,9 @@ impl<'a> TryFrom<&Row<'a>> for Event {
                     };
                     serde_json::from_slice(&blob)
                 })?
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(3, Type::Any, Box::new(e)))?,
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(4, Type::Any, Box::new(e)))?,
             locations: row
-                .get::<usize, Value>(4)
+                .get::<usize, Value>(5)
                 .map(|locations| {
                     let list_locations = match locations {
                         Value::List(list) => list,
@@ -615,12 +672,12 @@ impl<'a> TryFrom<&Row<'a>> for Event {
                     info!("locations: {:?}", locations_conv);
                     locations_conv
                 })
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(4, Type::Any, Box::new(e)))?,
-            total_allowed_entries: row.get::<usize, i64>(5)?,
-            number_of_places_win: row.get::<usize, i64>(6)?,
-            number_of_values_per_entry: row.get::<usize, i64>(7)?,
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(5, Type::Any, Box::new(e)))?,
+            total_allowed_entries: row.get::<usize, i64>(6)?,
+            number_of_places_win: row.get::<usize, i64>(7)?,
+            number_of_values_per_entry: row.get::<usize, i64>(8)?,
             attestation: row
-                .get::<usize, Value>(8)
+                .get::<usize, Value>(9)
                 .map(|v| {
                     info!("val: {:?}", v);
                     let blob_attestation = match v {
@@ -636,9 +693,9 @@ impl<'a> TryFrom<&Row<'a>> for Event {
                         None
                     }
                 })
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(8, Type::Any, Box::new(e)))?,
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(9, Type::Any, Box::new(e)))?,
             nonce: row
-                .get::<usize, Value>(9)
+                .get::<usize, Value>(10)
                 .map(|raw| {
                     let blob = match raw {
                         Value::Blob(val) => val,
@@ -646,8 +703,8 @@ impl<'a> TryFrom<&Row<'a>> for Event {
                     };
                     serde_json::from_slice(&blob)
                 })?
-                .map_err(|e| duckdb::Error::FromSqlConversionFailure(9, Type::Any, Box::new(e)))?,
-            coordinator_pubkey: row.get(10)?,
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(10, Type::Any, Box::new(e)))?,
+            coordinator_pubkey: row.get(11)?,
             status: EventStatus::default(),
             //These nested values have to be made by more quries
             entry_ids: vec![],

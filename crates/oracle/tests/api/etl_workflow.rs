@@ -75,12 +75,16 @@ async fn can_get_event_run_etl_and_see_it_signed() {
     let test_app = spawn_app(Arc::new(weather_data)).await;
 
     // This makes the event window 1 day (what is used by the oracle)
-    let observation_date = OffsetDateTime::parse("2024-08-12T00:00:00+00:00", &Rfc3339).unwrap();
-    let signing_date = OffsetDateTime::parse("2024-08-13T00:00:00+00:00", &Rfc3339).unwrap();
+    let start_observation_date =
+        OffsetDateTime::parse("2024-08-12T00:00:00+00:00", &Rfc3339).unwrap();
+    let end_observation_date =
+        OffsetDateTime::parse("2024-08-13T00:00:00+00:00", &Rfc3339).unwrap();
+    let signing_date = OffsetDateTime::parse("2024-08-13T03:00:00+00:00", &Rfc3339).unwrap();
 
     let new_event_1 = CreateEvent {
         id: Uuid::now_v7(),
-        observation_date,
+        start_observation_date,
+        end_observation_date,
         signing_date,
         locations: vec![
             String::from("PFNO"),
@@ -90,7 +94,7 @@ async fn can_get_event_run_etl_and_see_it_signed() {
         ],
         total_allowed_entries: 4,
         number_of_values_per_entry: 6,
-        number_of_places_win: 1,
+        number_of_places_win: 3,
     };
 
     info!("above create event");
@@ -285,24 +289,28 @@ async fn can_get_event_run_etl_and_see_it_signed() {
         .find(|entry| entry.id == entry_1.id)
         .unwrap();
     assert_eq!(entry_1_res.score.unwrap(), 399900);
+    assert_eq!(entry_1_res.base_score.unwrap(), 40);
 
     let entry_3_res = entries_scores_order
         .iter()
         .find(|entry| entry.id == entry_3.id)
         .unwrap();
     assert_eq!(entry_3_res.score.unwrap(), 399700);
+    assert_eq!(entry_3_res.base_score.unwrap(), 40);
 
     let entry_2_res = entries_scores_order
         .iter()
         .find(|entry| entry.id == entry_2.id)
         .unwrap();
     assert_eq!(entry_2_res.score.unwrap(), 299800);
+    assert_eq!(entry_2_res.base_score.unwrap(), 30);
 
     let entry_4_res = entries_scores_order
         .iter()
         .find(|entry| entry.id == entry_4.id)
         .unwrap();
     assert_eq!(entry_4_res.score.unwrap(), 99600);
+    assert_eq!(entry_4_res.base_score.unwrap(), 10);
 
     let mut entry_outcome_order = res.entries.clone();
     entry_outcome_order.sort_by_key(|entry| entry.id);

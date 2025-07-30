@@ -20,7 +20,8 @@ async fn can_get_all_events() {
 
     let new_event_1 = CreateEvent {
         id: Uuid::now_v7(),
-        observation_date: OffsetDateTime::now_utc(),
+        start_observation_date: OffsetDateTime::now_utc(),
+        end_observation_date: OffsetDateTime::now_utc(),
         signing_date: OffsetDateTime::now_utc(),
         locations: vec![
             String::from("PFNO"),
@@ -34,7 +35,8 @@ async fn can_get_all_events() {
     };
     let new_event_2 = CreateEvent {
         id: Uuid::now_v7(),
-        observation_date: OffsetDateTime::now_utc(),
+        start_observation_date: OffsetDateTime::now_utc(),
+        end_observation_date: OffsetDateTime::now_utc(),
         signing_date: OffsetDateTime::now_utc(),
         locations: vec![
             String::from("KITH"),
@@ -48,7 +50,8 @@ async fn can_get_all_events() {
     };
     let new_event_3 = CreateEvent {
         id: Uuid::now_v7(),
-        observation_date: OffsetDateTime::now_utc(),
+        start_observation_date: OffsetDateTime::now_utc(),
+        end_observation_date: OffsetDateTime::now_utc(),
         signing_date: OffsetDateTime::now_utc(),
         locations: vec![
             String::from("KCQW"),
@@ -106,10 +109,17 @@ async fn can_get_all_events() {
                 .unwrap()
         );
         assert_eq!(
-            event_summary.observation_date,
+            event_summary.start_observation_date,
             cur_expect
-                .observation_date
-                .replace_nanosecond(cur_expect.observation_date.nanosecond() / 1_000 * 1_000)
+                .start_observation_date
+                .replace_nanosecond(cur_expect.start_observation_date.nanosecond() / 1_000 * 1_000)
+                .unwrap()
+        );
+        assert_eq!(
+            event_summary.end_observation_date,
+            cur_expect
+                .end_observation_date
+                .replace_nanosecond(cur_expect.end_observation_date.nanosecond() / 1_000 * 1_000)
                 .unwrap()
         );
         assert_eq!(

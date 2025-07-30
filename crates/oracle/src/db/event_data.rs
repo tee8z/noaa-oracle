@@ -232,7 +232,9 @@ impl EventData {
 
         let signing_date = OffsetDateTime::format(event.signing_date, &Rfc3339)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
-        let observation_date = OffsetDateTime::format(event.observation_date, &Rfc3339)
+        let start_observation_date = OffsetDateTime::format(event.start_observation_date, &Rfc3339)
+            .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let end_observation_date = OffsetDateTime::format(event.end_observation_date, &Rfc3339)
             .map_err(|e| duckdb::Error::ToSqlConversionFailure(Box::new(e)))?;
         let nonce = to_vec(&event.nonce).unwrap();
         let announcement_bytes = to_vec(&event.event_announcement).unwrap();
@@ -245,10 +247,11 @@ impl EventData {
                 number_of_values_per_entry,
                 nonce,
                 signing_date,
-                observation_date,
+                start_observation_date,
+                end_observation_date,
                 locations,
                 event_announcement,
-                coordinator_pubkey) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                coordinator_pubkey) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         )?;
         stmt.execute(params![
             event.id.to_string(),
@@ -257,7 +260,8 @@ impl EventData {
             event.number_of_values_per_entry,
             nonce,
             signing_date,
-            observation_date,
+            start_observation_date,
+            end_observation_date,
             locations_sql,
             announcement_bytes,
             event.coordinator_pubkey
@@ -431,7 +435,7 @@ impl EventData {
         let mut entry_score_values = String::new();
         entry_score_values.push_str("VALUES");
         for (index, val) in entry_scores.iter().enumerate() {
-            entry_score_values.push_str(&format!("('{}',{},{}),", val.0, val.1, val.2));
+            entry_score_values.push_str(&format!("('{}',{},{})", val.0, val.1, val.2));
             if index + 1 < number_entry_scores {
                 entry_score_values.push(',');
             }
@@ -652,9 +656,12 @@ impl EventData {
             .select((
                 "id",
                 "signing_date::TEXT",
-                "observation_date::TEXT",
+                "start_observation_date::TEXT",
+                "end_observation_date::TEXT",
                 "locations",
                 "total_allowed_entries",
+            ))
+            .and_select((
                 "COALESCE(event_entries.total_entries,0) as total_entries",
                 "number_of_places_win",
                 "number_of_values_per_entry",
@@ -721,7 +728,8 @@ impl EventData {
         let event_select = select((
             "id",
             "signing_date::TEXT",
-            "observation_date::TEXT",
+            "start_observation_date::TEXT",
+            "end_observation_date::TEXT",
             "event_announcement",
             "locations",
             "total_allowed_entries",
@@ -754,7 +762,8 @@ impl EventData {
             .select((
                 "id",
                 "signing_date::TEXT",
-                "observation_date::TEXT",
+                "start_observation_date::TEXT",
+                "end_observation_date::TEXT",
                 "locations",
                 "total_allowed_entries",
                 "COALESCE(event_entries.total_entries, 0) as total_entries",
@@ -805,7 +814,8 @@ impl EventData {
         let event_select = select((
             "id",
             "signing_date::TEXT",
-            "observation_date::TEXT",
+            "start_observation_date::TEXT",
+            "end_observation_date::TEXT",
             "number_of_places_win",
             "number_of_values_per_entry",
             "attestation_signature as attestation",
