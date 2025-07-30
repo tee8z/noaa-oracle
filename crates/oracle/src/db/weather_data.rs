@@ -128,7 +128,7 @@ impl WeatherData for WeatherAccess {
         }
         if let Some(start) = &req.start {
             daily_forecasts = daily_forecasts.where_(format!(
-                "(DATE_TRUNC('day', begin_time::TIMESTAMP)::TIMESTAMPTZ) >= {}::TIMESTAMPTZ",
+                "begin_time::TIMESTAMPTZ <= {}::TIMESTAMPTZ",
                 placeholders.next()
             ));
             values.push(start.format(&Rfc3339)?.to_owned());
@@ -136,29 +136,42 @@ impl WeatherData for WeatherAccess {
 
         if let Some(end) = &req.end {
             daily_forecasts = daily_forecasts.where_(format!(
-                "(DATE_TRUNC('day', end_time::TIMESTAMP)::TIMESTAMPTZ) <= {}::TIMESTAMPTZ",
+                "end_time::TIMESTAMPTZ >= {}::TIMESTAMPTZ",
                 placeholders.next()
             ));
             values.push(end.format(&Rfc3339)?.to_owned());
         }
-        daily_forecasts = daily_forecasts.group_by(("station_id", "begin_time"));
+        daily_forecasts = daily_forecasts.group_by((
+            "station_id",
+            "DATE_TRUNC('day', begin_time::TIMESTAMP)::TEXT",
+        ));
 
         let query = with("daily_forecasts")
             .as_(daily_forecasts)
             .select((
                 "station_id",
                 "date",
-                "MIN(start_time)".as_("start_time"),
-                "MAX(end_time)".as_("end_time"),
+                if let Some(start) = &req.start {
+                    format!("GREATEST('{}', MIN(start_time))", start.format(&Rfc3339)?)
+                        .as_("start_time")
+                } else {
+                    "MIN(start_time)".as_("start_time")
+                },
+                if let Some(end) = &req.end {
+                    format!("LEAST('{}', MAX(end_time))", end.format(&Rfc3339)?).as_("end_time")
+                } else {
+                    "MAX(end_time)".as_("end_time")
+                },
                 "MIN(temp_low)".as_("temp_low"),
                 "MAX(temp_high)".as_("temp_high"),
                 "MAX(wind_speed)".as_("wind_speed"),
-                "MAX(temperature_unit_code)".as_("temperature_unit_code"), // assumes consistent units per grouping
+                "MAX(temperature_unit_code)".as_("temperature_unit_code"),
             ))
             .from("daily_forecasts")
             .group_by(("station_id", "date"));
 
         let records = self.query(query, values).await?;
+
         let forecasts: Forecasts = records
             .iter()
             .map(|record| Forecasts::from_with_temp_unit(record, &req.temperature_unit))
