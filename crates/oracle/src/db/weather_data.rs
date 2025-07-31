@@ -188,29 +188,41 @@ impl WeatherData for WeatherAccess {
         req: &ObservationRequest,
         station_ids: Vec<String>,
     ) -> Result<Vec<Observation>, Error> {
-        let parquet_files = self.file_access.grab_file_names(req.into()).await?;
+        let start_back_one_day = if let Some(start_date) = req.start {
+            start_date.saturating_sub(Duration::days(1))
+        } else {
+            OffsetDateTime::now_utc().saturating_sub(Duration::days(1))
+        };
+        let mut file_params: FileParams = req.into();
+        file_params.start = Some(start_back_one_day);
+        let parquet_files = self.file_access.grab_file_names(file_params).await?;
         let file_paths = self.file_access.build_file_paths(parquet_files);
+
         if file_paths.is_empty() {
             return Ok(vec![]);
         }
+
+        if file_paths.is_empty() {
+            return Ok(vec![]);
+        }
+
         let mut placeholders = Parameters::new();
-        let mut query = select((
+        let mut values: Vec<String> = vec![];
+
+        let mut base_query = select((
             "station_id",
-            "min(generated_at)".as_("start_time"),
-            "max(generated_at)".as_("end_time"),
-            "min(temperature_value)".as_("temp_low"),
-            "max(temperature_value)".as_("temp_high"),
-            "max(wind_speed)".as_("wind_speed"),
-            "MAX(temperature_unit_code)".as_("temperature_unit_code"), // assumes consistent units per grouping
+            "generated_at",
+            "temperature_value",
+            "wind_speed",
+            "temperature_unit_code",
         ))
         .from(format!(
             "read_parquet(['{}'], union_by_name = true)",
             file_paths.join("', '")
         ));
 
-        let mut values: Vec<String> = vec![];
         if !station_ids.is_empty() {
-            query = query.where_(format!(
+            base_query = base_query.where_(format!(
                 "station_id IN ({})",
                 placeholders.next_n(station_ids.len())
             ));
@@ -219,23 +231,52 @@ impl WeatherData for WeatherAccess {
                 values.push(station_id);
             }
         }
+
+        let filtered_data = with("all_station_data").as_(base_query);
+        let agg_query = filtered_data
+            .select((
+                "station_id",
+                "MIN(generated_at)".as_("min_time"),
+                "MAX(generated_at)".as_("max_time"),
+                "MIN(temperature_value)".as_("temp_low"),
+                "MAX(temperature_value)".as_("temp_high"),
+                "MAX(wind_speed)".as_("wind_speed"),
+                "MAX(temperature_unit_code)".as_("temperature_unit_code"),
+            ))
+            .from("all_station_data")
+            .group_by("station_id");
+
+        let agg_cte = with("station_aggregates").as_(agg_query);
+
+        let mut final_query = agg_cte
+            .select((
+                "station_id",
+                if let Some(start) = &req.start {
+                    format!("GREATEST('{}', min_time)", start.format(&Rfc3339)?).as_("start_time")
+                } else {
+                    "min_time".as_("start_time")
+                },
+                if let Some(end) = &req.end {
+                    format!("LEAST('{}', max_time)", end.format(&Rfc3339)?).as_("end_time")
+                } else {
+                    "max_time".as_("end_time")
+                },
+                "temp_low",
+                "temp_high",
+                "wind_speed",
+                "temperature_unit_code",
+            ))
+            .from("station_aggregates");
+
         if let Some(start) = &req.start {
-            query = query.where_(format!(
-                "generated_at::TIMESTAMPTZ >= {}::TIMESTAMPTZ",
-                placeholders.next()
-            ));
-            values.push(start.format(&Rfc3339)?.to_owned());
+            final_query = final_query.where_(format!("max_time >= '{}'", start.format(&Rfc3339)?));
         }
 
         if let Some(end) = &req.end {
-            query = query.where_(format!(
-                "generated_at::TIMESTAMPTZ <= {}::TIMESTAMPTZ",
-                placeholders.next()
-            ));
-            values.push(end.format(&Rfc3339)?.to_owned());
+            final_query = final_query.where_(format!("min_time <= '{}'", end.format(&Rfc3339)?));
         }
-        query = query.group_by("station_id");
-        let records = self.query(query, values).await?;
+
+        let records = self.query(final_query, values).await?;
         let observations: Observations = records
             .iter()
             .map(|record| Observations::from_with_temp_unit(record, &req.temperature_unit))
