@@ -1066,7 +1066,7 @@ pub struct Forecasted {
     pub date: OffsetDateTime,
     pub temp_low: i64,
     pub temp_high: i64,
-    pub wind_speed: i64,
+    pub wind_speed: Option<i64>,
 }
 
 impl TryInto<Forecasted> for &OrderedMap<String, Value> {
@@ -1123,6 +1123,12 @@ impl TryInto<Forecasted> for &OrderedMap<String, Value> {
                     raw_speed
                 )),
             })?;
+
+        let wind_speed = if wind_speed >= 0 && wind_speed <= 3000 {
+            Some(wind_speed)
+        } else {
+            None
+        };
 
         Ok(Forecasted {
             date,
@@ -1188,6 +1194,12 @@ impl TryInto<Forecasted> for OrderedMap<String, Value> {
                 )),
             })?;
 
+        let wind_speed = if wind_speed >= 0 && wind_speed <= 3000 {
+            Some(wind_speed)
+        } else {
+            None
+        };
+
         Ok(Forecasted {
             date,
             temp_low,
@@ -1216,7 +1228,13 @@ impl ToRawSql for Forecasted {
         vals.push(',');
         vals.push_str(&format!("{}", self.temp_high));
         vals.push(',');
-        vals.push_str(&format!("{}", self.wind_speed));
+
+        // Handle optional wind_speed - use NULL for None values
+        match self.wind_speed {
+            Some(speed) => vals.push_str(&format!("{}", speed)),
+            None => vals.push_str("NULL"),
+        }
+
         vals.push(')');
         vals
     }
@@ -1233,7 +1251,10 @@ impl ToSql for Forecasted {
             (String::from("temp_high"), Value::Int(self.temp_high as i32)),
             (
                 String::from("wind_speed"),
-                Value::Int(self.wind_speed as i32),
+                match self.wind_speed {
+                    Some(speed) => Value::Int(speed as i32),
+                    None => Value::Null,
+                },
             ),
         ]);
         Ok(ToSqlOutput::Owned(Value::Struct(ordered_struct)))

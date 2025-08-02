@@ -233,7 +233,6 @@ impl ObservationService {
         &self,
         city_weather: &CityWeather,
     ) -> Result<Vec<Observation>, Error> {
-        // Broken @ NOAA: https://forecast.weather.gov/xml/current_obs/all_xml.zip
         let url = "https://aviationweather.gov/data/cache/metars.cache.xml.gz";
         let raw_observation = self.fetcher.fetch_xml_gzip(url).await?;
         let converted_xml: ObservationData = serde_xml_rs::from_str(&raw_observation)?;

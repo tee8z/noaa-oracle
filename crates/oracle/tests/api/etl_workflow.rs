@@ -351,7 +351,7 @@ fn mock_forecast_data() -> Vec<Forecast> {
             end_time: String::from("2024-08-12T00:00:00+00:00"),
             temp_low: 9,
             temp_high: 35,
-            wind_speed: 8,
+            wind_speed: Some(8),
             temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
         },
         Forecast {
@@ -361,7 +361,7 @@ fn mock_forecast_data() -> Vec<Forecast> {
             end_time: String::from("2024-08-12T00:00:00+00:00"),
             temp_low: 17,
             temp_high: 25,
-            wind_speed: 3,
+            wind_speed: Some(3),
             temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
         },
         Forecast {
@@ -371,7 +371,7 @@ fn mock_forecast_data() -> Vec<Forecast> {
             end_time: String::from("2024-08-12T00:00:00+00:00"),
             temp_low: 14,
             temp_high: 17,
-            wind_speed: 6,
+            wind_speed: Some(6),
             temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
         },
         Forecast {
@@ -381,7 +381,7 @@ fn mock_forecast_data() -> Vec<Forecast> {
             end_time: String::from("2024-08-12T00:00:00+00:00"),
             temp_low: 31,
             temp_high: 33,
-            wind_speed: 11,
+            wind_speed: Some(11),
             temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
         },
     ]

@@ -105,9 +105,9 @@ impl WeatherData for WeatherAccess {
             "DATE_TRUNC('day', begin_time::TIMESTAMP)::TEXT".as_("date"),
             "MIN(begin_time)".as_("start_time"),
             "MAX(end_time)".as_("end_time"),
-            "MIN(min_temp)".as_("temp_low"),
-            "MAX(max_temp)".as_("temp_high"),
-            "MAX(wind_speed)".as_("wind_speed"),
+            "MIN(min_temp) FILTER (WHERE min_temp IS NOT NULL AND min_temp >= -200 AND min_temp <= 200)".as_("temp_low"),
+            "MAX(max_temp) FILTER (WHERE max_temp IS NOT NULL AND max_temp >= -200 AND max_temp <= 200)".as_("temp_high"),
+            "MAX(wind_speed) FILTER (WHERE wind_speed IS NOT NULL AND wind_speed >= 0 AND wind_speed <= 500)".as_("wind_speed"),
             "MAX(temperature_unit_code)".as_("temperature_unit_code"), // assumes consistent units per grouping
         ))
         .from(format!(
@@ -128,7 +128,7 @@ impl WeatherData for WeatherAccess {
         }
         if let Some(start) = &req.start {
             daily_forecasts = daily_forecasts.where_(format!(
-                "begin_time::TIMESTAMPTZ <= {}::TIMESTAMPTZ",
+                "begin_time::TIMESTAMPTZ >= {}::TIMESTAMPTZ",
                 placeholders.next()
             ));
             values.push(start.format(&Rfc3339)?.to_owned());
@@ -136,7 +136,7 @@ impl WeatherData for WeatherAccess {
 
         if let Some(end) = &req.end {
             daily_forecasts = daily_forecasts.where_(format!(
-                "end_time::TIMESTAMPTZ >= {}::TIMESTAMPTZ",
+                "end_time::TIMESTAMPTZ <= {}::TIMESTAMPTZ",
                 placeholders.next()
             ));
             values.push(end.format(&Rfc3339)?.to_owned());
@@ -268,12 +268,27 @@ impl WeatherData for WeatherAccess {
             ))
             .from("station_aggregates");
 
-        if let Some(start) = &req.start {
-            final_query = final_query.where_(format!("max_time >= '{}'", start.format(&Rfc3339)?));
-        }
-
-        if let Some(end) = &req.end {
-            final_query = final_query.where_(format!("min_time <= '{}'", end.format(&Rfc3339)?));
+        match (&req.start, &req.end) {
+            (Some(start), Some(end)) => {
+                final_query = final_query.where_(format!(
+                    "GREATEST('{}', min_time) <= LEAST('{}', max_time)",
+                    start.format(&Rfc3339)?,
+                    end.format(&Rfc3339)?
+                ));
+            }
+            (Some(start), None) => {
+                final_query = final_query.where_(format!(
+                    "GREATEST('{}', min_time) <= max_time",
+                    start.format(&Rfc3339)?
+                ));
+            }
+            (None, Some(end)) => {
+                final_query = final_query.where_(format!(
+                    "min_time <= LEAST('{}', max_time)",
+                    end.format(&Rfc3339)?
+                ));
+            }
+            (None, None) => {}
         }
 
         let records = self.query(final_query, values).await?;
@@ -390,7 +405,14 @@ impl Forecasts {
             let end_time = end_time_arr.value(row_index).to_owned();
             let temp_low = temp_low_arr.value(row_index);
             let temp_high = temp_high_arr.value(row_index);
-            let wind_speed = wind_speed_arr.value(row_index);
+
+            let wind_speed_val = wind_speed_arr.value(row_index);
+            //We set max expected wind speed to something outlandish for nulls
+            let wind_speed = if wind_speed_val >= 0 && wind_speed_val <= 3000 {
+                Some(wind_speed_val)
+            } else {
+                None
+            };
             let temp_unit_code = temperature_unit_code_arr.value(row_index).to_owned();
 
             let mut forecast = Forecast {
@@ -419,7 +441,7 @@ pub struct Forecast {
     pub end_time: String,
     pub temp_low: i64,
     pub temp_high: i64,
-    pub wind_speed: i64,
+    pub wind_speed: Option<i64>,
     pub temp_unit_code: String,
 }
 

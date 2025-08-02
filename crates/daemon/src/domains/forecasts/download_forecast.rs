@@ -322,14 +322,82 @@ impl TryFrom<Dwml> for HashMap<String, Vec<WeatherForecast>> {
             time_layouts.insert(time_range.first().unwrap().key.clone(), time_range);
         }
 
-        // The `location-key` is the key for each hashmap entry
-        let mut weather: HashMap<String, Vec<WeatherForecast>> = HashMap::new();
+        let mut all_time_ranges: Vec<TimeRange> = Vec::new();
+        for time_range_set in time_layouts.values() {
+            for time_range in time_range_set {
+                if let Some(end_time) = time_range.end_time {
+                    if !all_time_ranges.iter().any(|existing| {
+                        existing.start_time == time_range.start_time
+                            && existing.end_time == Some(end_time)
+                    }) {
+                        all_time_ranges.push(time_range.clone());
+                    }
+                } else {
+                    // For time ranges without end_time,
+                    // we estimate end_time from the next time range
+
+                    let estimated_end_time = estimate_end_time(time_range, time_range_set);
+                    if let Some(end_time) = estimated_end_time {
+                        let estimated_range = TimeRange {
+                            key: time_range.key.clone(),
+                            start_time: time_range.start_time,
+                            end_time: Some(end_time),
+                        };
+
+                        if !all_time_ranges.iter().any(|existing| {
+                            existing.start_time == estimated_range.start_time
+                                && existing.end_time == Some(end_time)
+                        }) {
+                            all_time_ranges.push(estimated_range);
+                        }
+                    }
+                    // If we can't estimate, we skip this time range
+                }
+            }
+        }
+
+        // Sort by start time to ensure consistent ordering
+        all_time_ranges.sort_by(|a, b| a.start_time.cmp(&b.start_time));
+
         let generated_at = get_generated_at(&raw_data);
 
-        raw_data.data.location.iter().for_each(|location| {
-            let weather_forecast = get_forecasts_ranges(location, generated_at);
-            weather.insert(location.location_key.clone(), weather_forecast);
-        });
+        // Create weather forecasts based on actual NOAA time ranges
+        let mut weather: HashMap<String, Vec<WeatherForecast>> = HashMap::new();
+
+        for location in &raw_data.data.location {
+            let weather_forecasts: Vec<WeatherForecast> = all_time_ranges
+                .iter()
+                .map(|time_range| {
+                    WeatherForecast {
+                        station_id: location.station_id.clone().unwrap_or_default(),
+                        station_name: String::from(""),
+                        latitude: location.point.latitude.clone(),
+                        longitude: location.point.longitude.clone(),
+                        generated_at,
+                        begin_time: time_range.start_time,
+                        end_time: time_range.end_time.unwrap(), // Safe because we filtered out None values
+                        max_temp: None,
+                        min_temp: None,
+                        temperature_unit_code: Units::Fahrenheit.to_string(),
+                        wind_speed: None,
+                        wind_speed_unit_code: Units::Knots.to_string(),
+                        wind_direction: None,
+                        wind_direction_unit_code: Units::DegreesTrue.to_string(),
+                        relative_humidity_max: None,
+                        relative_humidity_min: None,
+                        relative_humidity_unit_code: Units::Percent.to_string(),
+                        liquid_precipitation_amt: None,
+                        liquid_precipitation_unit_code: Units::Inches.to_string(),
+                        twelve_hour_probability_of_precipitation: None,
+                        twelve_hour_probability_of_precipitation_unit_code: Units::Percent
+                            .to_string(),
+                    }
+                })
+                .collect();
+
+            weather.insert(location.location_key.clone(), weather_forecasts);
+        }
+
         // Used to pull the data forward from last time we had a forecast for a value
         let mut prev_weather = weather.clone();
         for parameter_point in raw_data.data.parameters {
@@ -570,22 +638,63 @@ fn add_data(
     Ok(())
 }
 
+fn estimate_end_time(
+    current_range: &TimeRange,
+    all_ranges: &[TimeRange],
+) -> Option<OffsetDateTime> {
+    // Find the next time range with the same key that starts after this one
+    let next_range = all_ranges
+        .iter()
+        .filter(|r| r.key == current_range.key && r.start_time > current_range.start_time)
+        .min_by_key(|r| r.start_time);
+
+    if let Some(next) = next_range {
+        // Use the next range's start time as this range's end time
+        Some(next.start_time)
+    } else {
+        // If no next range found, estimate based on common intervals
+        // Most NOAA forecasts are 1, 3, 6, 12, or 24 hours
+        // We'll default to 3 hours as a reasonable estimate
+        Some(current_range.start_time + Duration::hours(3))
+    }
+}
+
 fn get_interval(current_data: &WeatherForecast, time_ranges: &[TimeRange]) -> Option<usize> {
-    let mut time_iter = time_ranges.iter();
-    let mut current_time = time_iter.next().unwrap();
-    let mut time_interval_index: Option<usize> = None;
-
-    // This is an important time comparison, if there are more None's than expected this may be the source
-    while current_time.start_time <= current_data.begin_time {
-        time_interval_index = time_interval_index.map_or(Some(0), |interval| Some(interval + 1));
-
-        if let Some(next_time) = time_iter.next() {
-            current_time = next_time;
-        } else {
-            break;
+    // First, try to find an exact match for the time range
+    for (index, time_range) in time_ranges.iter().enumerate() {
+        if let Some(end_time) = time_range.end_time {
+            if time_range.start_time == current_data.begin_time && end_time == current_data.end_time
+            {
+                return Some(index);
+            }
         }
     }
-    time_interval_index
+
+    // If no exact match, find the time range that contains this forecast's begin_time
+    for (index, time_range) in time_ranges.iter().enumerate() {
+        if let Some(end_time) = time_range.end_time {
+            if time_range.start_time <= current_data.begin_time
+                && current_data.begin_time < end_time
+            {
+                return Some(index);
+            }
+        }
+    }
+
+    // If still no match, try to find overlap between time ranges
+    for (index, time_range) in time_ranges.iter().enumerate() {
+        if let Some(end_time) = time_range.end_time {
+            if (time_range.start_time <= current_data.begin_time
+                && current_data.begin_time < end_time)
+                || (current_data.begin_time <= time_range.start_time
+                    && time_range.start_time < current_data.end_time)
+            {
+                return Some(index);
+            }
+        }
+    }
+
+    None
 }
 
 pub struct ForecastRetry {
@@ -787,45 +896,6 @@ impl ForecastService {
 
         Ok(forecasts)
     }
-}
-
-fn get_forecasts_ranges(location: &Location, generated_at: OffsetDateTime) -> Vec<WeatherForecast> {
-    let now = OffsetDateTime::now_utc();
-    let one_week_from_now = now + Duration::weeks(1);
-
-    let mut current_time = now;
-    let mut forecasts = vec![];
-    while current_time <= one_week_from_now {
-        let weather_forecast = WeatherForecast {
-            station_id: location.station_id.clone().unwrap_or_default(),
-            station_name: String::from(""),
-            latitude: location.point.latitude.clone(),
-            longitude: location.point.longitude.clone(),
-            generated_at,
-            begin_time: current_time,
-            end_time: current_time + Duration::hours(3),
-            max_temp: None,
-            min_temp: None,
-            temperature_unit_code: Units::Fahrenheit.to_string(),
-            wind_speed: None,
-            wind_speed_unit_code: Units::Knots.to_string(),
-            wind_direction: None,
-            wind_direction_unit_code: Units::DegreesTrue.to_string(),
-            relative_humidity_max: None,
-            relative_humidity_min: None,
-            relative_humidity_unit_code: Units::Percent.to_string(),
-            liquid_precipitation_amt: None,
-            liquid_precipitation_unit_code: Units::Inches.to_string(),
-            twelve_hour_probability_of_precipitation: None,
-            twelve_hour_probability_of_precipitation_unit_code: Units::Percent.to_string(),
-        };
-
-        forecasts.push(weather_forecast);
-
-        current_time += Duration::hours(3);
-    }
-
-    forecasts
 }
 
 fn add_station_ids(city_weather: &CityWeather, mut converted_xml: Dwml) -> Dwml {

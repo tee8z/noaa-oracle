@@ -562,21 +562,45 @@ impl Oracle {
                     }
                 }
 
-                if let Some(wind_speed) = choice.wind_speed.clone() {
-                    match wind_speed {
-                        ValueOptions::Over => {
-                            if forecast.wind_speed < observation.wind_speed {
-                                base_score += OVER_OR_UNDER_POINTS;
+                if let Some(wind_speed_choice) = choice.wind_speed.clone() {
+                    match forecast.wind_speed {
+                        // NOAA provided a wind forecast - normal scoring
+                        Some(forecast_wind) => match wind_speed_choice {
+                            ValueOptions::Over => {
+                                if forecast_wind < observation.wind_speed {
+                                    base_score += OVER_OR_UNDER_POINTS;
+                                }
                             }
-                        }
-                        ValueOptions::Par => {
-                            if forecast.wind_speed == observation.wind_speed {
-                                base_score += PAR_POINTS;
+                            ValueOptions::Par => {
+                                if forecast_wind == observation.wind_speed {
+                                    base_score += PAR_POINTS;
+                                }
                             }
-                        }
-                        ValueOptions::Under => {
-                            if forecast.wind_speed > observation.wind_speed {
-                                base_score += OVER_OR_UNDER_POINTS;
+                            ValueOptions::Under => {
+                                if forecast_wind > observation.wind_speed {
+                                    base_score += OVER_OR_UNDER_POINTS;
+                                }
+                            }
+                        },
+                        // NOAA didn't forecast wind (implying 0/calm) - compare against actual
+                        None => {
+                            let implicit_forecast = 0; // NOAA's implicit calm prediction
+                            match wind_speed_choice {
+                                ValueOptions::Over => {
+                                    if implicit_forecast < observation.wind_speed {
+                                        base_score += OVER_OR_UNDER_POINTS;
+                                    }
+                                }
+                                ValueOptions::Par => {
+                                    if implicit_forecast == observation.wind_speed {
+                                        base_score += PAR_POINTS;
+                                    }
+                                }
+                                ValueOptions::Under => {
+                                    if implicit_forecast > observation.wind_speed {
+                                        base_score += OVER_OR_UNDER_POINTS;
+                                    }
+                                }
                             }
                         }
                     }
