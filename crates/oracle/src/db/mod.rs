@@ -1183,22 +1183,24 @@ impl TryInto<Forecasted> for OrderedMap<String, Value> {
                 _ => Err(anyhow!("error converting temp into int: {:?}", raw_temp)),
             })?;
 
-        let wind_speed = values
+        let wind_speed: Option<i64> = values
             .get(3)
             .ok_or_else(|| anyhow!("wind_speed not found in the map"))
             .and_then(|raw_speed| match raw_speed {
-                Value::Int(speed) => Ok(*speed as i64),
+                Value::Int(speed) => Ok(Some(*speed as i64)),
+                Value::Null => Ok(None),
                 _ => Err(anyhow!(
                     "error converting wind_speed into int: {:?}",
                     raw_speed
                 )),
-            })?;
-
-        let wind_speed = if wind_speed >= 0 && wind_speed <= 3000 {
-            Some(wind_speed)
-        } else {
-            None
-        };
+            })?
+            .and_then(|speed| {
+                if speed >= 0 && speed <= 3000 {
+                    Some(speed)
+                } else {
+                    None
+                }
+            });
 
         Ok(Forecasted {
             date,
