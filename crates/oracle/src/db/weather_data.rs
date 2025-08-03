@@ -126,9 +126,14 @@ impl WeatherData for WeatherAccess {
                 values.push(station_id);
             }
         }
+        // We are finding values for any overlapping forecast time range
+        // There is some oddity here where we may end up with a forecast
+        // That is heavily influenced by the weather conditions outside our
+        // Requested time range, but at least we will more likely to HAVE a
+        // forecast value no matter the requested time range.
         if let Some(start) = &req.start {
             daily_forecasts = daily_forecasts.where_(format!(
-                "begin_time::TIMESTAMPTZ >= {}::TIMESTAMPTZ",
+                "end_time::TIMESTAMPTZ > {}::TIMESTAMPTZ",
                 placeholders.next()
             ));
             values.push(start.format(&Rfc3339)?.to_owned());
@@ -136,7 +141,7 @@ impl WeatherData for WeatherAccess {
 
         if let Some(end) = &req.end {
             daily_forecasts = daily_forecasts.where_(format!(
-                "end_time::TIMESTAMPTZ <= {}::TIMESTAMPTZ",
+                "begin_time::TIMESTAMPTZ < {}::TIMESTAMPTZ",
                 placeholders.next()
             ));
             values.push(end.format(&Rfc3339)?.to_owned());
