@@ -41,12 +41,12 @@ securityContext: {}
 
 # Health check configuration
 healthCheck:
-  path: /health
+  path: /oracle/pubkey
   port: 9800
 
 livenessProbe:
   httpGet:
-    path: /health
+    path: /oracle/pubkey
     port: http
   initialDelaySeconds: 10
   periodSeconds: 30
@@ -55,7 +55,7 @@ livenessProbe:
 
 readinessProbe:
   httpGet:
-    path: /health
+    path: /oracle/pubkey
     port: http
   initialDelaySeconds: 5
   periodSeconds: 10
