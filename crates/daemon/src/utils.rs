@@ -2,14 +2,15 @@ use anyhow::{anyhow, Error};
 use async_compression::tokio::bufread::GzipDecoder;
 use clap::Parser;
 use futures::TryStreamExt;
+use noaa_oracle_core::{
+    find_config_file, load_config, ConfigSource, DEFAULT_FETCH_INTERVAL, DEFAULT_ORACLE_PORT,
+};
 use reqwest::Client;
 use reqwest_middleware::ClientBuilder;
 use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
 use slog::{debug, error, info, o, Drain, Level, Logger};
 use std::{
-    env,
-    fs::{self, File},
-    io::Read,
+    env, fs,
     path::Path,
     sync::Arc,
     thread,
@@ -19,60 +20,112 @@ use tokio::io::AsyncBufReadExt;
 use tokio::sync::Mutex;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-#[derive(Parser, Clone, Debug, serde::Deserialize)]
-#[command(author, version, about, long_about = None)]
+#[derive(Parser, Clone, Debug, serde::Deserialize, Default)]
+#[command(
+    author,
+    version,
+    about = "NOAA Daemon - Fetches weather data and uploads to oracle"
+)]
 pub struct Cli {
-    /// Path to Settings.toml file holding the rest of the cli options
+    /// Path to config file (TOML format)
+    /// Searched in order: this flag, $NOAA_DAEMON_CONFIG, ./daemon.toml,
+    /// $XDG_CONFIG_HOME/noaa-oracle/daemon.toml, /etc/noaa-oracle/daemon.toml
     #[arg(short, long)]
+    #[serde(skip)]
     pub config: Option<String>,
 
-    /// Set the log level (default: info)
-    #[arg(short, long)]
+    /// Log level: trace, debug, info, warn, error
+    #[arg(short, long, env = "NOAA_DAEMON_LEVEL")]
     pub level: Option<String>,
 
-    /// Base url to the parquet file service (default: http://localhost:9100)
-    #[arg(short, long)]
+    /// Oracle server URL to upload parquet files to
+    #[arg(short, long, env = "NOAA_DAEMON_BASE_URL")]
     pub base_url: Option<String>,
 
-    /// Path to directly storing parquet files before upload (default: ./data)
-    #[arg(short, long)]
+    /// Local directory for temporary parquet storage before upload
+    #[arg(short, long, env = "NOAA_DAEMON_DATA_DIR")]
     pub data_dir: Option<String>,
 
-    /// Length of time to wait before pulling data again in seconds (default: 3600)
-    #[arg(short, long)]
+    /// Fetch interval in seconds (NOAA updates hourly)
+    #[arg(short, long, env = "NOAA_DAEMON_SLEEP_INTERVAL")]
     pub sleep_interval: Option<u64>,
 
-    /// How quickly the rate limiter will release tokens (default: 15 seconds)
-    #[arg(short, long)]
+    /// Rate limiter refill rate in seconds
+    #[arg(short, long, env = "NOAA_DAEMON_REFILL_RATE")]
     pub refill_rate: Option<f64>,
 
-    /// How man tokens can be used within the refill rate (default: 3)
-    #[arg(short, long)]
+    /// Rate limiter token capacity
+    #[arg(short, long, env = "NOAA_DAEMON_TOKEN_CAPACITY")]
     pub token_capacity: Option<usize>,
 
-    /// User agent, header sent to NOAA's api to allow them to connect you
-    #[arg(short, long)]
+    /// HTTP User-Agent header for NOAA API requests
+    #[arg(short, long, env = "NOAA_DAEMON_USER_AGENT")]
     pub user_agent: Option<String>,
 }
 
-pub fn get_config_info() -> Cli {
-    let mut cli = Cli::parse();
+impl Cli {
+    /// Get the effective configuration value with defaults
+    pub fn base_url(&self) -> String {
+        self.base_url
+            .clone()
+            .unwrap_or_else(|| format!("http://localhost:{}", DEFAULT_ORACLE_PORT))
+    }
 
-    if let Some(config_path) = cli.config.clone() {
-        if let Ok(mut file) = File::open(config_path) {
-            let mut content = String::new();
-            file.read_to_string(&mut content)
-                .expect("Failed to read config file");
-            cli = toml::from_str(&content).expect("Failed to deserialize config")
-        };
+    pub fn data_dir(&self) -> String {
+        self.data_dir
+            .clone()
+            .unwrap_or_else(|| "./data".to_string())
+    }
+
+    pub fn sleep_interval(&self) -> u64 {
+        self.sleep_interval.unwrap_or(DEFAULT_FETCH_INTERVAL)
+    }
+
+    pub fn refill_rate(&self) -> f64 {
+        self.refill_rate.unwrap_or(15.0)
+    }
+
+    pub fn token_capacity(&self) -> usize {
+        self.token_capacity.unwrap_or(3)
+    }
+
+    pub fn user_agent(&self) -> String {
+        self.user_agent
+            .clone()
+            .unwrap_or_else(|| "noaa-oracle-daemon/1.0".to_string())
+    }
+}
+
+/// Load configuration from CLI args, config file, and environment
+pub fn get_config_info() -> Cli {
+    let cli_args = Cli::parse();
+
+    // Determine config file path
+    let source = if let Some(ref path) = cli_args.config {
+        ConfigSource::Explicit(path.into())
+    } else {
+        find_config_file("NOAA_DAEMON_CONFIG", "daemon.toml")
     };
-    cli
+
+    // Load from config file
+    let file_config: Cli = load_config(&source).unwrap_or_default();
+
+    // CLI args override file config (env vars are handled by clap)
+    Cli {
+        config: cli_args.config,
+        level: cli_args.level.or(file_config.level),
+        base_url: cli_args.base_url.or(file_config.base_url),
+        data_dir: cli_args.data_dir.or(file_config.data_dir),
+        sleep_interval: cli_args.sleep_interval.or(file_config.sleep_interval),
+        refill_rate: cli_args.refill_rate.or(file_config.refill_rate),
+        token_capacity: cli_args.token_capacity.or(file_config.token_capacity),
+        user_agent: cli_args.user_agent.or(file_config.user_agent),
+    }
 }
 
 pub fn setup_logger(cli: &Cli) -> Logger {
-    let log_level = if cli.level.is_some() {
-        let level = cli.level.as_ref().unwrap();
-        match level.as_ref() {
+    let log_level = if let Some(level) = cli.level.as_ref() {
+        match level.to_lowercase().as_str() {
             "trace" => Level::Trace,
             "debug" => Level::Debug,
             "info" => Level::Info,
@@ -81,7 +134,7 @@ pub fn setup_logger(cli: &Cli) -> Logger {
             _ => Level::Info,
         }
     } else {
-        let rust_log = env::var("RUST_LOG").unwrap_or_else(|_| String::from(""));
+        let rust_log = env::var("RUST_LOG").unwrap_or_default();
         match rust_log.to_lowercase().as_str() {
             "trace" => Level::Trace,
             "debug" => Level::Debug,
@@ -96,7 +149,7 @@ pub fn setup_logger(cli: &Cli) -> Logger {
     let drain = slog_term::CompactFormat::new(decorator).build().fuse();
     let drain = slog_async::Async::new(drain).build().fuse();
     let drain = drain.filter_level(log_level).fuse();
-    slog::Logger::root(drain, o!("version" => "0.5"))
+    slog::Logger::root(drain, o!("version" => env!("CARGO_PKG_VERSION")))
 }
 
 pub struct RateLimiter {
@@ -136,10 +189,8 @@ impl RateLimiter {
                 return true;
             } else {
                 if retries >= 3 {
-                    // Maximum number of retries reached
                     return false;
                 }
-
                 retries += 1;
                 thread::sleep(Duration::from_secs(20));
             }
@@ -165,10 +216,10 @@ impl XmlFetcher {
             rate_limiter,
         }
     }
+
     pub async fn fetch_xml(&self, url: &str) -> Result<String, Error> {
         let mut limiter = self.rate_limiter.lock().await;
         if !limiter.try_acquire(1.0) {
-            // This happens after waitin and trying 3 times
             return Err(anyhow!("Rate limit exceeded after retries"));
         }
 
@@ -193,9 +244,9 @@ impl XmlFetcher {
     pub async fn fetch_xml_gzip(&self, url: &str) -> Result<String, Error> {
         let mut limiter = self.rate_limiter.lock().await;
         if !limiter.try_acquire(1.0) {
-            // This happens after waiting and trying 3 times
             return Err(anyhow!("Rate limit exceeded after retries"));
         }
+
         let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
         let client = ClientBuilder::new(Client::builder().user_agent(&self.user_agent).build()?)
             .with(RetryTransientMiddleware::new_with_policy(retry_policy))
@@ -233,11 +284,7 @@ impl XmlFetcher {
 
 pub fn get_full_path(relative_path: String) -> String {
     let mut current_dir = env::current_dir().expect("Failed to get current directory");
-
-    // Append the relative path to the current working directory
     current_dir.push(relative_path);
-
-    // Convert the `PathBuf` to a `String` if needed
     current_dir.to_string_lossy().to_string()
 }
 
@@ -245,10 +292,8 @@ pub fn create_folder(root_path: &str, logger: &Logger) {
     let path = Path::new(root_path);
 
     if !path.exists() || !path.is_dir() {
-        // Create the folder if it doesn't exist
-        if let Err(err) = fs::create_dir(path) {
+        if let Err(err) = fs::create_dir_all(path) {
             error!(logger, "error creating folder: {}", err);
-            // Handle the error as needed
         } else {
             info!(logger, "folder created: {}", root_path);
         }
