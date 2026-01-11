@@ -28,8 +28,8 @@ futures.workspace = true
 
 # HTTP
 reqwest = { workspace = true, features = ["stream", "multipart", "json"] }
-reqwest-retry = "0.6"
-reqwest-middleware = "0.3"
+reqwest-retry = "0.7"
+reqwest-middleware = "0.4"
 
 # Logging
 slog.workspace = true
