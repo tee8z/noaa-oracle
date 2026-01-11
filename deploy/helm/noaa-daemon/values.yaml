@@ -48,6 +48,16 @@ config:
   refillRate: 15.0
   tokenCapacity: 3
 
+# S3 storage for parquet archival (requires 's3' feature in binary)
+s3:
+  enabled: false
+  bucket: ""
+  # Endpoint URL (for moto/localstack, leave empty for AWS)
+  endpoint: ""
+  # AWS credentials (for local dev with moto)
+  accessKeyId: ""
+  secretAccessKey: ""
+
 # Environment variables
 env: {}
 envFrom: []
@@ -58,3 +68,9 @@ affinity: {}
 
 podAnnotations: {}
 podLabels: {}
+
+# Dev mode configuration for fast local development
+devMode:
+  enabled: false
+  hostPath: /mnt/noaa-oracle/daemon
+  baseImage: debian:bookworm-slim
