@@ -25,14 +25,17 @@ impl fmt::Display for WeatherStation {
     }
 }
 
-impl From<Station> for WeatherStation {
-    fn from(value: Station) -> Self {
-        WeatherStation {
-            station_id: value.station_id,
-            station_name: value.site,
-            latitude: value.latitude,
-            longitude: value.longitude,
-        }
+impl Station {
+    /// Try to convert to WeatherStation, returning None if latitude or longitude is missing
+    fn try_into_weather_station(self) -> Option<WeatherStation> {
+        let latitude = self.latitude?;
+        let longitude = self.longitude?;
+        Some(WeatherStation {
+            station_id: self.station_id,
+            station_name: self.site,
+            latitude,
+            longitude,
+        })
     }
 }
 
@@ -153,8 +156,8 @@ pub async fn get_coordinates(fetcher: Arc<XmlFetcher>) -> Result<CityWeather, Er
         } else {
             continue;
         }
-        let weather_station: WeatherStation = station.clone().into();
-        city_data.insert(station.station_id, weather_station);
+        let station_id = station.station_id.clone();
+        if let Some(weather_station) = station.try_into_weather_station() { city_data.insert(station_id, weather_station); }
     }
 
     Ok(CityWeather { city_data })
@@ -178,6 +181,9 @@ pub struct WxStationIndex {
     #[serde(rename = "warnings")]
     warnings: String,
 
+    #[serde(rename = "time_taken_ms")]
+    time_taken_ms: Option<String>,
+
     #[serde(rename = "data")]
     data: StationData,
 }
@@ -197,10 +203,10 @@ pub struct Station {
     station_id: String,
 
     #[serde(rename = "latitude")]
-    latitude: String,
+    latitude: Option<String>,
 
     #[serde(rename = "longitude")]
-    longitude: String,
+    longitude: Option<String>,
 
     #[serde(rename = "elevation_m")]
     elevation_m: Option<String>,
@@ -216,6 +222,12 @@ pub struct Station {
 
     #[serde(rename = "state")]
     state: Option<String>,
+
+    #[serde(rename = "faa_id")]
+    faa_id: Option<String>,
+
+    #[serde(rename = "site_type")]
+    site_type: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
