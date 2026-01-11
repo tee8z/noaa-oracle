@@ -1,0 +1,18 @@
+[package]
+name = "noaa-oracle-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared utilities for NOAA Oracle services"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+toml.workspace = true
+thiserror = "1.0"
+
+[features]
+default = []
