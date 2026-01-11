@@ -104,6 +104,7 @@
             (craneLib.filterCargoSources path type) ||
             (builtins.match ".*ui/.*" path != null) ||
             (builtins.match ".*config/.*" path != null) ||
+            (builtins.match ".*migrations/.*" path != null) ||
             (builtins.match ".*\.toml$" path != null);
         };
 
@@ -282,6 +283,7 @@
           name = "noaa-oracle";
           tag = "latest";
           contents = [
+            pkgs.stdenv.cc.cc.lib
             oracle
             duckdb-lib
             pkgs.cacert
@@ -290,7 +292,7 @@
           config = {
             Cmd = [ "${oracle}/bin/oracle" ];
             Env = [
-              "LD_LIBRARY_PATH=${duckdb-lib}/lib"
+              "LD_LIBRARY_PATH=${duckdb-lib}/lib:${pkgs.stdenv.cc.cc.lib}/lib"
               "NOAA_ORACLE_UI_DIR=${oracle}/share/noaa-oracle/ui"
               "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
             ];
@@ -308,6 +310,7 @@
           name = "noaa-daemon";
           tag = "latest";
           contents = [
+            pkgs.stdenv.cc.cc.lib
             daemon
             pkgs.cacert
             pkgs.tzdata

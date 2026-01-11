@@ -103,7 +103,7 @@ config:
   # UI static files
   uiDir: /usr/share/noaa-oracle/ui
   # Private key path for signing
-  privateKeyPath: /var/lib/noaa-oracle/keys/oracle.pem
+  privateKeyPath: /etc/noaa-oracle/keys/oracle.pem
 
 # Environment variables
 env: {}

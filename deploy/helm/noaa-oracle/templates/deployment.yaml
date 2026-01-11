@@ -75,7 +75,7 @@ spec:
               mountPath: {{ .Values.persistence.mountPath }}
             {{- if .Values.secrets.privateKey.create }}
             - name: keys
-              mountPath: /var/lib/noaa-oracle/keys
+              mountPath: /etc/noaa-oracle/keys
               readOnly: true
             {{- end }}
             {{- if .Values.devMode.enabled }}
