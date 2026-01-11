@@ -1,0 +1,58 @@
+# NOAA Daemon Configuration
+#
+# The Daemon is a background service that:
+#   1. Fetches weather data from NOAA APIs (observations + forecasts)
+#   2. Converts data to parquet format
+#   3. Uploads parquet files to an Oracle server
+#
+# The Daemon is OPTIONAL - you can run an Oracle without it by:
+#   - Using pre-existing weather data
+#   - Syncing data from another oracle
+#   - Downloading historical datasets
+#
+# Copy this file to one of these locations:
+#   - ./daemon.toml (current directory)
+#   - $XDG_CONFIG_HOME/noaa-oracle/daemon.toml (~/.config/noaa-oracle/)
+#   - /etc/noaa-oracle/daemon.toml (system-wide)
+#
+# Or specify a custom path with: daemon --config /path/to/config.toml
+#
+# All settings can also be set via environment variables:
+#   NOAA_DAEMON_LEVEL, NOAA_DAEMON_BASE_URL, etc.
+
+# Logging level: trace, debug, info, warn, error
+level = "info"
+
+# =============================================================================
+# Oracle Connection
+# =============================================================================
+# URL of the Oracle server to upload weather data to
+# The daemon will POST parquet files to {base_url}/file/{filename}
+base_url = "http://localhost:9800"
+
+# =============================================================================
+# Local Storage
+# =============================================================================
+# Temporary directory for parquet files before upload
+# Files are organized by date: data_dir/YYYY-MM-DD/*.parquet
+#
+# For user installs: ~/.cache/noaa-oracle/
+# For system installs: /var/cache/noaa-oracle/
+data_dir = "./data"
+
+# =============================================================================
+# Scheduling
+# =============================================================================
+# Fetch interval in seconds (default: 1 hour = 3600)
+# NOAA updates data hourly, so shorter intervals provide no benefit
+sleep_interval = 3600
+
+# =============================================================================
+# HTTP Client
+# =============================================================================
+user_agent = "noaa-oracle-daemon/1.0"
+
+# Rate limiting for NOAA API (be respectful of public APIs)
+# Default: 3 requests per 15 second window
+refill_rate = 15.0
+token_capacity = 3
