@@ -1,5 +1,0 @@
-level = "debug"
-base_url = "http://localhost:9100"
-data_dir = "./data"
-sleep_interval = 3600
-user_agent = "noaa-data/1.0 "

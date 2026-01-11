@@ -1,8 +1,0 @@
-level = "debug"
-data_dir = "./weather_data"
-ui_dir = "./crates/oracle/ui"
-host = "127.0.0.1"
-port = "9800"
-remote_url = "http://127.0.0.1:9800"
-event_db = "event_data"
-private_key_path = "oracle_private_key.pem"
