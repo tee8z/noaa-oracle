@@ -8,8 +8,9 @@ use tokio::{net::TcpListener, signal};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli: oracle::Cli = get_config_info();
+    let cli = get_config_info();
     let log_level = get_log_level(&cli);
+
     setup_logger()
         .level(log_level)
         .level_for("duckdb", log_level)
@@ -17,40 +18,42 @@ async fn main() -> anyhow::Result<()> {
         .level_for("http_response", log_level)
         .level_for("http_request", log_level)
         .apply()?;
-    let weather_data = cli.weather_dir.unwrap_or(String::from("./weather_data"));
-    create_folder(&weather_data.clone());
-    let event_data = cli.event_db.unwrap_or(String::from("./event_data"));
-    create_folder(&event_data.clone());
-    let socket_addr = SocketAddr::from_str(&format!(
-        "{}:{}",
-        cli.domain.unwrap_or(String::from("127.0.0.1")),
-        cli.port.unwrap_or(String::from("9800"))
-    ))
-    .unwrap();
+
+    // Get paths using the new helper methods
+    let weather_data = cli.weather_dir();
+    let event_data = cli.event_db();
+    let ui_dir = cli.ui_dir();
+    let private_key = cli.private_key();
+    let remote_url = cli.remote_url();
+    let host = cli.host();
+    let port = cli.port();
+
+    // Create required directories
+    create_folder(&weather_data);
+    create_folder(&event_data);
+
+    let socket_addr = SocketAddr::from_str(&format!("{}:{}", host, port))
+        .map_err(|e| anyhow!("invalid address: {}", e))?;
 
     let listener = TcpListener::bind(socket_addr)
-        .map_err(|e| anyhow!("error binding to IO socket: {}", e.to_string()))
+        .map_err(|e| anyhow!("error binding to socket: {}", e))
         .await?;
 
-    info!("listening on http://{}", socket_addr);
-    info!("docs hosted @ http://{}/docs", socket_addr);
+    info!("NOAA Oracle starting...");
+    info!("  Listen: http://{}", socket_addr);
+    info!("  Docs:   http://{}/docs", socket_addr);
+    info!("  Weather data: {}", weather_data);
+    info!("  Event DB: {}", event_data);
+    info!("  UI: {}", ui_dir);
 
-    let app_state = build_app_state(
-        cli.remote_url
-            .unwrap_or(String::from("http://127.0.0.1:9100")),
-        cli.ui_dir.unwrap_or(String::from("./ui")),
-        weather_data,
-        event_data,
-        cli.oracle_private_key
-            .unwrap_or(String::from("./oracle_private_key.pem")),
-    )
-    .await
-    .map_err(|e| {
-        error!("error building app: {}", e);
-        e
-    })?;
+    let app_state = build_app_state(remote_url, ui_dir, weather_data, event_data, private_key)
+        .await
+        .map_err(|e| {
+            error!("error building app: {}", e);
+            e
+        })?;
 
-    let app = app(app_state.clone());
+    let app = app(app_state);
 
     serve(
         listener,
@@ -58,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;
+
     Ok(())
 }
 
