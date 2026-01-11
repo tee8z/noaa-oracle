@@ -66,7 +66,7 @@ pub struct Metar {
     pub wind_speed_kt: Option<String>,
 
     #[serde(rename = "elevation_m")]
-    pub elevation_m: String,
+    pub elevation_m: Option<String>,
 
     #[serde(rename = "wx_string")]
     pub wx_string: Option<String>,
