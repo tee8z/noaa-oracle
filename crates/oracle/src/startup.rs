@@ -4,7 +4,7 @@ use crate::{
     oracle::{self, Oracle},
     routes, update_data, upload,
     weather_data::WeatherAccess,
-    EventData, FileAccess, FileData, WeatherData,
+    Database, FileAccess, FileData, WeatherData,
 };
 use anyhow::anyhow;
 use axum::{
@@ -86,10 +86,12 @@ pub async fn build_app_state(
             .map_err(|e| anyhow!("error setting up weather data: {}", e))?,
     );
 
-    let event_db = Arc::new(
-        EventData::new(&event_dir).map_err(|e| anyhow!("error setting up event data: {}", e))?,
+    let db = Arc::new(
+        Database::new(&event_dir)
+            .await
+            .map_err(|e| anyhow!("error setting up SQLite database: {}", e))?,
     );
-    let oracle = Arc::new(Oracle::new(event_db, weather_db.clone(), &private_key_file_path).await?);
+    let oracle = Arc::new(Oracle::new(db, weather_db.clone(), &private_key_file_path).await?);
 
     Ok(AppState {
         ui_dir,

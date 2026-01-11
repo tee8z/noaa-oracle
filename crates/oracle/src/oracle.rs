@@ -1,5 +1,5 @@
 use crate::{
-    weather_data, ActiveEvent, AddEventEntry, CreateEvent, CreateEventData, Event, EventData,
+    weather_data, ActiveEvent, AddEventEntry, CreateEvent, CreateEventData, Database, Event,
     EventFilter, EventStatus, EventSummary, Forecast, ForecastRequest, Observation,
     ObservationRequest, SignEvent, TemperatureUnit, ValueOptions, Weather, WeatherData,
     WeatherEntry,
@@ -11,7 +11,6 @@ use dlctix::{
     musig2::secp256k1::{rand, PublicKey, Secp256k1, SecretKey},
     secp::{MaybePoint, Point},
 };
-use duckdb::arrow::datatypes::ArrowNativeType;
 use log::{debug, error, info, warn};
 use nostr_sdk::{key::Keys, nips::nip19::ToBech32, PublicKey as NostrPublicKey};
 use pem_rfc7468::{decode_vec, encode_string};
@@ -62,7 +61,7 @@ pub enum Error {
     DataQuery(
         #[serde(skip)]
         #[from]
-        duckdb::Error,
+        sqlx::Error,
     ),
     #[error("Pubkeys in DB doesn't match with .pem")]
     MismatchPubkey(String),
@@ -90,15 +89,15 @@ pub enum Error {
 }
 
 pub struct Oracle {
-    event_data: Arc<EventData>,
-    weather_data: Arc<dyn WeatherData>, //need this to be a trait so I can mock the weather data
+    db: Arc<Database>,
+    weather_data: Arc<dyn WeatherData>,
     private_key: SecretKey,
     public_key: PublicKey,
 }
 
 impl Oracle {
     pub async fn new(
-        event_data: Arc<EventData>,
+        db: Arc<Database>,
         weather_data: Arc<dyn WeatherData>,
         private_key_file_path: &String,
     ) -> Result<Self, Error> {
@@ -106,7 +105,7 @@ impl Oracle {
         let secp = Secp256k1::new();
         let public_key = secret_key.public_key(&secp);
         let oracle = Self {
-            event_data,
+            db,
             weather_data,
             private_key: secret_key,
             public_key,
@@ -116,29 +115,30 @@ impl Oracle {
     }
 
     pub async fn validate_oracle_metadata(&self) -> Result<(), Error> {
-        let stored_public_key = match self.event_data.get_stored_public_key().await {
-            Ok(key) => key,
-            Err(duckdb::Error::QueryReturnedNoRows) => {
-                self.add_meta_data().await?;
-                return Ok(());
+        match self.db.get_stored_public_key().await {
+            Ok(stored_public_key) => {
+                if stored_public_key != self.public_key.x_only_public_key().0 {
+                    return Err(Error::MismatchPubkey(format!(
+                        "stored_pubkey: {:?} pem_pubkey: {:?}",
+                        stored_public_key,
+                        self.public_key()
+                    )));
+                }
+                Ok(())
             }
-            Err(e) => return Err(Error::DataQuery(e)),
-        };
-        if stored_public_key != self.public_key.x_only_public_key().0 {
-            return Err(Error::MismatchPubkey(format!(
-                "stored_pubkey: {:?} pem_pubkey: {:?}",
-                stored_public_key,
-                self.public_key()
-            )));
+            Err(e) if e.to_string().contains("no rows") => {
+                self.add_meta_data().await?;
+                Ok(())
+            }
+            Err(e) => Err(Error::ValidateKey(e)),
         }
-        Ok(())
     }
 
     async fn add_meta_data(&self) -> Result<(), Error> {
-        self.event_data
+        self.db
             .add_oracle_metadata(self.public_key.x_only_public_key().0)
             .await
-            .map_err(Error::DataQuery)
+            .map_err(|e| Error::ValidateKey(e))
     }
 
     pub fn raw_public_key(&self) -> PublicKey {
@@ -162,23 +162,19 @@ impl Oracle {
     }
 
     pub async fn list_events(&self, filter: EventFilter) -> Result<Vec<EventSummary>, Error> {
-        // TODO: add filter/pagination etc.
-        // filter on active event/completed event/time range of event
-        // if we're not careful, this endpoint might bring down the whole server
-        // just due to the amount of data that can come out of it
-        self.event_data
+        self.db
             .filtered_list_events(filter)
             .await
-            .map_err(Error::DataQuery)
+            .map_err(|e| Error::ValidateKey(e))
     }
 
     pub async fn get_event(&self, id: &Uuid) -> Result<Event, Error> {
-        match self.event_data.get_event(id).await {
+        match self.db.get_event(id).await {
             Ok(event_data) => Ok(event_data),
-            Err(duckdb::Error::QueryReturnedNoRows) => {
+            Err(e) if e.to_string().contains("no rows") => {
                 Err(Error::NotFound(format!("event with id {} not found", id)))
             }
-            Err(e) => Err(Error::DataQuery(e)),
+            Err(e) => Err(Error::ValidateKey(e)),
         }
     }
 
@@ -211,10 +207,10 @@ impl Oracle {
             event,
         )
         .map_err(Error::BadEvent)?;
-        self.event_data
+        self.db
             .add_event(oracle_event)
             .await
-            .map_err(Error::DataQuery)
+            .map_err(|e| Error::ValidateKey(e))
     }
 
     pub async fn add_event_entries(
@@ -230,13 +226,13 @@ impl Oracle {
                 event_id
             )));
         }
-        let event = match self.event_data.get_event(&event_id).await {
+        let event = match self.db.get_event(&event_id).await {
             Ok(event_data) => Ok(event_data),
-            Err(duckdb::Error::QueryReturnedNoRows) => Err(Error::NotFound(format!(
+            Err(e) if e.to_string().contains("no rows") => Err(Error::NotFound(format!(
                 "event with id {} not found",
                 &event_id
             ))),
-            Err(e) => Err(Error::DataQuery(e)),
+            Err(e) => Err(Error::ValidateKey(e)),
         }?;
         if !event.entries.is_empty() {
             return Err(Error::BadEntry(format!(
@@ -244,7 +240,7 @@ impl Oracle {
                 event.id
             )));
         }
-        if event.total_allowed_entries.as_usize() != entries.len() {
+        if event.total_allowed_entries as usize != entries.len() {
             return Err(Error::BadEntry(format!(
                 "Client needs to provide {} entries for this event {}",
                 event.total_allowed_entries, event_id
@@ -268,10 +264,10 @@ impl Oracle {
                 .await?;
             weather_entry.push(entry.into());
         }
-        self.event_data
+        self.db
             .add_event_entries(weather_entry.clone())
             .await
-            .map_err(Error::DataQuery)?;
+            .map_err(|e| Error::ValidateKey(e))?;
 
         Ok(weather_entry)
     }
@@ -323,11 +319,10 @@ impl Oracle {
     }
 
     pub async fn get_running_events(&self) -> Result<Vec<ActiveEvent>, Error> {
-        match self.event_data.get_active_events().await {
-            Ok(event_data) => Ok(event_data),
-            Err(duckdb::Error::QueryReturnedNoRows) => Ok(vec![]),
-            Err(e) => Err(Error::DataQuery(e)),
-        }
+        self.db
+            .get_active_events()
+            .await
+            .map_err(|e| Error::ValidateKey(e))
     }
 
     pub async fn get_event_entry(
@@ -335,13 +330,13 @@ impl Oracle {
         event_id: &Uuid,
         entry_id: &Uuid,
     ) -> Result<WeatherEntry, Error> {
-        match self.event_data.get_weather_entry(event_id, entry_id).await {
+        match self.db.get_weather_entry(event_id, entry_id).await {
             Ok(event_data) => Ok(event_data),
-            Err(duckdb::Error::QueryReturnedNoRows) => Err(Error::NotFound(format!(
+            Err(e) if e.to_string().contains("no rows") => Err(Error::NotFound(format!(
                 "entry with id {} not found for event {}",
                 &entry_id, &event_id
             ))),
-            Err(e) => Err(Error::DataQuery(e)),
+            Err(e) => Err(Error::ValidateKey(e)),
         }
     }
 
@@ -440,7 +435,7 @@ impl Oracle {
                 add_forecast_data_and_observation_data(&event, forecast_data, observation_data)
                     .await?
             };
-            self.event_data
+            self.db
                 .update_weather_station_data(event.id, weather)
                 .await?;
             info!(
@@ -479,8 +474,7 @@ impl Oracle {
         etl_process_id: usize,
         event: ActiveEvent,
     ) -> Result<(), Error> {
-        let entries: Vec<WeatherEntry> =
-            self.event_data.get_event_weather_entries(&event.id).await?;
+        let entries: Vec<WeatherEntry> = self.db.get_event_weather_entries(&event.id).await?;
 
         let observation_data = self.event_observation_data(&event).await?;
         let forecast_data = self.event_forecast_data(&event).await?;
@@ -639,7 +633,7 @@ impl Oracle {
             entry_scores.push((entry.id, total_score, base_score as i64));
         }
 
-        self.event_data.update_entry_scores(entry_scores).await?;
+        self.db.update_entry_scores(entry_scores).await?;
 
         Ok(())
     }
@@ -649,10 +643,10 @@ impl Oracle {
         etl_process_id: usize,
         event_ids: Vec<Uuid>,
     ) -> Result<(), Error> {
-        let mut events: Vec<SignEvent> = self.event_data.get_events_to_sign(event_ids).await?;
+        let mut events: Vec<SignEvent> = self.db.get_events_to_sign(event_ids).await?;
         info!("events: {:?}", events);
         for event in events.iter_mut() {
-            let entries = self.event_data.get_event_weather_entries(&event.id).await?;
+            let entries = self.db.get_event_weather_entries(&event.id).await?;
             let mut entry_indices = entries.clone();
             // very important, the sort index of the entry should always be the same when getting the outcome
             entry_indices.sort_by_key(|entry| entry.id);
@@ -674,7 +668,7 @@ impl Oracle {
                         .cloned()
                         .collect();
                     top_entries.sort_by_key(|entry| cmp::Reverse(entry.score));
-                    top_entries.truncate(event.number_of_places_win.as_usize());
+                    top_entries.truncate(event.number_of_places_win as usize);
 
                     // Get indices of winners in original entry_indices order
                     let winners: Vec<usize> = top_entries
@@ -719,7 +713,7 @@ impl Oracle {
 
                 let attestation = attestation_secret(self.private_key, event.nonce, &winner_bytes);
                 event.attestation = Some(attestation);
-                self.event_data.update_event_attestation(event).await?;
+                self.db.update_event_attestation(event).await?;
             }
         }
         info!(

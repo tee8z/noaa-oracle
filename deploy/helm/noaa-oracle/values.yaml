@@ -70,17 +70,19 @@ persistence:
   size: 10Gi
   mountPath: /var/lib/noaa-oracle
 
-# Litestream S3 backup for event database
+# Litestream S3 backup for SQLite event database
 litestream:
-  enabled: true
+  enabled: false
   image:
     repository: litestream/litestream
     tag: "0.3.13"
   s3Bucket: ""
-  s3Path: "oracle.db"
+  s3Path: "noaa-oracle/events.sqlite"
   s3Region: "us-east-1"
   s3Endpoint: ""
   s3ForcePathStyle: false
+  s3AccessKeyId: ""
+  s3SecretAccessKey: ""
   syncInterval: "10s"
   retention: "168h"
   snapshotInterval: "1h"
@@ -94,9 +96,9 @@ config:
   port: 9800
   # Public URL for API responses
   remoteUrl: ""
-  # Weather data directory
+  # Weather data directory (parquet files)
   dataDir: /var/lib/noaa-oracle/weather
-  # Event database directory (DuckDB)
+  # Event database directory (SQLite)
   eventDb: /var/lib/noaa-oracle/events
   # UI static files
   uiDir: /usr/share/noaa-oracle/ui
@@ -118,3 +120,20 @@ metrics:
   enabled: false
   path: /metrics
   interval: 30s
+
+# Secrets configuration
+secrets:
+  privateKey:
+    # Set to true to create a secret from the value below
+    create: false
+    # The private key PEM content (for local dev only - use external secrets in prod)
+    value: ""
+
+# Dev mode configuration for fast local development
+# Uses locally-compiled cargo binaries instead of container images
+devMode:
+  enabled: false
+  # Path to the binary inside the k3d node (mounted from host)
+  hostPath: /mnt/noaa-oracle/oracle
+  # Base image for running the binary (must have libc, ssl, etc.)
+  baseImage: debian:bookworm-slim

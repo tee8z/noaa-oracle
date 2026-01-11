@@ -10,6 +10,10 @@ description = "NOAA weather data fetcher daemon"
 name = "daemon"
 path = "src/main.rs"
 
+[features]
+default = []
+s3 = ["aws-sdk-s3", "aws-config"]
+
 [dependencies]
 # Internal
 noaa-oracle-core.workspace = true
@@ -48,6 +52,10 @@ serde-xml-rs = "0.6"
 
 # Compression
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
+
+# S3 (optional, behind feature flag)
+aws-sdk-s3 = { version = "1.65", optional = true }
+aws-config = { version = "1.5", features = ["behavior-version-latest"], optional = true }
 
 [lints]
 workspace = true

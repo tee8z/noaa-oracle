@@ -1,5 +1,8 @@
 use std::{fs::File, sync::Arc};
 
+#[cfg(feature = "s3")]
+use std::path::Path;
+
 use anyhow::{anyhow, Error};
 use parquet::{
     file::{properties::WriterProperties, writer::SerializedFileWriter},
@@ -13,6 +16,9 @@ use tokio_util::codec::{BytesCodec, FramedRead};
 use crate::{
     create_forecast_schema, create_observation_schema, get_full_path, Cli, Forecast, Observation,
 };
+
+#[cfg(feature = "s3")]
+use crate::S3Storage;
 
 pub fn save_observations(
     observations: Vec<Observation>,
@@ -54,6 +60,34 @@ pub fn save_forecasts(forecast: Vec<Forecast>, root_path: &str, file_name: Strin
     row_group.close().unwrap();
     writer.close().unwrap();
     full_name
+}
+
+#[cfg(feature = "s3")]
+pub async fn upload_to_s3(
+    s3: &S3Storage,
+    logger: &Logger,
+    observation_path: &str,
+    forecast_path: &str,
+    date_folder: &str,
+) -> Result<(), Error> {
+    let obs_filename = Path::new(observation_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow!("invalid observation path"))?;
+
+    let forecast_filename = Path::new(forecast_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow!("invalid forecast path"))?;
+
+    s3.upload_parquet(Path::new(observation_path), date_folder, obs_filename)
+        .await?;
+
+    s3.upload_parquet(Path::new(forecast_path), date_folder, forecast_filename)
+        .await?;
+
+    info!(logger, "Uploaded parquet files to S3");
+    Ok(())
 }
 
 pub async fn send_parquet_files(
@@ -110,26 +144,21 @@ async fn send_file_to_endpoint(
     file_name: &str,
     endpoint_url: &str,
 ) -> Result<(), anyhow::Error> {
-    // Create a reqwest client.
     let client = Client::new();
 
-    // Open the file for reading.
     let file = TokioFile::open(file_path)
         .await
         .map_err(|e| anyhow!("error opening file to upload: {}", e))?;
 
-    // read file body stream
     let stream = FramedRead::new(file, BytesCodec::new());
     let file_body = Body::wrap_stream(stream);
 
-    //make form part of file
     let parquet_file = multipart::Part::stream(file_body)
         .file_name(file_name.to_owned())
         .mime_str("application/parquet")?;
 
     let form = multipart::Form::new().part("file", parquet_file);
 
-    // Create a request builder for a POST request to the endpoint.
     info!(logger, "sending file to endpoint: {}", endpoint_url);
     let response = client
         .post(endpoint_url)
@@ -138,7 +167,6 @@ async fn send_file_to_endpoint(
         .await
         .map_err(|e| anyhow!("error sending file to api: {}", e))?;
 
-    // Check the response status.
     if response.status().is_success() {
         info!(logger, "file successfully uploaded.");
     } else {

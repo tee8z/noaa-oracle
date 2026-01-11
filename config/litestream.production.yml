@@ -1,0 +1,27 @@
+# Litestream Configuration for NOAA Oracle (Production)
+# Continuously replicates SQLite database to S3 for disaster recovery
+#
+# Required environment variables:
+#   AWS_ACCESS_KEY_ID
+#   AWS_SECRET_ACCESS_KEY
+#
+# Or use IAM roles when running on AWS infrastructure
+
+dbs:
+  - path: /data/oracle.db
+    replicas:
+      - type: s3
+        bucket: noaa-oracle-backups
+        path: oracle.db
+        region: us-west-2
+        # Sync interval - how often to replicate changes
+        sync-interval: 10s
+        # Retention - keep 7 days of snapshots
+        retention: 168h
+        # Snapshot interval - full database snapshots
+        snapshot-interval: 1h
+        # Validation interval - verify replica integrity
+        validation-interval: 6h
+
+# Credentials from environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+# or IAM role when running on EC2/ECS/EKS

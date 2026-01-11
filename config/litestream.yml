@@ -1,0 +1,25 @@
+# Litestream Configuration for NOAA Oracle (Local Development)
+# Continuously replicates SQLite database to S3 (moto) for disaster recovery
+
+dbs:
+  - path: ./data/oracle.db
+    replicas:
+      # Moto S3 for local development
+      - type: s3
+        bucket: noaa-oracle-backups
+        path: oracle.db
+        region: us-west-2
+        endpoint: http://localhost:4566
+        force-path-style: true
+        # Sync interval - how often to replicate changes
+        sync-interval: 10s
+        # Retention - keep snapshots for disaster recovery
+        retention: 24h
+        # Snapshot interval - full database snapshots
+        snapshot-interval: 1h
+        # Validation interval - verify replica integrity
+        validation-interval: 6h
+
+# Moto credentials for local dev
+access-key-id: test
+secret-access-key: test

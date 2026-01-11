@@ -82,6 +82,8 @@
           openssl
           openssl.dev
           perl
+          sqlite
+          sqlite.dev
         ];
 
         # Build dependencies including DuckDB
@@ -126,7 +128,7 @@
           version = "1.9.2";
           inherit src;
           cargoArtifacts = workspaceDeps;
-          buildInputs = buildDeps;
+          buildInputs = buildDeps ++ [ pkgs.stdenv.cc.cc.lib ];
           nativeBuildInputs = buildDeps;
           cargoExtraArgs = "--bin oracle";
 
@@ -148,6 +150,76 @@
           cargoExtraArgs = "--bin daemon";
         } // commonEnv);
 
+        # Python environment with moto for S3 mocking
+        moto-env = pkgs.python3.withPackages (ps: with ps; [
+          moto
+          flask
+          flask-cors
+          werkzeug
+          boto3
+        ]);
+
+        # Script to run moto S3 server
+        run-moto = pkgs.writeShellScriptBin "run-moto" ''
+          set -e
+          export AWS_ACCESS_KEY_ID=test
+          export AWS_SECRET_ACCESS_KEY=test
+          export AWS_DEFAULT_REGION=us-west-2
+          export MOTO_PORT=''${MOTO_PORT:-4566}
+
+          echo "Starting Moto S3 server on port $MOTO_PORT..."
+          ${moto-env}/bin/moto_server -p $MOTO_PORT &
+          MOTO_PID=$!
+          sleep 2
+
+          echo "Creating S3 buckets..."
+          ${pkgs.awscli2}/bin/aws --endpoint-url=http://localhost:$MOTO_PORT s3 mb s3://noaa-oracle-weather 2>/dev/null || true
+          ${pkgs.awscli2}/bin/aws --endpoint-url=http://localhost:$MOTO_PORT s3 mb s3://noaa-oracle-backups 2>/dev/null || true
+
+          echo "Moto S3 ready on http://localhost:$MOTO_PORT"
+          echo "  Buckets: noaa-oracle-weather, noaa-oracle-backups"
+          echo "  Credentials: AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test"
+          echo ""
+          echo "Press Ctrl+C to stop..."
+          wait $MOTO_PID
+        '';
+
+        # Script to run litestream replication
+        run-litestream = pkgs.writeShellScriptBin "run-litestream" ''
+          set -e
+          export AWS_ACCESS_KEY_ID=''${AWS_ACCESS_KEY_ID:-test}
+          export AWS_SECRET_ACCESS_KEY=''${AWS_SECRET_ACCESS_KEY:-test}
+
+          CONFIG_FILE="''${LITESTREAM_CONFIG:-./config/litestream.yml}"
+
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "Error: Litestream config not found at $CONFIG_FILE"
+            exit 1
+          fi
+
+          echo "Starting Litestream with config: $CONFIG_FILE"
+          exec ${pkgs.litestream}/bin/litestream replicate -config "$CONFIG_FILE"
+        '';
+
+        # Script to restore from litestream backup
+        run-restore = pkgs.writeShellScriptBin "run-restore" ''
+          set -e
+          export AWS_ACCESS_KEY_ID=''${AWS_ACCESS_KEY_ID:-test}
+          export AWS_SECRET_ACCESS_KEY=''${AWS_SECRET_ACCESS_KEY:-test}
+
+          CONFIG_FILE="''${LITESTREAM_CONFIG:-./config/litestream.yml}"
+          RESTORE_PATH="''${1:-./data/oracle.db}"
+
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "Error: Litestream config not found at $CONFIG_FILE"
+            exit 1
+          fi
+
+          echo "Restoring database to: $RESTORE_PATH"
+          ${pkgs.litestream}/bin/litestream restore -config "$CONFIG_FILE" -o "$RESTORE_PATH" "$RESTORE_PATH"
+          echo "Restore complete!"
+        '';
+
         # Development shell
         devShell = pkgs.mkShell {
           buildInputs = buildDeps ++ [
@@ -156,6 +228,11 @@
             pkgs.cargo-edit
             pkgs.lld
             pkgs.stdenv.cc.cc.lib  # Provides libstdc++ for DuckDB
+            # S3 and backup tools
+            moto-env
+            pkgs.awscli2
+            pkgs.litestream
+            pkgs.sqlx-cli
           ];
 
           shellHook = ''
@@ -163,24 +240,35 @@
             export LD_LIBRARY_PATH="${duckdb-lib}/lib:${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH"
             export RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 
+            # Default AWS credentials for moto
+            export AWS_ACCESS_KEY_ID=''${AWS_ACCESS_KEY_ID:-test}
+            export AWS_SECRET_ACCESS_KEY=''${AWS_SECRET_ACCESS_KEY:-test}
+            export AWS_DEFAULT_REGION=''${AWS_DEFAULT_REGION:-us-west-2}
+
             echo "NOAA Oracle Development Environment"
             echo "  System: ${system}"
             echo "  Rust: ${rustToolchain.version}"
             echo "  DuckDB: ${duckdbVersion} (${duckdbArch})"
             echo ""
             echo "Commands:"
-            echo "  just build      - Build all crates"
-            echo "  just run-oracle - Run oracle server"
-            echo "  just run-daemon - Run data daemon"
-            echo "  just check      - Run fmt, clippy, tests"
+            echo "  just build        - Build all crates"
+            echo "  just run-oracle   - Run oracle server"
+            echo "  just run-daemon   - Run data daemon"
+            echo "  just check        - Run fmt, clippy, tests"
+            echo ""
+            echo "S3/Backup tools:"
+            echo "  nix run .#moto       - Start moto S3 server"
+            echo "  nix run .#litestream - Start litestream replication"
+            echo "  nix run .#restore    - Restore from litestream backup"
           '';
 
           DUCKDB_LIB_DIR = "${duckdb-lib}/lib";
+          SQLX_OFFLINE = "true";
         };
 
         # Runner scripts
         run-oracle = pkgs.writeShellScriptBin "noaa-oracle" ''
-          export LD_LIBRARY_PATH="${duckdb-lib}/lib:$LD_LIBRARY_PATH"
+          export LD_LIBRARY_PATH="${duckdb-lib}/lib:${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH"
           export NOAA_ORACLE_UI_DIR="''${NOAA_ORACLE_UI_DIR:-${oracle}/share/noaa-oracle/ui}"
           exec ${oracle}/bin/oracle "$@"
         '';
@@ -252,6 +340,18 @@
           daemon = flake-utils.lib.mkApp {
             drv = run-daemon;
             name = "noaa-daemon";
+          };
+          moto = flake-utils.lib.mkApp {
+            drv = run-moto;
+            name = "run-moto";
+          };
+          litestream = flake-utils.lib.mkApp {
+            drv = run-litestream;
+            name = "run-litestream";
+          };
+          restore = flake-utils.lib.mkApp {
+            drv = run-restore;
+            name = "run-restore";
           };
           default = flake-utils.lib.mkApp {
             drv = run-oracle;

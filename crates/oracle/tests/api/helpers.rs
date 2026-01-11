@@ -8,7 +8,7 @@ use nostr_sdk::{
     Event, EventBuilder, Keys, Url,
 };
 use oracle::{
-    app, create_folder, oracle::Oracle, setup_logger, AppState, EventData, FileData, WeatherData,
+    app, create_folder, oracle::Oracle, setup_logger, AppState, Database, FileData, WeatherData,
 };
 use rand::Rng;
 use std::{
@@ -42,10 +42,10 @@ pub async fn spawn_app(weather_db: Arc<dyn WeatherData>) -> TestApp {
     let event_data = format!("{}/event_data", test_folder);
     create_folder(&event_data.clone());
 
-    let event_db = Arc::new(EventData::new(&event_data).unwrap());
+    let db = Arc::new(Database::new(&event_data).await.unwrap());
     let private_key_file_path = String::from("./oracle_private_key.pem");
     let oracle = Arc::new(
-        Oracle::new(event_db, weather_db.clone(), &private_key_file_path)
+        Oracle::new(db, weather_db.clone(), &private_key_file_path)
             .await
             .unwrap(),
     );

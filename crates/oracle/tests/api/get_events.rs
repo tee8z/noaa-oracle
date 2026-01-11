@@ -101,25 +101,23 @@ async fn can_get_all_events() {
     let res: Vec<EventSummary> = from_slice(&body).unwrap();
     for (index, event_summary) in res.iter().enumerate() {
         let cur_expect = expected.get(index).unwrap();
+        // SQLite stores timestamps as seconds, so we truncate to second precision
         assert_eq!(
             event_summary.signing_date,
-            cur_expect
-                .signing_date
-                .replace_nanosecond(cur_expect.signing_date.nanosecond() / 1_000 * 1_000)
-                .unwrap()
+            cur_expect.signing_date.replace_nanosecond(0).unwrap()
         );
         assert_eq!(
             event_summary.start_observation_date,
             cur_expect
                 .start_observation_date
-                .replace_nanosecond(cur_expect.start_observation_date.nanosecond() / 1_000 * 1_000)
+                .replace_nanosecond(0)
                 .unwrap()
         );
         assert_eq!(
             event_summary.end_observation_date,
             cur_expect
                 .end_observation_date
-                .replace_nanosecond(cur_expect.end_observation_date.nanosecond() / 1_000 * 1_000)
+                .replace_nanosecond(0)
                 .unwrap()
         );
         assert_eq!(
