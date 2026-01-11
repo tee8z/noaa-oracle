@@ -131,11 +131,12 @@
             pkgs.just
             pkgs.cargo-edit
             pkgs.lld
+            pkgs.stdenv.cc.cc.lib  # Provides libstdc++ for DuckDB
           ];
 
           shellHook = ''
             export DUCKDB_LIB_DIR="${duckdb-lib}/lib"
-            export LD_LIBRARY_PATH="${duckdb-lib}/lib:$LD_LIBRARY_PATH"
+            export LD_LIBRARY_PATH="${duckdb-lib}/lib:${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH"
             export RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 
             echo "NOAA Oracle Development Environment"

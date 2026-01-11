@@ -260,8 +260,8 @@ async fn event_not_signed_before_signing_date() {
         .await
         .unwrap();
 
-    let entry = AddEventEntry {
-        id: Uuid::now_v7(),
+    let entry_1 = AddEventEntry {
+        id: get_uuid_from_timestamp("2024-08-11T00:00:00.10Z"),
         event_id: event.id,
         expected_observations: vec![WeatherChoices {
             stations: String::from("PFNO"),
@@ -271,9 +271,20 @@ async fn event_not_signed_before_signing_date() {
         }],
     };
 
+    let entry_2 = AddEventEntry {
+        id: get_uuid_from_timestamp("2024-08-11T00:00:00.20Z"),
+        event_id: event.id,
+        expected_observations: vec![WeatherChoices {
+            stations: String::from("PFNO"),
+            temp_low: Some(ValueOptions::Over),
+            temp_high: None,
+            wind_speed: None,
+        }],
+    };
+
     test_app
         .oracle
-        .add_event_entries(keys.public_key, event.id, vec![entry])
+        .add_event_entries(keys.public_key, event.id, vec![entry_1, entry_2])
         .await
         .unwrap();
 
@@ -446,7 +457,7 @@ async fn attestation_is_deterministic() {
         .await
         .unwrap();
 
-    let entry = AddEventEntry {
+    let entry_1 = AddEventEntry {
         id: get_uuid_from_timestamp("2024-08-11T00:00:00.10Z"),
         event_id: created.id,
         expected_observations: vec![WeatherChoices {
@@ -457,34 +468,28 @@ async fn attestation_is_deterministic() {
         }],
     };
 
+    let entry_2 = AddEventEntry {
+        id: get_uuid_from_timestamp("2024-08-11T00:00:00.20Z"),
+        event_id: created.id,
+        expected_observations: vec![WeatherChoices {
+            stations: String::from("PFNO"),
+            temp_low: Some(ValueOptions::Par),
+            temp_high: None,
+            wind_speed: Some(ValueOptions::Par),
+        }],
+    };
+
     test_app
         .oracle
-        .add_event_entries(keys.public_key, created.id, vec![entry.clone()])
+        .add_event_entries(
+            keys.public_key,
+            created.id,
+            vec![entry_1.clone(), entry_2.clone()],
+        )
         .await
         .unwrap();
 
-    // Get the event before ETL
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri(format!("/oracle/events/{}", created.id))
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::empty())
-        .unwrap();
-
-    let response = test_app.app.clone().oneshot(request).await.unwrap();
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let before_etl: Event = from_slice(&body).unwrap();
-
-    // Manually compute what the attestation should be
-    let winners = vec![0usize]; // Only one entry, it wins
-    let winning_bytes = get_winning_bytes(winners);
-    let expected_attestation = attestation_secret(
-        test_app.oracle.raw_private_key(),
-        before_etl.nonce,
-        &winning_bytes,
-    );
-
-    // Run ETL
+    // Run ETL first to get scores
     let request = Request::builder()
         .method(Method::POST)
         .uri(String::from("/oracle/update"))
@@ -499,11 +504,40 @@ async fn attestation_is_deterministic() {
         .uri(format!("/oracle/events/{}", created.id))
         .body(Body::empty())
         .unwrap();
-    let response = test_app.app.oneshot(request).await.unwrap();
+    let response = test_app.app.clone().oneshot(request).await.unwrap();
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let after_etl: Event = from_slice(&body).unwrap();
 
     assert_eq!(after_etl.status, EventStatus::Signed);
+
+    // Now verify the attestation was computed correctly
+    // Sort entries by score (descending) to find winners
+    let mut entries_by_score = after_etl.entries.clone();
+    entries_by_score.sort_by_key(|e| cmp::Reverse(e.score));
+
+    // Sort entries by id to determine winner indices
+    let mut entries_by_id = after_etl.entries.clone();
+    entries_by_id.sort_by_key(|e| e.id);
+
+    // Get winner indices (position in id-sorted list)
+    let winners: Vec<usize> = entries_by_score
+        .iter()
+        .take(1) // number_of_places_win = 1
+        .map(|winner| {
+            entries_by_id
+                .iter()
+                .position(|e| e.id == winner.id)
+                .unwrap()
+        })
+        .collect();
+
+    let winning_bytes = get_winning_bytes(winners);
+    let expected_attestation = attestation_secret(
+        test_app.oracle.raw_private_key(),
+        after_etl.nonce,
+        &winning_bytes,
+    );
+
     assert_eq!(
         after_etl.attestation.unwrap(),
         expected_attestation,
