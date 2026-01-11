@@ -203,7 +203,7 @@ pub struct Station {
     longitude: String,
 
     #[serde(rename = "elevation_m")]
-    elevation_m: String,
+    elevation_m: Option<String>,
 
     #[serde(rename = "site")]
     site: String,
