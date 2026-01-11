@@ -238,7 +238,7 @@ impl Oracle {
             ))),
             Err(e) => Err(Error::DataQuery(e)),
         }?;
-        if event.entries.len() > 0 {
+        if !event.entries.is_empty() {
             return Err(Error::BadEntry(format!(
                 "event {} already has entries, no more entries are allowed",
                 event.id
@@ -674,7 +674,7 @@ impl Oracle {
                         .cloned()
                         .collect();
                     top_entries.sort_by_key(|entry| cmp::Reverse(entry.score));
-                    top_entries.truncate(event.number_of_places_win.clone().as_usize());
+                    top_entries.truncate(event.number_of_places_win.as_usize());
 
                     // Get indices of winners in original entry_indices order
                     let winners: Vec<usize> = top_entries
