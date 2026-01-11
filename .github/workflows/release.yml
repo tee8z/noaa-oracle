@@ -84,9 +84,9 @@ jobs:
           git commit -m "chore: bump version to ${{ needs.prepare-release.outputs.version }}" || echo "No changes to commit"
           git push origin HEAD:master || echo "No changes to push"
 
-  # Build release binaries using Nix
-  build-release:
-    name: Build Release
+  # Build release binaries for x86_64 using Nix
+  build-release-x86_64:
+    name: Build Release (x86_64)
     runs-on: ubuntu-latest
     needs: prepare-release
     # For real releases, wait for version update; for dry-run, proceed immediately
@@ -262,11 +262,182 @@ jobs:
           path: release/*
           retention-days: 7
 
+  # Build release binaries for ARM64 (aarch64) using Nix cross-compilation
+  build-release-arm64:
+    name: Build Release (ARM64)
+    runs-on: ubuntu-latest
+    needs: prepare-release
+    # For real releases, wait for version update; for dry-run, proceed immediately
+    if: always() && needs.prepare-release.result == 'success'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          sudo apt-get clean || true
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            extra-platforms = aarch64-linux
+
+      - name: Setup Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-gha-cache: false
+          use-flakehub: false
+
+      - name: Install QEMU for ARM64 emulation
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static binfmt-support
+          sudo update-binfmts --enable qemu-aarch64
+
+      - name: Build with Nix for ARM64
+        run: |
+          nix build .#packages.aarch64-linux.oracle --print-build-logs
+          nix build .#packages.aarch64-linux.daemon --print-build-logs -o result-daemon
+
+      - name: Create release package
+        run: |
+          VERSION="${{ needs.prepare-release.outputs.version }}"
+          PKG_NAME="noaa-oracle-${VERSION}-aarch64-linux"
+
+          mkdir -p "${PKG_NAME}/bin"
+          mkdir -p "${PKG_NAME}/ui"
+          mkdir -p "${PKG_NAME}/config"
+
+          # Copy Nix-built binaries
+          cp result/bin/oracle "${PKG_NAME}/bin/"
+          cp result-daemon/bin/daemon "${PKG_NAME}/bin/"
+
+          # Copy UI
+          cp -r ui/* "${PKG_NAME}/ui/"
+
+          # Copy and rename config examples to usable defaults
+          cp config/oracle.example.toml "${PKG_NAME}/config/oracle.toml"
+          cp config/daemon.example.toml "${PKG_NAME}/config/daemon.toml"
+
+          # Create setup script for first-time deployment
+          cat > "${PKG_NAME}/setup.sh" << 'EOF'
+          #!/bin/bash
+          set -e
+          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          cd "$SCRIPT_DIR"
+
+          echo "NOAA Oracle Setup"
+          echo "================="
+
+          # Create data directories
+          echo "Creating data directories..."
+          mkdir -p weather_data event_data logs data
+
+          # Generate signing key
+          if [ -f "oracle_private_key.pem" ]; then
+              echo "WARNING: oracle_private_key.pem already exists!"
+              echo "Skipping key generation. Delete the file manually if you want to regenerate."
+          else
+              echo "Generating oracle signing key..."
+              openssl ecparam -genkey -name secp256k1 -out oracle_private_key.pem
+              chmod 600 oracle_private_key.pem
+              echo "Private key created: oracle_private_key.pem"
+              echo ""
+              echo "IMPORTANT: Back up this key securely! It is used for DLC attestations."
+              echo "If lost, any events signed with this key cannot be attested."
+          fi
+
+          echo ""
+          echo "Setup complete! You can now run:"
+          echo "  ./run-oracle.sh  - Start the oracle server"
+          echo "  ./run-daemon.sh  - Start the data fetching daemon"
+          EOF
+          chmod +x "${PKG_NAME}/setup.sh"
+
+          # Create run script for oracle
+          cat > "${PKG_NAME}/run-oracle.sh" << 'EOF'
+          #!/bin/bash
+          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          cd "$SCRIPT_DIR"
+
+          if [ ! -f "oracle_private_key.pem" ]; then
+              echo "ERROR: oracle_private_key.pem not found!"
+              echo "Run ./setup.sh first to generate the signing key."
+              exit 1
+          fi
+
+          # Create data directories if missing
+          mkdir -p weather_data event_data logs
+
+          export RUST_LOG="${RUST_LOG:-info}"
+          exec ./bin/oracle "$@"
+          EOF
+          chmod +x "${PKG_NAME}/run-oracle.sh"
+
+          # Create run script for daemon
+          cat > "${PKG_NAME}/run-daemon.sh" << 'EOF'
+          #!/bin/bash
+          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          cd "$SCRIPT_DIR"
+
+          mkdir -p data logs
+
+          export RUST_LOG="${RUST_LOG:-info}"
+          exec ./bin/daemon "$@"
+          EOF
+          chmod +x "${PKG_NAME}/run-daemon.sh"
+
+          # Create README
+          cat > "${PKG_NAME}/README.txt" << EOF
+          NOAA Oracle v${VERSION} (ARM64/aarch64)
+          =======================================
+
+          Quick Start:
+            1. Run ./setup.sh to initialize (creates directories and signing key)
+            2. Run ./run-oracle.sh to start the oracle server (default port 9800)
+            3. Run ./run-daemon.sh to start fetching NOAA weather data
+
+          Configuration:
+            - Edit config/oracle.toml for oracle settings
+            - Edit config/daemon.toml for daemon settings
+
+          Directories:
+            - ui/           Browser UI files
+            - config/       Configuration files
+            - bin/          Binaries
+            - weather_data/ Downloaded parquet files (created on first run)
+            - event_data/   DLC event database (created on first run)
+
+          Security:
+            - oracle_private_key.pem is your signing key - BACK IT UP!
+            - This key is used for DLC attestations and must be kept secure
+
+          For more info: https://github.com/tee8z/noaa-oracle
+          EOF
+
+          # Create zip
+          mkdir -p release
+          zip -r "release/${PKG_NAME}.zip" "${PKG_NAME}"
+
+          ls -lh release/
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-aarch64-linux
+          path: release/*
+          retention-days: 7
+
   # Create GitHub release (skipped in dry-run)
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [prepare-release, build-release]
+    needs: [prepare-release, build-release-x86_64, build-release-arm64]
     if: needs.prepare-release.outputs.dry_run != 'true'
     permissions:
       contents: write

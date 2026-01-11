@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "noaa-oracle.fullname" . }}
+  labels:
+    {{- include "noaa-oracle.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "noaa-oracle.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "noaa-oracle.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "noaa-oracle.serviceAccountName" . }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.config.port }}
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.config.level }}
+            - name: NOAA_ORACLE_HOST
+              value: {{ .Values.config.host | quote }}
+            - name: NOAA_ORACLE_PORT
+              value: {{ .Values.config.port | quote }}
+            - name: NOAA_ORACLE_DATA_DIR
+              value: {{ .Values.config.dataDir }}
+            - name: NOAA_ORACLE_EVENT_DB
+              value: {{ .Values.config.eventDb }}
+            - name: NOAA_ORACLE_UI_DIR
+              value: {{ .Values.config.uiDir }}
+            - name: NOAA_ORACLE_PRIVATE_KEY
+              value: {{ .Values.config.privateKeyPath }}
+            {{- if .Values.config.remoteUrl }}
+            - name: NOAA_ORACLE_REMOTE_URL
+              value: {{ .Values.config.remoteUrl | quote }}
+            {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "noaa-oracle.fullname" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}

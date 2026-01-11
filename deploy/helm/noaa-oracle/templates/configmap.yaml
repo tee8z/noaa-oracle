@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "noaa-oracle.fullname" . }}
+  labels:
+    {{- include "noaa-oracle.labels" . | nindent 4 }}
+data:
+  oracle.toml: |
+    level = {{ .Values.config.level | quote }}
+    host = {{ .Values.config.host | quote }}
+    port = {{ .Values.config.port | quote }}
+    {{- if .Values.config.remoteUrl }}
+    remote_url = {{ .Values.config.remoteUrl | quote }}
+    {{- end }}
+    data_dir = {{ .Values.config.dataDir | quote }}
+    event_db = {{ .Values.config.eventDb | quote }}
+    ui_dir = {{ .Values.config.uiDir | quote }}
+    private_key_path = {{ .Values.config.privateKeyPath | quote }}
+---
+{{- if .Values.litestream.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "noaa-oracle.fullname" . }}-litestream
+  labels:
+    {{- include "noaa-oracle.labels" . | nindent 4 }}
+data:
+  litestream.yml: |
+    dbs:
+      - path: {{ .Values.config.eventDb }}/events.duckdb
+        replicas:
+          - type: s3
+            bucket: {{ .Values.litestream.s3Bucket }}
+            path: {{ .Values.litestream.s3Path }}
+            region: {{ .Values.litestream.s3Region }}
+            {{- if .Values.litestream.s3Endpoint }}
+            endpoint: {{ .Values.litestream.s3Endpoint }}
+            force-path-style: {{ .Values.litestream.s3ForcePathStyle }}
+            {{- end }}
+            sync-interval: {{ .Values.litestream.syncInterval }}
+            retention: {{ .Values.litestream.retention }}
+            snapshot-interval: {{ .Values.litestream.snapshotInterval }}
+{{- end }}

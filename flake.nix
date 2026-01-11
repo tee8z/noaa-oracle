@@ -27,7 +27,27 @@
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
         # DuckDB version
-        duckdbVersion = "1.0.0";
+        duckdbVersion = "1.1.3";
+
+        # Architecture-specific DuckDB download
+        duckdbArch = if system == "aarch64-linux" then "aarch64"
+                     else if system == "x86_64-linux" then "amd64"
+                     else if system == "aarch64-darwin" then "osx-universal"
+                     else if system == "x86_64-darwin" then "osx-universal"
+                     else throw "Unsupported system: ${system}";
+
+        duckdbUrl = if pkgs.stdenv.isDarwin
+          then "https://github.com/duckdb/duckdb/releases/download/v${duckdbVersion}/libduckdb-${duckdbArch}.zip"
+          else "https://github.com/duckdb/duckdb/releases/download/v${duckdbVersion}/libduckdb-linux-${duckdbArch}.zip";
+
+        # SHA256 hashes for each architecture (nix-prefetch-url output)
+        duckdbSha256 = {
+          "x86_64-linux" = "02z4qwzxb5w0xmjrlxhz7zacrhbk1vbcl9pl70d98jbd3gq9n6c1";
+          "aarch64-linux" = "00bqmn5s2zhmglcjnfy93cxqdishskc3r9wr8fqvhsj54wvdnsch";
+          # Darwin hashes - will need to be updated if macOS support is needed
+          "x86_64-darwin" = "0000000000000000000000000000000000000000000000000000";
+          "aarch64-darwin" = "0000000000000000000000000000000000000000000000000000";
+        }.${system} or (throw "Unsupported system: ${system}");
 
         # Download DuckDB library
         duckdb-lib = pkgs.stdenv.mkDerivation {
@@ -35,8 +55,8 @@
           version = duckdbVersion;
 
           src = pkgs.fetchurl {
-            url = "https://github.com/duckdb/duckdb/releases/download/v${duckdbVersion}/libduckdb-linux-amd64.zip";
-            sha256 = "sha256-m462XSq49lIQApYCEiGU17RnKKlFDMPVKABedMfjsgY=";
+            url = duckdbUrl;
+            sha256 = duckdbSha256;
           };
 
           nativeBuildInputs = [ pkgs.unzip ];
@@ -47,7 +67,11 @@
 
           installPhase = ''
             mkdir -p $out/lib $out/include
-            cp -r *.so* $out/lib/
+            if [ -f libduckdb.so ]; then
+              cp -r *.so* $out/lib/
+            elif [ -f libduckdb.dylib ]; then
+              cp -r *.dylib* $out/lib/
+            fi
             cp -r *.h $out/include/ 2>/dev/null || true
           '';
         };
@@ -78,7 +102,7 @@
             (craneLib.filterCargoSources path type) ||
             (builtins.match ".*ui/.*" path != null) ||
             (builtins.match ".*config/.*" path != null) ||
-            (builtins.match ".*\\.toml$" path != null);
+            (builtins.match ".*\.toml$" path != null);
         };
 
         # Common environment
@@ -140,8 +164,9 @@
             export RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 
             echo "NOAA Oracle Development Environment"
+            echo "  System: ${system}"
             echo "  Rust: ${rustToolchain.version}"
-            echo "  DuckDB: ${duckdbVersion}"
+            echo "  DuckDB: ${duckdbVersion} (${duckdbArch})"
             echo ""
             echo "Commands:"
             echo "  just build      - Build all crates"
@@ -164,10 +189,58 @@
           exec ${daemon}/bin/daemon "$@"
         '';
 
+        # Docker images for k8s deployment
+        docker-oracle = pkgs.dockerTools.buildLayeredImage {
+          name = "noaa-oracle";
+          tag = "latest";
+          contents = [
+            oracle
+            duckdb-lib
+            pkgs.cacert
+            pkgs.tzdata
+          ];
+          config = {
+            Cmd = [ "${oracle}/bin/oracle" ];
+            Env = [
+              "LD_LIBRARY_PATH=${duckdb-lib}/lib"
+              "NOAA_ORACLE_UI_DIR=${oracle}/share/noaa-oracle/ui"
+              "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+            ];
+            ExposedPorts = {
+              "9100/tcp" = {};
+            };
+            WorkingDir = "/data";
+            Volumes = {
+              "/data" = {};
+            };
+          };
+        };
+
+        docker-daemon = pkgs.dockerTools.buildLayeredImage {
+          name = "noaa-daemon";
+          tag = "latest";
+          contents = [
+            daemon
+            pkgs.cacert
+            pkgs.tzdata
+          ];
+          config = {
+            Cmd = [ "${daemon}/bin/daemon" ];
+            Env = [
+              "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+            ];
+            WorkingDir = "/data";
+            Volumes = {
+              "/data" = {};
+            };
+          };
+        };
+
+
       in
       {
         packages = {
-          inherit oracle daemon duckdb-lib;
+          inherit oracle daemon duckdb-lib docker-oracle docker-daemon;
           default = oracle;
         };
 
