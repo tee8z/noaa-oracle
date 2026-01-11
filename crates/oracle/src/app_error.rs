@@ -20,7 +20,7 @@ pub enum AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        error!("error handling request: {}", self.to_string());
+        error!("error handling request: {}", self);
 
         let (status, error_message) = match self.borrow() {
             AppError::Request(_) => (StatusCode::BAD_REQUEST, self.to_string()),

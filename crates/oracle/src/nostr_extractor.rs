@@ -182,7 +182,7 @@ impl IntoResponse for AuthError {
     fn into_response(self) -> axum::response::Response {
         let (body, code) = match &self {
             Self::InvalidSignature(_) => {
-                warn!("{}", self.to_string());
+                warn!("{}", self);
                 (json!({ "error": self }), StatusCode::FORBIDDEN)
             }
             Self::NoAuthHeader
@@ -192,11 +192,11 @@ impl IntoResponse for AuthError {
             | Self::InvalidUrl(_)
             | Self::InvalidLogin
             | Self::InvalidMethod(_) => {
-                warn!("{}", self.to_string());
+                warn!("{}", self);
                 (json!({ "error": self }), StatusCode::UNAUTHORIZED)
             }
             _ => {
-                warn!("{}", self.to_string());
+                warn!("{}", self);
                 (json!({ "error": self }), StatusCode::BAD_REQUEST)
             }
         };

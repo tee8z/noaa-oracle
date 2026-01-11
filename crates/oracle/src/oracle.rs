@@ -843,10 +843,7 @@ fn generate_new_key() -> SecretKey {
 }
 
 fn is_pem_file(file_path: &String) -> bool {
-    Path::new(file_path)
-        .extension()
-        .and_then(|s| s.to_str())
-        .map_or(false, |ext| ext == "pem")
+    Path::new(file_path).extension().and_then(|s| s.to_str()) == Some("pem")
 }
 
 fn read_key(file_path: &String) -> Result<SecretKey, anyhow::Error> {
