@@ -38,11 +38,11 @@ axum = { version = "0.8", features = [
     "tracing",
     "original-uri",
 ] }
-tower-http = { version = "0.5", features = ["fs", "cors"] }
-hyper = "1.4"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+hyper = "1.8"
 
 # Database
-duckdb = "1.1"
+duckdb = "1.4"
 
 # DLC / Crypto
 dlctix = "0.0.8"
@@ -53,13 +53,13 @@ rand = "0.8"
 
 # Logging
 log.workspace = true
-fern = { version = "0.6", features = ["colored"] }
+fern.workspace = true
 
 # Time
 time.workspace = true
 
 # API docs
-utoipa = { version = "5.3", features = [
+utoipa = { version = "5.4", features = [
     "axum_extras",
     "time",
     "uuid",
@@ -69,12 +69,12 @@ utoipa = { version = "5.3", features = [
 utoipa-scalar = { version = "0.3", features = ["axum"] }
 
 # Other
-uuid = { version = "1.4", features = ["v7", "serde"] }
-regex = "1.10"
-itertools = "0.13"
+uuid = { version = "1.19", features = ["v7", "serde"] }
+regex = "1.12"
+itertools = "0.14"
 scooby = "0.5"
 async-trait = "0.1"
 
 [dev-dependencies]
-tower = "0.4"
-mockall = "0.13"
+tower = "0.5"
+mockall = "0.14"
