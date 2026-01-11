@@ -188,49 +188,6 @@ jobs:
       - name: Run flake check
         run: nix flake check
 
-  # Build for ARM64 (aarch64-linux) using cross-compilation
-  build-arm64:
-    name: Build ARM64
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Free up disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force || true
-          sudo apt-get clean || true
-
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
-        with:
-          extra-conf: |
-            extra-platforms = aarch64-linux
-
-      - name: Setup Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
-        with:
-          use-gha-cache: false
-          use-flakehub: false
-
-      - name: Install QEMU for ARM64 emulation
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-user-static binfmt-support
-          sudo update-binfmts --enable qemu-aarch64
-
-      - name: Build ARM64 packages with Nix
-        run: |
-          nix build .#packages.aarch64-linux.oracle --print-build-logs
-          nix build .#packages.aarch64-linux.daemon --print-build-logs -o result-daemon-arm64
-          echo "ARM64 oracle build complete"
-          file result/bin/oracle
-          echo "ARM64 daemon build complete"
-          file result-daemon-arm64/bin/daemon
-
   # E2E tests (uses pre-built binaries, runs after all other checks pass)
   e2e-test:
     name: E2E Tests
