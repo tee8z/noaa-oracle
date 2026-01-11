@@ -86,7 +86,7 @@ impl CreateEventData {
                 event.id
             ));
         }
-        if event.start_observation_date > event.start_observation_date {
+        if event.start_observation_date > event.end_observation_date {
             return Err(anyhow::anyhow!(
                 "Start observation date {} needs to be after end observation date {}",
                 event.signing_date.format(&Rfc3339).unwrap(),
@@ -1124,7 +1124,7 @@ impl TryInto<Forecasted> for &OrderedMap<String, Value> {
                 )),
             })?;
 
-        let wind_speed = if wind_speed >= 0 && wind_speed <= 3000 {
+        let wind_speed = if (0..=3000).contains(&wind_speed) {
             Some(wind_speed)
         } else {
             None
@@ -1194,13 +1194,7 @@ impl TryInto<Forecasted> for OrderedMap<String, Value> {
                     raw_speed
                 )),
             })?
-            .and_then(|speed| {
-                if speed >= 0 && speed <= 3000 {
-                    Some(speed)
-                } else {
-                    None
-                }
-            });
+            .filter(|speed| (0..=3000).contains(speed));
 
         Ok(Forecasted {
             date,

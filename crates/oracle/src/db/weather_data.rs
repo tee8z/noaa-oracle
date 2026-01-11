@@ -413,7 +413,7 @@ impl Forecasts {
 
             let wind_speed_val = wind_speed_arr.value(row_index);
             //We set max expected wind speed to something outlandish for nulls
-            let wind_speed = if wind_speed_val >= 0 && wind_speed_val <= 3000 {
+            let wind_speed = if (0..=3000).contains(&wind_speed_val) {
                 Some(wind_speed_val)
             } else {
                 None
@@ -588,13 +588,13 @@ impl Observation {
 
         match (current_unit.as_str(), target_unit) {
             ("celsius", TemperatureUnit::Fahrenheit) => {
-                self.temp_low = (self.temp_low as f64) * 9.0 / 5.0 + 32.0;
-                self.temp_high = (self.temp_high as f64) * 9.0 / 5.0 + 32.0;
+                self.temp_low = self.temp_low * 9.0 / 5.0 + 32.0;
+                self.temp_high = self.temp_high * 9.0 / 5.0 + 32.0;
                 self.temp_unit_code = target_unit.to_string();
             }
             ("fahrenheit", TemperatureUnit::Celsius) => {
-                self.temp_low = (self.temp_low as f64 - 32.0) * 5.0 / 9.0;
-                self.temp_high = (self.temp_high as f64 - 32.0) * 5.0 / 9.0;
+                self.temp_low = (self.temp_low - 32.0) * 5.0 / 9.0;
+                self.temp_high = (self.temp_high - 32.0) * 5.0 / 9.0;
                 self.temp_unit_code = target_unit.to_string();
             }
             _ => (), // No conversion needed or unknown unit
