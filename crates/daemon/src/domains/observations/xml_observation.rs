@@ -32,8 +32,9 @@ pub struct CurrentData {
     #[serde(rename = "METAR")]
     pub metar: Vec<Metar>,
 
-    #[serde(rename = "num_results")]
-    pub num_results: String,
+    // num_results is now an attribute on the data element, not a child element
+    #[serde(rename = "num_results", default)]
+    pub num_results: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

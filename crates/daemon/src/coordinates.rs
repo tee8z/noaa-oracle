@@ -26,13 +26,21 @@ impl fmt::Display for WeatherStation {
 }
 
 impl Station {
-    /// Try to convert to WeatherStation, returning None if latitude or longitude is missing
+    /// Try to convert to WeatherStation, returning None if latitude or longitude is missing or invalid
     fn try_into_weather_station(self) -> Option<WeatherStation> {
         let latitude = self.latitude?;
         let longitude = self.longitude?;
+
+        // Skip invalid placeholder coordinates (-99.99, -99.99)
+        let lat_val: f64 = latitude.parse().ok()?;
+        let lon_val: f64 = longitude.parse().ok()?;
+        if lat_val < -90.0 || lat_val > 90.0 || lon_val < -180.0 || lon_val > 180.0 {
+            return None;
+        }
+
         Some(WeatherStation {
             station_id: self.station_id,
-            station_name: self.site,
+            station_name: self.site.unwrap_or_default(),
             latitude,
             longitude,
         })
@@ -157,7 +165,9 @@ pub async fn get_coordinates(fetcher: Arc<XmlFetcher>) -> Result<CityWeather, Er
             continue;
         }
         let station_id = station.station_id.clone();
-        if let Some(weather_station) = station.try_into_weather_station() { city_data.insert(station_id, weather_station); }
+        if let Some(weather_station) = station.try_into_weather_station() {
+            city_data.insert(station_id, weather_station);
+        }
     }
 
     Ok(CityWeather { city_data })
@@ -193,8 +203,9 @@ pub struct StationData {
     #[serde(rename = "Station")]
     station: Vec<Station>,
 
-    #[serde(rename = "num_results")]
-    num_results: String,
+    // num_results is now an attribute on the data element, not a child element
+    #[serde(rename = "num_results", default)]
+    num_results: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -212,7 +223,7 @@ pub struct Station {
     elevation_m: Option<String>,
 
     #[serde(rename = "site")]
-    site: String,
+    site: Option<String>,
 
     #[serde(rename = "country")]
     country: Option<String>,
@@ -226,9 +237,30 @@ pub struct Station {
     #[serde(rename = "faa_id")]
     faa_id: Option<String>,
 
+    // site_type now contains nested METAR/TAF elements indicating available data types
     #[serde(rename = "site_type")]
-    site_type: Option<String>,
+    site_type: Option<SiteType>,
+
+    #[serde(rename = "icao_id")]
+    icao_id: Option<String>,
+
+    #[serde(rename = "iata_id")]
+    iata_id: Option<String>,
 }
+
+/// Represents the site_type element which can contain METAR and TAF child elements
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct SiteType {
+    #[serde(rename = "METAR", default)]
+    metar: Option<EmptyElement>,
+
+    #[serde(rename = "TAF", default)]
+    taf: Option<EmptyElement>,
+}
+
+/// Represents an empty XML element like <METAR/> or <TAF/>
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct EmptyElement;
 
 #[derive(Serialize, Deserialize)]
 pub struct DataSource {
