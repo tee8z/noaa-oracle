@@ -17,8 +17,6 @@ noaa-oracle-core.workspace = true
 # Core
 anyhow.workspace = true
 serde.workspace = true
-serde_json.workspace = true
-toml.workspace = true
 
 # CLI
 clap.workspace = true
@@ -34,7 +32,6 @@ reqwest-retry = "0.6"
 reqwest-middleware = "0.3"
 
 # Logging
-log.workspace = true
 slog.workspace = true
 slog-term.workspace = true
 slog-async.workspace = true
@@ -44,7 +41,6 @@ time.workspace = true
 
 # Data
 parquet.workspace = true
-arrow.workspace = true
 parquet_derive.workspace = true
 
 # XML parsing
@@ -52,7 +48,3 @@ serde-xml-rs = "0.6"
 
 # Compression
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
-
-# Other
-regex = "1.10"
-openssl.workspace = true
