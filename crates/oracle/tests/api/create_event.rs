@@ -169,18 +169,16 @@ async fn can_create_and_get_oracle_event() {
         .await
         .unwrap();
     let res: Event = from_slice(&body).unwrap();
+    // SQLite stores timestamps as seconds, so we truncate to second precision
     assert_eq!(
         res.signing_date,
-        new_event
-            .signing_date
-            .replace_nanosecond(new_event.signing_date.nanosecond() / 1_000 * 1_000)
-            .unwrap()
+        new_event.signing_date.replace_nanosecond(0).unwrap()
     );
     assert_eq!(
         res.start_observation_date,
         new_event
             .start_observation_date
-            .replace_nanosecond(new_event.start_observation_date.nanosecond() / 1_000 * 1_000)
+            .replace_nanosecond(0)
             .unwrap()
     );
     assert_eq!(res.locations, new_event.locations);

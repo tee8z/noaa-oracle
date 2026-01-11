@@ -27,7 +27,7 @@ metadata:
 data:
   litestream.yml: |
     dbs:
-      - path: {{ .Values.config.eventDb }}/events.duckdb
+      - path: {{ .Values.config.eventDb }}/events.sqlite
         replicas:
           - type: s3
             bucket: {{ .Values.litestream.s3Bucket }}

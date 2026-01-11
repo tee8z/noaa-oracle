@@ -42,6 +42,7 @@ hyper = "1.8"
 
 # Database
 duckdb = "1.4"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 
 # DLC / Crypto
 dlctix = "0.0.8"

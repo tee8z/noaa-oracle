@@ -61,6 +61,14 @@ pub struct Cli {
     /// HTTP User-Agent header for NOAA API requests
     #[arg(short, long, env = "NOAA_DAEMON_USER_AGENT")]
     pub user_agent: Option<String>,
+
+    /// S3 bucket for parquet storage (requires 's3' feature)
+    #[arg(long, env = "NOAA_DAEMON_S3_BUCKET")]
+    pub s3_bucket: Option<String>,
+
+    /// S3 endpoint URL (for moto/localstack, leave unset for AWS)
+    #[arg(long, env = "NOAA_DAEMON_S3_ENDPOINT")]
+    pub s3_endpoint: Option<String>,
 }
 
 impl Cli {
@@ -120,6 +128,8 @@ pub fn get_config_info() -> Cli {
         refill_rate: cli_args.refill_rate.or(file_config.refill_rate),
         token_capacity: cli_args.token_capacity.or(file_config.token_capacity),
         user_agent: cli_args.user_agent.or(file_config.user_agent),
+        s3_bucket: cli_args.s3_bucket.or(file_config.s3_bucket),
+        s3_endpoint: cli_args.s3_endpoint.or(file_config.s3_endpoint),
     }
 }
 

@@ -15,9 +15,37 @@ spec:
         {{- include "noaa-oracle.selectorLabels" . | nindent 8 }}
     spec:
       serviceAccountName: {{ include "noaa-oracle.serviceAccountName" . }}
+      {{- if .Values.litestream.enabled }}
+      initContainers:
+        - name: litestream-restore
+          image: "{{ .Values.litestream.image.repository }}:{{ .Values.litestream.image.tag }}"
+          args: ["restore", "-if-db-not-exists", "-if-replica-exists", "{{ .Values.config.eventDb }}/events.sqlite"]
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+            - name: litestream-config
+              mountPath: /etc/litestream.yml
+              subPath: litestream.yml
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "noaa-oracle.fullname" . }}-s3
+                  key: access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "noaa-oracle.fullname" . }}-s3
+                  key: secret-access-key
+      {{- end }}
       containers:
         - name: {{ .Chart.Name }}
+          {{- if .Values.devMode.enabled }}
+          image: {{ .Values.devMode.baseImage }}
+          command: ["/app/oracle"]
+          {{- else }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          {{- end }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: http
@@ -45,12 +73,50 @@ spec:
           volumeMounts:
             - name: data
               mountPath: {{ .Values.persistence.mountPath }}
+            {{- if .Values.secrets.privateKey.create }}
+            - name: keys
+              mountPath: /var/lib/noaa-oracle/keys
+              readOnly: true
+            {{- end }}
+            {{- if .Values.devMode.enabled }}
+            - name: dev-binary
+              mountPath: /app
+              readOnly: true
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           livenessProbe:
             {{- toYaml .Values.livenessProbe | nindent 12 }}
           readinessProbe:
             {{- toYaml .Values.readinessProbe | nindent 12 }}
+        {{- if .Values.litestream.enabled }}
+        - name: litestream
+          image: "{{ .Values.litestream.image.repository }}:{{ .Values.litestream.image.tag }}"
+          args: ["replicate"]
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath }}
+            - name: litestream-config
+              mountPath: /etc/litestream.yml
+              subPath: litestream.yml
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "noaa-oracle.fullname" . }}-s3
+                  key: access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "noaa-oracle.fullname" . }}-s3
+                  key: secret-access-key
+          resources:
+            requests:
+              memory: 32Mi
+              cpu: 10m
+            limits:
+              memory: 64Mi
+        {{- end }}
       volumes:
         - name: data
           {{- if .Values.persistence.enabled }}
@@ -59,3 +125,19 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        {{- if .Values.secrets.privateKey.create }}
+        - name: keys
+          secret:
+            secretName: {{ include "noaa-oracle.fullname" . }}-keys
+        {{- end }}
+        {{- if .Values.devMode.enabled }}
+        - name: dev-binary
+          hostPath:
+            path: {{ .Values.devMode.hostPath | dir }}
+            type: Directory
+        {{- end }}
+        {{- if .Values.litestream.enabled }}
+        - name: litestream-config
+          configMap:
+            name: {{ include "noaa-oracle.fullname" . }}-litestream
+        {{- end }}
