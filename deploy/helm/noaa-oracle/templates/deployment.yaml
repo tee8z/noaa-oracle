@@ -73,7 +73,7 @@ spec:
           volumeMounts:
             - name: data
               mountPath: {{ .Values.persistence.mountPath }}
-            {{- if .Values.secrets.privateKey.create }}
+            {{- if or .Values.secrets.privateKey.create .Values.secrets.privateKey.external }}
             - name: keys
               mountPath: /etc/noaa-oracle/keys
               readOnly: true
@@ -125,7 +125,7 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
-        {{- if .Values.secrets.privateKey.create }}
+        {{- if or .Values.secrets.privateKey.create .Values.secrets.privateKey.external }}
         - name: keys
           secret:
             secretName: {{ include "noaa-oracle.fullname" . }}-keys
