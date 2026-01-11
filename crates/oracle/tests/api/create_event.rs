@@ -85,7 +85,7 @@ async fn can_create_oracle_event() {
         new_event.number_of_values_per_entry as i64
     );
     assert!(res.weather.is_empty());
-    assert!(res.nonce.serialize().len() > 0);
+    assert!(!res.nonce.serialize().is_empty());
     assert!(res.attestation.is_none());
     assert!(res
         .event_announcement
@@ -194,7 +194,7 @@ async fn can_create_and_get_oracle_event() {
         new_event.number_of_values_per_entry as i64
     );
     assert!(res.weather.is_empty());
-    assert!(res.nonce.serialize().len() > 0);
+    assert!(!res.nonce.serialize().is_empty());
     assert!(res.attestation.is_none());
     assert!(res
         .event_announcement
