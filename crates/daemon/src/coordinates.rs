@@ -34,7 +34,7 @@ impl Station {
         // Skip invalid placeholder coordinates (-99.99, -99.99)
         let lat_val: f64 = latitude.parse().ok()?;
         let lon_val: f64 = longitude.parse().ok()?;
-        if lat_val < -90.0 || lat_val > 90.0 || lon_val < -180.0 || lon_val > 180.0 {
+        if !(-90.0..=90.0).contains(&lat_val) || !(-180.0..=180.0).contains(&lon_val) {
             return None;
         }
 

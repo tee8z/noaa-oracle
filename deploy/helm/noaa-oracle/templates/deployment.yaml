@@ -65,6 +65,8 @@ spec:
             {{- if .Values.devMode.enabled }}
             - name: NOAA_ORACLE_UI_DIR
               value: {{ .Values.config.uiDir }}
+            - name: LD_LIBRARY_PATH
+              value: /lib/duckdb
             {{- end }}
             - name: NOAA_ORACLE_PRIVATE_KEY
               value: {{ .Values.config.privateKeyPath }}
@@ -83,6 +85,9 @@ spec:
             {{- if .Values.devMode.enabled }}
             - name: dev-binary
               mountPath: /app
+              readOnly: true
+            - name: duckdb-lib
+              mountPath: /lib/duckdb
               readOnly: true
             {{- end }}
           resources:
@@ -136,6 +141,10 @@ spec:
         - name: dev-binary
           hostPath:
             path: {{ .Values.devMode.hostPath | dir }}
+            type: Directory
+        - name: duckdb-lib
+          hostPath:
+            path: {{ .Values.devMode.duckdbLibPath | default "/mnt/duckdb_lib" }}
             type: Directory
         {{- end }}
         {{- if .Values.litestream.enabled }}
