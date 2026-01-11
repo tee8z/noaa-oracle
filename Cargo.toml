@@ -49,6 +49,10 @@ parquet_derive = "54.0"
 
 
 
+# Suppress warnings from dependencies using non-standard cfg values
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(target_arch, values(\"amdgpu\"))"] }
+
 [profile.release]
 lto = "thin"
 strip = true
