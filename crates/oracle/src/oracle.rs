@@ -138,7 +138,7 @@ impl Oracle {
         self.db
             .add_oracle_metadata(self.public_key.x_only_public_key().0)
             .await
-            .map_err(|e| Error::ValidateKey(e))
+            .map_err(Error::ValidateKey)
     }
 
     pub fn raw_public_key(&self) -> PublicKey {
@@ -165,7 +165,7 @@ impl Oracle {
         self.db
             .filtered_list_events(filter)
             .await
-            .map_err(|e| Error::ValidateKey(e))
+            .map_err(Error::ValidateKey)
     }
 
     pub async fn get_event(&self, id: &Uuid) -> Result<Event, Error> {
@@ -210,7 +210,7 @@ impl Oracle {
         self.db
             .add_event(oracle_event)
             .await
-            .map_err(|e| Error::ValidateKey(e))
+            .map_err(Error::ValidateKey)
     }
 
     pub async fn add_event_entries(
@@ -267,7 +267,7 @@ impl Oracle {
         self.db
             .add_event_entries(weather_entry.clone())
             .await
-            .map_err(|e| Error::ValidateKey(e))?;
+            .map_err(Error::ValidateKey)?;
 
         Ok(weather_entry)
     }
@@ -322,7 +322,7 @@ impl Oracle {
         self.db
             .get_active_events()
             .await
-            .map_err(|e| Error::ValidateKey(e))
+            .map_err(Error::ValidateKey)
     }
 
     pub async fn get_event_entry(
