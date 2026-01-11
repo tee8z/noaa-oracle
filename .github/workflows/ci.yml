@@ -15,7 +15,40 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Build everything once, upload binaries for e2e tests
+  # Format check (no Nix needed, fast)
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # Machete unused deps checking (no Nix needed)
+  machete:
+    name: Machete
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+
+      - name: Check for unused deps
+        run: cargo machete --with-metadata
+
+  # Build (needs Nix for DuckDB)
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -76,21 +109,6 @@ jobs:
             target/debug/daemon
           retention-days: 1
 
-  # Format check (no Nix needed)
-  fmt:
-    name: Format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          components: rustfmt
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
   # Clippy linting (needs Nix for DuckDB)
   clippy:
     name: Clippy
@@ -121,29 +139,10 @@ jobs:
       - name: Run Clippy
         run: nix develop -c cargo clippy --workspace --all-targets -- -D warnings
 
-  # Machete unused deps checking
-  machete:
-    name: Machete
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-
-      - name: Install cargo-machete
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-machete
-
-      - name: Check for unused deps
-        run: cargo machete --with-metadata
-
   # Unit tests (needs Nix for DuckDB)
   test:
     name: Test
     runs-on: ubuntu-latest
-    needs: [build]
     steps:
       - uses: actions/checkout@v4
 
@@ -189,11 +188,11 @@ jobs:
       - name: Run flake check
         run: nix flake check
 
-  # E2E tests (uses pre-built binaries)
+  # E2E tests (uses pre-built binaries, runs after all other checks pass)
   e2e-test:
     name: E2E Tests
     runs-on: ubuntu-latest
-    needs: [build, fmt, clippy, test]
+    needs: [fmt, machete, build, clippy, test, nix-check]
     if: "!contains(github.event.pull_request.labels.*.name, 'skip-e2e')"
     timeout-minutes: 15
     steps:

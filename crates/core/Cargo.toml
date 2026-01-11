@@ -8,11 +8,8 @@ description = "Shared utilities for NOAA Oracle services"
 
 [dependencies]
 anyhow.workspace = true
-clap.workspace = true
-log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 toml.workspace = true
-thiserror = "1.0"
 
 [features]
 default = []

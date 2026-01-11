@@ -47,11 +47,7 @@ parquet = "54.0"
 arrow = "54.0"
 parquet_derive = "54.0"
 
-# Crypto/SSL
-openssl = { version = "0.10", features = ["vendored"] }
 
-# Other
-rustix = "0.38"
 
 [profile.release]
 lto = "thin"
