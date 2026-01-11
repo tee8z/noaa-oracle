@@ -77,3 +77,6 @@ async-trait = "0.1"
 [dev-dependencies]
 tower = "0.5"
 mockall = "0.14"
+
+[lints]
+workspace = true
