@@ -4,33 +4,53 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g., 1.9.3)"
+        required: true
+        type: string
+      dry_run:
+        description: "Dry run (build only, no release)"
+        required: false
+        type: boolean
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
-  # Extract version from tag
+  # Extract version from tag or input
   prepare-release:
     name: Prepare Release
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.get_version.outputs.version }}
       version_name: ${{ steps.get_version.outputs.version_name }}
+      dry_run: ${{ steps.get_version.outputs.dry_run }}
     steps:
-      - name: Get version from tag
+      - name: Get version from tag or input
         id: get_version
         run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+            DRY_RUN="${{ github.event.inputs.dry_run }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/v}
+            DRY_RUN="false"
+          fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "version_name=v$VERSION" >> $GITHUB_OUTPUT
-          echo "Release version: $VERSION"
+          echo "dry_run=$DRY_RUN" >> $GITHUB_OUTPUT
+          echo "Release version: $VERSION (dry_run: $DRY_RUN)"
 
-  # Update version in Cargo.toml files
+  # Update version in Cargo.toml files (skipped in dry-run)
   update-versions:
     name: Update Crate Versions
     runs-on: ubuntu-latest
     needs: prepare-release
+    if: needs.prepare-release.outputs.dry_run != 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -68,11 +88,11 @@ jobs:
   build-release:
     name: Build Release
     runs-on: ubuntu-latest
-    needs: [prepare-release, update-versions]
+    needs: prepare-release
+    # For real releases, wait for version update; for dry-run, proceed immediately
+    if: always() && needs.prepare-release.result == 'success'
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: master
 
       - name: Free up disk space
         run: |
@@ -123,20 +143,54 @@ jobs:
           cp config/oracle.example.toml "${PKG_NAME}/config/oracle.toml"
           cp config/daemon.example.toml "${PKG_NAME}/config/daemon.toml"
 
-          # Create a simple run script
+          # Create setup script for first-time deployment
+          cat > "${PKG_NAME}/setup.sh" << 'EOF'
+          #!/bin/bash
+          set -e
+          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          cd "$SCRIPT_DIR"
+
+          echo "NOAA Oracle Setup"
+          echo "================="
+
+          # Create data directories
+          echo "Creating data directories..."
+          mkdir -p weather_data event_data logs data
+
+          # Generate signing key
+          if [ -f "oracle_private_key.pem" ]; then
+              echo "WARNING: oracle_private_key.pem already exists!"
+              echo "Skipping key generation. Delete the file manually if you want to regenerate."
+          else
+              echo "Generating oracle signing key..."
+              openssl ecparam -genkey -name secp256k1 -out oracle_private_key.pem
+              chmod 600 oracle_private_key.pem
+              echo "Private key created: oracle_private_key.pem"
+              echo ""
+              echo "IMPORTANT: Back up this key securely! It is used for DLC attestations."
+              echo "If lost, any events signed with this key cannot be attested."
+          fi
+
+          echo ""
+          echo "Setup complete! You can now run:"
+          echo "  ./run-oracle.sh  - Start the oracle server"
+          echo "  ./run-daemon.sh  - Start the data fetching daemon"
+          EOF
+          chmod +x "${PKG_NAME}/setup.sh"
+
+          # Create run script for oracle
           cat > "${PKG_NAME}/run-oracle.sh" << 'EOF'
           #!/bin/bash
           SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
           cd "$SCRIPT_DIR"
 
-          # Generate signing key if not exists
           if [ ! -f "oracle_private_key.pem" ]; then
-              echo "Generating oracle signing key..."
-              openssl ecparam -genkey -name secp256k1 -out oracle_private_key.pem
-              chmod 600 oracle_private_key.pem
+              echo "ERROR: oracle_private_key.pem not found!"
+              echo "Run ./setup.sh first to generate the signing key."
+              exit 1
           fi
 
-          # Create data directories
+          # Create data directories if missing
           mkdir -p weather_data event_data logs
 
           export RUST_LOG="${RUST_LOG:-info}"
@@ -144,6 +198,7 @@ jobs:
           EOF
           chmod +x "${PKG_NAME}/run-oracle.sh"
 
+          # Create run script for daemon
           cat > "${PKG_NAME}/run-daemon.sh" << 'EOF'
           #!/bin/bash
           SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -162,8 +217,9 @@ jobs:
           =======================
 
           Quick Start:
-            1. Run ./run-oracle.sh to start the oracle server (default port 9800)
-            2. Run ./run-daemon.sh to start fetching NOAA weather data
+            1. Run ./setup.sh to initialize (creates directories and signing key)
+            2. Run ./run-oracle.sh to start the oracle server (default port 9800)
+            3. Run ./run-daemon.sh to start fetching NOAA weather data
 
           Configuration:
             - Edit config/oracle.toml for oracle settings
@@ -175,6 +231,10 @@ jobs:
             - bin/          Binaries
             - weather_data/ Downloaded parquet files (created on first run)
             - event_data/   DLC event database (created on first run)
+
+          Security:
+            - oracle_private_key.pem is your signing key - BACK IT UP!
+            - This key is used for DLC attestations and must be kept secure
 
           For more info: https://github.com/tee8z/noaa-oracle
           EOF
@@ -202,11 +262,12 @@ jobs:
           path: release/*
           retention-days: 7
 
-  # Create GitHub release
+  # Create GitHub release (skipped in dry-run)
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
     needs: [prepare-release, build-release]
+    if: needs.prepare-release.outputs.dry_run != 'true'
     permissions:
       contents: write
     steps:
