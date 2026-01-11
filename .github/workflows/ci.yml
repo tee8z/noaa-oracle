@@ -1,0 +1,242 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Build everything once, upload binaries for e2e tests
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          sudo apt-get clean || true
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Setup Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-gha-cache: false
+          use-flakehub: false
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: target/
+          key: ${{ runner.os }}-nix-cargo-build-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/*.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-nix-cargo-build-${{ hashFiles('**/Cargo.lock') }}-
+            ${{ runner.os }}-nix-cargo-build-
+          save-always: false
+
+      - name: Build project
+        run: nix develop -c cargo build --workspace --locked
+        env:
+          RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+
+      - name: Upload binaries for e2e tests
+        uses: actions/upload-artifact@v4
+        with:
+          name: noaa-oracle-binaries
+          path: |
+            target/debug/oracle
+            target/debug/daemon
+          retention-days: 1
+
+  # Format check (no Nix needed)
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # Clippy linting (needs Nix for DuckDB)
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Setup Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-gha-cache: false
+          use-flakehub: false
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Run Clippy
+        run: nix develop -c cargo clippy --workspace --all-targets -- -D warnings
+
+  # Machete unused deps checking
+  machete:
+    name: Machete
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+
+      - name: Check for unused deps
+        run: cargo machete --with-metadata
+
+  # Unit tests (needs Nix for DuckDB)
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Setup Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-gha-cache: false
+          use-flakehub: false
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Run tests
+        run: nix develop -c cargo test --workspace --locked
+
+  # Nix flake check
+  nix-check:
+    name: Nix Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Setup Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-gha-cache: false
+          use-flakehub: false
+
+      - name: Run flake check
+        run: nix flake check
+
+  # E2E tests (uses pre-built binaries)
+  e2e-test:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    needs: [build, fmt, clippy, test]
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-e2e')"
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Setup Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-gha-cache: false
+          use-flakehub: false
+
+      - name: Download pre-built binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: noaa-oracle-binaries
+          path: target/debug/
+
+      - name: Make binaries executable
+        run: chmod +x target/debug/oracle target/debug/daemon
+
+      - name: Setup test environment
+        run: |
+          mkdir -p weather_data event_data data logs test_data
+          # Generate test signing key
+          openssl ecparam -genkey -name secp256k1 -out oracle_private_key.pem
+          chmod 600 oracle_private_key.pem
+
+      - name: Run E2E tests
+        run: |
+          nix develop -c cargo test --package oracle --test api -- --test-threads=1
+        env:
+          RUST_LOG: debug
+
+      - name: Upload e2e logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs-${{ github.run_id }}
+          path: |
+            logs/
+            test_data/
+            *.log
+          retention-days: 7
