@@ -1,0 +1,69 @@
+# NOAA Oracle Server Configuration
+#
+# The Oracle is a REST API server that:
+#   1. Serves weather data (parquet files) via HTTP
+#   2. Hosts a browser UI for querying weather data
+#   3. Manages prediction events and signs outcomes for DLC (dlctix) contracts
+#
+# The Oracle can run INDEPENDENTLY of the daemon - just point it at a directory
+# containing weather data parquet files (e.g., downloaded from another source).
+#
+# Copy this file to one of these locations:
+#   - ./oracle.toml (current directory)
+#   - $XDG_CONFIG_HOME/noaa-oracle/oracle.toml (~/.config/noaa-oracle/)
+#   - /etc/noaa-oracle/oracle.toml (system-wide)
+#
+# Or specify a custom path with: oracle --config /path/to/config.toml
+#
+# All settings can also be set via environment variables:
+#   NOAA_ORACLE_LEVEL, NOAA_ORACLE_HOST, NOAA_ORACLE_PORT, etc.
+
+# Logging level: trace, debug, info, warn, error
+level = "info"
+
+# Server binding
+host = "127.0.0.1"    # Use "0.0.0.0" to listen on all interfaces
+port = "9800"
+
+# Public URL (used for generating links in API responses)
+remote_url = "http://127.0.0.1:9800"
+
+# =============================================================================
+# Weather Data Storage
+# =============================================================================
+# Directory containing parquet files with weather observations and forecasts.
+# Structure: data_dir/YYYY-MM-DD/observations_*.parquet, forecasts_*.parquet
+#
+# This can be:
+#   - Populated by the daemon (automatic)
+#   - Downloaded/synced from another oracle
+#   - Manually populated with historical data
+#
+# For user installs: ~/.local/share/noaa-oracle/weather/
+# For system installs: /var/lib/noaa-oracle/weather/
+data_dir = "./weather_data"
+
+# =============================================================================
+# Event Database (DLC Contract State)
+# =============================================================================
+# DuckDB database storing prediction events, entries, and attestations.
+# This is where the oracle tracks:
+#   - Active prediction events
+#   - User entries/predictions
+#   - Signed attestations for completed events
+#
+# For user installs: ~/.local/share/noaa-oracle/events/
+# For system installs: /var/lib/noaa-oracle/events/
+event_db = "./event_data"
+
+# =============================================================================
+# UI & Keys
+# =============================================================================
+# Browser UI static files location
+# For Nix installs this is set automatically to the package's share directory
+ui_dir = "./ui"
+
+# Oracle signing key (ECDSA secp256k1)
+# Used to sign DLC attestations - keep this secure!
+# Will be generated automatically if it doesn't exist
+private_key_path = "./oracle_private_key.pem"
