@@ -62,8 +62,10 @@ spec:
               value: {{ .Values.config.dataDir }}
             - name: NOAA_ORACLE_EVENT_DB
               value: {{ .Values.config.eventDb }}
+            {{- if .Values.devMode.enabled }}
             - name: NOAA_ORACLE_UI_DIR
               value: {{ .Values.config.uiDir }}
+            {{- end }}
             - name: NOAA_ORACLE_PRIVATE_KEY
               value: {{ .Values.config.privateKeyPath }}
             {{- if .Values.config.remoteUrl }}
