@@ -223,7 +223,7 @@ impl SignEvent {
     }
 }
 
-impl<'a> TryFrom<&Row<'a>> for SignEvent {
+impl TryFrom<&Row<'_>> for SignEvent {
     type Error = duckdb::Error;
 
     fn try_from(row: &Row) -> Result<Self, Self::Error> {
@@ -365,7 +365,7 @@ impl TryFrom<String> for EventStatus {
     }
 }
 
-impl<'a> TryFrom<&Row<'a>> for ActiveEvent {
+impl TryFrom<&Row<'_>> for ActiveEvent {
     type Error = duckdb::Error;
 
     fn try_from(row: &Row) -> Result<Self, Self::Error> {
@@ -489,7 +489,7 @@ pub fn get_status(
     EventStatus::Completed
 }
 
-impl<'a> TryFrom<&Row<'a>> for EventSummary {
+impl TryFrom<&Row<'_>> for EventSummary {
     type Error = duckdb::Error;
 
     fn try_from(row: &Row) -> Result<Self, Self::Error> {
@@ -609,7 +609,7 @@ impl Event {
     }
 }
 
-impl<'a> TryFrom<&Row<'a>> for Event {
+impl TryFrom<&Row<'_>> for Event {
     type Error = duckdb::Error;
 
     fn try_from(row: &Row) -> Result<Self, Self::Error> {
@@ -723,7 +723,7 @@ pub struct Weather {
     pub forecasted: Forecasted,
 }
 
-impl<'a> TryFrom<&Row<'a>> for Weather {
+impl TryFrom<&Row<'_>> for Weather {
     type Error = duckdb::Error;
 
     fn try_from(row: &Row) -> Result<Self, Self::Error> {
@@ -1377,7 +1377,7 @@ impl TryInto<WeatherEntry> for &OrderedMap<String, Value> {
     }
 }
 
-impl<'a> TryFrom<&Row<'a>> for WeatherEntry {
+impl TryFrom<&Row<'_>> for WeatherEntry {
     type Error = duckdb::Error;
 
     fn try_from(row: &Row) -> Result<Self, Self::Error> {
@@ -1411,9 +1411,9 @@ pub struct WeatherChoicesWithEntry {
     pub wind_speed: Option<ValueOptions>,
 }
 
-impl<'a> TryFrom<&Row<'a>> for WeatherChoicesWithEntry {
+impl TryFrom<&Row<'_>> for WeatherChoicesWithEntry {
     type Error = duckdb::Error;
-    fn try_from(row: &Row<'a>) -> Result<Self, Self::Error> {
+    fn try_from(row: &Row<'_>) -> Result<Self, Self::Error> {
         Ok(WeatherChoicesWithEntry {
             entry_id: row
                 .get::<usize, String>(0)
@@ -1458,7 +1458,7 @@ impl From<WeatherChoicesWithEntry> for WeatherChoices {
     }
 }
 
-impl<'a> TryFrom<&Row<'a>> for WeatherChoices {
+impl TryFrom<&Row<'_>> for WeatherChoices {
     type Error = duckdb::Error;
 
     fn try_from(row: &Row) -> Result<Self, Self::Error> {
