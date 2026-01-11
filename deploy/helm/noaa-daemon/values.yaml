@@ -1,0 +1,60 @@
+# NOAA Daemon Helm Chart Values
+# Weather data fetching daemon
+
+image:
+  repository: ghcr.io/tee8z/noaa-daemon
+  tag: ""  # Defaults to appVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+  automount: true
+
+# CronJob schedule (default: hourly at :05)
+schedule: "5 * * * *"
+
+# Job configuration
+job:
+  backoffLimit: 3
+  activeDeadlineSeconds: 3600
+  ttlSecondsAfterFinished: 86400
+
+resources:
+  requests:
+    memory: 64Mi
+    cpu: 25m
+  limits:
+    memory: 128Mi
+
+podSecurityContext: {}
+securityContext: {}
+
+# Application configuration
+config:
+  # Logging level
+  level: "info"
+  # Oracle server URL to upload data to
+  baseUrl: "http://noaa-oracle.oracle.svc.cluster.local:9800"
+  # Temporary data directory
+  dataDir: /tmp/noaa-daemon
+  # HTTP client settings
+  userAgent: "noaa-oracle-daemon/1.0"
+  refillRate: 15.0
+  tokenCapacity: 3
+
+# Environment variables
+env: {}
+envFrom: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podAnnotations: {}
+podLabels: {}

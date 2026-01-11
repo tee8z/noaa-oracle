@@ -1,0 +1,21 @@
+apiVersion: v2
+name: noaa-oracle
+description: Weather data oracle API for DLC-based prediction markets
+type: application
+version: 0.1.0
+appVersion: "1.9.2"
+
+home: https://github.com/tee8z/noaa-oracle
+sources:
+  - https://github.com/tee8z/noaa-oracle
+
+maintainers:
+  - name: tee8z
+    email: tee8z@protonmail.com
+
+keywords:
+  - bitcoin
+  - dlc
+  - weather
+  - oracle
+  - noaa
