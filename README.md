@@ -1,43 +1,162 @@
-## A simple system showing how to create a data pipeline from NOAA
-- Live site located at: [4casttruth.win](https://www.4casttruth.win/)
-- Feel free to pull the parquet files and use in your own data analysis (python is a good choice to do this with)
+# NOAA Oracle
 
-### Example of using the UI:
+A data pipeline system that fetches weather data from NOAA and serves it via a REST API with DLC (Discreet Log Contract) attestation support.
 
-![Initial Screen](ui_demo/ksnip_20240114-151717.png)
-![Select Files](ui_demo/ksnip_20240114-151738.png)
-![View File Schemas](ui_demo/ksnip_20240114-151818.png)
-![Enter Bad Query](ui_demo/ksnip_20240114-153740.png)
-![Enter Good Query](ui_demo/ksnip_20240114-154002.png)
+- Live site: [4casttruth.win](https://www.4casttruth.win/)
+- Feel free to pull the parquet files and use in your own data analysis
 
-### Where data comes from:
-- Info on where the data used to generate the parquet files comes from:
-    - Observations: https://madis.ncep.noaa.gov/madis_metar.shtml accessed via https://aviationweather.gov/data/api/
-    - Forecasts (Multiple Point Un-summarized Data): https://graphical.weather.gov/xml/rest.php
-- These xml data files are updated once an hour by NOAA, so to be respectful of their services we run our data pulling process once an hour as well
+## Architecture
 
-### How the system works:
-- daemon:
-    - Background process to pull down data from NOAA and transform it into flatted parquet files. These files are then pushed to the `oracle` via the REST endpoint `POST http://localhost:9100/file` (via multipart form)
-- oracle:
-    - A REST API that takes in the parquet files and allows downloading of them from a browser UI that is also hosted by the api.
-- ui:
-    - Holds the browser UI that's just an index.html and main.js file. It uses `@duckdb/duckdb-wasm` to allow the end user to query directly against the download parquet files
-    - It uses `https://bulma.io/` for css styling
-
-### Why build a data pipeline like this:
-- No remote DB needed, only a dumb file server, makes this cheap to run
-- Faster and more flexible querying ability provided to the end user, allowing them to find unique insights that the original system design may not be looking to find
-- Each piece is a 'simple' logical item, allowing for scalability for however large the usage is on the service
-- Would NOT recommend using this approach if the data being tracked needs to be updated in the parquet files and stored as a relational model, only really works if the data model can be snapshots and immutable over time
-
-
-### Data Pipeline Process (arrows in direction of who initiates the talking): 
 ```
-[noaa api] <- [daemon] -> parquet files -> [oracle] <- parquet files <- [browser duck_db]
+[NOAA API] <- [daemon] -> parquet files -> [oracle] <- parquet files <- [browser DuckDB]
 ```
 
-### How to use:
-- [Daemon](./daemon/README.md)
-- [Oracle](./oracle/README.md)
-- [Browser](./ui/README.md)
+**Components:**
+- **daemon** - Background process that pulls data from NOAA, transforms it into parquet files, and pushes to the oracle
+- **oracle** - REST API that stores parquet files, serves them via browser UI, and provides DLC attestation
+- **ui** - Browser interface using DuckDB-WASM for client-side querying of parquet files
+- **core** - Shared library for configuration loading and utilities
+
+## Quick Start
+
+### Using Nix (Recommended)
+
+```bash
+# Enter development shell
+nix develop
+
+# Build both binaries
+cargo build --workspace
+
+# Or use just commands
+just build
+```
+
+### Running the Services
+
+```bash
+# Run daemon (fetches NOAA data)
+just run-daemon
+
+# Run oracle (serves data and API)
+just run-oracle
+
+# Run oracle with pre-existing weather data
+just run-oracle-standalone /path/to/weather/data
+```
+
+## Configuration
+
+Configuration follows XDG Base Directory Specification. Files are searched in order:
+
+1. Environment variable (`ORACLE_CONFIG` / `DAEMON_CONFIG`)
+2. Current directory (`./oracle.toml` / `./daemon.toml`)
+3. XDG config (`~/.config/noaa-oracle/oracle.toml`)
+4. System config (`/etc/noaa-oracle/oracle.toml`)
+
+Example configurations are in the `config/` directory:
+- `config/oracle.example.toml`
+- `config/daemon.example.toml`
+
+### Oracle Configuration
+
+```toml
+[oracle]
+host = "127.0.0.1"
+port = "9800"
+log_level = "info"
+
+# Path to weather data (parquet files)
+weather_dir = "/var/lib/noaa-oracle/weather"
+
+# Path to UI files
+ui_path = "/var/lib/noaa-oracle/ui"
+
+# Oracle private key for DLC attestation
+oracle_private_key = "/etc/noaa-oracle/oracle.pem"
+```
+
+### Daemon Configuration
+
+```toml
+[daemon]
+log_level = "info"
+
+# Where to store downloaded parquet files
+data_path = "/var/lib/noaa-oracle/data"
+
+# Oracle endpoint to push files to
+oracle_url = "http://localhost:9800"
+
+# Fetch interval in seconds (default: 3600 = 1 hour)
+fetch_interval = 3600
+```
+
+## NixOS Deployment
+
+Add to your NixOS configuration:
+
+```nix
+{
+  inputs.noaa-oracle.url = "github:tee8z/noaa-oracle";
+
+  outputs = { self, nixpkgs, noaa-oracle, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      modules = [
+        noaa-oracle.nixosModules.default
+        {
+          services.noaa-oracle = {
+            enable = true;
+            oracle = {
+              enable = true;
+              host = "0.0.0.0";
+              port = 9800;
+            };
+            daemon = {
+              enable = true;
+              fetchInterval = 3600;
+            };
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+## Development
+
+```bash
+# Enter dev shell
+nix develop
+
+# Format code
+just fmt
+
+# Run clippy
+just clippy
+
+# Run tests
+just test
+
+# Build release
+just release
+```
+
+## Data Sources
+
+- **Observations**: [MADIS METAR](https://madis.ncep.noaa.gov/madis_metar.shtml) via [Aviation Weather API](https://aviationweather.gov/data/api/)
+- **Forecasts**: [NOAA Graphical Forecasts](https://graphical.weather.gov/xml/rest.php)
+
+Data is updated hourly by NOAA; the daemon respects this by fetching once per hour.
+
+## Why This Architecture?
+
+- No remote database needed - just a file server, cheap to run
+- Client-side querying via DuckDB-WASM for flexible analysis
+- Simple, decoupled components that scale independently
+- Immutable data model (snapshots over time)
+
+## License
+
+MIT
