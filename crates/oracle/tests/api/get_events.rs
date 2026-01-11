@@ -63,7 +63,7 @@ async fn can_get_all_events() {
         number_of_values_per_entry: 6,
         number_of_places_win: 1,
     };
-    let expected = vec![
+    let expected = [
         new_event_1.clone(),
         new_event_2.clone(),
         new_event_3.clone(),

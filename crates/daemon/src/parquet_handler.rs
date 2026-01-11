@@ -66,8 +66,14 @@ pub async fn send_parquet_files(
         .base_url
         .clone()
         .unwrap_or(String::from("http://localhost:9100"));
-    let observation_filename = observation_relative_file_path.split('/').last().unwrap();
-    let forecast_filename = forecast_relative_file_path_file.split('/').last().unwrap();
+    let observation_filename = observation_relative_file_path
+        .split('/')
+        .next_back()
+        .unwrap();
+    let forecast_filename = forecast_relative_file_path_file
+        .split('/')
+        .next_back()
+        .unwrap();
 
     let observation_full_path = get_full_path(observation_relative_file_path.clone());
     let forecast_full_path = get_full_path(forecast_relative_file_path_file.clone());

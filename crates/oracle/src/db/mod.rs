@@ -621,18 +621,18 @@ impl<'a> TryFrom<&Row<'a>> for Event {
             id: row
                 .get::<usize, String>(0)
                 .map(|val| {
-                    debug!("{}", val.to_string());
+                    debug!("{}", val);
                     Uuid::parse_str(&val)
                 })?
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(0, Type::Any, Box::new(e)))?,
             signing_date: row
                 .get::<usize, String>(1)
                 .map(|val| {
-                    debug!("{}", val.to_string());
+                    debug!("{}", val);
                     OffsetDateTime::parse(&val, &sql_time_format)
                 })?
                 .map(|val| {
-                    debug!("{}", val.to_string());
+                    debug!("{}", val);
                     val.to_offset(UtcOffset::UTC)
                 })
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(1, Type::Any, Box::new(e)))?,
