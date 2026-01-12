@@ -19,8 +19,8 @@
           inherit system overlays;
         };
 
-        # Use stable Rust (1.85 required for duckdb 1.4 and arrow 56)
-        rustToolchain = pkgs.rust-bin.stable."1.85.0".default.override {
+        # Use latest stable Rust
+        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" "rust-analyzer" ];
         };
 
