@@ -10,9 +10,9 @@ description = "NOAA weather data fetcher daemon"
 name = "daemon"
 path = "src/main.rs"
 
-[features]
-default = []
-s3 = ["aws-sdk-s3", "aws-config"]
+
+
+
 
 [dependencies]
 # Internal
@@ -54,8 +54,8 @@ serde-xml-rs = "0.6"
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 
 # S3 (optional, behind feature flag)
-aws-sdk-s3 = { version = "1.65", optional = true }
-aws-config = { version = "1.5", features = ["behavior-version-latest"], optional = true }
+aws-sdk-s3 = "1.65"
+aws-config = { version = "1.5", features = ["behavior-version-latest"] }
 
 [lints]
 workspace = true

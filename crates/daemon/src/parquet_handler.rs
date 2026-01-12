@@ -1,7 +1,4 @@
-use std::{fs::File, sync::Arc};
-
-#[cfg(feature = "s3")]
-use std::path::Path;
+use std::{fs::File, path::Path, sync::Arc};
 
 use anyhow::{anyhow, Error};
 use parquet::{
@@ -15,10 +12,8 @@ use tokio_util::codec::{BytesCodec, FramedRead};
 
 use crate::{
     create_forecast_schema, create_observation_schema, get_full_path, Cli, Forecast, Observation,
+    S3Storage,
 };
-
-#[cfg(feature = "s3")]
-use crate::S3Storage;
 
 pub fn save_observations(
     observations: Vec<Observation>,
@@ -62,7 +57,6 @@ pub fn save_forecasts(forecast: Vec<Forecast>, root_path: &str, file_name: Strin
     full_name
 }
 
-#[cfg(feature = "s3")]
 pub async fn upload_to_s3(
     s3: &S3Storage,
     logger: &Logger,
