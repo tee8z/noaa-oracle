@@ -1,18 +1,13 @@
-#[cfg(feature = "s3")]
 use aws_sdk_s3::Client;
-#[cfg(feature = "s3")]
 use slog::{error, info, Logger};
-#[cfg(feature = "s3")]
 use std::path::Path;
 
-#[cfg(feature = "s3")]
 pub struct S3Storage {
     client: Client,
     bucket: String,
     logger: Logger,
 }
 
-#[cfg(feature = "s3")]
 impl S3Storage {
     pub async fn new(
         bucket: String,
@@ -78,21 +73,5 @@ impl S3Storage {
     ) -> Result<(), anyhow::Error> {
         let s3_key = format!("weather_data/{}/{}", date_folder, filename);
         self.upload_file(local_path, &s3_key).await
-    }
-}
-
-#[cfg(not(feature = "s3"))]
-pub struct S3Storage;
-
-#[cfg(not(feature = "s3"))]
-impl S3Storage {
-    pub async fn new(
-        _bucket: String,
-        _endpoint: Option<String>,
-        _logger: slog::Logger,
-    ) -> Result<Self, anyhow::Error> {
-        Err(anyhow::anyhow!(
-            "S3 storage requires the 's3' feature to be enabled"
-        ))
     }
 }
