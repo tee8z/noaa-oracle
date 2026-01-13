@@ -122,6 +122,10 @@ async fn process_data(
         format!("{}_{}", "observations", current_utc_time),
     );
 
+    // Always send to oracle for local caching
+    send_parquet_files(&cli, logger_cpy, observation_parquet.clone(), forecast_parquet.clone()).await?;
+
+    // Also upload to S3 for archival if configured
     if let Some(s3) = s3_storage {
         let date_folder = current_date.to_string();
         upload_to_s3(
@@ -132,8 +136,6 @@ async fn process_data(
             &date_folder,
         )
         .await?;
-    } else {
-        send_parquet_files(&cli, logger_cpy, observation_parquet, forecast_parquet).await?;
     }
 
     Ok(())
