@@ -12,12 +12,226 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay, crane, ... }:
+    let
+      # Helper to create package set for a target system (native or cross-compiled)
+      mkPackagesFor = { hostPkgs, targetSystem }:
+        let
+          isCross = hostPkgs.system != targetSystem;
+
+          # For cross-compilation, use pkgsCross; for native, use hostPkgs directly
+          pkgs = if isCross
+            then hostPkgs.pkgsCross.aarch64-multiplatform
+            else hostPkgs;
+
+          # DuckDB version
+          duckdbVersion = "1.1.3";
+
+          # Architecture-specific DuckDB download (based on target)
+          duckdbArch = if targetSystem == "aarch64-linux" then "aarch64"
+                       else if targetSystem == "x86_64-linux" then "amd64"
+                       else throw "Unsupported target system for DuckDB: ${targetSystem}";
+
+          duckdbUrl = "https://github.com/duckdb/duckdb/releases/download/v${duckdbVersion}/libduckdb-linux-${duckdbArch}.zip";
+
+          duckdbSha256 = {
+            "x86_64-linux" = "02z4qwzxb5w0xmjrlxhz7zacrhbk1vbcl9pl70d98jbd3gq9n6c1";
+            "aarch64-linux" = "00bqmn5s2zhmglcjnfy93cxqdishskc3r9wr8fqvhsj54wvdnsch";
+          }.${targetSystem};
+
+          # Download DuckDB library for target architecture
+          # Use hostPkgs for fetching (runs on build machine)
+          duckdb-lib = hostPkgs.stdenv.mkDerivation {
+            pname = "duckdb-lib";
+            version = duckdbVersion;
+
+            src = hostPkgs.fetchurl {
+              url = duckdbUrl;
+              sha256 = duckdbSha256;
+            };
+
+            nativeBuildInputs = [ hostPkgs.unzip ];
+
+            unpackPhase = ''
+              unzip $src
+            '';
+
+            installPhase = ''
+              mkdir -p $out/lib $out/include
+              cp -r *.so* $out/lib/
+              cp -r *.h $out/include/ 2>/dev/null || true
+            '';
+          };
+
+          # Rust toolchain with cross-compilation target if needed
+          rustToolchain = if isCross
+            then hostPkgs.rust-bin.stable.latest.default.override {
+              extensions = [ "rust-src" ];
+              targets = [ "aarch64-unknown-linux-gnu" ];
+            }
+            else hostPkgs.rust-bin.stable.latest.default.override {
+              extensions = [ "rust-src" "rust-analyzer" ];
+            };
+
+          craneLib = (crane.mkLib hostPkgs).overrideToolchain rustToolchain;
+
+          # Source filtering (use hostPkgs for build-time operations)
+          src = hostPkgs.lib.cleanSourceWith {
+            src = craneLib.path ./.;
+            filter = path: type:
+              (craneLib.filterCargoSources path type) ||
+              (builtins.match ".*ui/.*" path != null) ||
+              (builtins.match ".*config/.*" path != null) ||
+              (builtins.match ".*migrations/.*" path != null) ||
+              (builtins.match ".*\.toml$" path != null);
+          };
+
+          # Environment for OpenSSL - use target pkgs for libraries
+          opensslEnv = {
+            OPENSSL_NO_VENDOR = "1";
+            OPENSSL_DIR = "${pkgs.openssl.dev}";
+            OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
+            OPENSSL_INCLUDE_DIR = "${pkgs.openssl.dev}/include";
+          };
+
+          # Common environment
+          commonEnv = {
+            DUCKDB_LIB_DIR = "${duckdb-lib}/lib";
+            LD_LIBRARY_PATH = "${duckdb-lib}/lib";
+          } // opensslEnv // (if isCross then {
+            CARGO_BUILD_TARGET = "aarch64-unknown-linux-gnu";
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER = "${pkgs.stdenv.cc.targetPrefix}cc";
+            HOST_CC = "${hostPkgs.stdenv.cc}/bin/cc";
+          } else {});
+
+          # Build inputs - libraries for target
+          commonDeps = [
+            pkgs.openssl
+            pkgs.openssl.dev
+            pkgs.sqlite
+            pkgs.sqlite.dev
+          ];
+
+          buildDeps = commonDeps ++ [ duckdb-lib ];
+
+          # Native build inputs - tools that run on build machine
+          nativeBuildDeps = [
+            hostPkgs.pkg-config
+            hostPkgs.perl
+          ] ++ (if isCross then [ pkgs.stdenv.cc ] else []);
+
+          # Build workspace dependencies once
+          workspaceDeps = craneLib.buildDepsOnly ({
+            pname = "noaa-oracle-workspace-deps";
+            version = "0.1.0";
+            inherit src;
+            buildInputs = buildDeps;
+            nativeBuildInputs = nativeBuildDeps;
+            strictDeps = true;
+          } // commonEnv);
+
+          # Oracle server
+          oracle = craneLib.buildPackage ({
+            pname = "oracle";
+            version = "1.9.4";
+            inherit src;
+            cargoArtifacts = workspaceDeps;
+            buildInputs = buildDeps ++ [ pkgs.stdenv.cc.cc.lib ];
+            nativeBuildInputs = nativeBuildDeps;
+            cargoExtraArgs = "--bin oracle";
+            strictDeps = true;
+
+            postInstall = ''
+              mkdir -p $out/share/noaa-oracle
+              cp -r ui $out/share/noaa-oracle/
+              cp -r config $out/share/noaa-oracle/
+            '';
+          } // commonEnv);
+
+          # Daemon
+          daemon = craneLib.buildPackage ({
+            pname = "daemon";
+            version = "1.9.4";
+            inherit src;
+            cargoArtifacts = workspaceDeps;
+            buildInputs = commonDeps;
+            nativeBuildInputs = nativeBuildDeps;
+            cargoExtraArgs = "--bin daemon";
+            strictDeps = true;
+          } // commonEnv);
+
+          # Docker images
+          docker-oracle = pkgs.dockerTools.buildLayeredImage {
+            name = "noaa-oracle";
+            tag = "latest";
+            contents = [
+              pkgs.stdenv.cc.cc.lib
+              oracle
+              duckdb-lib
+              pkgs.cacert
+              pkgs.tzdata
+            ];
+            config = {
+              Cmd = [ "${oracle}/bin/oracle" ];
+              Env = [
+                "LD_LIBRARY_PATH=${duckdb-lib}/lib:${pkgs.stdenv.cc.cc.lib}/lib"
+                "NOAA_ORACLE_UI_DIR=${oracle}/share/noaa-oracle/ui"
+                "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+              ];
+              ExposedPorts = {
+                "9100/tcp" = {};
+              };
+              WorkingDir = "/data";
+              Volumes = {
+                "/data" = {};
+              };
+            };
+          };
+
+          docker-daemon = pkgs.dockerTools.buildLayeredImage {
+            name = "noaa-daemon";
+            tag = "latest";
+            contents = [
+              pkgs.stdenv.cc.cc.lib
+              daemon
+              pkgs.cacert
+              pkgs.tzdata
+            ];
+            config = {
+              Cmd = [ "${daemon}/bin/daemon" ];
+              Env = [
+                "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+              ];
+              WorkingDir = "/data";
+              Volumes = {
+                "/data" = {};
+              };
+            };
+          };
+
+        in {
+          inherit oracle daemon duckdb-lib docker-oracle docker-daemon;
+        };
+    in
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs {
           inherit system overlays;
         };
+
+        # Native packages for this system
+        nativePackages = mkPackagesFor {
+          hostPkgs = pkgs;
+          targetSystem = system;
+        };
+
+        # Cross-compiled packages (x86_64-linux -> aarch64-linux)
+        crossPackages = if system == "x86_64-linux" then
+          mkPackagesFor {
+            hostPkgs = pkgs;
+            targetSystem = "aarch64-linux";
+          }
+        else null;
 
         # Use latest stable Rust
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
@@ -124,32 +338,14 @@
         } // commonEnv);
 
         # Oracle server
-        oracle = craneLib.buildPackage ({
-          pname = "oracle";
-          version = "1.9.2";
-          inherit src;
-          cargoArtifacts = workspaceDeps;
-          buildInputs = buildDeps ++ [ pkgs.stdenv.cc.cc.lib ];
-          nativeBuildInputs = buildDeps;
-          cargoExtraArgs = "--bin oracle";
-
-          postInstall = ''
-            mkdir -p $out/share/noaa-oracle
-            cp -r ui $out/share/noaa-oracle/
-            cp -r config $out/share/noaa-oracle/
-          '';
-        } // commonEnv);
+        oracle = nativePackages.oracle;
 
         # Daemon
-        daemon = craneLib.buildPackage ({
-          pname = "daemon";
-          version = "1.9.2";
-          inherit src;
-          cargoArtifacts = workspaceDeps;
-          buildInputs = commonDeps;
-          nativeBuildInputs = commonDeps;
-          cargoExtraArgs = "--bin daemon";
-        } // commonEnv);
+        daemon = nativePackages.daemon;
+
+        # Docker images
+        docker-oracle = nativePackages.docker-oracle;
+        docker-daemon = nativePackages.docker-daemon;
 
         # Python environment with moto for S3 mocking
         moto-env = pkgs.python3.withPackages (ps: with ps; [
@@ -278,62 +474,18 @@
           exec ${daemon}/bin/daemon "$@"
         '';
 
-        # Docker images for k8s deployment
-        docker-oracle = pkgs.dockerTools.buildLayeredImage {
-          name = "noaa-oracle";
-          tag = "latest";
-          contents = [
-            pkgs.stdenv.cc.cc.lib
-            oracle
-            duckdb-lib
-            pkgs.cacert
-            pkgs.tzdata
-          ];
-          config = {
-            Cmd = [ "${oracle}/bin/oracle" ];
-            Env = [
-              "LD_LIBRARY_PATH=${duckdb-lib}/lib:${pkgs.stdenv.cc.cc.lib}/lib"
-              "NOAA_ORACLE_UI_DIR=${oracle}/share/noaa-oracle/ui"
-              "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-            ];
-            ExposedPorts = {
-              "9100/tcp" = {};
-            };
-            WorkingDir = "/data";
-            Volumes = {
-              "/data" = {};
-            };
-          };
-        };
-
-        docker-daemon = pkgs.dockerTools.buildLayeredImage {
-          name = "noaa-daemon";
-          tag = "latest";
-          contents = [
-            pkgs.stdenv.cc.cc.lib
-            daemon
-            pkgs.cacert
-            pkgs.tzdata
-          ];
-          config = {
-            Cmd = [ "${daemon}/bin/daemon" ];
-            Env = [
-              "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-            ];
-            WorkingDir = "/data";
-            Volumes = {
-              "/data" = {};
-            };
-          };
-        };
-
-
       in
       {
         packages = {
           inherit oracle daemon duckdb-lib docker-oracle docker-daemon;
           default = oracle;
-        };
+        } // (if crossPackages != null then {
+          # Cross-compiled packages for aarch64-linux (available on x86_64-linux)
+          oracle-aarch64-linux = crossPackages.oracle;
+          daemon-aarch64-linux = crossPackages.daemon;
+          docker-oracle-aarch64-linux = crossPackages.docker-oracle;
+          docker-daemon-aarch64-linux = crossPackages.docker-daemon;
+        } else {});
 
         apps = {
           oracle = flake-utils.lib.mkApp {
