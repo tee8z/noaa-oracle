@@ -101,6 +101,9 @@
             CARGO_BUILD_TARGET = "aarch64-unknown-linux-gnu";
             CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER = "${pkgs.stdenv.cc.targetPrefix}cc";
             HOST_CC = "${hostPkgs.stdenv.cc}/bin/cc";
+            # Disable assembly for aws-lc-sys during cross-compilation
+            # This avoids the ARM64 assembly compilation issues
+            AWS_LC_SYS_NO_ASM = "1";
           } else {});
 
           # Build inputs - libraries for target
