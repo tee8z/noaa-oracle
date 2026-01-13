@@ -54,8 +54,19 @@ spec:
                 - name: NOAA_DAEMON_S3_ENDPOINT
                   value: {{ .Values.s3.endpoint | quote }}
                 {{- end }}
-                {{/* Only inject explicit credentials if provided; otherwise use instance profile */}}
-                {{- if and .Values.s3.accessKeyId .Values.s3.secretAccessKey }}
+                {{/* Use existing secret if specified, otherwise create new secret from values */}}
+                {{- if .Values.s3.existingSecret }}
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.s3.existingSecret }}
+                      key: {{ .Values.s3.existingSecretAccessKeyIdKey | default "access-key-id" }}
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.s3.existingSecret }}
+                      key: {{ .Values.s3.existingSecretSecretAccessKeyKey | default "secret-access-key" }}
+                {{- else if and .Values.s3.accessKeyId .Values.s3.secretAccessKey }}
                 - name: AWS_ACCESS_KEY_ID
                   valueFrom:
                     secretKeyRef:
