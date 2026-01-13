@@ -123,7 +123,13 @@ async fn process_data(
     );
 
     // Always send to oracle for local caching
-    send_parquet_files(&cli, logger_cpy, observation_parquet.clone(), forecast_parquet.clone()).await?;
+    send_parquet_files(
+        &cli,
+        logger_cpy,
+        observation_parquet.clone(),
+        forecast_parquet.clone(),
+    )
+    .await?;
 
     // Also upload to S3 for archival if configured
     if let Some(s3) = s3_storage {
