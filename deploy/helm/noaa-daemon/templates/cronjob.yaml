@@ -54,6 +54,8 @@ spec:
                 - name: NOAA_DAEMON_S3_ENDPOINT
                   value: {{ .Values.s3.endpoint | quote }}
                 {{- end }}
+                {{/* Only inject explicit credentials if provided; otherwise use instance profile */}}
+                {{- if and .Values.s3.accessKeyId .Values.s3.secretAccessKey }}
                 - name: AWS_ACCESS_KEY_ID
                   valueFrom:
                     secretKeyRef:
@@ -64,6 +66,7 @@ spec:
                     secretKeyRef:
                       name: {{ include "noaa-daemon.fullname" . }}-s3
                       key: secret-access-key
+                {{- end }}
                 {{- end }}
               {{- if .Values.devMode.enabled }}
               volumeMounts:
