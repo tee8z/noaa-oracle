@@ -104,8 +104,9 @@ pub async fn build_app_state(
 
 pub fn app(app_state: AppState) -> Router {
     let api_docs = ApiDoc::openapi();
-    // The ui folder needs to be generated and have this relative path from where the binary is being run
-    let serve_dir = ServeDir::new("ui").not_found_service(ServeFile::new(app_state.ui_dir.clone()));
+    // Serve static UI files from the configured ui_dir path
+    let index_file = format!("{}/index.html", &app_state.ui_dir);
+    let serve_dir = ServeDir::new(&app_state.ui_dir).not_found_service(ServeFile::new(index_file));
     let cors = CorsLayer::new()
         // allow `GET` and `POST` when accessing the resource
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
