@@ -137,3 +137,14 @@ devMode:
   hostPath: /mnt/noaa-oracle/oracle
   # Base image for running the binary (must have libc, ssl, etc.)
   baseImage: debian:bookworm-slim
+
+# Weather data cleanup configuration
+cleanup:
+  # Enable the cleanup cronjob
+  enabled: false
+  # Cron schedule (default: daily at 3am)
+  schedule: "0 3 * * *"
+  # Directory containing dated weather data folders
+  weatherDataDir: /var/lib/noaa-oracle/weather
+  # Number of days to retain weather data
+  retentionDays: 32
