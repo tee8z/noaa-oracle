@@ -27,16 +27,22 @@ spec:
               mountPath: /etc/litestream.yml
               subPath: litestream.yml
           env:
+            {{- if or .Values.litestream.s3AccessKeyId .Values.litestream.existingSecret }}
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "noaa-oracle.fullname" . }}-s3
+                  name: {{ .Values.litestream.existingSecret | default (printf "%s-s3" (include "noaa-oracle.fullname" .)) }}
                   key: access-key-id
             - name: AWS_SECRET_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "noaa-oracle.fullname" . }}-s3
+                  name: {{ .Values.litestream.existingSecret | default (printf "%s-s3" (include "noaa-oracle.fullname" .)) }}
                   key: secret-access-key
+            {{- end }}
+            {{- if .Values.litestream.s3Region }}
+            - name: AWS_REGION
+              value: {{ .Values.litestream.s3Region | quote }}
+            {{- end }}
       {{- end }}
       containers:
         - name: {{ .Chart.Name }}
@@ -107,16 +113,22 @@ spec:
               mountPath: /etc/litestream.yml
               subPath: litestream.yml
           env:
+            {{- if or .Values.litestream.s3AccessKeyId .Values.litestream.existingSecret }}
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "noaa-oracle.fullname" . }}-s3
+                  name: {{ .Values.litestream.existingSecret | default (printf "%s-s3" (include "noaa-oracle.fullname" .)) }}
                   key: access-key-id
             - name: AWS_SECRET_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "noaa-oracle.fullname" . }}-s3
+                  name: {{ .Values.litestream.existingSecret | default (printf "%s-s3" (include "noaa-oracle.fullname" .)) }}
                   key: secret-access-key
+            {{- end }}
+            {{- if .Values.litestream.s3Region }}
+            - name: AWS_REGION
+              value: {{ .Values.litestream.s3Region | quote }}
+            {{- end }}
           resources:
             requests:
               memory: 32Mi
