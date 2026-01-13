@@ -283,9 +283,6 @@ jobs:
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
-        with:
-          extra-conf: |
-            extra-platforms = aarch64-linux
 
       - name: Setup Nix cache
         uses: DeterminateSystems/magic-nix-cache-action@main
@@ -293,16 +290,11 @@ jobs:
           use-gha-cache: false
           use-flakehub: false
 
-      - name: Install QEMU for ARM64 emulation
+      - name: Build with Nix for ARM64 (cross-compiled)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-user-static binfmt-support
-          sudo update-binfmts --enable qemu-aarch64
-
-      - name: Build with Nix for ARM64
-        run: |
-          nix build .#packages.aarch64-linux.oracle --print-build-logs
-          nix build .#packages.aarch64-linux.daemon --print-build-logs -o result-daemon
+          # Use cross-compilation from x86_64-linux to aarch64-linux (no QEMU needed)
+          nix build .#oracle-aarch64-linux --print-build-logs
+          nix build .#daemon-aarch64-linux --print-build-logs -o result-daemon
 
       - name: Create release package
         run: |
