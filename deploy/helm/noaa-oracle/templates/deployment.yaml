@@ -43,6 +43,13 @@ spec:
             - name: AWS_REGION
               value: {{ .Values.litestream.s3Region | quote }}
             {{- end }}
+            {{- if .Values.litestream.encryptionKeySecret.enabled }}
+            - name: LITESTREAM_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.litestream.encryptionKeySecret.name }}
+                  key: {{ .Values.litestream.encryptionKeySecret.key }}
+            {{- end }}
       {{- end }}
       containers:
         - name: {{ .Chart.Name }}
@@ -128,6 +135,13 @@ spec:
             {{- if .Values.litestream.s3Region }}
             - name: AWS_REGION
               value: {{ .Values.litestream.s3Region | quote }}
+            {{- end }}
+            {{- if .Values.litestream.encryptionKeySecret.enabled }}
+            - name: LITESTREAM_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.litestream.encryptionKeySecret.name }}
+                  key: {{ .Values.litestream.encryptionKeySecret.key }}
             {{- end }}
           resources:
             requests:
