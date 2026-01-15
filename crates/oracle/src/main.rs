@@ -46,12 +46,18 @@ async fn main() -> anyhow::Result<()> {
     info!("  Event DB: {}", event_data);
     info!("  Static: {}", static_dir);
 
-    let app_state = build_app_state(remote_url, static_dir, weather_data, event_data, private_key)
-        .await
-        .map_err(|e| {
-            error!("error building app: {}", e);
-            e
-        })?;
+    let app_state = build_app_state(
+        remote_url,
+        static_dir,
+        weather_data,
+        event_data,
+        private_key,
+    )
+    .await
+    .map_err(|e| {
+        error!("error building app: {}", e);
+        e
+    })?;
 
     let app = app(app_state);
 

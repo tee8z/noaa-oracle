@@ -1,10 +1,11 @@
 use crate::{
-    add_event_entries, create_event, db, download, files, forecasts, get_event, get_event_entry,
-    get_npub, get_pubkey, get_stations, index_handler, list_events, observations,
+    add_event_entries, create_event, dashboard_handler, db, download, event_detail_handler,
+    event_stats_handler, events_handler, events_rows_handler, files, forecasts, get_event,
+    get_event_entry, get_npub, get_pubkey, get_stations, list_events, observations,
     oracle::{self, Oracle},
-    routes, update_data, upload,
+    oracle_info_handler, raw_data_handler, routes, update_data, upload,
     weather_data::WeatherAccess,
-    Database, FileAccess, FileData, WeatherData,
+    weather_handler, Database, FileAccess, FileData, WeatherData,
 };
 use anyhow::anyhow;
 use axum::{
@@ -111,7 +112,17 @@ pub fn app(app_state: AppState) -> Router {
         .allow_origin(Any);
 
     Router::new()
-        .route("/", get(index_handler))
+        // UI routes
+        .route("/", get(dashboard_handler))
+        .route("/events", get(events_handler))
+        .route("/events/{event_id}", get(event_detail_handler))
+        .route("/raw", get(raw_data_handler))
+        // HTMX fragment routes
+        .route("/fragments/oracle-info", get(oracle_info_handler))
+        .route("/fragments/event-stats", get(event_stats_handler))
+        .route("/fragments/weather", get(weather_handler))
+        .route("/fragments/events-rows", get(events_rows_handler))
+        // API routes
         .route("/files", get(files))
         .route("/file/{file_name}", get(download))
         .route("/file/{file_name}", post(upload))

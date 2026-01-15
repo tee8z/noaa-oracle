@@ -135,7 +135,7 @@
 
           postInstall = ''
             mkdir -p $out/share/noaa-oracle
-            cp -r ui $out/share/noaa-oracle/
+            cp -r crates/oracle/static $out/share/noaa-oracle/
             cp -r config $out/share/noaa-oracle/
           '';
         } // commonEnv);
@@ -166,7 +166,7 @@
             Cmd = [ "${oracle}/bin/oracle" ];
             Env = [
               "LD_LIBRARY_PATH=${duckdb-lib}/lib:${pkgs.stdenv.cc.cc.lib}/lib"
-              "NOAA_ORACLE_UI_DIR=${oracle}/share/noaa-oracle/ui"
+              "NOAA_ORACLE_UI_DIR=${oracle}/share/noaa-oracle/static"
               "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
             ];
             ExposedPorts = {
@@ -319,7 +319,7 @@
         # Runner scripts
         run-oracle = pkgs.writeShellScriptBin "noaa-oracle" ''
           export LD_LIBRARY_PATH="${duckdb-lib}/lib:${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH"
-          export NOAA_ORACLE_UI_DIR="''${NOAA_ORACLE_UI_DIR:-${oracle}/share/noaa-oracle/ui}"
+          export NOAA_ORACLE_UI_DIR="''${NOAA_ORACLE_UI_DIR:-${oracle}/share/noaa-oracle/static}"
           exec ${oracle}/bin/oracle "$@"
         '';
 
@@ -477,7 +477,7 @@
                 NOAA_ORACLE_PORT = toString cfg.oracle.port;
                 NOAA_ORACLE_DATA_DIR = cfg.oracle.weatherDir;
                 NOAA_ORACLE_EVENT_DB = cfg.oracle.eventDb;
-                NOAA_ORACLE_UI_DIR = "${cfg.oracle.package}/share/noaa-oracle/ui";
+                NOAA_ORACLE_UI_DIR = "${cfg.oracle.package}/share/noaa-oracle/static";
                 NOAA_ORACLE_PRIVATE_KEY = "${cfg.oracle.dataDir}/keys/oracle.pem";
                 LD_LIBRARY_PATH = "${self.packages.${pkgs.system}.duckdb-lib}/lib";
                 RUST_LOG = "info";

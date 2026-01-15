@@ -106,7 +106,9 @@ impl Cli {
     }
 
     pub fn static_dir(&self) -> String {
-        self.ui_dir.clone().unwrap_or_else(|| "./static".to_string())
+        self.ui_dir
+            .clone()
+            .unwrap_or_else(|| "./static".to_string())
     }
 
     pub fn private_key(&self) -> String {
