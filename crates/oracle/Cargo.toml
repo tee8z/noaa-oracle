@@ -39,6 +39,7 @@ axum = { version = "0.8", features = [
 ] }
 tower-http = { version = "0.6", features = ["fs", "cors"] }
 hyper = "1.8"
+maud = { version = "0.26", features = ["axum"] }
 
 # Database
 duckdb = "1.4"
@@ -74,6 +75,12 @@ regex = "1.12"
 itertools = "0.14"
 scooby = "0.5"
 async-trait = "0.1"
+
+[build-dependencies]
+minify-js = "0.6"
+walkdir = "2.5"
+sha2 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
 tower = "0.5"
