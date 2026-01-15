@@ -23,14 +23,14 @@ use log::info;
 use std::sync::Arc;
 use tower_http::{
     cors::{Any, CorsLayer},
-    services::{ServeDir, ServeFile},
+    services::ServeDir,
 };
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
 #[derive(Clone)]
 pub struct AppState {
-    pub ui_dir: String,
+    pub static_dir: String,
     pub remote_url: String,
     pub file_access: Arc<dyn FileData>,
     pub weather_db: Arc<dyn WeatherData>,
@@ -75,7 +75,7 @@ struct ApiDoc;
 
 pub async fn build_app_state(
     remote_url: String,
-    ui_dir: String,
+    static_dir: String,
     data_dir: String,
     event_dir: String,
     private_key_file_path: String,
@@ -94,7 +94,7 @@ pub async fn build_app_state(
     let oracle = Arc::new(Oracle::new(db, weather_db.clone(), &private_key_file_path).await?);
 
     Ok(AppState {
-        ui_dir,
+        static_dir,
         remote_url,
         weather_db,
         file_access,
@@ -104,16 +104,14 @@ pub async fn build_app_state(
 
 pub fn app(app_state: AppState) -> Router {
     let api_docs = ApiDoc::openapi();
-    // Serve static UI files from the configured ui_dir path
-    let index_file = format!("{}/index.html", &app_state.ui_dir);
-    let serve_dir = ServeDir::new(&app_state.ui_dir).not_found_service(ServeFile::new(index_file));
+    let serve_static = ServeDir::new(&app_state.static_dir);
     let cors = CorsLayer::new()
-        // allow `GET` and `POST` when accessing the resource
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([ACCEPT, CONTENT_TYPE])
-        // allow requests from any origin
         .allow_origin(Any);
+
     Router::new()
+        .route("/", get(index_handler))
         .route("/files", get(files))
         .route("/file/{file_name}", get(download))
         .route("/file/{file_name}", post(upload))
@@ -131,13 +129,11 @@ pub fn app(app_state: AppState) -> Router {
             "/oracle/events/{event_id}/entries/{entry_id}",
             get(get_event_entry),
         )
-        .layer(middleware::from_fn(log_request))
-        .layer(DefaultBodyLimit::max(30 * 1024 * 1024)) // max is in bytes
-        .route("/", get(index_handler))
         .with_state(Arc::new(app_state))
+        .layer(middleware::from_fn(log_request))
+        .layer(DefaultBodyLimit::max(30 * 1024 * 1024))
         .merge(Scalar::with_url("/docs", api_docs))
-        .nest_service("/ui", serve_dir.clone())
-        .fallback_service(serve_dir)
+        .nest_service("/static", serve_static)
         .layer(cors)
 }
 

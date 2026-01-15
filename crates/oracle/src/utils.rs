@@ -105,8 +105,8 @@ impl Cli {
             .unwrap_or_else(|| "./event_data".to_string())
     }
 
-    pub fn ui_dir(&self) -> String {
-        self.ui_dir.clone().unwrap_or_else(|| "./ui".to_string())
+    pub fn static_dir(&self) -> String {
+        self.ui_dir.clone().unwrap_or_else(|| "./static".to_string())
     }
 
     pub fn private_key(&self) -> String {

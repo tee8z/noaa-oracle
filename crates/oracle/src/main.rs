@@ -22,7 +22,7 @@ async fn main() -> anyhow::Result<()> {
     // Get paths using the new helper methods
     let weather_data = cli.weather_dir();
     let event_data = cli.event_db();
-    let ui_dir = cli.ui_dir();
+    let static_dir = cli.static_dir();
     let private_key = cli.private_key();
     let remote_url = cli.remote_url();
     let host = cli.host();
@@ -44,9 +44,9 @@ async fn main() -> anyhow::Result<()> {
     info!("  Docs:   http://{}/docs", socket_addr);
     info!("  Weather data: {}", weather_data);
     info!("  Event DB: {}", event_data);
-    info!("  UI: {}", ui_dir);
+    info!("  Static: {}", static_dir);
 
-    let app_state = build_app_state(remote_url, ui_dir, weather_data, event_data, private_key)
+    let app_state = build_app_state(remote_url, static_dir, weather_data, event_data, private_key)
         .await
         .map_err(|e| {
             error!("error building app: {}", e);

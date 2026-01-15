@@ -5,6 +5,7 @@ mod nostr_extractor;
 pub mod oracle;
 pub mod routes;
 mod startup;
+pub mod templates;
 mod utils;
 
 pub use app_error::AppError;
