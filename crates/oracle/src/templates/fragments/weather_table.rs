@@ -74,7 +74,7 @@ pub fn weather_table_body(weather_data: &[WeatherDisplay]) -> Markup {
                         }
                     }
                     tbody hx-get="/fragments/weather"
-                          hx-trigger="every 30s"
+                          hx-trigger="every 1s"
                           hx-swap="innerHTML"
                           hx-select="tbody > tr" {
                         @for weather in weather_data {
