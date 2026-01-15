@@ -51,7 +51,7 @@ pub async fn spawn_app(weather_db: Arc<dyn WeatherData>) -> TestApp {
     );
 
     let app_state = AppState {
-        ui_dir: String::from("./ui"),
+        static_dir: String::from("./static"),
         remote_url: String::from("http://127.0.0.1:9100"),
         weather_db,
         file_access: Arc::new(MockFileAccess::new()),

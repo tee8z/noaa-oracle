@@ -31,7 +31,7 @@ fn build_js(templates: &Path, output: &Path) {
     let mut files: Vec<_> = WalkDir::new(templates)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |e| e == "js"))
+        .filter(|e| e.path().extension().is_some_and(|e| e == "js"))
         .map(|e| e.path().to_path_buf())
         .collect();
     files.sort();
@@ -84,7 +84,7 @@ fn build_css(templates: &Path, output: &Path) {
     let mut files: Vec<_> = WalkDir::new(templates)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |e| e == "css"))
+        .filter(|e| e.path().extension().is_some_and(|e| e == "css"))
         .map(|e| e.path().to_path_buf())
         .collect();
     files.sort();
@@ -112,7 +112,10 @@ fn build_css(templates: &Path, output: &Path) {
     let _ = fs::write(output.join(format!("styles.{}.min.css", short)), &minified);
     let _ = fs::write(output.join("styles.min.css"), &minified);
 
-    println!("cargo:warning=Built styles.min.css ({} bytes)", minified.len());
+    println!(
+        "cargo:warning=Built styles.min.css ({} bytes)",
+        minified.len()
+    );
 }
 
 fn try_minify_js(source: &str) -> Option<String> {
@@ -146,10 +149,10 @@ fn minify_css(css: &str) -> String {
             continue;
         }
         if c.is_whitespace() {
-            if !out.ends_with(|ch: char| ch.is_whitespace() || "{:;,".contains(ch)) {
-                if chars.peek().map_or(false, |&n| !"{}:;,".contains(n)) {
-                    out.push(' ');
-                }
+            if !out.ends_with(|ch: char| ch.is_whitespace() || "{:;,".contains(ch))
+                && chars.peek().is_some_and(|&n| !"{}:;,".contains(n))
+            {
+                out.push(' ');
             }
             continue;
         }

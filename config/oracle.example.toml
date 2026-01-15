@@ -61,7 +61,7 @@ event_db = "./event_data"
 # =============================================================================
 # Browser UI static files location
 # For Nix installs this is set automatically to the package's share directory
-ui_dir = "./ui"
+ui_dir = "./static"
 
 # Oracle signing key (ECDSA secp256k1)
 # Used to sign DLC attestations - keep this secure!
