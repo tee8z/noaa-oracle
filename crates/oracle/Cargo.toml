@@ -86,5 +86,8 @@ hex = "0.4"
 tower = "0.5"
 mockall = "0.14"
 
+[package.metadata.cargo-machete]
+ignored = ["hex", "minify-js", "sha2", "walkdir"]
+
 [lints]
 workspace = true

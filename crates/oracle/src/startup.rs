@@ -10,9 +10,10 @@ use crate::{
 use anyhow::anyhow;
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Request},
+    extract::{DefaultBodyLimit, Path, Request, State},
+    http::{header, StatusCode},
     middleware::{self, Next},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
@@ -22,10 +23,7 @@ use hyper::{
 };
 use log::info;
 use std::sync::Arc;
-use tower_http::{
-    cors::{Any, CorsLayer},
-    services::ServeDir,
-};
+use tower_http::cors::{Any, CorsLayer};
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
@@ -105,7 +103,6 @@ pub async fn build_app_state(
 
 pub fn app(app_state: AppState) -> Router {
     let api_docs = ApiDoc::openapi();
-    let serve_static = ServeDir::new(&app_state.static_dir);
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([ACCEPT, CONTENT_TYPE])
@@ -140,11 +137,12 @@ pub fn app(app_state: AppState) -> Router {
             "/oracle/events/{event_id}/entries/{entry_id}",
             get(get_event_entry),
         )
+        // Static files with explicit MIME types
+        .route("/static/{*path}", get(serve_static_file))
         .with_state(Arc::new(app_state))
         .layer(middleware::from_fn(log_request))
         .layer(DefaultBodyLimit::max(30 * 1024 * 1024))
         .merge(Scalar::with_url("/docs", api_docs))
-        .nest_service("/static", serve_static)
         .layer(cors)
 }
 
@@ -162,4 +160,55 @@ async fn log_request(request: Request<Body>, next: Next) -> impl IntoResponse {
     info!(target: "http_response", "response, code: {}, time: {}", response.status().as_str(), response_time);
 
     response
+}
+
+/// Serves static files with explicit MIME type mappings.
+/// This avoids relying on the system's MIME database which may be missing in containers.
+async fn serve_static_file(
+    State(state): State<Arc<AppState>>,
+    Path(path): Path<String>,
+) -> Response {
+    // Prevent directory traversal attacks
+    if path.contains("..") {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let file_path = std::path::Path::new(&state.static_dir).join(&path);
+
+    let content = match tokio::fs::read(&file_path).await {
+        Ok(content) => content,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let content_type = get_mime_type(&path);
+
+    ([(header::CONTENT_TYPE, content_type)], content).into_response()
+}
+
+/// Returns the appropriate MIME type for a file based on its extension.
+fn get_mime_type(path: &str) -> &'static str {
+    match path.rsplit('.').next() {
+        Some("js") => "application/javascript; charset=utf-8",
+        Some("mjs") => "application/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("html") => "text/html; charset=utf-8",
+        Some("htm") => "text/html; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("svg") => "image/svg+xml",
+        Some("ico") => "image/x-icon",
+        Some("webp") => "image/webp",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        Some("ttf") => "font/ttf",
+        Some("otf") => "font/otf",
+        Some("eot") => "application/vnd.ms-fontobject",
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("xml") => "application/xml; charset=utf-8",
+        Some("wasm") => "application/wasm",
+        Some("map") => "application/json",
+        _ => "application/octet-stream",
+    }
 }
