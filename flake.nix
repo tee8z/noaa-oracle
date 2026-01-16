@@ -137,15 +137,16 @@
           # Copy static files right after cargo build, before they get cleaned up
           postBuild = ''
             mkdir -p $TMPDIR/static-files
-            # Static files are built by build.rs into $OUT_DIR/static
-            STATIC_DIR=$(find target -path "*/build/oracle-*/out/static" -type d 2>/dev/null | head -1)
-            if [ -n "$STATIC_DIR" ] && [ -d "$STATIC_DIR" ]; then
+            # build.rs outputs static files to $CARGO_MANIFEST_DIR/static (source tree)
+            # which in Nix build is /build/source/crates/oracle/static/
+            STATIC_DIR="/build/source/crates/oracle/static"
+            if [ -d "$STATIC_DIR" ] && [ -f "$STATIC_DIR/app.min.js" ]; then
               echo "Found static files at: $STATIC_DIR"
-              cp -r "$STATIC_DIR"/* $TMPDIR/static-files/ || true
+              cp -r "$STATIC_DIR"/* $TMPDIR/static-files/
             else
-              echo "Warning: Static files directory not found at expected path"
-              # Try finding any static files in the build output
-              for f in $(find target -name "app.min.js" -type f 2>/dev/null); do
+              echo "Warning: Static files not found at $STATIC_DIR"
+              echo "Searching for app.min.js in source tree..."
+              for f in $(find /build/source -name "app.min.js" -type f 2>/dev/null); do
                 echo "Found static files at: $(dirname "$f")"
                 cp "$(dirname "$f")"/* $TMPDIR/static-files/ || true
                 break
@@ -158,10 +159,16 @@
           postInstall = ''
             mkdir -p $out/share/noaa-oracle/static
             # Copy the static files we saved during postBuild
-            if [ -d "$TMPDIR/static-files" ] && [ -n "$(ls -A $TMPDIR/static-files 2>/dev/null)" ]; then
+            if [ -d "$TMPDIR/static-files" ] && [ -f "$TMPDIR/static-files/app.min.js" ]; then
               cp -r $TMPDIR/static-files/* $out/share/noaa-oracle/static/
+              echo "Installed static files:"
+              ls -la $out/share/noaa-oracle/static/
             else
               echo "Error: No static files found in $TMPDIR/static-files"
+              echo "Contents of TMPDIR:"
+              ls -la $TMPDIR/ || true
+              echo "Contents of static-files (if exists):"
+              ls -la $TMPDIR/static-files/ || true
               exit 1
             fi
             cp -r config $out/share/noaa-oracle/
