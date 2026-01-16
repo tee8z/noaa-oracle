@@ -318,12 +318,16 @@ jobs:
           npm ci
           npx playwright install firefox --with-deps
 
-      - name: Build DuckDB library
+      - name: Build runtime libraries
         run: |
-          # Build only the duckdb-lib package (fast, just downloads and unpacks)
+          # Build DuckDB library (fast, just downloads and unpacks)
           nix build .#duckdb-lib -o duckdb-lib-result
           echo "DuckDB library built at: $(readlink -f duckdb-lib-result)"
           ls -la duckdb-lib-result/lib/
+          # Get stdenv cc lib path for libstdc++
+          nix build nixpkgs#stdenv.cc.cc.lib -o stdenv-cc-lib
+          echo "stdenv cc lib at: $(readlink -f stdenv-cc-lib)"
+          ls -la stdenv-cc-lib/lib/ | head -10
 
       - name: Start oracle server
         run: |
@@ -331,9 +335,11 @@ jobs:
           export NOAA_ORACLE_UI_DIR="${{ github.workspace }}/crates/oracle/static"
           export NOAA_ORACLE_HOST="0.0.0.0"
           export RUST_LOG=info
-          # Set library path directly instead of using nix develop (which downloads many deps)
-          export LD_LIBRARY_PATH="$(readlink -f duckdb-lib-result)/lib:$LD_LIBRARY_PATH"
-          export DUCKDB_LIB_DIR="$(readlink -f duckdb-lib-result)/lib"
+          # Set library path for DuckDB and libstdc++
+          DUCKDB_PATH="$(readlink -f duckdb-lib-result)/lib"
+          STDENV_PATH="$(readlink -f stdenv-cc-lib)/lib"
+          export LD_LIBRARY_PATH="${DUCKDB_PATH}:${STDENV_PATH}:$LD_LIBRARY_PATH"
+          export DUCKDB_LIB_DIR="$DUCKDB_PATH"
           echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
           # Start the server in background
           ./target/debug/oracle > /tmp/oracle.log 2>&1 &
