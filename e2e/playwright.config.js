@@ -10,7 +10,8 @@ module.exports = defineConfig({
   reporter: process.env.CI ? "github" : "list",
   timeout: 30000,
   use: {
-    baseURL: process.env.BASE_URL || "http://localhost:9800",
+    // Use 127.0.0.1 explicitly to avoid IPv6 resolution issues in CI
+    baseURL: process.env.BASE_URL || "http://127.0.0.1:9800",
     trace: "on-first-retry",
     screenshot: "only-on-failure",
     // Disable HTTP/2 to avoid connection issues

@@ -328,12 +328,13 @@ jobs:
         run: |
           export NOAA_ORACLE_DATA_DIR="${{ github.workspace }}/e2e/fixtures/weather_data"
           export NOAA_ORACLE_UI_DIR="${{ github.workspace }}/crates/oracle/static"
+          export NOAA_ORACLE_HOST="0.0.0.0"
           export RUST_LOG=info
           # Use nohup to prevent SIGHUP from killing the server when the shell exits
           nohup nix develop -c ./target/debug/oracle > /tmp/oracle.log 2>&1 &
-          # Wait for server to be ready
+          # Wait for server to be ready (use 127.0.0.1 to avoid IPv6 issues)
           for i in {1..30}; do
-            if curl -s "http://localhost:9800/oracle/pubkey" 2>/dev/null | grep -q key; then
+            if curl -s "http://127.0.0.1:9800/oracle/pubkey" 2>/dev/null | grep -q key; then
               echo "Server is ready"
               break
             fi
@@ -348,7 +349,7 @@ jobs:
         run: npx playwright test
         env:
           CI: true
-          BASE_URL: http://localhost:9800
+          BASE_URL: http://127.0.0.1:9800
 
       - name: Show server logs on failure
         if: failure()
