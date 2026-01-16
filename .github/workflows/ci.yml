@@ -100,6 +100,23 @@ jobs:
         env:
           RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
 
+      - name: Copy static files from build output
+        run: |
+          mkdir -p crates/oracle/static
+          # Static files are built by build.rs into target/debug/build/oracle-*/out/static/
+          STATIC_DIR=$(find target -path "*/build/oracle-*/out/static" -type d 2>/dev/null | head -1)
+          if [ -n "$STATIC_DIR" ] && [ -d "$STATIC_DIR" ]; then
+            echo "Found static files at: $STATIC_DIR"
+            cp -r "$STATIC_DIR"/* crates/oracle/static/
+            echo "Copied static files:"
+            ls -la crates/oracle/static/
+          else
+            echo "Error: Static files directory not found"
+            echo "Searching for any built JS files..."
+            find target -name "app.min.js" -type f 2>/dev/null || true
+            exit 1
+          fi
+
       - name: Upload binaries and static files for e2e tests
         uses: actions/upload-artifact@v4
         with:
@@ -272,6 +289,16 @@ jobs:
 
       - name: Make binaries executable
         run: chmod +x target/debug/oracle target/debug/daemon
+
+      - name: Verify static files
+        run: |
+          echo "Checking downloaded static files..."
+          ls -la crates/oracle/static/ || echo "Static files directory missing!"
+          if [ ! -f "crates/oracle/static/app.min.js" ]; then
+            echo "Error: app.min.js not found in static files"
+            exit 1
+          fi
+          echo "Static files verified successfully"
 
       - name: Setup test environment
         run: |
