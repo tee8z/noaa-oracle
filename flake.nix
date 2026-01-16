@@ -134,11 +134,36 @@
           nativeBuildInputs = buildDeps;
           cargoExtraArgs = "--bin oracle";
 
+          # Copy static files right after cargo build, before they get cleaned up
+          postBuild = ''
+            mkdir -p $TMPDIR/static-files
+            # Static files are built by build.rs into $OUT_DIR/static
+            STATIC_DIR=$(find target -path "*/build/oracle-*/out/static" -type d 2>/dev/null | head -1)
+            if [ -n "$STATIC_DIR" ] && [ -d "$STATIC_DIR" ]; then
+              echo "Found static files at: $STATIC_DIR"
+              cp -r "$STATIC_DIR"/* $TMPDIR/static-files/ || true
+            else
+              echo "Warning: Static files directory not found at expected path"
+              # Try finding any static files in the build output
+              for f in $(find target -name "app.min.js" -type f 2>/dev/null); do
+                echo "Found static files at: $(dirname "$f")"
+                cp "$(dirname "$f")"/* $TMPDIR/static-files/ || true
+                break
+              done
+            fi
+            echo "Static files collected:"
+            ls -la $TMPDIR/static-files/ || true
+          '';
+
           postInstall = ''
             mkdir -p $out/share/noaa-oracle/static
-            # Static files are built by build.rs into $OUT_DIR/static
-            # Find and copy them from the cargo build output
-            find target -path "*/build/oracle-*/out/static" -type d | head -1 | xargs -I {} cp -r {}/* $out/share/noaa-oracle/static/
+            # Copy the static files we saved during postBuild
+            if [ -d "$TMPDIR/static-files" ] && [ -n "$(ls -A $TMPDIR/static-files 2>/dev/null)" ]; then
+              cp -r $TMPDIR/static-files/* $out/share/noaa-oracle/static/
+            else
+              echo "Error: No static files found in $TMPDIR/static-files"
+              exit 1
+            fi
             cp -r config $out/share/noaa-oracle/
           '';
         } // commonEnv);
