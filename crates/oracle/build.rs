@@ -26,6 +26,7 @@ fn main() {
 
     build_js(&templates, &output);
     build_css(&templates, &output);
+    copy_loader(&templates, &output);
 
     // Tell downstream where to find the static files
     println!("cargo:rustc-env=STATIC_DIR={}", output.display());
@@ -36,6 +37,8 @@ fn build_js(templates: &Path, output: &Path) {
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|e| e == "js"))
+        // Exclude loader.js - it's copied separately, not bundled
+        .filter(|e| e.path().file_name().is_some_and(|n| n != "loader.js"))
         .map(|e| e.path().to_path_buf())
         .collect();
     files.sort();
@@ -163,4 +166,15 @@ fn minify_css(css: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// Copies loader.js directly (not bundled with app.min.js)
+fn copy_loader(templates: &Path, output: &Path) {
+    let loader = templates.join("loader.js");
+    if loader.exists() {
+        if let Ok(content) = fs::read_to_string(&loader) {
+            let _ = fs::write(output.join("loader.js"), &content);
+            println!("cargo:warning=Copied loader.js ({} bytes)", content.len());
+        }
+    }
 }
