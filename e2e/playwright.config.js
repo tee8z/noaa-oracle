@@ -28,7 +28,7 @@ module.exports = defineConfig({
     ? undefined
     : {
         command: `NOAA_ORACLE_DATA_DIR=${path.join(__dirname, "fixtures/weather_data")} just run-oracle`,
-        url: "http://localhost:9800",
+        url: "http://127.0.0.1:9800",
         reuseExistingServer: true,
         timeout: 120000,
         cwd: "..",

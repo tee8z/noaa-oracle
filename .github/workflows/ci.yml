@@ -330,19 +330,28 @@ jobs:
           export NOAA_ORACLE_UI_DIR="${{ github.workspace }}/crates/oracle/static"
           export NOAA_ORACLE_HOST="0.0.0.0"
           export RUST_LOG=info
-          # Use nohup to prevent SIGHUP from killing the server when the shell exits
-          nohup nix develop -c ./target/debug/oracle > /tmp/oracle.log 2>&1 &
-          # Wait for server to be ready (use 127.0.0.1 to avoid IPv6 issues)
+          # Start the server in background using nix develop to get proper library paths
+          nix develop -c sh -c './target/debug/oracle > /tmp/oracle.log 2>&1' &
+          SERVER_PID=$!
+          echo "Started server with PID: $SERVER_PID"
+          # Wait for server to be ready
           for i in {1..30}; do
             if curl -s "http://127.0.0.1:9800/oracle/pubkey" 2>/dev/null | grep -q key; then
               echo "Server is ready"
               break
+            fi
+            if ! kill -0 $SERVER_PID 2>/dev/null; then
+              echo "Server process died!"
+              cat /tmp/oracle.log || true
+              exit 1
             fi
             echo "Waiting for server... ($i/30)"
             sleep 1
           done
           # Show server startup logs
           cat /tmp/oracle.log || true
+          # Final verification
+          curl -s "http://127.0.0.1:9800/oracle/pubkey" || { echo "Server not responding!"; exit 1; }
 
       - name: Run Playwright tests
         working-directory: e2e
