@@ -319,15 +319,19 @@ jobs:
           npx playwright install firefox --with-deps
 
       - name: Build runtime libraries
+        id: runtime-libs
         run: |
-          # Build DuckDB library (fast, just downloads and unpacks)
-          nix build .#duckdb-lib -o duckdb-lib-result
-          echo "DuckDB library built at: $(readlink -f duckdb-lib-result)"
-          ls -la duckdb-lib-result/lib/
+          # Build DuckDB library and get its path
+          DUCKDB_PATH=$(nix build .#duckdb-lib --print-out-paths)
+          echo "DuckDB library at: $DUCKDB_PATH"
+          ls -la "$DUCKDB_PATH/lib/"
+          echo "duckdb_path=$DUCKDB_PATH" >> $GITHUB_OUTPUT
+          
           # Get stdenv cc lib path for libstdc++
-          nix build nixpkgs#stdenv.cc.cc.lib -o stdenv-cc-lib
-          echo "stdenv cc lib at: $(readlink -f stdenv-cc-lib)"
-          ls -la stdenv-cc-lib/lib/ | head -10
+          STDENV_PATH=$(nix build nixpkgs#stdenv.cc.cc.lib --print-out-paths)
+          echo "stdenv cc lib at: $STDENV_PATH"
+          ls -la "$STDENV_PATH/lib/" | grep stdc
+          echo "stdenv_path=$STDENV_PATH" >> $GITHUB_OUTPUT
 
       - name: Start oracle server
         run: |
@@ -336,8 +340,8 @@ jobs:
           export NOAA_ORACLE_HOST="0.0.0.0"
           export RUST_LOG=info
           # Set library path for DuckDB and libstdc++
-          DUCKDB_PATH="$(readlink -f duckdb-lib-result)/lib"
-          STDENV_PATH="$(readlink -f stdenv-cc-lib)/lib"
+          DUCKDB_PATH="${{ steps.runtime-libs.outputs.duckdb_path }}/lib"
+          STDENV_PATH="${{ steps.runtime-libs.outputs.stdenv_path }}/lib"
           export LD_LIBRARY_PATH="${DUCKDB_PATH}:${STDENV_PATH}:$LD_LIBRARY_PATH"
           export DUCKDB_LIB_DIR="$DUCKDB_PATH"
           echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
