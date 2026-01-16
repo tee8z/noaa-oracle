@@ -5,9 +5,10 @@ use walkdir::WalkDir;
 
 fn main() {
     let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let out_dir = env::var("OUT_DIR").unwrap();
     let templates = Path::new(&manifest).join("src/templates");
-    let output = Path::new(&out_dir).join("static");
+    // Output to source tree (like keymeld) so it's available at runtime
+    // without needing to copy from target directory
+    let output = Path::new(&manifest).join("static");
 
     if !templates.exists() {
         return;
@@ -27,9 +28,6 @@ fn main() {
     build_js(&templates, &output);
     build_css(&templates, &output);
     copy_loader(&templates, &output);
-
-    // Tell downstream where to find the static files
-    println!("cargo:rustc-env=STATIC_DIR={}", output.display());
 }
 
 fn build_js(templates: &Path, output: &Path) {

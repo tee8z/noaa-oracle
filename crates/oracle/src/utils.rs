@@ -108,7 +108,8 @@ impl Cli {
     pub fn static_dir(&self) -> String {
         self.ui_dir
             .clone()
-            .unwrap_or_else(|| "./static".to_string())
+            // Fall back to compile-time path (where build.rs outputs files)
+            .unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/static").to_string())
     }
 
     pub fn private_key(&self) -> String {
