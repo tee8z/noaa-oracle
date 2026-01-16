@@ -318,14 +318,25 @@ jobs:
           npm ci
           npx playwright install firefox --with-deps
 
+      - name: Build DuckDB library
+        run: |
+          # Build only the duckdb-lib package (fast, just downloads and unpacks)
+          nix build .#duckdb-lib -o duckdb-lib-result
+          echo "DuckDB library built at: $(readlink -f duckdb-lib-result)"
+          ls -la duckdb-lib-result/lib/
+
       - name: Start oracle server
         run: |
           export NOAA_ORACLE_DATA_DIR="${{ github.workspace }}/e2e/fixtures/weather_data"
           export NOAA_ORACLE_UI_DIR="${{ github.workspace }}/crates/oracle/static"
           export NOAA_ORACLE_HOST="0.0.0.0"
           export RUST_LOG=info
-          # Start the server in background using nix develop to get proper library paths
-          nix develop -c sh -c './target/debug/oracle > /tmp/oracle.log 2>&1' &
+          # Set library path directly instead of using nix develop (which downloads many deps)
+          export LD_LIBRARY_PATH="$(readlink -f duckdb-lib-result)/lib:$LD_LIBRARY_PATH"
+          export DUCKDB_LIB_DIR="$(readlink -f duckdb-lib-result)/lib"
+          echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
+          # Start the server in background
+          ./target/debug/oracle > /tmp/oracle.log 2>&1 &
           SERVER_PID=$!
           echo "Started server with PID: $SERVER_PID"
           # Wait for server to be ready
