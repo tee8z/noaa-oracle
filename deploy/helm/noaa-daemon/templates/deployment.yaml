@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "noaa-daemon.fullname" . }}
+  labels:
+    {{- include "noaa-daemon.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "noaa-daemon.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "noaa-daemon.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "noaa-daemon.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          {{- if .Values.devMode.enabled }}
+          image: {{ .Values.devMode.baseImage }}
+          command: ["/app/daemon"]
+          {{- else }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          {{- end }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.config.level }}
+            - name: NOAA_DAEMON_BASE_URL
+              value: {{ .Values.config.baseUrl | quote }}
+            - name: NOAA_DAEMON_DATA_DIR
+              value: {{ .Values.config.dataDir }}
+            - name: NOAA_DAEMON_USER_AGENT
+              value: {{ .Values.config.userAgent | quote }}
+            - name: NOAA_DAEMON_REFILL_RATE
+              value: {{ .Values.config.refillRate | quote }}
+            - name: NOAA_DAEMON_TOKEN_CAPACITY
+              value: {{ .Values.config.tokenCapacity | quote }}
+            {{- if .Values.sleepInterval }}
+            - name: NOAA_DAEMON_SLEEP_INTERVAL
+              value: {{ .Values.sleepInterval | quote }}
+            {{- end }}
+            {{- if .Values.s3.enabled }}
+            - name: NOAA_DAEMON_S3_BUCKET
+              value: {{ .Values.s3.bucket | quote }}
+            {{- if .Values.s3.region }}
+            - name: AWS_REGION
+              value: {{ .Values.s3.region | quote }}
+            {{- end }}
+            {{- if .Values.s3.endpoint }}
+            - name: NOAA_DAEMON_S3_ENDPOINT
+              value: {{ .Values.s3.endpoint | quote }}
+            {{- end }}
+            {{- if .Values.s3.existingSecret }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.s3.existingSecret }}
+                  key: {{ .Values.s3.existingSecretAccessKeyIdKey | default "access-key-id" }}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.s3.existingSecret }}
+                  key: {{ .Values.s3.existingSecretSecretAccessKeyKey | default "secret-access-key" }}
+            {{- else if and .Values.s3.accessKeyId .Values.s3.secretAccessKey }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "noaa-daemon.fullname" . }}-s3
+                  key: access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "noaa-daemon.fullname" . }}-s3
+                  key: secret-access-key
+            {{- end }}
+            {{- end }}
+          {{- if .Values.devMode.enabled }}
+          volumeMounts:
+            - name: dev-binary
+              mountPath: /app
+              readOnly: true
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- if .Values.devMode.enabled }}
+      volumes:
+        - name: dev-binary
+          hostPath:
+            path: {{ .Values.devMode.hostPath | dir }}
+            type: Directory
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

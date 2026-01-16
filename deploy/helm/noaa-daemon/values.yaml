@@ -1,5 +1,5 @@
 # NOAA Daemon Helm Chart Values
-# Weather data fetching daemon
+# Weather data fetching daemon (runs continuously)
 
 image:
   repository: ghcr.io/tee8z/noaa-daemon
@@ -16,14 +16,9 @@ serviceAccount:
   name: ""
   automount: true
 
-# CronJob schedule (default: hourly at :05)
-schedule: "5 * * * *"
-
-# Job configuration
-job:
-  backoffLimit: 3
-  activeDeadlineSeconds: 3600
-  ttlSecondsAfterFinished: 86400
+# Sleep interval between data fetches (in seconds)
+# Default: 3600 (1 hour)
+sleepInterval: 3600
 
 resources:
   requests:
@@ -52,6 +47,7 @@ config:
 s3:
   enabled: false
   bucket: ""
+  region: ""
   # Endpoint URL (for moto/localstack, leave empty for AWS)
   endpoint: ""
   # AWS credentials (for local dev with moto)
