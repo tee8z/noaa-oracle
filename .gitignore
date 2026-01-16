@@ -8,6 +8,7 @@ test-results/*
 
 # Data directories (runtime)
 weather_data/
+!e2e/fixtures/weather_data/
 event_data/
 data/
 logs/
