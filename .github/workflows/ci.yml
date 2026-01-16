@@ -100,13 +100,14 @@ jobs:
         env:
           RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
 
-      - name: Upload binaries for e2e tests
+      - name: Upload binaries and static files for e2e tests
         uses: actions/upload-artifact@v4
         with:
           name: noaa-oracle-binaries
           path: |
             target/debug/oracle
             target/debug/daemon
+            crates/oracle/static/
           retention-days: 1
 
   # Clippy linting (needs Nix for DuckDB)
@@ -207,11 +208,10 @@ jobs:
           use-gha-cache: false
           use-flakehub: false
 
-      - name: Download pre-built binaries
+      - name: Download pre-built binaries and static files
         uses: actions/download-artifact@v4
         with:
           name: noaa-oracle-binaries
-          path: target/debug/
 
       - name: Make binaries executable
         run: chmod +x target/debug/oracle target/debug/daemon
@@ -219,8 +219,14 @@ jobs:
       - name: Setup test environment
         run: |
           mkdir -p weather_data event_data data logs test_data
-          # Generate test signing key
-          openssl ecparam -genkey -name secp256k1 -out oracle_private_key.pem
+          # Generate test signing key in the format expected by the oracle
+          # (raw 32-byte secp256k1 secret key, not SEC1/ASN.1 format)
+          openssl rand -base64 32 | tr -d '\n' > /tmp/raw_key.txt
+          echo "-----BEGIN EC PRIVATE KEY-----" > oracle_private_key.pem
+          cat /tmp/raw_key.txt >> oracle_private_key.pem
+          echo "" >> oracle_private_key.pem
+          echo "-----END EC PRIVATE KEY-----" >> oracle_private_key.pem
+          rm /tmp/raw_key.txt
           chmod 600 oracle_private_key.pem
 
       - name: Run E2E tests
@@ -259,11 +265,10 @@ jobs:
           use-gha-cache: false
           use-flakehub: false
 
-      - name: Download pre-built binaries
+      - name: Download pre-built binaries and static files
         uses: actions/download-artifact@v4
         with:
           name: noaa-oracle-binaries
-          path: target/debug/
 
       - name: Make binaries executable
         run: chmod +x target/debug/oracle target/debug/daemon
@@ -271,8 +276,14 @@ jobs:
       - name: Setup test environment
         run: |
           mkdir -p event_data data logs
-          # Generate test signing key
-          openssl ecparam -genkey -name secp256k1 -out oracle_private_key.pem
+          # Generate test signing key in the format expected by the oracle
+          # (raw 32-byte secp256k1 secret key, not SEC1/ASN.1 format)
+          openssl rand -base64 32 | tr -d '\n' > /tmp/raw_key.txt
+          echo "-----BEGIN EC PRIVATE KEY-----" > oracle_private_key.pem
+          cat /tmp/raw_key.txt >> oracle_private_key.pem
+          echo "" >> oracle_private_key.pem
+          echo "-----END EC PRIVATE KEY-----" >> oracle_private_key.pem
+          rm /tmp/raw_key.txt
           chmod 600 oracle_private_key.pem
 
       - name: Setup Node.js

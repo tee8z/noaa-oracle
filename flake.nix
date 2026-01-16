@@ -105,6 +105,7 @@
             (builtins.match ".*ui/.*" path != null) ||
             (builtins.match ".*config/.*" path != null) ||
             (builtins.match ".*migrations/.*" path != null) ||
+            (builtins.match ".*templates/.*" path != null) ||
             (builtins.match ".*\.toml$" path != null);
         };
 
@@ -134,8 +135,10 @@
           cargoExtraArgs = "--bin oracle";
 
           postInstall = ''
-            mkdir -p $out/share/noaa-oracle
-            cp -r crates/oracle/static $out/share/noaa-oracle/
+            mkdir -p $out/share/noaa-oracle/static
+            # Static files are built by build.rs into $OUT_DIR/static
+            # Find and copy them from the cargo build output
+            find target -path "*/build/oracle-*/out/static" -type d | head -1 | xargs -I {} cp -r {}/* $out/share/noaa-oracle/static/
             cp -r config $out/share/noaa-oracle/
           '';
         } // commonEnv);
