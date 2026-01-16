@@ -76,6 +76,28 @@ test-e2e:
 # Run all tests including e2e
 test-all: test test-e2e
 
+# Run Playwright UI tests (uses fixtures data)
+test-ui:
+    #!/usr/bin/env bash
+    cd e2e
+    if [ ! -d "node_modules" ]; then
+        echo "Installing Playwright dependencies..."
+        npm install
+        npx playwright install firefox
+    fi
+    npx playwright test
+
+# Run Playwright UI tests in headed mode (for debugging)
+test-ui-headed:
+    #!/usr/bin/env bash
+    cd e2e
+    if [ ! -d "node_modules" ]; then
+        echo "Installing Playwright dependencies..."
+        npm install
+        npx playwright install firefox
+    fi
+    npx playwright test --headed
+
 # Run clippy lints
 clippy:
     #!/usr/bin/env bash
@@ -204,6 +226,18 @@ init-config:
     else \
         echo "daemon.toml already exists"; \
     fi
+
+# =============================================================================
+# Process Management
+# =============================================================================
+
+# Stop running oracle server
+stop:
+    @pkill -f "target/debug/oracle" 2>/dev/null || pkill -f "target/release/oracle" 2>/dev/null || echo "No oracle process found"
+
+# Stop running daemon
+stop-daemon:
+    @pkill -f "target/debug/daemon" 2>/dev/null || pkill -f "target/release/daemon" 2>/dev/null || echo "No daemon process found"
 
 # =============================================================================
 # Cleanup

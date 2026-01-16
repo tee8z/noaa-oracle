@@ -4,14 +4,14 @@ use crate::{
 };
 use async_trait::async_trait;
 use duckdb::{
-    arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray},
+    arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray},
     params_from_iter, Connection,
 };
 use regex::Regex;
 use scooby::postgres::{select, with, Aliasable, Parameters, Select};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
+use time::{format_description::well_known::Rfc3339, Duration};
 use utoipa::ToSchema;
 
 pub struct WeatherAccess {
@@ -86,13 +86,12 @@ impl WeatherData for WeatherAccess {
         req: &ForecastRequest,
         station_ids: Vec<String>,
     ) -> Result<Vec<Forecast>, Error> {
-        let start_back_one_day = if let Some(start_date) = req.start {
-            start_date.saturating_sub(Duration::days(1))
-        } else {
-            OffsetDateTime::now_utc().saturating_sub(Duration::days(1))
-        };
+        // If start is provided, look back one day to ensure we capture relevant files
+        // If start is None, keep it None to find all available data
         let mut file_params: FileParams = req.into();
-        file_params.start = Some(start_back_one_day);
+        if let Some(start_date) = req.start {
+            file_params.start = Some(start_date.saturating_sub(Duration::days(1)));
+        }
         let parquet_files = self.file_access.grab_file_names(file_params).await?;
         let file_paths = self.file_access.build_file_paths(parquet_files);
         if file_paths.is_empty() {
@@ -193,13 +192,12 @@ impl WeatherData for WeatherAccess {
         req: &ObservationRequest,
         station_ids: Vec<String>,
     ) -> Result<Vec<Observation>, Error> {
-        let start_back_one_day = if let Some(start_date) = req.start {
-            start_date.saturating_sub(Duration::days(1))
-        } else {
-            OffsetDateTime::now_utc().saturating_sub(Duration::days(1))
-        };
+        // If start is provided, look back one day to ensure we capture relevant files
+        // If start is None, keep it None to find all available data
         let mut file_params: FileParams = req.into();
-        file_params.start = Some(start_back_one_day);
+        if let Some(start_date) = req.start {
+            file_params.start = Some(start_date.saturating_sub(Duration::days(1)));
+        }
         let parquet_files = self.file_access.grab_file_names(file_params).await?;
         let file_paths = self.file_access.build_file_paths(parquet_files);
 
@@ -308,13 +306,13 @@ impl WeatherData for WeatherAccess {
     }
 
     async fn stations(&self) -> Result<Vec<Station>, Error> {
-        let now = OffsetDateTime::now_utc();
-        let start = now.saturating_sub(Duration::hours(4_i64));
+        // Query all available observation files to find station data
+        // Using None for start/end finds all available data
         let parquet_files = self
             .file_access
             .grab_file_names(FileParams {
-                start: Some(start),
-                end: Some(now),
+                start: None,
+                end: None,
                 observations: Some(true),
                 forecasts: Some(false),
             })
@@ -323,14 +321,36 @@ impl WeatherData for WeatherAccess {
         if file_paths.is_empty() {
             return Ok(vec![]);
         }
-        let mut query =
-            select(("station_id", "station_name", "latitude", "longitude")).from(format!(
-                "read_parquet(['{}'], union_by_name = true)",
-                file_paths.join("', '")
-            ));
-        query = query.group_by(("station_id", "station_name", "latitude", "longitude"));
+        // Query station data with union_by_name to handle schema differences
+        // between old files (without new columns) and new files (with state, iata_id, elevation_m)
+        // We use a dummy row with NULL values to define columns that may not exist in old files,
+        // then UNION ALL BY NAME merges everything and COALESCE handles NULLs
+        let query_sql = format!(
+            r#"
+            SELECT DISTINCT
+                station_id,
+                COALESCE(station_name, '') AS station_name,
+                COALESCE(state, '') AS state,
+                COALESCE(iata_id, '') AS iata_id,
+                elevation_m,
+                latitude,
+                longitude
+            FROM (
+                SELECT NULL::VARCHAR AS station_id, NULL::VARCHAR AS station_name,
+                       NULL::VARCHAR AS state, NULL::VARCHAR AS iata_id,
+                       NULL::DOUBLE AS elevation_m, NULL::DOUBLE AS latitude, NULL::DOUBLE AS longitude
+                WHERE false
+                UNION ALL BY NAME
+                SELECT * FROM read_parquet(['{}'], union_by_name = true)
+            )
+            "#,
+            file_paths.join("', '")
+        );
 
-        let records = self.query(query, vec![]).await?;
+        // Execute raw SQL directly since we're not using the scooby builder
+        let conn = self.open_connection()?;
+        let mut stmt = conn.prepare(&query_sql)?;
+        let records: Vec<RecordBatch> = stmt.query_arrow([])?.collect();
 
         let stations: Stations =
             records
@@ -630,26 +650,51 @@ impl From<&RecordBatch> for Stations {
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("Expected StringArray in column 1");
-        let latitude_arr = record_batch
+        let state_arr = record_batch
             .column(2)
             .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Expected Float64Array in column 2");
-        let longitude_arr = record_batch
+            .downcast_ref::<StringArray>()
+            .expect("Expected StringArray in column 2");
+        let iata_id_arr = record_batch
             .column(3)
             .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Expected StringArray in column 3");
+        let elevation_m_arr = record_batch
+            .column(4)
+            .as_any()
             .downcast_ref::<Float64Array>()
-            .expect("Expected Float64Array in column 3");
+            .expect("Expected Float64Array in column 4");
+        let latitude_arr = record_batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("Expected Float64Array in column 5");
+        let longitude_arr = record_batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("Expected Float64Array in column 6");
 
         for row_index in 0..record_batch.num_rows() {
             let station_id = station_id_arr.value(row_index).to_owned();
             let station_name = station_name_arr.value(row_index).to_owned();
+            let state = state_arr.value(row_index).to_owned();
+            let iata_id = iata_id_arr.value(row_index).to_owned();
+            let elevation_m = if elevation_m_arr.is_null(row_index) {
+                None
+            } else {
+                Some(elevation_m_arr.value(row_index))
+            };
             let latitude = latitude_arr.value(row_index);
             let longitude = longitude_arr.value(row_index);
 
             stations.push(Station {
                 station_id,
                 station_name,
+                state,
+                iata_id,
+                elevation_m,
                 latitude,
                 longitude,
             });
@@ -663,6 +708,9 @@ impl From<&RecordBatch> for Stations {
 pub struct Station {
     pub station_id: String,
     pub station_name: String,
+    pub state: String,
+    pub iata_id: String,
+    pub elevation_m: Option<f64>,
     pub latitude: f64,
     pub longitude: f64,
 }

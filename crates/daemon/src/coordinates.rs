@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 pub struct WeatherStation {
     pub station_id: String,
     pub station_name: String,
+    pub state: String,
+    pub iata_id: String,
+    pub elevation_m: Option<f64>,
     pub latitude: String,
     pub longitude: String,
 }
@@ -19,8 +22,8 @@ impl fmt::Display for WeatherStation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Station ID: {}, Station Name: {}, Latitude: {}, Longitude: {}",
-            self.station_id, self.station_name, self.latitude, self.longitude
+            "Station ID: {}, Station Name: {}, State: {}, IATA: {}, Elevation: {:?}m, Latitude: {}, Longitude: {}",
+            self.station_id, self.station_name, self.state, self.iata_id, self.elevation_m, self.latitude, self.longitude
         )
     }
 }
@@ -38,9 +41,15 @@ impl Station {
             return None;
         }
 
+        // Parse elevation if available
+        let elevation_m = self.elevation_m.and_then(|e| e.parse::<f64>().ok());
+
         Some(WeatherStation {
             station_id: self.station_id,
             station_name: self.site.unwrap_or_default(),
+            state: self.state.unwrap_or_default(),
+            iata_id: self.iata_id.unwrap_or_default(),
+            elevation_m,
             latitude,
             longitude,
         })

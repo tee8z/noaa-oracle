@@ -93,6 +93,10 @@ pub struct Observation {
     pub wind_speed_unit_code: String,
     pub dewpoint_value: Option<f64>,
     pub dewpoint_unit_code: String,
+    // New fields at the end for backwards compatibility
+    pub state: String,
+    pub iata_id: String,
+    pub elevation_m: Option<f64>,
 }
 
 impl TryFrom<CurrentWeather> for Observation {
@@ -117,6 +121,10 @@ impl TryFrom<CurrentWeather> for Observation {
             wind_direction_unit_code: val.wind_direction_unit_code,
             dewpoint_value: val.dewpoint_value,
             dewpoint_unit_code: val.dewpoint_unit_code,
+            // New fields
+            state: String::from(""),
+            iata_id: String::from(""),
+            elevation_m: None,
         };
         Ok(parquet)
     }
@@ -199,6 +207,24 @@ pub fn create_observation_schema() -> Type {
             .build()
             .unwrap();
 
+    // New fields at the end for backwards compatibility
+    let state = Type::primitive_type_builder("state", PhysicalType::BYTE_ARRAY)
+        .with_repetition(Repetition::REQUIRED)
+        .with_logical_type(Some(LogicalType::String))
+        .build()
+        .unwrap();
+
+    let iata_id = Type::primitive_type_builder("iata_id", PhysicalType::BYTE_ARRAY)
+        .with_repetition(Repetition::REQUIRED)
+        .with_logical_type(Some(LogicalType::String))
+        .build()
+        .unwrap();
+
+    let elevation_m = Type::primitive_type_builder("elevation_m", PhysicalType::DOUBLE)
+        .with_repetition(Repetition::OPTIONAL)
+        .build()
+        .unwrap();
+
     let schema = Type::group_type_builder("observation")
         .with_fields(vec![
             Arc::new(station_id),
@@ -214,6 +240,10 @@ pub fn create_observation_schema() -> Type {
             Arc::new(wind_speed_unit_code),
             Arc::new(dewpoint_value),
             Arc::new(dewpoint_unit_code),
+            // New fields at end
+            Arc::new(state),
+            Arc::new(iata_id),
+            Arc::new(elevation_m),
         ])
         .build()
         .unwrap();
@@ -253,6 +283,9 @@ impl ObservationService {
             if let Some(city) = city_weather.city_data.get(&observation.station_id) {
                 // only add observation if we have a station_name with it
                 observation.station_name = city.station_name.clone();
+                observation.state = city.state.clone();
+                observation.iata_id = city.iata_id.clone();
+                observation.elevation_m = city.elevation_m;
                 observations.push(observation)
             }
         }

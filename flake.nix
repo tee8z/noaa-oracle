@@ -290,6 +290,9 @@
             export LD_LIBRARY_PATH="${duckdb-lib}/lib:${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH"
             export RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 
+            # UI static files for development
+            export NOAA_ORACLE_UI_DIR="''${NOAA_ORACLE_UI_DIR:-./crates/oracle/static}"
+
             # Default AWS credentials for moto
             export AWS_ACCESS_KEY_ID=''${AWS_ACCESS_KEY_ID:-test}
             export AWS_SECRET_ACCESS_KEY=''${AWS_SECRET_ACCESS_KEY:-test}

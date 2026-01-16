@@ -4,6 +4,9 @@ use maud::{html, Markup};
 pub struct WeatherDisplay {
     pub station_id: String,
     pub station_name: String,
+    pub state: String,
+    pub iata_id: String,
+    pub elevation_m: Option<f64>,
     pub temp_high: Option<f64>,
     pub temp_low: Option<f64>,
     pub wind_speed: Option<i64>,
@@ -58,8 +61,8 @@ pub fn weather_table_body(weather_data: &[WeatherDisplay]) -> Markup {
     html! {
         @if weather_data.is_empty() {
             div class="has-text-centered has-text-grey py-4" {
-                p { "No active events with weather stations." }
-                p class="is-size-7" { "Weather data will appear when events are created." }
+                p { "No weather data available." }
+                p class="is-size-7" { "Weather observations may not be available yet. Try again later." }
             }
         } @else {
             div class="table-container" {
@@ -74,17 +77,33 @@ pub fn weather_table_body(weather_data: &[WeatherDisplay]) -> Markup {
                         }
                     }
                     tbody hx-get="/fragments/weather"
-                          hx-trigger="every 1s"
+                          hx-trigger="every 300s"
                           hx-swap="innerHTML"
                           hx-select="tbody > tr" {
                         @for weather in weather_data {
                             tr {
                                 td {
                                     strong { (weather.station_id.clone()) }
-                                    @if !weather.station_name.is_empty() {
-                                        br;
-                                        span class="is-size-7 has-text-grey" {
+                                    @if !weather.iata_id.is_empty() {
+                                        " "
+                                        span class="tag is-light is-small" { (weather.iata_id.clone()) }
+                                    }
+                                    br;
+                                    span class="is-size-7 has-text-grey" {
+                                        @if !weather.station_name.is_empty() {
                                             (weather.station_name.clone())
+                                        }
+                                        @if !weather.station_name.is_empty() && !weather.state.is_empty() {
+                                            ", "
+                                        }
+                                        @if !weather.state.is_empty() {
+                                            (weather.state.clone())
+                                        }
+                                        @if let Some(elev) = weather.elevation_m {
+                                            " "
+                                            span class="has-text-grey-light" title="Elevation" {
+                                                (format!("({:.0}m)", elev))
+                                            }
                                         }
                                     }
                                 }
@@ -116,7 +135,7 @@ pub fn weather_table_body(weather_data: &[WeatherDisplay]) -> Markup {
                                     }
                                 }
                                 td {
-                                    span class="is-size-7" {
+                                    span class="is-size-7 local-time" data-utc=(weather.last_updated.clone()) {
                                         (weather.last_updated.clone())
                                     }
                                 }

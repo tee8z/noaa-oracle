@@ -119,15 +119,14 @@ async fn get_weather_for_stations(
 
     for station_id in station_ids {
         if let Some(obs) = observations.iter().find(|o| o.station_id == *station_id) {
-            let station_name = all_stations
-                .iter()
-                .find(|s| s.station_id == *station_id)
-                .map(|s| s.station_name.clone())
-                .unwrap_or_default();
+            let station = all_stations.iter().find(|s| s.station_id == *station_id);
 
             weather_data.push(WeatherDisplay {
                 station_id: station_id.clone(),
-                station_name,
+                station_name: station.map(|s| s.station_name.clone()).unwrap_or_default(),
+                state: station.map(|s| s.state.clone()).unwrap_or_default(),
+                iata_id: station.map(|s| s.iata_id.clone()).unwrap_or_default(),
+                elevation_m: station.and_then(|s| s.elevation_m),
                 temp_high: Some(obs.temp_high),
                 temp_low: Some(obs.temp_low),
                 wind_speed: Some(obs.wind_speed),

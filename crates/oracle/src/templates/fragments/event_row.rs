@@ -47,18 +47,20 @@ pub fn event_row(event: &EventView) -> Markup {
 
             // Observation window
             td class="is-hidden-mobile" {
-                span class="is-size-7" {
+                span class="is-size-7 local-time" data-utc=(event.start_observation.clone()) {
                     (event.start_observation.clone())
-                    br;
-                    " to "
-                    br;
+                }
+                br;
+                " to "
+                br;
+                span class="is-size-7 local-time" data-utc=(event.end_observation.clone()) {
                     (event.end_observation.clone())
                 }
             }
 
             // Signing date
             td class="is-hidden-mobile" {
-                span class="is-size-7" {
+                span class="is-size-7 local-time" data-utc=(event.signing_date.clone()) {
                     (event.signing_date.clone())
                 }
             }

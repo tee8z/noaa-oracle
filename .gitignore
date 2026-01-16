@@ -2,7 +2,7 @@
 target/
 debug/
 *.pdb
-
+test-results/*
 # Rust backup files
 **/*.rs.bk
 

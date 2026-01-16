@@ -1,4 +1,4 @@
-use maud::{html, Markup};
+use maud::{html, Markup, PreEscaped};
 
 /// Oracle information display fragment
 /// Shows the oracle's public key and npub with copy functionality
@@ -49,7 +49,7 @@ pub fn oracle_info(pubkey: &str, npub: &str) -> Markup {
         }
 
         script {
-            r#"
+            (PreEscaped(r#"
             function copyToClipboard(elementId, button) {
                 const text = document.getElementById(elementId).innerText;
                 navigator.clipboard.writeText(text).then(() => {
@@ -63,7 +63,7 @@ pub fn oracle_info(pubkey: &str, npub: &str) -> Markup {
                     }, 2000);
                 });
             }
-            "#
+            "#))
         }
     }
 }

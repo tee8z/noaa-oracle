@@ -1,18 +1,30 @@
 use std::sync::Arc;
 
-use axum::{extract::State, response::Html};
+use axum::{extract::State, http::HeaderMap, response::Html};
 use time::format_description::well_known::Rfc3339;
 
 use crate::{
     db::EventFilter,
-    templates::{events_page, events_table_rows, EventView},
+    templates::{events_page, events_table_rows, pages::events::events_content, EventView},
     AppState,
 };
 
 /// Handler for the events page (GET /events)
-pub async fn events_handler(State(state): State<Arc<AppState>>) -> Html<String> {
+/// Returns full page for normal requests, content only for HTMX requests
+pub async fn events_handler(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Html<String> {
     let events = build_events_view(&state).await;
-    Html(events_page(&state.remote_url, &events).into_string())
+
+    // Check if this is an HTMX request
+    if headers.contains_key("hx-request") {
+        // Return only the content for HTMX partial updates
+        Html(events_content(&events).into_string())
+    } else {
+        // Return full page for normal browser requests
+        Html(events_page(&state.remote_url, &events).into_string())
+    }
 }
 
 /// Handler for events table rows only (HTMX partial for auto-refresh)

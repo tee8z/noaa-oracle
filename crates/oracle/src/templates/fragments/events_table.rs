@@ -44,7 +44,7 @@ pub fn events_table(events: &[EventView]) -> Markup {
                         }
                         tbody id="events-tbody"
                               hx-get="/fragments/events-rows"
-                              hx-trigger="every 1s"
+                              hx-trigger="every 30s"
                               hx-swap="innerHTML" {
                             @for event in events {
                                 (event_row(event))
