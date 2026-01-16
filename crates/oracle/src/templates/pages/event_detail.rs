@@ -90,15 +90,27 @@ pub fn event_detail_content(event: &Event) -> Markup {
                         tbody {
                             tr {
                                 th { "Observation Start" }
-                                td { (format_datetime(&event.start_observation_date)) }
+                                td {
+                                    span class="local-time" data-utc=(format_datetime(&event.start_observation_date)) {
+                                        (format_datetime(&event.start_observation_date))
+                                    }
+                                }
                             }
                             tr {
                                 th { "Observation End" }
-                                td { (format_datetime(&event.end_observation_date)) }
+                                td {
+                                    span class="local-time" data-utc=(format_datetime(&event.end_observation_date)) {
+                                        (format_datetime(&event.end_observation_date))
+                                    }
+                                }
                             }
                             tr {
                                 th { "Signing Date" }
-                                td { (format_datetime(&event.signing_date)) }
+                                td {
+                                    span class="local-time" data-utc=(format_datetime(&event.signing_date)) {
+                                        (format_datetime(&event.signing_date))
+                                    }
+                                }
                             }
                         }
                     }

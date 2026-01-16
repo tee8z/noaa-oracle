@@ -239,3 +239,92 @@ jobs:
             test_data/
             *.log
           retention-days: 7
+
+  # Playwright UI tests (uses pre-built binaries and fixture data)
+  ui-test:
+    name: UI Tests
+    runs-on: ubuntu-latest
+    needs: [fmt, machete, build, clippy, test, nix-check]
+    if: "!contains(github.event.pull_request.labels.*.name, 'skip-e2e')"
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Setup Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+        with:
+          use-gha-cache: false
+          use-flakehub: false
+
+      - name: Download pre-built binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: noaa-oracle-binaries
+          path: target/debug/
+
+      - name: Make binaries executable
+        run: chmod +x target/debug/oracle target/debug/daemon
+
+      - name: Setup test environment
+        run: |
+          mkdir -p event_data data logs
+          # Generate test signing key
+          openssl ecparam -genkey -name secp256k1 -out oracle_private_key.pem
+          chmod 600 oracle_private_key.pem
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Playwright
+        working-directory: e2e
+        run: |
+          npm ci
+          npx playwright install firefox --with-deps
+
+      - name: Start oracle server
+        run: |
+          export NOAA_ORACLE_DATA_DIR="${{ github.workspace }}/e2e/fixtures/weather_data"
+          export NOAA_ORACLE_UI_DIR="${{ github.workspace }}/crates/oracle/static"
+          export RUST_LOG=info
+          # Use nohup to prevent SIGHUP from killing the server when the shell exits
+          nohup nix develop -c ./target/debug/oracle > /tmp/oracle.log 2>&1 &
+          # Wait for server to be ready
+          for i in {1..30}; do
+            if curl -s "http://localhost:9800/oracle/pubkey" 2>/dev/null | grep -q key; then
+              echo "Server is ready"
+              break
+            fi
+            echo "Waiting for server... ($i/30)"
+            sleep 1
+          done
+          # Show server startup logs
+          cat /tmp/oracle.log || true
+
+      - name: Run Playwright tests
+        working-directory: e2e
+        run: npx playwright test
+        env:
+          CI: true
+          BASE_URL: http://localhost:9800
+
+      - name: Show server logs on failure
+        if: failure()
+        run: |
+          echo "=== Oracle Server Logs ==="
+          cat /tmp/oracle.log || echo "No server log found"
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ github.run_id }}
+          path: |
+            e2e/playwright-report/
+            e2e/test-results/
+            /tmp/oracle.log
+          retention-days: 7

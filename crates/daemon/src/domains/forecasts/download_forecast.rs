@@ -85,6 +85,10 @@ pub struct Forecast {
     pub liquid_precipitation_unit_code: String,
     pub twelve_hour_probability_of_precipitation: Option<i64>,
     pub twelve_hour_probability_of_precipitation_unit_code: String,
+    // New fields at the end for backwards compatibility
+    pub state: String,
+    pub iata_id: String,
+    pub elevation_m: Option<f64>,
 }
 
 impl TryFrom<WeatherForecast> for Forecast {
@@ -122,6 +126,10 @@ impl TryFrom<WeatherForecast> for Forecast {
             twelve_hour_probability_of_precipitation: val.twelve_hour_probability_of_precipitation,
             twelve_hour_probability_of_precipitation_unit_code: val
                 .twelve_hour_probability_of_precipitation_unit_code,
+            // New fields
+            state: String::from(""),
+            iata_id: String::from(""),
+            elevation_m: None,
         };
         Ok(parquet)
     }
@@ -258,6 +266,24 @@ pub fn create_forecast_schema() -> Type {
     .build()
     .unwrap();
 
+    // New fields at the end for backwards compatibility
+    let state = Type::primitive_type_builder("state", PhysicalType::BYTE_ARRAY)
+        .with_repetition(Repetition::REQUIRED)
+        .with_logical_type(Some(LogicalType::String))
+        .build()
+        .unwrap();
+
+    let iata_id = Type::primitive_type_builder("iata_id", PhysicalType::BYTE_ARRAY)
+        .with_repetition(Repetition::REQUIRED)
+        .with_logical_type(Some(LogicalType::String))
+        .build()
+        .unwrap();
+
+    let elevation_m = Type::primitive_type_builder("elevation_m", PhysicalType::DOUBLE)
+        .with_repetition(Repetition::OPTIONAL)
+        .build()
+        .unwrap();
+
     let schema = Type::group_type_builder("forecast")
         .with_fields(vec![
             Arc::new(station_id),
@@ -281,6 +307,10 @@ pub fn create_forecast_schema() -> Type {
             Arc::new(liquid_precipitation_unit_code),
             Arc::new(twelve_hour_probability_of_precipitation),
             Arc::new(twelve_hour_probability_of_precipitation_unit_code),
+            // New fields at end
+            Arc::new(state),
+            Arc::new(iata_id),
+            Arc::new(elevation_m),
         ])
         .build()
         .unwrap();
@@ -890,6 +920,9 @@ impl ForecastService {
                 );
                 let city = city_weather.city_data.get(&forecast.station_id).unwrap();
                 forecast.station_name = city.station_name.clone();
+                forecast.state = city.state.clone();
+                forecast.iata_id = city.iata_id.clone();
+                forecast.elevation_m = city.elevation_m;
                 forecasts.push(forecast)
             }
         }

@@ -57,18 +57,36 @@ pub fn raw_data_content() -> Markup {
                 }
             }
 
-            // Schema display
+            // Schema display - resizable textareas with loading states
             div class="columns is-multiline mb-4" {
                 div class="column is-full-mobile is-half-desktop" {
-                    div class="field" {
-                        label class="label is-small" { "Forecasts Schema" }
-                        pre id="forecasts-schema" class="is-size-7" style="max-height: 150px; overflow-y: auto;" {}
+                    div class="schema-box" {
+                        div class="schema-header" {
+                            span class="schema-title" {
+                                " Forecasts Schema"
+                            }
+                            span id="forecasts-status" class="tag is-light is-small ml-2" { "Empty" }
+                        }
+                        div id="forecasts-loading" class="schema-loading" style="display: none;" {
+                            span class="loader mr-2" {}
+                            "Loading forecasts..."
+                        }
+                        textarea id="forecasts-schema" class="schema-content is-size-7" readonly placeholder="Schema will appear here after downloading files..." {}
                     }
                 }
                 div class="column is-full-mobile is-half-desktop" {
-                    div class="field" {
-                        label class="label is-small" { "Observations Schema" }
-                        pre id="observations-schema" class="is-size-7" style="max-height: 150px; overflow-y: auto;" {}
+                    div class="schema-box" {
+                        div class="schema-header" {
+                            span class="schema-title" {
+                                " Observations Schema"
+                            }
+                            span id="observations-status" class="tag is-light is-small ml-2" { "Empty" }
+                        }
+                        div id="observations-loading" class="schema-loading" style="display: none;" {
+                            span class="loader mr-2" {}
+                            "Loading observations..."
+                        }
+                        textarea id="observations-schema" class="schema-content is-size-7" readonly placeholder="Schema will appear here after downloading files..." {}
                     }
                 }
             }
@@ -100,10 +118,16 @@ pub fn raw_data_content() -> Markup {
                         span { "Clear" }
                     }
                 }
+                div class="control" {
+                    button id="downloadCsv" class="button is-success" disabled {
+                        span class="icon" { (download_icon()) }
+                        span { "Download CSV" }
+                    }
+                }
             }
 
             // Query results
-            div class="table-container" id="queryResult-container" {}
+            div class="query-result-wrapper" id="queryResult-container" {}
         }
     }
 }

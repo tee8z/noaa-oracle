@@ -25,13 +25,13 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
                 title { (config.title) }
                 link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@1.0.4/css/bulma.min.css";
                 link rel="stylesheet" href="/static/styles.min.css";
-                script src="https://unpkg.com/htmx.org@1.9.10" {}
+                script src="https://cdn.jsdelivr.net/npm/htmx.org@1.9.10/dist/htmx.min.js" {}
                 // Apply saved theme before page renders to prevent flash
                 script { (PreEscaped(THEME_INIT_SCRIPT)) }
             }
             body {
                 script {
-                    (format!("const API_BASE = \"{}\";", config.api_base))
+                    (PreEscaped(format!("const API_BASE = \"{}\";", config.api_base)))
                 }
 
                 section class="section" {

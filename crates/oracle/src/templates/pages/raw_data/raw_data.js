@@ -16,6 +16,9 @@ async function initRawDataPage() {
     return;
   }
 
+  // Use API_BASE if available, otherwise use relative URLs
+  window.API_BASE = window.API_BASE || "";
+
   // Setup duckdb
   const JSDELIVR_BUNDLES = duckdb.getJsDelivrBundles();
   const bundle = await duckdb.selectBundle(JSDELIVR_BUNDLES);
@@ -51,19 +54,33 @@ async function initRawDataPage() {
     clearButton.addEventListener("click", clearQuerys);
   }
 
-  // Setting the date
-  const currentUTCDate = new Date();
-  const fourHoursAgoUTCDate = new Date(currentUTCDate.getTime() - 14400000);
-  const rfc3339TimeFourHoursAgo = fourHoursAgoUTCDate.toISOString();
-  const startTime = document.getElementById("start");
-  if (startTime) {
-    startTime.value = rfc3339TimeFourHoursAgo;
+  const downloadButton = document.getElementById("downloadCsv");
+  if (downloadButton) {
+    downloadButton.addEventListener("click", downloadCsv);
   }
 
-  const rfc3339TimeUTC = currentUTCDate.toISOString();
+  // Setup drag-to-scroll for query results
+  setupDragScroll("queryResult-container");
+
+  // Setting the date (48-hour window to capture available data)
+  const currentUTCDate = new Date();
+  const windowStartDate = new Date(
+    currentUTCDate.getTime() - 48 * 60 * 60 * 1000,
+  );
+
+  // Format for datetime-local input (YYYY-MM-DDTHH:MM)
+  const formatForInput = (date) => {
+    return date.toISOString().slice(0, 16);
+  };
+
+  const startTime = document.getElementById("start");
+  if (startTime) {
+    startTime.value = formatForInput(windowStartDate);
+  }
+
   const endTime = document.getElementById("end");
   if (endTime) {
-    endTime.value = rfc3339TimeUTC;
+    endTime.value = formatForInput(currentUTCDate);
   }
 
   const forecasts = document.getElementById("forecasts");
@@ -82,27 +99,51 @@ async function initRawDataPage() {
       "SELECT * FROM observations ORDER BY station_id, generated_at DESC LIMIT 200";
   }
 
-  // Download todays files on initial load
-  submitDownloadRequest(null);
+  // Download files and run sample query on initial load
+  submitDownloadRequest(null, true);
 }
 
-async function submitDownloadRequest(event) {
+async function submitDownloadRequest(event, autoRunQuery = false) {
   if (event !== null) {
     event.preventDefault();
   }
   try {
+    // Show loading states
+    showSchemaLoading("forecasts", true);
+    showSchemaLoading("observations", true);
+
     const fileNames = await fetchFileNames();
     console.log(`Files to download: ${fileNames}`);
     await loadFiles(fileNames);
-    console.log("Successfully download parquet files");
+    console.log("Successfully downloaded parquet files");
+
+    // Hide loading states
+    showSchemaLoading("forecasts", false);
+    showSchemaLoading("observations", false);
+
+    // Auto-run the sample query after initial load
+    if (autoRunQuery) {
+      await runQuery(null);
+    }
   } catch (error) {
-    console.error("Error to download files:", error);
+    console.error("Error downloading files:", error);
+    // Hide loading on error
+    showSchemaLoading("forecasts", false);
+    showSchemaLoading("observations", false);
+    updateSchemaStatus("forecasts", "error");
+    updateSchemaStatus("observations", "error");
   }
 }
 
 function fetchFileNames() {
-  const startTime = document.getElementById("start").value;
-  const endTime = document.getElementById("end").value;
+  // Get values from datetime-local inputs (format: YYYY-MM-DDTHH:MM)
+  const startTimeRaw = document.getElementById("start").value;
+  const endTimeRaw = document.getElementById("end").value;
+
+  // Convert to RFC3339 format with seconds and Z suffix for API
+  const startTime = startTimeRaw ? `${startTimeRaw}:00Z` : "";
+  const endTime = endTimeRaw ? `${endTimeRaw}:00Z` : "";
+
   const forecasts = document.getElementById("forecasts").checked;
   const observations = document.getElementById("observations").checked;
   const apiBase = window.API_BASE;
@@ -129,7 +170,8 @@ function fetchFileNames() {
 }
 
 async function loadFiles(fileNames) {
-  const apiBase = window.API_BASE;
+  // Use absolute URL for DuckDB-WASM (it needs full URLs, not relative paths)
+  const apiBase = window.API_BASE || window.location.origin;
   const conn = await db.connect();
   let observation_files = [];
   let forecast_files = [];
@@ -190,8 +232,8 @@ async function runQuery(event) {
 
 function loadSchema(tableName, queryResult) {
   console.log(queryResult);
-  const schemaDiv = document.getElementById(`${tableName}-schema`);
-  if (!schemaDiv) return;
+  const schemaTextarea = document.getElementById(`${tableName}-schema`);
+  if (!schemaTextarea) return;
 
   const fields = {};
   for (const feild_index in queryResult.schema.fields) {
@@ -205,7 +247,59 @@ function loadSchema(tableName, queryResult) {
     table_name: tableName,
     fields: fields,
   };
-  schemaDiv.textContent = JSON.stringify(table_schema, null, 2);
+  schemaTextarea.value = JSON.stringify(table_schema, null, 2);
+
+  // Update status to show field count
+  const fieldCount = Object.keys(fields).length;
+  updateSchemaStatus(tableName, "loaded", fieldCount);
+}
+
+// Schema UI helper functions
+function showSchemaLoading(tableName, show) {
+  const loadingDiv = document.getElementById(`${tableName}-loading`);
+  const schemaTextarea = document.getElementById(`${tableName}-schema`);
+  if (loadingDiv) {
+    loadingDiv.style.display = show ? "flex" : "none";
+  }
+  if (schemaTextarea) {
+    // Hide schema while loading, show when done
+    if (show) {
+      schemaTextarea.style.display = "none";
+    } else {
+      schemaTextarea.style.display = "block";
+    }
+  }
+
+  // Update status while loading
+  if (show) {
+    updateSchemaStatus(tableName, "loading");
+  }
+}
+
+function updateSchemaStatus(tableName, status, fieldCount = 0) {
+  const statusTag = document.getElementById(`${tableName}-status`);
+  if (!statusTag) return;
+
+  statusTag.classList.remove(
+    "is-light",
+    "is-success",
+    "is-warning",
+    "is-danger",
+  );
+
+  if (status === "loaded") {
+    statusTag.textContent = `${fieldCount} fields`;
+    statusTag.classList.add("is-success");
+  } else if (status === "loading") {
+    statusTag.textContent = "Loading...";
+    statusTag.classList.add("is-warning");
+  } else if (status === "error") {
+    statusTag.textContent = "Error";
+    statusTag.classList.add("is-danger");
+  } else {
+    statusTag.textContent = "Empty";
+    statusTag.classList.add("is-light");
+  }
 }
 
 function loadTable(tableName, queryResult) {
@@ -254,6 +348,12 @@ function loadTable(tableName, queryResult) {
     }
 
     tableParentDiv.appendChild(table);
+  }
+
+  // Enable download button when table is loaded
+  const downloadButton = document.getElementById("downloadCsv");
+  if (downloadButton) {
+    downloadButton.disabled = false;
   }
 }
 
@@ -324,6 +424,69 @@ function formatInts(intArray) {
 function clearQuerys(event) {
   deleteTable("queryResult");
   deleteErr();
+  // Disable download button when clearing
+  const downloadButton = document.getElementById("downloadCsv");
+  if (downloadButton) {
+    downloadButton.disabled = true;
+  }
+}
+
+function downloadCsv() {
+  const table = document.getElementById("queryResult");
+  if (!table) return;
+
+  let csv = [];
+
+  // Get headers
+  const headers = [];
+  const headerRow = table.querySelector("thead tr");
+  if (headerRow) {
+    headerRow.querySelectorAll("th").forEach((th) => {
+      headers.push(escapeCsvValue(th.textContent));
+    });
+    csv.push(headers.join(","));
+  }
+
+  // Get data rows
+  const rows = table.querySelectorAll("tbody tr, tr:not(:first-child)");
+  rows.forEach((row) => {
+    const rowData = [];
+    row.querySelectorAll("td").forEach((td) => {
+      rowData.push(escapeCsvValue(td.textContent));
+    });
+    if (rowData.length > 0) {
+      csv.push(rowData.join(","));
+    }
+  });
+
+  // Create and download file
+  const csvContent = csv.join("\n");
+  const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+  const link = document.createElement("a");
+  const url = URL.createObjectURL(blob);
+
+  link.setAttribute("href", url);
+  link.setAttribute(
+    "download",
+    `query_result_${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}.csv`,
+  );
+  link.style.visibility = "hidden";
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+function escapeCsvValue(value) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+  const str = String(value);
+  // Escape quotes and wrap in quotes if contains comma, quote, or newline
+  if (str.includes(",") || str.includes('"') || str.includes("\n")) {
+    return '"' + str.replace(/"/g, '""') + '"';
+  }
+  return str;
 }
 
 function deleteTable(tableName) {
@@ -332,6 +495,49 @@ function deleteTable(tableName) {
   if (parentElement && childElement) {
     parentElement.removeChild(childElement);
   }
+}
+
+function setupDragScroll(containerId) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+
+  let isDown = false;
+  let startX;
+  let scrollLeft;
+
+  container.addEventListener("mousedown", (e) => {
+    // Only start drag if clicking on the container or table (not on interactive elements)
+    if (
+      e.target.tagName === "A" ||
+      e.target.tagName === "BUTTON" ||
+      e.target.tagName === "INPUT"
+    ) {
+      return;
+    }
+    isDown = true;
+    container.classList.add("dragging");
+    startX = e.pageX - container.offsetLeft;
+    scrollLeft = container.scrollLeft;
+    e.preventDefault();
+  });
+
+  container.addEventListener("mouseleave", () => {
+    isDown = false;
+    container.classList.remove("dragging");
+  });
+
+  container.addEventListener("mouseup", () => {
+    isDown = false;
+    container.classList.remove("dragging");
+  });
+
+  container.addEventListener("mousemove", (e) => {
+    if (!isDown) return;
+    e.preventDefault();
+    const x = e.pageX - container.offsetLeft;
+    const walk = (x - startX) * 1.5; // Multiply for faster scrolling
+    container.scrollLeft = scrollLeft - walk;
+  });
 }
 
 // Initialize when DOM is ready and on page navigation (HTMX)
