@@ -57,10 +57,11 @@ data_dir = "./weather_data"
 event_db = "./event_data"
 
 # =============================================================================
-# UI & Keys
+# Static Files & Keys
 # =============================================================================
-# Browser UI static files location
-# For Nix installs this is set automatically to the package's share directory
+# Static files directory (CSS, JS assets built by build.rs)
+# For development: ./static (populated automatically during cargo build)
+# For Nix installs: set automatically to the package's share directory
 ui_dir = "./static"
 
 # Oracle signing key (ECDSA secp256k1)

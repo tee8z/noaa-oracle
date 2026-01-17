@@ -91,7 +91,7 @@ export NOAA_ORACLE_HOST=0.0.0.0
 export NOAA_ORACLE_PORT=9800
 export NOAA_ORACLE_DATA_DIR=/path/to/weather_data
 export NOAA_ORACLE_EVENT_DB=/path/to/events
-export NOAA_ORACLE_UI_DIR=/usr/share/noaa-oracle/ui
+export NOAA_ORACLE_UI_DIR=/usr/share/noaa-oracle/static
 export NOAA_ORACLE_PRIVATE_KEY_PATH=/etc/noaa-oracle/oracle.pem
 ```
 

@@ -129,15 +129,12 @@ jobs:
           PKG_NAME="noaa-oracle-${VERSION}-x86_64-linux"
 
           mkdir -p "${PKG_NAME}/bin"
-          mkdir -p "${PKG_NAME}/ui"
           mkdir -p "${PKG_NAME}/config"
 
           # Copy Nix-built binaries (preferred - fully static)
+          # Note: UI is embedded in the oracle binary, no separate files needed
           cp result/bin/oracle "${PKG_NAME}/bin/"
           cp result-daemon/bin/daemon "${PKG_NAME}/bin/"
-
-          # Copy UI
-          cp -r ui/* "${PKG_NAME}/ui/"
 
           # Copy and rename config examples to usable defaults
           cp config/oracle.example.toml "${PKG_NAME}/config/oracle.toml"
@@ -226,9 +223,8 @@ jobs:
             - Edit config/daemon.toml for daemon settings
 
           Directories:
-            - ui/           Browser UI files
             - config/       Configuration files
-            - bin/          Binaries
+            - bin/          Binaries (UI is embedded in the oracle binary)
             - weather_data/ Downloaded parquet files (created on first run)
             - event_data/   DLC event database (created on first run)
 
@@ -302,15 +298,12 @@ jobs:
           PKG_NAME="noaa-oracle-${VERSION}-aarch64-linux"
 
           mkdir -p "${PKG_NAME}/bin"
-          mkdir -p "${PKG_NAME}/ui"
           mkdir -p "${PKG_NAME}/config"
 
           # Copy Nix-built binaries
+          # Note: UI is embedded in the oracle binary, no separate files needed
           cp result/bin/oracle "${PKG_NAME}/bin/"
           cp result-daemon/bin/daemon "${PKG_NAME}/bin/"
-
-          # Copy UI
-          cp -r ui/* "${PKG_NAME}/ui/"
 
           # Copy and rename config examples to usable defaults
           cp config/oracle.example.toml "${PKG_NAME}/config/oracle.toml"
@@ -399,9 +392,8 @@ jobs:
             - Edit config/daemon.toml for daemon settings
 
           Directories:
-            - ui/           Browser UI files
             - config/       Configuration files
-            - bin/          Binaries
+            - bin/          Binaries (UI is embedded in the oracle binary)
             - weather_data/ Downloaded parquet files (created on first run)
             - event_data/   DLC event database (created on first run)
 
