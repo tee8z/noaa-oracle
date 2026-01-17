@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::{extract::State, http::HeaderMap, response::Html};
+use time::OffsetDateTime;
 
 use crate::{
     db::EventStatus,
@@ -43,37 +44,18 @@ async fn build_dashboard_data(state: &Arc<AppState>) -> DashboardData {
         .unwrap_or_default();
 
     let mut stats = EventStats::default();
-    let mut active_stations: Vec<String> = Vec::new();
 
     for event in &events {
         match event.status {
-            EventStatus::Live => {
-                stats.live_count += 1;
-                // Collect stations from live events
-                active_stations.extend(event.locations.clone());
-            }
-            EventStatus::Running => {
-                stats.running_count += 1;
-                // Collect stations from running events
-                active_stations.extend(event.locations.clone());
-            }
+            EventStatus::Live => stats.live_count += 1,
+            EventStatus::Running => stats.running_count += 1,
             EventStatus::Completed => stats.completed_count += 1,
             EventStatus::Signed => stats.signed_count += 1,
         }
     }
 
-    // Deduplicate stations
-    active_stations.sort();
-    active_stations.dedup();
-
-    // Get weather data - either for active event stations or from all available data
-    let weather = if active_stations.is_empty() {
-        // No active events - show weather from latest available observation data
-        get_latest_weather(state).await
-    } else {
-        // Show weather for active event stations
-        get_weather_for_stations(state, &active_stations).await
-    };
+    // Always show weather for major airports on the dashboard
+    let weather = get_latest_weather(state).await;
 
     // Get all available stations for the dropdown (from the weather data we already have)
     let all_stations: Vec<(String, String)> = weather
@@ -188,7 +170,22 @@ const DEFAULT_MAJOR_AIRPORTS: &[&str] = &[
     "KFSM", // Fort Smith AR
 ];
 
-/// Get weather from the latest available observation files (when no active events)
+/// Geographic region based on longitude, ordered West to East
+fn get_region(longitude: f64) -> u8 {
+    if longitude < -140.0 {
+        0 // Alaska/Hawaii (far west)
+    } else if longitude < -115.0 {
+        1 // Pacific (West Coast)
+    } else if longitude < -100.0 {
+        2 // Mountain
+    } else if longitude < -85.0 {
+        3 // Central (Midwest/South Central)
+    } else {
+        4 // Eastern (East Coast + Southeast)
+    }
+}
+
+/// Get weather from the latest available observation files
 async fn get_latest_weather(state: &Arc<AppState>) -> Vec<WeatherDisplay> {
     // Query all available observation files to show current weather data
     // Using None for start/end finds all available data
@@ -208,6 +205,12 @@ async fn get_latest_weather(state: &Arc<AppState>) -> Vec<WeatherDisplay> {
     // Get station names for lookup
     let all_stations = state.weather_db.stations().await.unwrap_or_default();
 
+    // Current time for "updated_at" field
+    let now = OffsetDateTime::now_utc();
+    let updated_at = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+
     // First, try to get data for major airports
     let mut weather_data: Vec<WeatherDisplay> = Vec::new();
 
@@ -225,10 +228,30 @@ async fn get_latest_weather(state: &Arc<AppState>) -> Vec<WeatherDisplay> {
                 temp_high: Some(obs.temp_high),
                 temp_low: Some(obs.temp_low),
                 wind_speed: Some(obs.wind_speed),
-                last_updated: obs.end_time.clone(),
+                observed_start: obs.start_time.clone(),
+                observed_end: obs.end_time.clone(),
+                updated_at: updated_at.clone(),
+                latitude: station.map(|s| s.latitude).unwrap_or(0.0),
+                longitude: station.map(|s| s.longitude).unwrap_or(0.0),
             });
         }
     }
+
+    // Sort by geographic region (West to East), then by latitude (North to South) within each region
+    weather_data.sort_by(|a, b| {
+        let region_a = get_region(a.longitude);
+        let region_b = get_region(b.longitude);
+
+        match region_a.cmp(&region_b) {
+            std::cmp::Ordering::Equal => {
+                // Within same region, sort north to south (descending latitude)
+                b.latitude
+                    .partial_cmp(&a.latitude)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }
+            other => other,
+        }
+    });
 
     // If we found major airports, return those
     if !weather_data.is_empty() {
@@ -250,61 +273,16 @@ async fn get_latest_weather(state: &Arc<AppState>) -> Vec<WeatherDisplay> {
                 temp_high: Some(obs.temp_high),
                 temp_low: Some(obs.temp_low),
                 wind_speed: Some(obs.wind_speed),
-                last_updated: obs.end_time,
+                observed_start: obs.start_time,
+                observed_end: obs.end_time,
+                updated_at: updated_at.clone(),
+                latitude: station.map(|s| s.latitude).unwrap_or(0.0),
+                longitude: station.map(|s| s.longitude).unwrap_or(0.0),
             }
         })
         .collect();
 
     weather_data.sort_by(|a, b| a.station_id.cmp(&b.station_id));
     weather_data.truncate(20);
-    weather_data
-}
-
-async fn get_weather_for_stations(
-    state: &Arc<AppState>,
-    station_ids: &[String],
-) -> Vec<WeatherDisplay> {
-    if station_ids.is_empty() {
-        return Vec::new();
-    }
-
-    let mut weather_data = Vec::new();
-
-    // Query all available observation files for these stations
-    let req = ObservationRequest {
-        start: None,
-        end: None,
-        station_ids: station_ids.join(","),
-        temperature_unit: TemperatureUnit::Fahrenheit,
-    };
-
-    let observations = state
-        .weather_db
-        .observation_data(&req, station_ids.to_vec())
-        .await
-        .unwrap_or_default();
-
-    // Get all stations for name lookup
-    let all_stations = state.weather_db.stations().await.unwrap_or_default();
-
-    for station_id in station_ids {
-        // Find the most recent observation for this station
-        if let Some(obs) = observations.iter().find(|o| o.station_id == *station_id) {
-            let station = all_stations.iter().find(|s| s.station_id == *station_id);
-
-            weather_data.push(WeatherDisplay {
-                station_id: station_id.clone(),
-                station_name: station.map(|s| s.station_name.clone()).unwrap_or_default(),
-                state: station.map(|s| s.state.clone()).unwrap_or_default(),
-                iata_id: station.map(|s| s.iata_id.clone()).unwrap_or_default(),
-                elevation_m: station.and_then(|s| s.elevation_m),
-                temp_high: Some(obs.temp_high),
-                temp_low: Some(obs.temp_low),
-                wind_speed: Some(obs.wind_speed),
-                last_updated: obs.end_time.clone(),
-            });
-        }
-    }
-
     weather_data
 }

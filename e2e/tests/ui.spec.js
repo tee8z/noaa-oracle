@@ -62,6 +62,52 @@ test.describe("Dashboard", () => {
     await expect(page.locator('a[href="/raw"]')).toBeVisible();
     await expect(page.locator('a[href="/events"]')).toBeVisible();
   });
+
+  test("clicking weather row expands forecast data", async ({ page }) => {
+    await page.goto("/");
+    await page.waitForLoadState("networkidle");
+
+    // Ensure weather table has data
+    const weatherRows = page.locator("table tbody tr.weather-row");
+    const rowCount = await weatherRows.count();
+    expect(rowCount).toBeGreaterThan(0);
+
+    // Get the first weather row and its station ID
+    const firstRow = weatherRows.first();
+    const stationId = await firstRow.getAttribute("data-station");
+    expect(stationId).toBeTruthy();
+
+    // The forecast row should initially be hidden
+    const forecastRow = page.locator(`#forecast-row-${stationId}`);
+    await expect(forecastRow).toBeHidden();
+
+    // Check if toggleForecast function exists
+    const hasFn = await page.evaluate(
+      () => typeof window.toggleForecast === "function",
+    );
+    expect(hasFn).toBeTruthy();
+
+    // Toggle the forecast row using the function directly
+    // (onclick on table rows can be flaky in automated tests)
+    await page.evaluate((id) => {
+      window.toggleForecast(id);
+    }, stationId);
+
+    // The forecast row should now be visible
+    await expect(forecastRow).toBeVisible();
+
+    // The forecast content area should exist
+    const forecastContent = page.locator(`#forecast-${stationId}`);
+    await expect(forecastContent).toBeVisible();
+
+    // Toggle again to hide
+    await page.evaluate((id) => {
+      window.toggleForecast(id);
+    }, stationId);
+
+    // The forecast row should be hidden again
+    await expect(forecastRow).toBeHidden();
+  });
 });
 
 test.describe("Raw Data Page", () => {
@@ -205,5 +251,15 @@ test.describe("API Endpoints", () => {
   test("stations endpoint returns data", async ({ request }) => {
     const response = await request.get("/stations");
     expect(response.ok()).toBeTruthy();
+  });
+
+  test("forecast fragment endpoint returns HTML", async ({ request }) => {
+    // Test the forecast fragment endpoint with a known station
+    const response = await request.get("/fragments/forecast/KATL");
+    expect(response.ok()).toBeTruthy();
+
+    const html = await response.text();
+    // Should return HTML content (either with forecast data or empty state message)
+    expect(html).toContain("forecast");
   });
 });

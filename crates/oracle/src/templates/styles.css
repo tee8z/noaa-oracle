@@ -43,6 +43,39 @@
     color: #fff;
 }
 
+/* IATA airport code badge - ensure visibility in both light and dark modes */
+.tag.is-iata {
+    background-color: #6b7280;
+    color: #fff;
+}
+
+/* Weather row expansion */
+.weather-row {
+    cursor: pointer;
+}
+
+.weather-row.is-expanded {
+    background-color: var(--bulma-scheme-main-bis) !important;
+}
+
+.forecast-row {
+    background-color: var(--bulma-scheme-main-bis);
+}
+
+.forecast-row td {
+    padding: 0 !important;
+}
+
+.forecast-detail {
+    background-color: var(--bulma-scheme-main-ter);
+    border-radius: 4px;
+    margin: 0.5rem;
+}
+
+.forecast-day {
+    background-color: var(--bulma-scheme-main) !important;
+}
+
 /* Card improvements */
 .box {
     transition: box-shadow 0.2s ease;

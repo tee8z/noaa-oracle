@@ -10,11 +10,23 @@ use time::OffsetDateTime;
 use crate::{
     db::EventStatus,
     templates::{
-        fragments::{event_stats, oracle_info, weather_table_body},
-        EventStats, WeatherDisplay,
+        fragments::{event_stats, forecast_detail, oracle_info, weather_table_body},
+        EventStats, ForecastDisplay, WeatherDisplay,
     },
-    AppState, ObservationRequest, TemperatureUnit,
+    AppState, ForecastRequest, ObservationRequest, TemperatureUnit,
 };
+
+/// Top 100 major US airport station IDs to show by default
+const DEFAULT_MAJOR_AIRPORTS: &[&str] = &[
+    "KATL", "KLAX", "KORD", "KDFW", "KDEN", "KJFK", "KSFO", "KSEA", "KLAS", "KMCO", "KEWR", "KMIA",
+    "KPHX", "KIAH", "KBOS", "KMSP", "KFLL", "KDTW", "KPHL", "KLGA", "KBWI", "KSLC", "KDCA", "KSAN",
+    "KTPA", "KPDX", "KSTL", "KHNL", "KBNA", "KAUS", "KMCI", "KRDU", "KMKE", "KSMF", "KCLT", "KPIT",
+    "KSAT", "KOAK", "KCLE", "KSJC", "KIND", "KCVG", "KCMH", "KJAN", "KRSW", "KABQ", "KANC", "KOMA",
+    "KBUF", "KPBI", "KBDL", "KPVD", "KBTV", "KPWM", "KMHT", "KBOI", "KBIL", "KFSD", "KFAR", "KGEG",
+    "KICT", "KLIT", "KLEX", "KBHM", "KMEM", "KJAX", "KCHS", "KRIC", "KORF", "KCRW", "KPNS", "KMOB",
+    "KSHV", "KMSY", "KTUL", "KELP", "KTUS", "KCOS", "KGRR", "KDSM", "KMSN", "KDLH", "KBZN", "KGJT",
+    "KRAP", "KFCA", "KCYS", "KJAR", "KSGF", "KFSM",
+];
 
 #[derive(Debug, Deserialize)]
 pub struct WeatherQuery {
@@ -55,26 +67,15 @@ pub async fn weather_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<WeatherQuery>,
 ) -> Html<String> {
-    // Get stations from query or from active events
+    // Get stations from query or use default major airports
     let mut station_ids: Vec<String> = if let Some(stations) = &query.stations {
         stations.split(',').map(|s| s.trim().to_string()).collect()
     } else {
-        // Default to stations from active events
-        let events = state
-            .oracle
-            .list_events(crate::db::EventFilter::default())
-            .await
-            .unwrap_or_default();
-
-        let mut active_stations: Vec<String> = events
+        // Default to major airports
+        DEFAULT_MAJOR_AIRPORTS
             .iter()
-            .filter(|e| matches!(e.status, EventStatus::Live | EventStatus::Running))
-            .flat_map(|e| e.locations.clone())
-            .collect();
-
-        active_stations.sort();
-        active_stations.dedup();
-        active_stations
+            .map(|s| s.to_string())
+            .collect()
     };
 
     // Add station if requested
@@ -100,6 +101,11 @@ async fn get_weather_for_stations(
 
     let now = OffsetDateTime::now_utc();
     let start = now - time::Duration::hours(24);
+
+    // Current time for "updated_at" field
+    let updated_at = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
 
     let req = ObservationRequest {
         start: Some(start),
@@ -130,10 +136,48 @@ async fn get_weather_for_stations(
                 temp_high: Some(obs.temp_high),
                 temp_low: Some(obs.temp_low),
                 wind_speed: Some(obs.wind_speed),
-                last_updated: obs.end_time.clone(),
+                observed_start: obs.start_time.clone(),
+                observed_end: obs.end_time.clone(),
+                updated_at: updated_at.clone(),
+                latitude: station.map(|s| s.latitude).unwrap_or(0.0),
+                longitude: station.map(|s| s.longitude).unwrap_or(0.0),
             });
         }
     }
 
     weather_data
+}
+
+/// Handler for forecast detail fragment (GET /fragments/forecast/:station_id)
+pub async fn forecast_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(station_id): axum::extract::Path<String>,
+) -> Html<String> {
+    let now = OffsetDateTime::now_utc();
+    let end = now + time::Duration::days(7);
+
+    let req = ForecastRequest {
+        start: Some(now),
+        end: Some(end),
+        station_ids: station_id.clone(),
+        temperature_unit: TemperatureUnit::Fahrenheit,
+    };
+
+    let forecasts = state
+        .weather_db
+        .forecasts_data(&req, vec![station_id.clone()])
+        .await
+        .unwrap_or_default();
+
+    let forecast_displays: Vec<ForecastDisplay> = forecasts
+        .into_iter()
+        .map(|f| ForecastDisplay {
+            date: f.date,
+            temp_high: f.temp_high,
+            temp_low: f.temp_low,
+            wind_speed: f.wind_speed,
+        })
+        .collect();
+
+    Html(forecast_detail(&station_id, &forecast_displays).into_string())
 }

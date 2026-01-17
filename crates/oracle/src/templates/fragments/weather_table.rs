@@ -10,7 +10,11 @@ pub struct WeatherDisplay {
     pub temp_high: Option<f64>,
     pub temp_low: Option<f64>,
     pub wind_speed: Option<i64>,
-    pub last_updated: String,
+    pub observed_start: String,
+    pub observed_end: String,
+    pub updated_at: String,
+    pub latitude: f64,
+    pub longitude: f64,
 }
 
 /// Weather table fragment
@@ -73,6 +77,7 @@ pub fn weather_table_body(weather_data: &[WeatherDisplay]) -> Markup {
                             th class="has-text-right" { "Temp High" }
                             th class="has-text-right" { "Temp Low" }
                             th class="has-text-right" { "Wind (mph)" }
+                            th { "Observed" }
                             th { "Updated" }
                         }
                     }
@@ -81,12 +86,19 @@ pub fn weather_table_body(weather_data: &[WeatherDisplay]) -> Markup {
                           hx-swap="innerHTML"
                           hx-select="tbody > tr" {
                         @for weather in weather_data {
-                            tr {
+                            tr class="is-clickable weather-row"
+                               data-station=(weather.station_id.clone())
+                               hx-get=(format!("/fragments/forecast/{}", weather.station_id))
+                               hx-target=(format!("#forecast-{}", weather.station_id))
+                               hx-swap="innerHTML"
+                               hx-trigger="click once"
+                               hx-on--after-request=(format!("toggleForecast('{}')", weather.station_id))
+                               onclick=(format!("toggleForecast('{}')", weather.station_id)) {
                                 td {
                                     strong { (weather.station_id.clone()) }
                                     @if !weather.iata_id.is_empty() {
                                         " "
-                                        span class="tag is-light is-small" { (weather.iata_id.clone()) }
+                                        span class="tag is-iata is-small" { (weather.iata_id.clone()) }
                                     }
                                     br;
                                     span class="is-size-7 has-text-grey" {
@@ -135,9 +147,22 @@ pub fn weather_table_body(weather_data: &[WeatherDisplay]) -> Markup {
                                     }
                                 }
                                 td {
-                                    span class="is-size-7 local-time" data-utc=(weather.last_updated.clone()) {
-                                        (weather.last_updated.clone())
+                                    span class="is-size-7 local-time-range"
+                                         data-utc-start=(weather.observed_start.clone())
+                                         data-utc-end=(weather.observed_end.clone()) {
+                                        (weather.observed_start.clone()) " - " (weather.observed_end.clone())
                                     }
+                                }
+                                td {
+                                    span class="is-size-7 local-time" data-utc=(weather.updated_at.clone()) {
+                                        (weather.updated_at.clone())
+                                    }
+                                }
+                            }
+                            // Hidden forecast row - expands when weather row is clicked
+                            tr class="forecast-row" id=(format!("forecast-row-{}", weather.station_id)) style="display: none;" {
+                                td colspan="6" id=(format!("forecast-{}", weather.station_id)) {
+                                    // Forecast data will be loaded here via HTMX
                                 }
                             }
                         }

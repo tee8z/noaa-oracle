@@ -3,7 +3,7 @@ pub mod fragments;
 pub mod layouts;
 pub mod pages;
 
-pub use fragments::{events_table_rows, EventStats, EventView, WeatherDisplay};
+pub use fragments::{events_table_rows, EventStats, EventView, ForecastDisplay, WeatherDisplay};
 pub use layouts::{CurrentPage, PageConfig};
 pub use pages::{
     dashboard::DashboardData, dashboard_page, event_detail_page, events::events_content,
