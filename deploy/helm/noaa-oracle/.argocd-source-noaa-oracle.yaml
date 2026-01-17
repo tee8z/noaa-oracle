@@ -4,5 +4,5 @@ helm:
     value: ghcr.io/tee8z/noaa-oracle/oracle
     forcestring: true
   - name: image.tag
-    value: 1.10.0
+    value: 1.11.0-arm64
     forcestring: true
