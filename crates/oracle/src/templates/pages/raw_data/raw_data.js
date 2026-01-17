@@ -62,10 +62,10 @@ async function initRawDataPage() {
   // Setup drag-to-scroll for query results
   setupDragScroll("queryResult-container");
 
-  // Setting the date (48-hour window to capture available data)
+  // Setting the date (4-hour window to avoid loading too much data)
   const currentUTCDate = new Date();
   const windowStartDate = new Date(
-    currentUTCDate.getTime() - 48 * 60 * 60 * 1000,
+    currentUTCDate.getTime() - 4 * 60 * 60 * 1000,
   );
 
   // Format for datetime-local input (YYYY-MM-DDTHH:MM)
