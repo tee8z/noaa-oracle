@@ -1,5 +1,14 @@
 const { test, expect } = require("@playwright/test");
 
+// Helper to build dashboard URL with date range that includes fixture data
+// Fixtures are dated with the current date, so we use a wide range to ensure they're included
+function getDashboardUrl() {
+  // Use a wide date range that will include any fixture data
+  const start = "2020-01-01T00:00:00Z";
+  const end = "2030-12-31T23:59:59Z";
+  return `/?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`;
+}
+
 test.describe("Dashboard", () => {
   test("loads without errors", async ({ page }) => {
     const errors = [];
@@ -7,7 +16,7 @@ test.describe("Dashboard", () => {
       if (msg.type() === "error") errors.push(msg.text());
     });
 
-    await page.goto("/");
+    await page.goto(getDashboardUrl());
     await expect(page).toHaveTitle(/4cast Truth Oracle/);
 
     // Check header is present (only once)
@@ -19,14 +28,14 @@ test.describe("Dashboard", () => {
   });
 
   test("displays oracle info", async ({ page }) => {
-    await page.goto("/");
+    await page.goto(getDashboardUrl());
 
     // Oracle info section should be visible
     await expect(page.locator("text=Public Key (Base64)")).toBeVisible();
   });
 
   test("displays weather data from observation files", async ({ page }) => {
-    await page.goto("/");
+    await page.goto(getDashboardUrl());
 
     // Wait for the page to fully load
     await page.waitForLoadState("networkidle");
@@ -55,7 +64,7 @@ test.describe("Dashboard", () => {
   });
 
   test("navigation links work", async ({ page }) => {
-    await page.goto("/");
+    await page.goto(getDashboardUrl());
 
     // Check nav links exist (use first() since there may be multiple links to /)
     await expect(page.locator('a[href="/"]').first()).toBeVisible();
@@ -64,7 +73,7 @@ test.describe("Dashboard", () => {
   });
 
   test("clicking weather row expands forecast data", async ({ page }) => {
-    await page.goto("/");
+    await page.goto(getDashboardUrl());
     await page.waitForLoadState("networkidle");
 
     // Ensure weather table has data
@@ -81,16 +90,22 @@ test.describe("Dashboard", () => {
     const forecastRow = page.locator(`#forecast-row-${stationId}`);
     await expect(forecastRow).toBeHidden();
 
-    // Check if toggleForecast function exists
-    const hasFn = await page.evaluate(
-      () => typeof window.toggleForecast === "function",
+    // Check if showForecast function exists (used after HTMX loads data)
+    const hasShowFn = await page.evaluate(
+      () => typeof window.showForecast === "function",
     );
-    expect(hasFn).toBeTruthy();
+    expect(hasShowFn).toBeTruthy();
 
-    // Toggle the forecast row using the function directly
-    // (onclick on table rows can be flaky in automated tests)
+    // Check if toggleForecastIfLoaded function exists (used for subsequent clicks)
+    const hasToggleFn = await page.evaluate(
+      () => typeof window.toggleForecastIfLoaded === "function",
+    );
+    expect(hasToggleFn).toBeTruthy();
+
+    // Simulate the HTMX load completing by calling showForecast directly
+    // This marks the row as loaded and shows it
     await page.evaluate((id) => {
-      window.toggleForecast(id);
+      window.showForecast(id);
     }, stationId);
 
     // The forecast row should now be visible
@@ -100,13 +115,21 @@ test.describe("Dashboard", () => {
     const forecastContent = page.locator(`#forecast-${stationId}`);
     await expect(forecastContent).toBeVisible();
 
-    // Toggle again to hide
+    // Toggle to hide using toggleForecastIfLoaded (simulates subsequent click)
     await page.evaluate((id) => {
-      window.toggleForecast(id);
+      window.toggleForecastIfLoaded(id);
     }, stationId);
 
     // The forecast row should be hidden again
     await expect(forecastRow).toBeHidden();
+
+    // Toggle again to show
+    await page.evaluate((id) => {
+      window.toggleForecastIfLoaded(id);
+    }, stationId);
+
+    // Should be visible again
+    await expect(forecastRow).toBeVisible();
   });
 });
 

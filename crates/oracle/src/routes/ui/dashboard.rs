@@ -1,7 +1,12 @@
 use std::sync::Arc;
 
-use axum::{extract::State, http::HeaderMap, response::Html};
-use time::OffsetDateTime;
+use axum::{
+    extract::{Query, State},
+    http::HeaderMap,
+    response::Html,
+};
+use serde::Deserialize;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     db::EventStatus,
@@ -13,13 +18,33 @@ use crate::{
     AppState, ObservationRequest, TemperatureUnit,
 };
 
+#[derive(Debug, Deserialize, Default)]
+pub struct DashboardQuery {
+    /// Start time for observation data (RFC3339 format)
+    pub start: Option<String>,
+    /// End time for observation data (RFC3339 format)
+    pub end: Option<String>,
+}
+
 /// Handler for the dashboard page (GET /)
 /// Returns full page for normal requests, content only for HTMX requests
+/// Accepts optional `start` and `end` query params (RFC3339) to override the default 24-hour window
 pub async fn dashboard_handler(
     headers: HeaderMap,
+    Query(query): Query<DashboardQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Html<String> {
-    let data = build_dashboard_data(&state).await;
+    // Parse optional time range from query params
+    let start = query
+        .start
+        .as_ref()
+        .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok());
+    let end = query
+        .end
+        .as_ref()
+        .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok());
+
+    let data = build_dashboard_data(&state, start, end).await;
 
     // Check if this is an HTMX request
     if headers.contains_key("hx-request") {
@@ -31,7 +56,11 @@ pub async fn dashboard_handler(
     }
 }
 
-async fn build_dashboard_data(state: &Arc<AppState>) -> DashboardData {
+async fn build_dashboard_data(
+    state: &Arc<AppState>,
+    start: Option<OffsetDateTime>,
+    end: Option<OffsetDateTime>,
+) -> DashboardData {
     // Get oracle identity
     let pubkey = state.oracle.public_key();
     let npub = state.oracle.npub().unwrap_or_else(|_| "Error".to_string());
@@ -55,7 +84,7 @@ async fn build_dashboard_data(state: &Arc<AppState>) -> DashboardData {
     }
 
     // Always show weather for major airports on the dashboard
-    let weather = get_latest_weather(state).await;
+    let weather = get_latest_weather(state, start, end).await;
 
     // Get all available stations for the dropdown (from the weather data we already have)
     let all_stations: Vec<(String, String)> = weather
@@ -186,14 +215,23 @@ fn get_region(longitude: f64) -> u8 {
 }
 
 /// Get weather from the latest available observation files
-async fn get_latest_weather(state: &Arc<AppState>) -> Vec<WeatherDisplay> {
-    // Query observations for the current day only (last 24 hours)
-    let now = OffsetDateTime::now_utc();
-    let start = now - time::Duration::hours(24);
+async fn get_latest_weather(
+    state: &Arc<AppState>,
+    start: Option<OffsetDateTime>,
+    end: Option<OffsetDateTime>,
+) -> Vec<WeatherDisplay> {
+    // Use provided time range or default to last 24 hours
+    let (query_start, query_end) = match (start, end) {
+        (Some(s), Some(e)) => (Some(s), Some(e)),
+        _ => {
+            let now = OffsetDateTime::now_utc();
+            (Some(now - time::Duration::hours(24)), Some(now))
+        }
+    };
 
     let req = ObservationRequest {
-        start: Some(start),
-        end: Some(now),
+        start: query_start,
+        end: query_end,
         station_ids: String::new(), // Empty = no filter, get all stations
         temperature_unit: TemperatureUnit::Fahrenheit,
     };
