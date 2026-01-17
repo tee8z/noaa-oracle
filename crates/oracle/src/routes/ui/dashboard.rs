@@ -187,11 +187,13 @@ fn get_region(longitude: f64) -> u8 {
 
 /// Get weather from the latest available observation files
 async fn get_latest_weather(state: &Arc<AppState>) -> Vec<WeatherDisplay> {
-    // Query all available observation files to show current weather data
-    // Using None for start/end finds all available data
+    // Query observations for the current day only (last 24 hours)
+    let now = OffsetDateTime::now_utc();
+    let start = now - time::Duration::hours(24);
+
     let req = ObservationRequest {
-        start: None,
-        end: None,
+        start: Some(start),
+        end: Some(now),
         station_ids: String::new(), // Empty = no filter, get all stations
         temperature_unit: TemperatureUnit::Fahrenheit,
     };

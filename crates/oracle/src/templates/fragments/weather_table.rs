@@ -92,8 +92,8 @@ pub fn weather_table_body(weather_data: &[WeatherDisplay]) -> Markup {
                                hx-target=(format!("#forecast-{}", weather.station_id))
                                hx-swap="innerHTML"
                                hx-trigger="click once"
-                               hx-on--after-request=(format!("toggleForecast('{}')", weather.station_id))
-                               onclick=(format!("toggleForecast('{}')", weather.station_id)) {
+                               hx-on--after-request=(format!("showForecast('{}')", weather.station_id))
+                               onclick=(format!("toggleForecastIfLoaded('{}')", weather.station_id)) {
                                 td {
                                     strong { (weather.station_id.clone()) }
                                     @if !weather.iata_id.is_empty() {

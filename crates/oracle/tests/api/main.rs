@@ -4,3 +4,4 @@ mod create_event_entry;
 mod etl_workflow;
 mod get_events;
 mod helpers;
+mod ui_fragments;
