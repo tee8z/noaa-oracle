@@ -63,6 +63,9 @@ fn build_js(templates: &Path, output: &Path) {
     let hash = hex::encode(Sha256::digest(minified.as_bytes()));
     let short = &hash[..8];
 
+    // Clean up old hash files before writing new ones
+    clean_old_hash_files(output, "app.", ".min.js", short);
+
     let _ = fs::write(output.join(format!("app.{}.min.js", short)), &minified);
     let _ = fs::write(output.join("app.min.js"), &minified);
 
@@ -113,6 +116,9 @@ fn build_css(templates: &Path, output: &Path) {
     let minified = minify_css(&combined);
     let hash = hex::encode(Sha256::digest(minified.as_bytes()));
     let short = &hash[..8];
+
+    // Clean up old hash files before writing new ones
+    clean_old_hash_files(output, "styles.", ".min.css", short);
 
     let _ = fs::write(output.join(format!("styles.{}.min.css", short)), &minified);
     let _ = fs::write(output.join("styles.min.css"), &minified);
@@ -166,13 +172,41 @@ fn minify_css(css: &str) -> String {
     out
 }
 
-/// Copies loader.js directly (not bundled with app.min.js)
+/// Remove old hash files that don't match the current hash
+fn clean_old_hash_files(output: &Path, prefix: &str, suffix: &str, current_hash: &str) {
+    if let Ok(entries) = fs::read_dir(output) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+
+            // Check if file matches the pattern (e.g., "app.{hash}.min.js")
+            // Must be long enough to contain prefix + hash + suffix
+            if name.starts_with(prefix)
+                && name.ends_with(suffix)
+                && name.len() > prefix.len() + suffix.len()
+            {
+                // Extract the hash portion
+                let hash_part = &name[prefix.len()..name.len() - suffix.len()];
+                // Only remove if it looks like a hash (8 hex chars) and doesn't match current
+                if hash_part.len() == 8
+                    && hash_part.chars().all(|c| c.is_ascii_hexdigit())
+                    && hash_part != current_hash
+                {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+}
+
+/// Minifies and copies loader.js (not bundled with app.min.js)
 fn copy_loader(templates: &Path, output: &Path) {
     let loader = templates.join("loader.js");
     if loader.exists() {
         if let Ok(content) = fs::read_to_string(&loader) {
-            let _ = fs::write(output.join("loader.js"), &content);
-            println!("cargo:warning=Copied loader.js ({} bytes)", content.len());
+            let minified = try_minify_js(&content).unwrap_or_else(|| content.clone());
+            let _ = fs::write(output.join("loader.js"), &minified);
+            println!("cargo:warning=Built loader.js ({} bytes)", minified.len());
         }
     }
 }

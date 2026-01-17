@@ -10,6 +10,10 @@ description = "NOAA Oracle REST API server and DLC attestation service"
 name = "oracle"
 path = "src/main.rs"
 
+[features]
+default = []
+bundled = ["duckdb/bundled"]
+
 [dependencies]
 # Internal
 noaa-oracle-core.workspace = true

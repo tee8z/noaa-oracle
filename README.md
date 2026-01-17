@@ -32,6 +32,19 @@ cargo build --workspace
 just build
 ```
 
+### Without Nix
+
+The oracle crate links against the DuckDB C library. Download the library from [DuckDB releases](https://github.com/duckdb/duckdb/releases) (e.g., `libduckdb-linux-amd64.zip`) and point to it:
+
+```bash
+# Extract and set environment variables
+export DUCKDB_LIB_DIR=/path/to/libduckdb
+export LD_LIBRARY_PATH=$DUCKDB_LIB_DIR:$LD_LIBRARY_PATH
+cargo build --workspace
+```
+
+Alternatively, use `--features oracle/bundled` to compile DuckDB from source (much slower build).
+
 ### Running the Services
 
 ```bash
