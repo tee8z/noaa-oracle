@@ -1,22 +1,53 @@
-// Show forecast row after HTMX has loaded the content
-// Called from hx-on--after-request
-window.showForecast = function showForecast(stationId) {
+// Load forecast data for a station
+// Called from onclick on weather row
+window.loadForecast = function loadForecast(stationId) {
   var forecastRow = document.getElementById("forecast-row-" + stationId);
+  var forecastContainer = document.getElementById("forecast-" + stationId);
   var weatherRow = document.querySelector(
     "tr[data-station='" + stationId + "']",
   );
 
-  if (!forecastRow) {
+  if (!forecastRow || !forecastContainer) {
     return;
   }
 
-  // Mark as loaded and show
-  forecastRow.dataset.loaded = "true";
-  forecastRow.style.display = "table-row";
-  if (weatherRow) {
-    weatherRow.classList.add("is-expanded");
+  // If already loaded, just toggle visibility
+  if (forecastRow.dataset.loaded === "true") {
+    var isHidden = window.getComputedStyle(forecastRow).display === "none";
+    if (isHidden) {
+      forecastRow.style.display = "table-row";
+      if (weatherRow) {
+        weatherRow.classList.add("is-expanded");
+      }
+    } else {
+      forecastRow.style.display = "none";
+      if (weatherRow) {
+        weatherRow.classList.remove("is-expanded");
+      }
+    }
+    return;
   }
+
+  // First time - fetch the forecast data
+  fetch("/fragments/forecast/" + stationId)
+    .then(function (response) {
+      return response.text();
+    })
+    .then(function (html) {
+      forecastContainer.innerHTML = html;
+      forecastRow.dataset.loaded = "true";
+      forecastRow.style.display = "table-row";
+      if (weatherRow) {
+        weatherRow.classList.add("is-expanded");
+      }
+    })
+    .catch(function (error) {
+      console.error("Failed to load forecast:", error);
+    });
 };
+
+// Legacy function for backwards compatibility
+window.showForecast = window.loadForecast;
 
 // Toggle forecast visibility only if already loaded
 // Called from onclick - does nothing on first click (HTMX handles that)

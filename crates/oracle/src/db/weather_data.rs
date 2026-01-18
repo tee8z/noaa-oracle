@@ -42,6 +42,12 @@ pub trait WeatherData: Sync + Send {
         req: &ObservationRequest,
         station_ids: Vec<String>,
     ) -> Result<Vec<Observation>, Error>;
+    /// Get daily aggregated observations (grouped by UTC date)
+    async fn daily_observations(
+        &self,
+        req: &ObservationRequest,
+        station_ids: Vec<String>,
+    ) -> Result<Vec<DailyObservation>, Error>;
     async fn stations(&self) -> Result<Vec<Station>, Error>;
 }
 
@@ -97,84 +103,102 @@ impl WeatherData for WeatherAccess {
         if file_paths.is_empty() {
             return Ok(vec![]);
         }
-        let mut placeholders = Parameters::new();
 
-        let mut daily_forecasts = select((
-            "station_id",
-            "DATE_TRUNC('day', begin_time::TIMESTAMP)::TEXT".as_("date"),
-            "MIN(begin_time)".as_("start_time"),
-            "MAX(end_time)".as_("end_time"),
-            "MIN(min_temp) FILTER (WHERE min_temp IS NOT NULL AND min_temp >= -200 AND min_temp <= 200)".as_("temp_low"),
-            "MAX(max_temp) FILTER (WHERE max_temp IS NOT NULL AND max_temp >= -200 AND max_temp <= 200)".as_("temp_high"),
-            "MAX(wind_speed) FILTER (WHERE wind_speed IS NOT NULL AND wind_speed >= 0 AND wind_speed <= 500)".as_("wind_speed"),
-            "MAX(temperature_unit_code)".as_("temperature_unit_code"), // assumes consistent units per grouping
-        ))
-        .from(format!(
-            "read_parquet(['{}'], union_by_name = true)",
-            file_paths.join("', '")
-        ));
+        // Build station filter clause
+        let station_filter = if !station_ids.is_empty() {
+            let quoted: Vec<String> = station_ids.iter().map(|s| format!("'{}'", s)).collect();
+            format!("WHERE station_id IN ({})", quoted.join(", "))
+        } else {
+            String::new()
+        };
 
-        let mut values: Vec<String> = vec![];
-        if !station_ids.is_empty() {
-            daily_forecasts = daily_forecasts.where_(format!(
-                "station_id IN ({})",
-                placeholders.next_n(station_ids.len())
-            ));
-
-            for station_id in station_ids {
-                values.push(station_id);
-            }
-        }
-        // We are finding values for any overlapping forecast time range
-        // There is some oddity here where we may end up with a forecast
-        // That is heavily influenced by the weather conditions outside our
-        // Requested time range, but at least we will more likely to HAVE a
-        // forecast value no matter the requested time range.
+        // Build time filter clauses
+        let mut time_filters = Vec::new();
         if let Some(start) = &req.start {
-            daily_forecasts = daily_forecasts.where_(format!(
-                "end_time::TIMESTAMPTZ > {}::TIMESTAMPTZ",
-                placeholders.next()
+            time_filters.push(format!(
+                "end_time::TIMESTAMPTZ > '{}'::TIMESTAMPTZ",
+                start.format(&Rfc3339)?
             ));
-            values.push(start.format(&Rfc3339)?.to_owned());
         }
-
         if let Some(end) = &req.end {
-            daily_forecasts = daily_forecasts.where_(format!(
-                "begin_time::TIMESTAMPTZ < {}::TIMESTAMPTZ",
-                placeholders.next()
+            time_filters.push(format!(
+                "begin_time::TIMESTAMPTZ < '{}'::TIMESTAMPTZ",
+                end.format(&Rfc3339)?
             ));
-            values.push(end.format(&Rfc3339)?.to_owned());
         }
-        daily_forecasts = daily_forecasts.group_by((
-            "station_id",
-            "DATE_TRUNC('day', begin_time::TIMESTAMP)::TEXT",
-        ));
+        let time_filter = if time_filters.is_empty() {
+            String::new()
+        } else if station_filter.is_empty() {
+            format!("WHERE {}", time_filters.join(" AND "))
+        } else {
+            format!("AND {}", time_filters.join(" AND "))
+        };
 
-        let query = with("daily_forecasts")
-            .as_(daily_forecasts)
-            .select((
-                "station_id",
-                "date",
-                if let Some(start) = &req.start {
-                    format!("GREATEST('{}', MIN(start_time))", start.format(&Rfc3339)?)
-                        .as_("start_time")
-                } else {
-                    "MIN(start_time)".as_("start_time")
-                },
-                if let Some(end) = &req.end {
-                    format!("LEAST('{}', MAX(end_time))", end.format(&Rfc3339)?).as_("end_time")
-                } else {
-                    "MAX(end_time)".as_("end_time")
-                },
-                "MIN(temp_low)".as_("temp_low"),
-                "MAX(temp_high)".as_("temp_high"),
-                "MAX(wind_speed)".as_("wind_speed"),
-                "MAX(temperature_unit_code)".as_("temperature_unit_code"),
-            ))
-            .from("daily_forecasts")
-            .group_by(("station_id", "date"));
+        // Build start/end time expressions for final select
+        let start_time_expr = if let Some(start) = &req.start {
+            format!("GREATEST('{}', MIN(start_time))", start.format(&Rfc3339)?)
+        } else {
+            "MIN(start_time)".to_string()
+        };
+        let end_time_expr = if let Some(end) = &req.end {
+            format!("LEAST('{}', MAX(end_time))", end.format(&Rfc3339)?)
+        } else {
+            "MAX(end_time)".to_string()
+        };
 
-        let records = self.query(query, values).await?;
+        // Use raw SQL with UNION ALL BY NAME to handle schema differences
+        // Old files may not have twelve_hour_probability_of_precipitation column
+        let query_sql = format!(
+            r#"
+            WITH parquet_data AS (
+                SELECT * FROM (
+                    SELECT NULL::VARCHAR AS station_id, NULL::VARCHAR AS begin_time, NULL::VARCHAR AS end_time,
+                           NULL::BIGINT AS min_temp, NULL::BIGINT AS max_temp, NULL::BIGINT AS wind_speed,
+                           NULL::VARCHAR AS temperature_unit_code, NULL::DOUBLE AS twelve_hour_probability_of_precipitation
+                    WHERE false
+                    UNION ALL BY NAME
+                    SELECT * FROM read_parquet(['{}'], union_by_name = true)
+                )
+            ),
+            daily_forecasts AS (
+                SELECT
+                    station_id,
+                    DATE_TRUNC('day', begin_time::TIMESTAMP)::TEXT AS date,
+                    MIN(begin_time) AS start_time,
+                    MAX(end_time) AS end_time,
+                    MIN(min_temp) FILTER (WHERE min_temp IS NOT NULL AND min_temp >= -200 AND min_temp <= 200) AS temp_low,
+                    MAX(max_temp) FILTER (WHERE max_temp IS NOT NULL AND max_temp >= -200 AND max_temp <= 200) AS temp_high,
+                    MAX(wind_speed) FILTER (WHERE wind_speed IS NOT NULL AND wind_speed >= 0 AND wind_speed <= 500) AS wind_speed,
+                    MAX(temperature_unit_code) AS temperature_unit_code,
+                    MAX(twelve_hour_probability_of_precipitation) FILTER (WHERE twelve_hour_probability_of_precipitation IS NOT NULL) AS precip_chance
+                FROM parquet_data
+                {} {}
+                GROUP BY station_id, DATE_TRUNC('day', begin_time::TIMESTAMP)::TEXT
+            )
+            SELECT
+                station_id,
+                date,
+                {} AS start_time,
+                {} AS end_time,
+                MIN(temp_low) AS temp_low,
+                MAX(temp_high) AS temp_high,
+                MAX(wind_speed) AS wind_speed,
+                MAX(temperature_unit_code) AS temperature_unit_code,
+                MAX(precip_chance) AS precip_chance
+            FROM daily_forecasts
+            GROUP BY station_id, date
+            "#,
+            file_paths.join("', '"),
+            station_filter,
+            time_filter,
+            start_time_expr,
+            end_time_expr,
+        );
+
+        // Execute raw SQL directly
+        let conn = self.open_connection()?;
+        let mut stmt = conn.prepare(&query_sql)?;
+        let records: Vec<RecordBatch> = stmt.query_arrow([])?.collect();
 
         let forecasts: Forecasts = records
             .iter()
@@ -305,6 +329,82 @@ impl WeatherData for WeatherAccess {
         Ok(observations.values)
     }
 
+    async fn daily_observations(
+        &self,
+        req: &ObservationRequest,
+        station_ids: Vec<String>,
+    ) -> Result<Vec<DailyObservation>, Error> {
+        let mut file_params: FileParams = req.into();
+        if let Some(start_date) = req.start {
+            file_params.start = Some(start_date.saturating_sub(Duration::days(1)));
+        }
+        let parquet_files = self.file_access.grab_file_names(file_params).await?;
+        let file_paths = self.file_access.build_file_paths(parquet_files);
+
+        if file_paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut placeholders = Parameters::new();
+        let mut values: Vec<String> = vec![];
+
+        // Group observations by station and UTC date
+        let mut base_query = select((
+            "station_id",
+            "DATE_TRUNC('day', generated_at::TIMESTAMP)::TEXT".as_("date"),
+            "MIN(temperature_value) FILTER (WHERE temperature_value IS NOT NULL)".as_("temp_low"),
+            "MAX(temperature_value) FILTER (WHERE temperature_value IS NOT NULL)".as_("temp_high"),
+            "MAX(wind_speed) FILTER (WHERE wind_speed IS NOT NULL)".as_("wind_speed"),
+            "MAX(temperature_unit_code)".as_("temperature_unit_code"),
+        ))
+        .from(format!(
+            "read_parquet(['{}'], union_by_name = true)",
+            file_paths.join("', '")
+        ));
+
+        if !station_ids.is_empty() {
+            base_query = base_query.where_(format!(
+                "station_id IN ({})",
+                placeholders.next_n(station_ids.len())
+            ));
+
+            for station_id in station_ids {
+                values.push(station_id);
+            }
+        }
+
+        if let Some(start) = &req.start {
+            base_query = base_query.where_(format!(
+                "generated_at::TIMESTAMPTZ >= {}::TIMESTAMPTZ",
+                placeholders.next()
+            ));
+            values.push(start.format(&Rfc3339)?.to_owned());
+        }
+
+        if let Some(end) = &req.end {
+            base_query = base_query.where_(format!(
+                "generated_at::TIMESTAMPTZ <= {}::TIMESTAMPTZ",
+                placeholders.next()
+            ));
+            values.push(end.format(&Rfc3339)?.to_owned());
+        }
+
+        base_query = base_query.group_by((
+            "station_id",
+            "DATE_TRUNC('day', generated_at::TIMESTAMP)::TEXT",
+        ));
+
+        let records = self.query(base_query, values).await?;
+        let observations: DailyObservations = records
+            .iter()
+            .map(|record| DailyObservations::from_with_temp_unit(record, &req.temperature_unit))
+            .fold(DailyObservations::new(), |mut acc, obs| {
+                acc.merge(obs);
+                acc
+            });
+        Ok(observations.values)
+    }
+
     async fn stations(&self) -> Result<Vec<Station>, Error> {
         // Query all available observation files to find station data
         // Using None for start/end finds all available data
@@ -423,6 +523,12 @@ impl Forecasts {
             .downcast_ref::<StringArray>()
             .expect("Expected StringArray in column 7");
 
+        let precip_chance_arr = record_batch
+            .column(8)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("Expected Float64Array in column 8");
+
         for row_index in 0..record_batch.num_rows() {
             let station_id = station_id_arr.value(row_index).to_owned();
             let date = date_arr.value(row_index).to_owned();
@@ -431,14 +537,31 @@ impl Forecasts {
             let temp_low = temp_low_arr.value(row_index);
             let temp_high = temp_high_arr.value(row_index);
 
-            let wind_speed_val = wind_speed_arr.value(row_index);
-            //We set max expected wind speed to something outlandish for nulls
-            let wind_speed = if (0..=3000).contains(&wind_speed_val) {
-                Some(wind_speed_val)
-            } else {
+            // Check for NULL first, then validate the range
+            let wind_speed = if wind_speed_arr.is_null(row_index) {
                 None
+            } else {
+                let wind_speed_val = wind_speed_arr.value(row_index);
+                // Filter out unreasonable values (negative or > 500 mph)
+                if (0..=500).contains(&wind_speed_val) {
+                    Some(wind_speed_val)
+                } else {
+                    None
+                }
             };
             let temp_unit_code = temperature_unit_code_arr.value(row_index).to_owned();
+
+            // Precipitation chance (0-100%)
+            let precip_chance = if precip_chance_arr.is_null(row_index) {
+                None
+            } else {
+                let val = precip_chance_arr.value(row_index);
+                if (0.0..=100.0).contains(&val) {
+                    Some(val.round() as i64)
+                } else {
+                    None
+                }
+            };
 
             let mut forecast = Forecast {
                 station_id,
@@ -449,6 +572,7 @@ impl Forecasts {
                 temp_high,
                 wind_speed,
                 temp_unit_code,
+                precip_chance,
             };
             forecast.convert_temperature(target_unit);
             forecasts.push(forecast);
@@ -468,6 +592,7 @@ pub struct Forecast {
     pub temp_high: i64,
     pub wind_speed: Option<i64>,
     pub temp_unit_code: String,
+    pub precip_chance: Option<i64>,
 }
 
 impl Forecast {
@@ -618,6 +743,117 @@ impl Observation {
                 self.temp_unit_code = target_unit.to_string();
             }
             _ => (), // No conversion needed or unknown unit
+        }
+    }
+}
+
+/// Daily aggregated observation (grouped by UTC date)
+#[derive(Serialize, Deserialize, Debug, ToSchema)]
+pub struct DailyObservation {
+    pub station_id: String,
+    pub date: String,
+    pub temp_low: f64,
+    pub temp_high: f64,
+    pub wind_speed: i64,
+    pub temp_unit_code: String,
+}
+
+impl DailyObservation {
+    pub fn convert_temperature(&mut self, target_unit: &TemperatureUnit) {
+        let current_unit = match self.temp_unit_code.to_lowercase().as_str() {
+            "celcius" => "celsius".to_string(),
+            _ => self.temp_unit_code.to_lowercase(),
+        };
+
+        if current_unit == target_unit.to_string() {
+            return;
+        }
+
+        match (current_unit.as_str(), target_unit) {
+            ("celsius", TemperatureUnit::Fahrenheit) => {
+                self.temp_low = self.temp_low * 9.0 / 5.0 + 32.0;
+                self.temp_high = self.temp_high * 9.0 / 5.0 + 32.0;
+                self.temp_unit_code = target_unit.to_string();
+            }
+            ("fahrenheit", TemperatureUnit::Celsius) => {
+                self.temp_low = (self.temp_low - 32.0) * 5.0 / 9.0;
+                self.temp_high = (self.temp_high - 32.0) * 5.0 / 9.0;
+                self.temp_unit_code = target_unit.to_string();
+            }
+            _ => (),
+        }
+    }
+}
+
+struct DailyObservations {
+    values: Vec<DailyObservation>,
+}
+
+impl DailyObservations {
+    pub fn new() -> Self {
+        DailyObservations { values: Vec::new() }
+    }
+
+    pub fn merge(&mut self, observations: DailyObservations) -> &DailyObservations {
+        self.values.extend(observations.values);
+        self
+    }
+
+    pub fn from_with_temp_unit(record_batch: &RecordBatch, target_unit: &TemperatureUnit) -> Self {
+        let mut observations = Vec::new();
+        let station_id_arr = record_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Expected StringArray in column 0");
+        let date_arr = record_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Expected StringArray in column 1");
+        let temp_low_arr = record_batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("Expected Float64Array in column 2");
+        let temp_high_arr = record_batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("Expected Float64Array in column 3");
+        let wind_speed_arr = record_batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Expected Int64Array in column 4");
+        let temperature_unit_code_arr = record_batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Expected StringArray in column 5");
+
+        for row_index in 0..record_batch.num_rows() {
+            let station_id = station_id_arr.value(row_index).to_owned();
+            let date = date_arr.value(row_index).to_owned();
+            let temp_low = temp_low_arr.value(row_index);
+            let temp_high = temp_high_arr.value(row_index);
+            let wind_speed = wind_speed_arr.value(row_index);
+            let temp_unit_code = temperature_unit_code_arr.value(row_index).to_owned();
+
+            let mut observation = DailyObservation {
+                station_id,
+                date,
+                temp_low,
+                temp_high,
+                wind_speed,
+                temp_unit_code,
+            };
+            observation.convert_temperature(target_unit);
+            observations.push(observation);
+        }
+
+        Self {
+            values: observations,
         }
     }
 }

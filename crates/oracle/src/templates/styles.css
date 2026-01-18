@@ -421,3 +421,293 @@ textarea.schema-content:focus {
     background-color: #ffe08a;
     color: rgba(0, 0, 0, 0.7);
 }
+
+/* ================================
+   Weather Map Styles
+   ================================ */
+
+/* Map container */
+.weather-map-container {
+    position: relative;
+    width: 100%;
+}
+
+.map-wrapper {
+    position: relative;
+    width: 100%;
+}
+
+.usa-map {
+    width: 100%;
+    height: auto;
+    display: block;
+}
+
+/* Station markers overlay */
+.station-markers {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+}
+
+.station-marker {
+    cursor: pointer;
+    pointer-events: auto;
+    transition: transform 0.15s ease;
+    stroke: #fff;
+    stroke-width: 1.5;
+    transform-origin: center;
+    transform-box: fill-box;
+}
+
+.station-marker:hover {
+    transform: scale(1.5);
+}
+
+/* Region colors for markers */
+.station-marker.region-alaska-hawaii {
+    fill: #8b5cf6; /* Purple */
+}
+
+.station-marker.region-pacific {
+    fill: #a855f7; /* Purple */
+}
+
+.station-marker.region-mountain {
+    fill: #10b981; /* Green */
+}
+
+.station-marker.region-central {
+    fill: #f59e0b; /* Amber */
+}
+
+.station-marker.region-eastern {
+    fill: #06b6d4; /* Cyan */
+}
+
+/* Station popup */
+.station-popup {
+    position: absolute;
+    z-index: 100;
+    background: var(--bulma-scheme-main);
+    border: 1px solid var(--bulma-border);
+    border-radius: 6px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    padding: 0.75rem;
+    min-width: 300px;
+    max-width: 360px;
+}
+
+.popup-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+}
+
+.popup-station-id {
+    font-size: 1rem;
+}
+
+.popup-close {
+    margin-left: auto;
+}
+
+.popup-name {
+    font-size: 0.875rem;
+    color: var(--bulma-text-weak);
+    margin-bottom: 0.75rem;
+}
+
+.popup-details {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.25rem 1rem;
+    font-size: 0.875rem;
+    margin-bottom: 0.75rem;
+}
+
+.popup-row {
+    display: flex;
+    justify-content: space-between;
+}
+
+.popup-label {
+    color: var(--bulma-text-weak);
+}
+
+.popup-value {
+    font-family: monospace;
+    font-weight: 500;
+}
+
+.popup-temp-high {
+    color: #b8956e;
+}
+
+.popup-temp-low {
+    color: #60a5fa;
+}
+
+.popup-footer {
+    text-align: center;
+}
+
+/* Popup forecast grid */
+.popup-forecast-grid {
+    font-size: 0.75rem;
+}
+
+.forecast-header-row,
+.forecast-data-row {
+    display: grid;
+    grid-template-columns: 70px repeat(3, 1fr);
+    gap: 0.25rem;
+    align-items: center;
+}
+
+.forecast-header-row {
+    font-weight: 600;
+    color: var(--bulma-text-weak);
+    margin-bottom: 0.25rem;
+    padding-bottom: 0.25rem;
+    border-bottom: 1px solid var(--bulma-border);
+}
+
+.forecast-data-row {
+    padding: 0.2rem 0;
+}
+
+.forecast-data-row:not(:last-child) {
+    border-bottom: 1px dotted var(--bulma-border-weak);
+}
+
+.forecast-col-label {
+    font-size: 0.7rem;
+    color: var(--bulma-text-weak);
+    white-space: nowrap;
+}
+
+.forecast-col-label .icon {
+    margin-right: 0.15rem;
+}
+
+.forecast-col {
+    text-align: center;
+    font-family: monospace;
+}
+
+.forecast-col.forecast-na {
+    color: var(--bulma-text-weak);
+}
+
+.popup-loading {
+    text-align: center;
+    padding: 0.5rem;
+    color: var(--bulma-text-weak);
+}
+
+/* ================================
+   Region Header Styles (Table)
+   ================================ */
+
+.region-header td {
+    font-weight: 600;
+    font-size: 0.875rem;
+    padding: 0.5rem 1rem !important;
+    background-color: var(--bulma-scheme-main-bis);
+    border-left: 4px solid;
+}
+
+.region-header.region-alaska-hawaii td {
+    border-left-color: #8b5cf6;
+    background-color: rgba(139, 92, 246, 0.1);
+}
+
+.region-header.region-pacific td {
+    border-left-color: #a855f7;
+    background-color: rgba(168, 85, 247, 0.1);
+}
+
+.region-header.region-mountain td {
+    border-left-color: #10b981;
+    background-color: rgba(16, 185, 129, 0.1);
+}
+
+.region-header.region-central td {
+    border-left-color: #f59e0b;
+    background-color: rgba(245, 158, 11, 0.1);
+}
+
+.region-header.region-eastern td {
+    border-left-color: #06b6d4;
+    background-color: rgba(6, 182, 212, 0.1);
+}
+
+/* Make region headers not clickable */
+.region-header {
+    cursor: default;
+}
+
+.region-header:hover {
+    background-color: inherit !important;
+}
+
+/* ================================
+   Weather View Toggle
+   ================================ */
+
+.tabs.is-boxed {
+    margin-bottom: 0 !important;
+}
+
+.tabs.is-boxed ul {
+    border-bottom-color: var(--bulma-border);
+}
+
+.tabs.is-boxed li[data-view] {
+    cursor: pointer;
+}
+
+.tabs.is-boxed li[data-view] a {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+/* ================================
+   Responsive Map Adjustments
+   ================================ */
+
+@media screen and (max-width: 768px) {
+    .station-marker {
+        stroke-width: 1;
+    }
+
+    .station-popup {
+        min-width: 260px;
+        max-width: 300px;
+        font-size: 0.75rem;
+    }
+
+    .popup-details {
+        grid-template-columns: 1fr;
+    }
+
+    .forecast-header-row,
+    .forecast-data-row {
+        grid-template-columns: 55px repeat(3, 1fr);
+        gap: 0.15rem;
+    }
+
+    .forecast-col-label {
+        font-size: 0.65rem;
+    }
+
+    .popup-forecast-grid {
+        font-size: 0.7rem;
+    }
+}

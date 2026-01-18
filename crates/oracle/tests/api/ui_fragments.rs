@@ -58,17 +58,17 @@ async fn dashboard_returns_current_day_observations() {
 
 /// Test that the weather fragment endpoint filters by time range
 #[tokio::test]
-async fn weather_fragment_uses_24_hour_window() {
+async fn weather_fragment_uses_3_day_window() {
     let mut weather_data = MockWeatherAccess::new();
 
     weather_data
         .expect_observation_data()
         .withf(|req, _| {
-            // The fragment handler should use a 24-hour window
+            // The fragment handler should use a 3-day window (for timezone handling)
             if let (Some(start), Some(end)) = (req.start, req.end) {
                 let duration = end - start;
-                // Should be approximately 24 hours (allow some tolerance)
-                duration.whole_hours() >= 23 && duration.whole_hours() <= 25
+                // Should be approximately 3 days (72 hours, allow some tolerance)
+                duration.whole_hours() >= 71 && duration.whole_hours() <= 73
             } else {
                 false
             }
@@ -105,14 +105,21 @@ async fn weather_fragment_uses_24_hour_window() {
 async fn forecast_fragment_returns_forecast_data() {
     let mut weather_data = MockWeatherAccess::new();
 
+    // Handler calls forecasts_data twice: once for future, once for past
     weather_data
         .expect_forecasts_data()
         .withf(|req, station_ids| {
             // Should request forecasts starting from now
             req.start.is_some() && req.end.is_some() && station_ids.contains(&"KORD".to_string())
         })
-        .times(1)
+        .times(2)
         .returning(|_, _| Ok(mock_forecast_data()));
+
+    // Handler also calls daily_observations for comparison data
+    weather_data
+        .expect_daily_observations()
+        .times(1)
+        .returning(|_, _| Ok(vec![]));
 
     let test_app = spawn_app(Arc::new(weather_data)).await;
 
@@ -147,8 +154,15 @@ async fn forecast_fragment_returns_forecast_data() {
 async fn forecast_fragment_handles_no_data() {
     let mut weather_data = MockWeatherAccess::new();
 
+    // Handler calls forecasts_data twice: once for future, once for past
     weather_data
         .expect_forecasts_data()
+        .times(2)
+        .returning(|_, _| Ok(vec![]));
+
+    // Handler also calls daily_observations for comparison data
+    weather_data
+        .expect_daily_observations()
         .times(1)
         .returning(|_, _| Ok(vec![]));
 
@@ -240,6 +254,7 @@ fn mock_forecast_data() -> Vec<Forecast> {
             temp_high: 75,
             wind_speed: Some(12),
             temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
+            precip_chance: None,
         },
         Forecast {
             station_id: String::from("KORD"),
@@ -250,6 +265,7 @@ fn mock_forecast_data() -> Vec<Forecast> {
             temp_high: 78,
             wind_speed: Some(8),
             temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
+            precip_chance: None,
         },
     ]
 }

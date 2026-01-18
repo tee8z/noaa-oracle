@@ -22,7 +22,7 @@ pub use event_data::*;
 pub use event_db_migrations::*;
 pub use outcome_generator::*;
 pub use sqlite::{Database, DatabaseWriter};
-pub use weather_data::{Forecast, Observation, Station, WeatherData};
+pub use weather_data::{DailyObservation, Forecast, Observation, Station, WeatherData};
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateEvent {
