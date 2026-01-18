@@ -40,25 +40,29 @@ test.describe("Dashboard", () => {
     // Wait for the page to fully load
     await page.waitForLoadState("networkidle");
 
-    // The weather table should show data from the fixture parquet files
+    // The weather section should show data from the fixture parquet files
     // Look for the Current Weather section and verify it has station data
     const weatherSection = page.locator("text=Current Weather");
     await expect(weatherSection).toBeVisible();
 
-    // There should be a table with weather data (not the empty state message)
-    const weatherTable = page.locator("table").first();
+    // Check that either map view or table view has content (not empty state)
     const emptyState = page.locator("text=No weather data available");
-
-    // Either we have a table with data, or we should fail
-    const hasTable = await weatherTable.isVisible().catch(() => false);
     const hasEmptyState = await emptyState.isVisible().catch(() => false);
-
-    // We expect weather data to be shown (not empty state)
-    expect(hasTable).toBeTruthy();
     expect(hasEmptyState).toBeFalsy();
 
+    // Switch to table view to verify table data
+    await page.evaluate(() => {
+      if (typeof window.switchWeatherView === "function") {
+        window.switchWeatherView("table");
+      }
+    });
+
+    // Now the table should be visible
+    const weatherTable = page.locator("#weather-table-view table").first();
+    await expect(weatherTable).toBeVisible();
+
     // Verify there are actual rows in the table (station data)
-    const tableRows = page.locator("table tbody tr");
+    const tableRows = page.locator("#weather-table-view table tbody tr");
     const rowCount = await tableRows.count();
     expect(rowCount).toBeGreaterThan(0);
   });
@@ -76,8 +80,20 @@ test.describe("Dashboard", () => {
     await page.goto(getDashboardUrl());
     await page.waitForLoadState("networkidle");
 
+    // Switch to table view first (map is default)
+    await page.evaluate(() => {
+      if (typeof window.switchWeatherView === "function") {
+        window.switchWeatherView("table");
+      }
+    });
+
+    // Wait for table view to be visible
+    await expect(page.locator("#weather-table-view")).toBeVisible();
+
     // Ensure weather table has data
-    const weatherRows = page.locator("table tbody tr.weather-row");
+    const weatherRows = page.locator(
+      "#weather-table-view table tbody tr.weather-row",
+    );
     const rowCount = await weatherRows.count();
     expect(rowCount).toBeGreaterThan(0);
 
@@ -90,11 +106,11 @@ test.describe("Dashboard", () => {
     const forecastRow = page.locator(`#forecast-row-${stationId}`);
     await expect(forecastRow).toBeHidden();
 
-    // Check if showForecast function exists (used after HTMX loads data)
-    const hasShowFn = await page.evaluate(
-      () => typeof window.showForecast === "function",
+    // Check if loadForecast function exists
+    const hasLoadFn = await page.evaluate(
+      () => typeof window.loadForecast === "function",
     );
-    expect(hasShowFn).toBeTruthy();
+    expect(hasLoadFn).toBeTruthy();
 
     // Check if toggleForecastIfLoaded function exists (used for subsequent clicks)
     const hasToggleFn = await page.evaluate(
@@ -102,16 +118,15 @@ test.describe("Dashboard", () => {
     );
     expect(hasToggleFn).toBeTruthy();
 
-    // Simulate the HTMX load completing by calling showForecast directly
-    // This marks the row as loaded and shows it
+    // Call loadForecast and wait for the fetch to complete
     await page.evaluate((id) => {
-      window.showForecast(id);
+      window.loadForecast(id);
     }, stationId);
 
-    // The forecast row should now be visible
-    await expect(forecastRow).toBeVisible();
+    // Wait for the forecast row to become visible (fetch completes and shows row)
+    await expect(forecastRow).toBeVisible({ timeout: 10000 });
 
-    // The forecast content area should exist
+    // The forecast content area should exist and have content
     const forecastContent = page.locator(`#forecast-${stationId}`);
     await expect(forecastContent).toBeVisible();
 
