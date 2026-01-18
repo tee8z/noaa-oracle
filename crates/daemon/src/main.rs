@@ -1,7 +1,7 @@
 use daemon::{
-    create_folder, get_config_info, get_coordinates, save_forecasts, save_observations,
-    send_parquet_files, setup_logger, subfolder_exists, upload_to_s3, Cli, ForecastService,
-    ObservationService, RateLimiter, S3Storage, XmlFetcher,
+    create_folder, get_config_info, get_coordinates, send_parquet_files, setup_logger,
+    subfolder_exists, upload_to_s3, Cli, ForecastService, ObservationService, RateLimiter,
+    S3Storage, XmlFetcher,
 };
 use slog::{debug, error, info, Logger};
 use std::{sync::Arc, time::Duration};
@@ -89,18 +89,6 @@ async fn process_data(
     let city_weather_coordinates = get_coordinates(fetcher.clone()).await?;
     debug!(logger_cpy, "coordinates: {}", city_weather_coordinates);
 
-    let forecast_service = ForecastService::new(logger.clone(), fetcher.clone());
-    let forecasts = forecast_service
-        .get_forecasts(&city_weather_coordinates)
-        .await?;
-    debug!(logger_cpy, "forecasts count: {}", forecasts.len());
-
-    let observation_service = ObservationService::new(logger, fetcher);
-    let observations = observation_service
-        .get_observations(&city_weather_coordinates)
-        .await?;
-    debug!(logger_cpy, "observations count: {:?}", observations.len());
-
     let current_utc_time: String = OffsetDateTime::now_utc().format(&Rfc3339)?;
     let root_path = cli.data_dir();
     create_folder(&root_path, logger_cpy);
@@ -111,15 +99,23 @@ async fn process_data(
         create_folder(&subfolder, logger_cpy)
     }
 
-    let forecast_parquet = save_forecasts(
-        forecasts,
-        &subfolder,
-        format!("{}_{}", "forecasts", current_utc_time),
-    );
-    let observation_parquet = save_observations(
-        observations,
-        &subfolder,
-        format!("{}_{}", "observations", current_utc_time),
+    // Write forecasts directly to parquet file (streaming, low memory)
+    let forecast_parquet = format!("{}/forecasts_{}.parquet", subfolder, current_utc_time);
+    let forecast_service = ForecastService::new(logger.clone(), fetcher.clone());
+    forecast_service
+        .get_forecasts_to_file(&city_weather_coordinates, &forecast_parquet)
+        .await?;
+    debug!(logger_cpy, "forecasts written to: {}", forecast_parquet);
+
+    // Write observations directly to parquet file
+    let observation_parquet = format!("{}/observations_{}.parquet", subfolder, current_utc_time);
+    let observation_service = ObservationService::new(logger, fetcher);
+    observation_service
+        .get_observations_to_file(&city_weather_coordinates, &observation_parquet)
+        .await?;
+    debug!(
+        logger_cpy,
+        "observations written to: {}", observation_parquet
     );
 
     // Always send to oracle for local caching

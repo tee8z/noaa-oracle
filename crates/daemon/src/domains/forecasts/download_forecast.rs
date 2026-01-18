@@ -8,13 +8,17 @@ use crate::{
 use anyhow::{anyhow, Error};
 use core::time::Duration as StdDuration;
 use parquet::basic::LogicalType;
+use parquet::file::properties::WriterProperties;
+use parquet::file::writer::SerializedFileWriter;
+use parquet::record::RecordWriter;
 use parquet::{
     basic::{Repetition, Type as PhysicalType},
     schema::types::Type,
 };
 use parquet_derive::ParquetRecordWriter;
 use serde_xml_rs::from_str;
-use slog::{debug, error, info, Logger};
+use slog::{error, info, Logger};
+use std::fs::File;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::{collections::HashMap, ops::Add};
@@ -758,6 +762,20 @@ impl ForecastRetry {
         loop {
             match self.fetcher.fetch_xml(&url).await {
                 Ok(xml) => {
+                    // Check if the response is an error from the NOAA API
+                    // Error responses start with "<error>" instead of "<dwml>"
+                    if xml.trim_start().starts_with("<error>") {
+                        info!(
+                            self.logger,
+                            "NOAA API returned error response for batch, skipping"
+                        );
+                        if let Err(err) = self.tx.send(Ok(HashMap::new())).await {
+                            error!(self.logger, "Error sending result through channel: {}", err);
+                            return Ok(());
+                        }
+                        return Ok(());
+                    }
+
                     let converted_xml: Dwml = match from_str(&xml) {
                         Ok(xml) => xml,
                         Err(err) => {
@@ -819,7 +837,15 @@ impl ForecastService {
     pub fn new(logger: Logger, fetcher: Arc<XmlFetcher>) -> Self {
         ForecastService { logger, fetcher }
     }
-    pub async fn get_forecasts(&self, city_weather: &CityWeather) -> Result<Vec<Forecast>, Error> {
+
+    /// Fetches forecasts and writes them directly to a parquet file in batches.
+    /// Returns the path to the written parquet file.
+    /// This approach streams data to disk as it arrives, avoiding memory accumulation.
+    pub async fn get_forecasts_to_file(
+        &self,
+        city_weather: &CityWeather,
+        output_path: &str,
+    ) -> Result<String, Error> {
         let split_maps = split_cityweather(city_weather.clone(), 50);
         let total_requests = split_maps.len();
         let (tx, mut rx) =
@@ -828,6 +854,8 @@ impl ForecastService {
         let max_retries = 3;
         let request_counter = Arc::new(AtomicUsize::new(total_requests));
         let mut set = JoinSet::new();
+
+        // Spawn fetch tasks
         for city_weather in split_maps {
             let url = get_url(&city_weather);
             let counter_clone = Arc::clone(&request_counter);
@@ -856,28 +884,85 @@ impl ForecastService {
             });
         }
 
-        let forecast_data = Arc::new(Mutex::new(HashMap::new()));
-        let forecast_data_clone = Arc::clone(&forecast_data);
+        // Drop the sender so the channel closes when all tasks complete
+        drop(tx);
+
+        // Create parquet writer
+        let file = File::create(output_path)
+            .map_err(|e| anyhow!("failed to create parquet file: {}", e))?;
+        let props = WriterProperties::builder().build();
+        let writer = Arc::new(Mutex::new(
+            SerializedFileWriter::new(file, Arc::new(create_forecast_schema()), Arc::new(props))
+                .map_err(|e| anyhow!("failed to create parquet writer: {}", e))?,
+        ));
+
+        let writer_clone = Arc::clone(&writer);
+        let city_weather_clone = city_weather.clone();
         let logger_clone = self.logger.clone();
+        let request_counter_clone = Arc::clone(&request_counter);
+
+        // Spawn receiver task that writes batches as they arrive
         set.spawn(async move {
             while let Some(result) = rx.recv().await {
                 match result {
                     Ok(data) => {
+                        if data.is_empty() {
+                            continue;
+                        }
+
                         info!(
                             &logger_clone,
-                            "found more forecast data for: {:?}",
-                            data.keys()
+                            "writing forecast batch with {} stations",
+                            data.len()
                         );
-                        let mut forecast_data = forecast_data_clone.lock().await;
-                        //using station_id as the key
-                        forecast_data.extend(data);
+
+                        // Convert batch to Forecast structs
+                        let mut batch_forecasts = Vec::new();
+                        for all_forecasts in data.values() {
+                            for weather_forecast in all_forecasts {
+                                if let Ok(mut forecast) =
+                                    Forecast::try_from(weather_forecast.clone())
+                                {
+                                    if let Some(city) =
+                                        city_weather_clone.city_data.get(&forecast.station_id)
+                                    {
+                                        forecast.station_name = city.station_name.clone();
+                                        forecast.state = city.state.clone();
+                                        forecast.iata_id = city.iata_id.clone();
+                                        forecast.elevation_m = city.elevation_m;
+                                        batch_forecasts.push(forecast);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Write batch as a row group
+                        if !batch_forecasts.is_empty() {
+                            let mut writer_guard = writer_clone.lock().await;
+                            match writer_guard.next_row_group() {
+                                Ok(mut row_group) => {
+                                    if let Err(e) = batch_forecasts
+                                        .as_slice()
+                                        .write_to_row_group(&mut row_group)
+                                    {
+                                        error!(&logger_clone, "failed to write row group: {}", e);
+                                    }
+                                    if let Err(e) = row_group.close() {
+                                        error!(&logger_clone, "failed to close row group: {}", e);
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(&logger_clone, "failed to create row group: {}", e);
+                                }
+                            };
+                        }
                     }
                     Err(err) => {
                         error!(&logger_clone, "Error fetching forecast data: {}", err);
                     }
                 }
 
-                let batches_left = request_counter.load(Ordering::Relaxed);
+                let batches_left = request_counter_clone.load(Ordering::Relaxed);
                 if batches_left > 0 {
                     let progress = ((total_requests as f64 - batches_left as f64)
                         / total_requests as f64)
@@ -888,15 +973,12 @@ impl ForecastService {
                         batches_left,
                         progress
                     );
-                } else {
-                    rx.close();
-                    rx.recv().await;
-                    info!(&logger_clone, "all request have completed, moving on");
-                    break;
                 }
             }
+            info!(&logger_clone, "all requests have completed, moving on");
         });
 
+        // Wait for all tasks to complete
         while let Some(inner_res) = set.join_next().await {
             match inner_res {
                 Ok(_) => info!(self.logger, "task finished"),
@@ -904,30 +986,17 @@ impl ForecastService {
             }
         }
 
-        info!(self.logger, "done waiting for data, continuing");
-        let mut forecasts = vec![];
-        for all_forecasts in forecast_data.lock().await.values() {
-            for weather_forecats in all_forecasts {
-                let current = weather_forecats.clone();
-                debug!(
-                    self.logger.clone(),
-                    "current weather forecast: {:?}", current
-                );
-                let mut forecast: Forecast = current.try_into()?;
-                debug!(
-                    self.logger.clone(),
-                    "parquet format forecast: {:?}", forecast
-                );
-                let city = city_weather.city_data.get(&forecast.station_id).unwrap();
-                forecast.station_name = city.station_name.clone();
-                forecast.state = city.state.clone();
-                forecast.iata_id = city.iata_id.clone();
-                forecast.elevation_m = city.elevation_m;
-                forecasts.push(forecast)
-            }
-        }
+        // Close the parquet writer
+        info!(self.logger, "closing parquet writer");
+        let writer_guard = Arc::try_unwrap(writer)
+            .map_err(|_| anyhow!("failed to unwrap writer Arc"))?
+            .into_inner();
+        writer_guard
+            .close()
+            .map_err(|e| anyhow!("failed to close parquet writer: {}", e))?;
 
-        Ok(forecasts)
+        info!(self.logger, "done writing forecasts to {}", output_path);
+        Ok(output_path.to_string())
     }
 }
 

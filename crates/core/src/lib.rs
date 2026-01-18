@@ -21,3 +21,6 @@ pub const DEFAULT_ORACLE_PORT: u16 = 9800;
 
 /// Default daemon fetch interval (1 hour)
 pub const DEFAULT_FETCH_INTERVAL: u64 = 3600;
+
+/// Default User-Agent for NOAA API requests
+pub const DEFAULT_USER_AGENT: &str = "noaa-oracle-daemon/1.0";

@@ -39,7 +39,8 @@ config:
   # Temporary data directory
   dataDir: /tmp/noaa-daemon
   # HTTP client settings
-  userAgent: "noaa-oracle-daemon/1.0"
+  # User-Agent header for NOAA API requests (include contact info)
+  userAgent: "4casttruth/1.0 (https://www.4casttruth.win/; 5day4cast@protonmail.com)"
   refillRate: 15.0
   tokenCapacity: 3
 

@@ -1,10 +1,14 @@
 use anyhow::{anyhow, Error};
+use parquet::file::properties::WriterProperties;
+use parquet::file::writer::SerializedFileWriter;
+use parquet::record::RecordWriter;
 use parquet::{
     basic::{LogicalType, Repetition, Type as PhysicalType},
     schema::types::Type,
 };
 use parquet_derive::ParquetRecordWriter;
-use slog::Logger;
+use slog::{info, Logger};
+use std::fs::File;
 use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, macros::format_description, OffsetDateTime};
 
@@ -286,13 +290,26 @@ impl ObservationService {
     pub fn new(logger: Logger, fetcher: Arc<XmlFetcher>) -> Self {
         ObservationService { logger, fetcher }
     }
-    pub async fn get_observations(
+
+    /// Fetches observations and writes them directly to a parquet file.
+    /// Returns the path to the written parquet file.
+    pub async fn get_observations_to_file(
         &self,
         city_weather: &CityWeather,
-    ) -> Result<Vec<Observation>, Error> {
+        output_path: &str,
+    ) -> Result<String, Error> {
         let url = "https://aviationweather.gov/data/cache/metars.cache.xml.gz";
+        info!(self.logger, "fetching observations from {}", url);
         let raw_observation = self.fetcher.fetch_xml_gzip(url).await?;
         let converted_xml: ObservationData = serde_xml_rs::from_str(&raw_observation)?;
+
+        // Create parquet writer
+        let file = File::create(output_path)
+            .map_err(|e| anyhow!("failed to create parquet file: {}", e))?;
+        let props = WriterProperties::builder().build();
+        let mut writer =
+            SerializedFileWriter::new(file, Arc::new(create_observation_schema()), Arc::new(props))
+                .map_err(|e| anyhow!("failed to create parquet writer: {}", e))?;
 
         let mut observations = vec![];
         for value in converted_xml.data.metar.iter() {
@@ -316,6 +333,29 @@ impl ObservationService {
                 observations.push(observation)
             }
         }
-        Ok(observations)
+
+        // Write all observations as a single row group
+        info!(
+            self.logger,
+            "writing {} observations to {}",
+            observations.len(),
+            output_path
+        );
+        let mut row_group = writer
+            .next_row_group()
+            .map_err(|e| anyhow!("failed to create row group: {}", e))?;
+        observations
+            .as_slice()
+            .write_to_row_group(&mut row_group)
+            .map_err(|e| anyhow!("failed to write observations: {}", e))?;
+        row_group
+            .close()
+            .map_err(|e| anyhow!("failed to close row group: {}", e))?;
+        writer
+            .close()
+            .map_err(|e| anyhow!("failed to close parquet writer: {}", e))?;
+
+        info!(self.logger, "done writing observations to {}", output_path);
+        Ok(output_path.to_string())
     }
 }

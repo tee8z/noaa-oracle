@@ -1,61 +1,12 @@
-use std::{fs::File, path::Path, sync::Arc};
+use std::path::Path;
 
 use anyhow::{anyhow, Error};
-use parquet::{
-    file::{properties::WriterProperties, writer::SerializedFileWriter},
-    record::RecordWriter,
-};
 use reqwest::{multipart, Body, Client};
 use slog::{error, info, Logger};
 use tokio::fs::File as TokioFile;
 use tokio_util::codec::{BytesCodec, FramedRead};
 
-use crate::{
-    create_forecast_schema, create_observation_schema, get_full_path, Cli, Forecast, Observation,
-    S3Storage,
-};
-
-pub fn save_observations(
-    observations: Vec<Observation>,
-    root_path: &str,
-    file_name: String,
-) -> String {
-    let full_name = format!("{}/{}.parquet", root_path, file_name);
-
-    let file = File::create(full_name.clone()).unwrap();
-    let props = WriterProperties::builder().build();
-    let mut writer =
-        SerializedFileWriter::new(file, Arc::new(create_observation_schema()), Arc::new(props))
-            .unwrap();
-
-    let mut row_group = writer.next_row_group().unwrap();
-    observations
-        .as_slice()
-        .write_to_row_group(&mut row_group)
-        .unwrap();
-    row_group.close().unwrap();
-    writer.close().unwrap();
-    full_name
-}
-
-pub fn save_forecasts(forecast: Vec<Forecast>, root_path: &str, file_name: String) -> String {
-    let full_name = format!("{}/{}.parquet", root_path, file_name);
-    let file = File::create(full_name.clone()).unwrap();
-
-    let props = WriterProperties::builder().build();
-    let mut writer =
-        SerializedFileWriter::new(file, Arc::new(create_forecast_schema()), Arc::new(props))
-            .unwrap();
-
-    let mut row_group = writer.next_row_group().unwrap();
-    forecast
-        .as_slice()
-        .write_to_row_group(&mut row_group)
-        .unwrap();
-    row_group.close().unwrap();
-    writer.close().unwrap();
-    full_name
-}
+use crate::{get_full_path, Cli, S3Storage};
 
 pub async fn upload_to_s3(
     s3: &S3Storage,

@@ -4,6 +4,7 @@ use clap::Parser;
 use futures::TryStreamExt;
 use noaa_oracle_core::{
     find_config_file, load_config, ConfigSource, DEFAULT_FETCH_INTERVAL, DEFAULT_ORACLE_PORT,
+    DEFAULT_USER_AGENT,
 };
 use reqwest::Client;
 use reqwest_middleware::ClientBuilder;
@@ -100,7 +101,7 @@ impl Cli {
     pub fn user_agent(&self) -> String {
         self.user_agent
             .clone()
-            .unwrap_or_else(|| "noaa-oracle-daemon/1.0".to_string())
+            .unwrap_or_else(|| DEFAULT_USER_AGENT.to_string())
     }
 }
 
