@@ -20,12 +20,16 @@ pub struct ForecastComparison {
 
 /// Forecast detail fragment - shown when a weather row is expanded
 pub fn forecast_detail(
-    _station_id: &str,
+    station_id: &str,
     comparisons: &[ForecastComparison],
     forecasts: &[ForecastDisplay],
 ) -> Markup {
     html! {
         div class="forecast-detail p-3" {
+            h3 class="title is-5 mb-4" {
+                "Forecast for " (station_id)
+            }
+
             // Recent accuracy section
             @if !comparisons.is_empty() {
                 h4 class="title is-6 mb-3" {
