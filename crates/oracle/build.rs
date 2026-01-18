@@ -28,6 +28,7 @@ fn main() {
     build_js(&templates, &output);
     build_css(&templates, &output);
     copy_loader(&templates, &output);
+    copy_static_assets(&templates, &output);
 }
 
 fn build_js(templates: &Path, output: &Path) {
@@ -207,6 +208,38 @@ fn copy_loader(templates: &Path, output: &Path) {
             let minified = try_minify_js(&content).unwrap_or_else(|| content.clone());
             let _ = fs::write(output.join("loader.js"), &minified);
             println!("cargo:warning=Built loader.js ({} bytes)", minified.len());
+        }
+    }
+}
+
+/// Copies static assets (SVG, images, etc.) from templates/static to output
+fn copy_static_assets(templates: &Path, output: &Path) {
+    let static_dir = templates.join("static");
+    if !static_dir.exists() {
+        return;
+    }
+
+    // Track changes for static assets
+    println!("cargo:rerun-if-changed={}", static_dir.display());
+
+    for entry in WalkDir::new(&static_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let path = entry.path();
+        println!("cargo:rerun-if-changed={}", path.display());
+
+        if let Some(filename) = path.file_name() {
+            if let Ok(content) = fs::read(path) {
+                let dest = output.join(filename);
+                let _ = fs::write(&dest, &content);
+                println!(
+                    "cargo:warning=Copied {} ({} bytes)",
+                    filename.to_string_lossy(),
+                    content.len()
+                );
+            }
         }
     }
 }

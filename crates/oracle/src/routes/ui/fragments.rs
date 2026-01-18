@@ -11,7 +11,7 @@ use crate::{
     db::EventStatus,
     templates::{
         fragments::{event_stats, forecast_detail, oracle_info, weather_table_body},
-        EventStats, ForecastDisplay, WeatherDisplay,
+        EventStats, ForecastComparison, ForecastDisplay, WeatherDisplay,
     },
     AppState, ForecastRequest, ObservationRequest, TemperatureUnit,
 };
@@ -100,7 +100,10 @@ async fn get_weather_for_stations(
     let mut weather_data = Vec::new();
 
     let now = OffsetDateTime::now_utc();
-    let start = now - time::Duration::hours(24);
+
+    // Return last 3 days of data - frontend will filter by user's local calendar day
+    // This ensures we have enough data for any timezone
+    let start = now - time::Duration::days(3);
 
     // Current time for "updated_at" field
     let updated_at = now
@@ -154,30 +157,83 @@ pub async fn forecast_handler(
     axum::extract::Path(station_id): axum::extract::Path<String>,
 ) -> Html<String> {
     let now = OffsetDateTime::now_utc();
-    let end = now + time::Duration::days(7);
 
-    let req = ForecastRequest {
+    // Fetch upcoming forecasts (today + 7 days)
+    let future_end = now + time::Duration::days(7);
+    let future_req = ForecastRequest {
         start: Some(now),
-        end: Some(end),
+        end: Some(future_end),
         station_ids: station_id.clone(),
         temperature_unit: TemperatureUnit::Fahrenheit,
     };
 
     let forecasts = state
         .weather_db
-        .forecasts_data(&req, vec![station_id.clone()])
+        .forecasts_data(&future_req, vec![station_id.clone()])
         .await
         .unwrap_or_default();
 
-    let forecast_displays: Vec<ForecastDisplay> = forecasts
+    let mut forecast_displays: Vec<ForecastDisplay> = forecasts
         .into_iter()
         .map(|f| ForecastDisplay {
             date: f.date,
             temp_high: f.temp_high,
             temp_low: f.temp_low,
             wind_speed: f.wind_speed,
+            precip_chance: f.precip_chance,
         })
         .collect();
 
-    Html(forecast_detail(&station_id, &forecast_displays).into_string())
+    // Sort by date chronologically
+    forecast_displays.sort_by(|a, b| a.date.cmp(&b.date));
+
+    // Fetch past forecasts (last 3 days) for comparison
+    let past_start = now - time::Duration::days(3);
+    let past_req = ForecastRequest {
+        start: Some(past_start),
+        end: Some(now),
+        station_ids: station_id.clone(),
+        temperature_unit: TemperatureUnit::Fahrenheit,
+    };
+
+    let past_forecasts = state
+        .weather_db
+        .forecasts_data(&past_req, vec![station_id.clone()])
+        .await
+        .unwrap_or_default();
+
+    // Fetch daily observations for the same period
+    let obs_req = ObservationRequest {
+        start: Some(past_start),
+        end: Some(now),
+        station_ids: station_id.clone(),
+        temperature_unit: TemperatureUnit::Fahrenheit,
+    };
+
+    let daily_obs = state
+        .weather_db
+        .daily_observations(&obs_req, vec![station_id.clone()])
+        .await
+        .unwrap_or_default();
+
+    // Build comparison data by matching forecast dates to observation dates
+    let mut comparisons: Vec<ForecastComparison> = past_forecasts
+        .into_iter()
+        .filter_map(|f| {
+            // Find matching observation for this date
+            let obs = daily_obs.iter().find(|o| o.date == f.date);
+            Some(ForecastComparison {
+                date: f.date,
+                forecast_high: f.temp_high,
+                forecast_low: f.temp_low,
+                actual_high: obs.map(|o| o.temp_high),
+                actual_low: obs.map(|o| o.temp_low),
+            })
+        })
+        .collect();
+
+    // Sort comparisons by date (most recent first)
+    comparisons.sort_by(|a, b| b.date.cmp(&a.date));
+
+    Html(forecast_detail(&station_id, &comparisons, &forecast_displays).into_string())
 }

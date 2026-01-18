@@ -24,6 +24,8 @@ pub struct CurrentWeather {
     pub wind_speed_unit_code: String,
     pub dewpoint_value: Option<f64>,
     pub dewpoint_unit_code: String,
+    pub precip_in: Option<f64>,
+    pub precip_unit_code: String,
 }
 
 impl TryFrom<Metar> for CurrentWeather {
@@ -74,6 +76,13 @@ impl TryFrom<Metar> for CurrentWeather {
                 .map(Some)
                 .unwrap_or(None),
             dewpoint_unit_code: Units::Celcius.to_string(),
+            precip_in: val
+                .precip_in
+                .unwrap_or(String::from(""))
+                .parse::<f64>()
+                .map(Some)
+                .unwrap_or(None),
+            precip_unit_code: Units::Inches.to_string(),
         })
     }
 }
@@ -97,6 +106,8 @@ pub struct Observation {
     pub state: String,
     pub iata_id: String,
     pub elevation_m: Option<f64>,
+    pub precip_in: Option<f64>,
+    pub precip_unit_code: String,
 }
 
 impl TryFrom<CurrentWeather> for Observation {
@@ -125,6 +136,8 @@ impl TryFrom<CurrentWeather> for Observation {
             state: String::from(""),
             iata_id: String::from(""),
             elevation_m: None,
+            precip_in: val.precip_in,
+            precip_unit_code: val.precip_unit_code,
         };
         Ok(parquet)
     }
@@ -225,6 +238,18 @@ pub fn create_observation_schema() -> Type {
         .build()
         .unwrap();
 
+    let precip_in = Type::primitive_type_builder("precip_in", PhysicalType::DOUBLE)
+        .with_repetition(Repetition::OPTIONAL)
+        .build()
+        .unwrap();
+
+    let precip_unit_code =
+        Type::primitive_type_builder("precip_unit_code", PhysicalType::BYTE_ARRAY)
+            .with_repetition(Repetition::REQUIRED)
+            .with_logical_type(Some(LogicalType::String))
+            .build()
+            .unwrap();
+
     let schema = Type::group_type_builder("observation")
         .with_fields(vec![
             Arc::new(station_id),
@@ -244,6 +269,8 @@ pub fn create_observation_schema() -> Type {
             Arc::new(state),
             Arc::new(iata_id),
             Arc::new(elevation_m),
+            Arc::new(precip_in),
+            Arc::new(precip_unit_code),
         ])
         .build()
         .unwrap();
