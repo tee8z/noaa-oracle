@@ -219,16 +219,16 @@ pub async fn forecast_handler(
     // Build comparison data by matching forecast dates to observation dates
     let mut comparisons: Vec<ForecastComparison> = past_forecasts
         .into_iter()
-        .filter_map(|f| {
+        .map(|f| {
             // Find matching observation for this date
             let obs = daily_obs.iter().find(|o| o.date == f.date);
-            Some(ForecastComparison {
+            ForecastComparison {
                 date: f.date,
                 forecast_high: f.temp_high,
                 forecast_low: f.temp_low,
                 actual_high: obs.map(|o| o.temp_high),
                 actual_low: obs.map(|o| o.temp_low),
-            })
+            }
         })
         .collect();
 

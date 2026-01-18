@@ -68,7 +68,7 @@ fn lat_lon_to_svg(lat: f64, lon: f64) -> Option<(f64, f64)> {
     const WEST: f64 = -124.75;
 
     // Continental US bounds check
-    if lat < SOUTH || lat > NORTH || lon < WEST || lon > EAST {
+    if !(SOUTH..=NORTH).contains(&lat) || !(WEST..=EAST).contains(&lon) {
         return None;
     }
 
