@@ -240,6 +240,7 @@ fn mock_forecast_data() -> Vec<Forecast> {
             temp_high: 75,
             wind_speed: Some(12),
             temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
+            precip_chance: None,
         },
         Forecast {
             station_id: String::from("KORD"),
@@ -250,6 +251,7 @@ fn mock_forecast_data() -> Vec<Forecast> {
             temp_high: 78,
             wind_speed: Some(8),
             temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
+            precip_chance: None,
         },
     ]
 }

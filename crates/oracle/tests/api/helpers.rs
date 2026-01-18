@@ -87,6 +87,11 @@ mock! {
             req: &oracle::ObservationRequest,
             station_ids: Vec<String>,
         ) -> Result<Vec<oracle::Observation>, oracle::weather_data::Error>;
+        async fn daily_observations(
+            &self,
+            req: &oracle::ObservationRequest,
+            station_ids: Vec<String>,
+        ) -> Result<Vec<oracle::DailyObservation>, oracle::weather_data::Error>;
         async fn stations(&self) -> Result<Vec<oracle::Station>, oracle::weather_data::Error>;
     }
 }
