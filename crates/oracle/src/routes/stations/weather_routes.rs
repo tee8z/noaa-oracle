@@ -36,12 +36,22 @@ pub async fn forecasts(
 
 #[derive(Clone, Serialize, Deserialize, IntoParams)]
 pub struct ForecastRequest {
+    /// Start of the forecast period (the time being forecast)
     #[serde(with = "time::serde::rfc3339::option")]
     #[serde(default)]
     pub start: Option<OffsetDateTime>,
+    /// End of the forecast period (the time being forecast)
     #[serde(with = "time::serde::rfc3339::option")]
     #[serde(default)]
     pub end: Option<OffsetDateTime>,
+    /// Start of when the forecast was generated/made
+    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(default)]
+    pub generated_start: Option<OffsetDateTime>,
+    /// End of when the forecast was generated/made
+    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(default)]
+    pub generated_end: Option<OffsetDateTime>,
     pub station_ids: String,
     #[serde(default)]
     pub temperature_unit: TemperatureUnit,

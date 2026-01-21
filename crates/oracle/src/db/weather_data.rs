@@ -11,7 +11,7 @@ use regex::Regex;
 use scooby::postgres::{select, with, Aliasable, Parameters, Select};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use time::{format_description::well_known::Rfc3339, Duration};
+use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 use utoipa::ToSchema;
 
 pub struct WeatherAccess {
@@ -112,7 +112,7 @@ impl WeatherData for WeatherAccess {
             String::new()
         };
 
-        // Build time filter clauses
+        // Build time filter clauses for forecast period (begin_time/end_time)
         let mut time_filters = Vec::new();
         if let Some(start) = &req.start {
             time_filters.push(format!(
@@ -126,6 +126,39 @@ impl WeatherData for WeatherAccess {
                 end.format(&Rfc3339)?
             ));
         }
+
+        let now = OffsetDateTime::now_utc();
+        let (generated_start, generated_end) = match (req.generated_start, req.generated_end) {
+            (Some(gs), Some(ge)) => (Some(gs), Some(ge)),
+            (Some(gs), None) => (Some(gs), None),
+            (None, Some(ge)) => (None, Some(ge)),
+            (None, None) => {
+                if let Some(start) = req.start {
+                    let threshold = now + Duration::days(1);
+                    if start <= threshold {
+                        (Some(start.saturating_sub(Duration::days(1))), Some(start))
+                    } else {
+                        (Some(now.saturating_sub(Duration::days(1))), Some(now))
+                    }
+                } else {
+                    (None, None)
+                }
+            }
+        };
+
+        if let Some(generated_start) = generated_start {
+            time_filters.push(format!(
+                "generated_at::TIMESTAMPTZ >= '{}'::TIMESTAMPTZ",
+                generated_start.format(&Rfc3339)?
+            ));
+        }
+        if let Some(generated_end) = generated_end {
+            time_filters.push(format!(
+                "generated_at::TIMESTAMPTZ <= '{}'::TIMESTAMPTZ",
+                generated_end.format(&Rfc3339)?
+            ));
+        }
+
         let time_filter = if time_filters.is_empty() {
             String::new()
         } else if station_filter.is_empty() {
@@ -154,7 +187,8 @@ impl WeatherData for WeatherAccess {
                 SELECT * FROM (
                     SELECT NULL::VARCHAR AS station_id, NULL::VARCHAR AS begin_time, NULL::VARCHAR AS end_time,
                            NULL::BIGINT AS min_temp, NULL::BIGINT AS max_temp, NULL::BIGINT AS wind_speed,
-                           NULL::VARCHAR AS temperature_unit_code, NULL::DOUBLE AS twelve_hour_probability_of_precipitation
+                           NULL::VARCHAR AS temperature_unit_code, NULL::DOUBLE AS twelve_hour_probability_of_precipitation,
+                           NULL::VARCHAR AS generated_at
                     WHERE false
                     UNION ALL BY NAME
                     SELECT * FROM read_parquet(['{}'], union_by_name = true)
@@ -257,6 +291,20 @@ impl WeatherData for WeatherAccess {
             for station_id in station_ids {
                 values.push(station_id);
             }
+        }
+
+        // Filter by generated_at timestamp to only include observations within the requested time range
+        if let Some(start) = &req.start {
+            base_query = base_query.where_(format!(
+                "generated_at::TIMESTAMPTZ >= '{}'::TIMESTAMPTZ",
+                start.format(&Rfc3339)?
+            ));
+        }
+        if let Some(end) = &req.end {
+            base_query = base_query.where_(format!(
+                "generated_at::TIMESTAMPTZ <= '{}'::TIMESTAMPTZ",
+                end.format(&Rfc3339)?
+            ));
         }
 
         let filtered_data = with("all_station_data").as_(base_query);

@@ -729,6 +729,8 @@ impl Oracle {
         let forecast_requests = ForecastRequest {
             start: Some(event.start_observation_date),
             end: Some(event.end_observation_date),
+            generated_start: None,
+            generated_end: None,
             station_ids: station_ids.clone(),
             temperature_unit: TemperatureUnit::Fahrenheit,
         };

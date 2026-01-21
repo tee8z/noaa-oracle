@@ -163,6 +163,8 @@ pub async fn forecast_handler(
     let future_req = ForecastRequest {
         start: Some(now),
         end: Some(future_end),
+        generated_start: None,
+        generated_end: None,
         station_ids: station_id.clone(),
         temperature_unit: TemperatureUnit::Fahrenheit,
     };
@@ -187,11 +189,13 @@ pub async fn forecast_handler(
     // Sort by date chronologically
     forecast_displays.sort_by(|a, b| a.date.cmp(&b.date));
 
-    // Fetch past forecasts (last 3 days) for comparison
+    // Fetch past forecasts for comparison - use forecasts generated before the period started
     let past_start = now - time::Duration::days(3);
     let past_req = ForecastRequest {
         start: Some(past_start),
         end: Some(now),
+        generated_start: Some(past_start - time::Duration::days(1)),
+        generated_end: Some(past_start),
         station_ids: station_id.clone(),
         temperature_unit: TemperatureUnit::Fahrenheit,
     };

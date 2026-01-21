@@ -154,23 +154,22 @@ pub fn drop_suffix(input: &str, suffix: &str) -> String {
 }
 
 fn is_date_in_range(compare_to: Date, params: &FileParams) -> bool {
-    if let Some(start) = params.start {
-        return compare_to >= start.date();
-    }
-
-    if let Some(end) = params.end {
-        return compare_to <= end.date();
-    }
-    true
+    let after_start = params
+        .start
+        .map(|start| compare_to >= start.date())
+        .unwrap_or(true);
+    let before_end = params
+        .end
+        .map(|end| compare_to <= end.date())
+        .unwrap_or(true);
+    after_start && before_end
 }
 
 fn is_time_in_range(compare_to: OffsetDateTime, params: &FileParams) -> bool {
-    if let Some(start) = params.start {
-        return compare_to >= start;
-    }
-
-    if let Some(end) = params.end {
-        return compare_to <= end;
-    }
-    true
+    let after_start = params
+        .start
+        .map(|start| compare_to >= start)
+        .unwrap_or(true);
+    let before_end = params.end.map(|end| compare_to <= end).unwrap_or(true);
+    after_start && before_end
 }
