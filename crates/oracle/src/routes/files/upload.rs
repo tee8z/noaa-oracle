@@ -55,7 +55,9 @@ pub async fn upload(
         })?;
 
         // Use build_file_path which uses file_generated_at.date() for the directory
-        let path = state.file_access.build_file_path(&file_name, file_generated_at);
+        let path = state
+            .file_access
+            .build_file_path(&file_name, file_generated_at);
 
         // Ensure the date directory exists
         if let Some(parent) = std::path::Path::new(&path).parent() {
