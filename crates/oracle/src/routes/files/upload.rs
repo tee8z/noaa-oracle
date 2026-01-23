@@ -4,9 +4,11 @@ use axum::{
 };
 use log::{error, info};
 use std::sync::Arc;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::{fs::File, io::AsyncWriteExt};
 
 use crate::AppState;
+use noaa_oracle_core::fs::create_dir_all;
 
 #[utoipa::path(
     post,
@@ -41,8 +43,31 @@ pub async fn upload(
             file_name,
             bytes_to_mb(data.len())
         );
-        let current_folder = state.file_access.current_folder();
-        let path = std::path::Path::new(&current_folder).join(&file_name);
+
+        // Parse the date from the filename to save in the correct date directory
+        // Filename format: observations_2026-01-21T23:59:43.269662415Z.parquet
+        let file_generated_at = parse_file_timestamp(&file_name).map_err(|err| {
+            error!("error parsing timestamp from filename: {}", err);
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to parse timestamp from filename: {}", err),
+            )
+        })?;
+
+        // Use build_file_path which uses file_generated_at.date() for the directory
+        let path = state.file_access.build_file_path(&file_name, file_generated_at);
+
+        // Ensure the date directory exists
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            create_dir_all(parent.to_str().unwrap_or_default()).map_err(|err| {
+                error!("error creating directory: {}", err);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to create directory: {}", err),
+                )
+            })?;
+        }
+
         // Create a new file and write the data to it
         let mut file = File::create(&path).await.map_err(|err| {
             error!("error creating file: {}", err);
@@ -52,7 +77,7 @@ pub async fn upload(
             )
         })?;
         file.write_all(&data).await.map_err(|err| {
-            error!("error creating file: {}", err);
+            error!("error writing file: {}", err);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to write to file: {}", err),
@@ -61,6 +86,23 @@ pub async fn upload(
     }
 
     Ok(())
+}
+
+/// Parse the timestamp from a filename like "observations_2026-01-21T23:59:43.269662415Z.parquet"
+fn parse_file_timestamp(file_name: &str) -> Result<OffsetDateTime, String> {
+    let parts: Vec<&str> = file_name.split('_').collect();
+    if parts.len() < 2 {
+        return Err("Invalid filename format: missing underscore".to_owned());
+    }
+
+    let timestamp_str = parts
+        .last()
+        .ok_or("Invalid filename format")?
+        .strip_suffix(".parquet")
+        .ok_or("Invalid filename format: missing .parquet suffix")?;
+
+    OffsetDateTime::parse(timestamp_str, &Rfc3339)
+        .map_err(|e| format!("Failed to parse timestamp '{}': {}", timestamp_str, e))
 }
 
 fn bytes_to_mb(bytes: usize) -> f64 {
@@ -87,5 +129,34 @@ fn is_parquet_file(path: &std::path::Path) -> bool {
         extenstion == "parquet"
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_file_timestamp_observations() {
+        let result = parse_file_timestamp("observations_2026-01-21T23:59:43.269662415Z.parquet");
+        assert!(result.is_ok());
+        let dt = result.unwrap();
+        assert_eq!(dt.date().year(), 2026);
+        assert_eq!(dt.date().month() as u8, 1);
+        assert_eq!(dt.date().day(), 21);
+    }
+
+    #[test]
+    fn test_parse_file_timestamp_forecasts() {
+        let result = parse_file_timestamp("forecasts_2026-01-21T15:59:43.858149618Z.parquet");
+        assert!(result.is_ok());
+        let dt = result.unwrap();
+        assert_eq!(dt.date().day(), 21);
+    }
+
+    #[test]
+    fn test_parse_file_timestamp_invalid() {
+        assert!(parse_file_timestamp("invalid.parquet").is_err());
+        assert!(parse_file_timestamp("observations_notadate.parquet").is_err());
     }
 }
