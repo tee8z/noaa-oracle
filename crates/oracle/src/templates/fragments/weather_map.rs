@@ -180,11 +180,11 @@ pub fn weather_map(weather_data: &[WeatherDisplay]) -> Markup {
                             div class="forecast-col" data-field="today-precip-chance" { "-" }
                             div class="forecast-col" data-field="tomorrow-precip-chance" { "-" }
                         }
-                        // Rain row
+                        // Precipitation row (liquid equivalent, includes melted snow)
                         div class="forecast-data-row" {
                             div class="forecast-col-label" {
                                 span class="icon is-small" { i class="fas fa-cloud-rain" {} }
-                                " Rain"
+                                " Precip"
                             }
                             div class="forecast-col" data-field="yesterday-rain" { "-" }
                             div class="forecast-col" data-field="today-rain" { "-" }

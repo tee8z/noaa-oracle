@@ -75,7 +75,7 @@ litestream:
   enabled: false
   image:
     repository: litestream/litestream
-    tag: "0.3.13"
+    tag: "0.5.6"
   s3Bucket: ""
   s3Path: "noaa-oracle/events.sqlite"
   s3Region: "us-east-1"

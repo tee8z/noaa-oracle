@@ -135,7 +135,7 @@ pub fn weather_table_body(weather_data: &[WeatherDisplay]) -> Markup {
                                 th class="has-text-right" { "Temp Low" }
                                 th class="has-text-right" { "Wind" }
                                 th class="has-text-right" { "Humidity" }
-                                th class="has-text-right" { "Rain" }
+                                th class="has-text-right" { "Precip" }
                                 th class="has-text-right" { "Snow" }
                                 th { "Observed" }
                             }

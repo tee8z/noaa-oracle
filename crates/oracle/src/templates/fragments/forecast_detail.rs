@@ -124,11 +124,11 @@ pub fn forecast_detail(
                                         }
                                     }
                                 }
-                                // Rain amount
-                                @if let Some(rain) = forecast.rain_amt {
-                                    @if rain > 0.0 {
+                                // Precipitation amount (liquid equivalent)
+                                @if let Some(precip_amt) = forecast.rain_amt {
+                                    @if precip_amt > 0.0 {
                                         p class="is-size-7 has-text-info" {
-                                            (format!("{:.2}\" rain", rain))
+                                            (format!("{:.2}\" precip", precip_amt))
                                         }
                                     }
                                 }
