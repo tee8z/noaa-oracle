@@ -240,6 +240,10 @@ fn mock_observation_data() -> Vec<Observation> {
         temp_high: 75.0,
         wind_speed: 10,
         temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
+        wind_direction: None,
+        humidity: None,
+        rain_amt: None,
+        snow_amt: None,
     }]
 }
 
@@ -253,8 +257,13 @@ fn mock_forecast_data() -> Vec<Forecast> {
             temp_low: 55,
             temp_high: 75,
             wind_speed: Some(12),
+            wind_direction: None,
+            humidity_max: None,
+            humidity_min: None,
             temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
             precip_chance: None,
+            rain_amt: None,
+            snow_amt: None,
         },
         Forecast {
             station_id: String::from("KORD"),
@@ -264,8 +273,13 @@ fn mock_forecast_data() -> Vec<Forecast> {
             temp_low: 58,
             temp_high: 78,
             wind_speed: Some(8),
+            wind_direction: None,
+            humidity_max: None,
+            humidity_min: None,
             temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
             precip_chance: None,
+            rain_amt: None,
+            snow_amt: None,
         },
     ]
 }

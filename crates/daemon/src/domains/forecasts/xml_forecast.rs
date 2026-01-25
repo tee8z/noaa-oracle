@@ -60,7 +60,8 @@ pub struct Parameter {
     pub temperature: Option<Vec<DataReading>>,
 
     #[serde(rename = "precipitation")]
-    pub precipitation: Option<DataReading>,
+    // holds liquid (rain) and snow precipitation types
+    pub precipitation: Option<Vec<DataReading>>,
 
     #[serde(rename = "wind-speed")]
     pub wind_speed: Option<DataReading>,
@@ -195,6 +196,9 @@ pub enum Type {
 
     #[serde(rename = "wind")]
     Wind,
+
+    #[serde(rename = "snow")]
+    Snow,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
@@ -214,6 +218,9 @@ pub enum Name {
 
     #[serde(rename = "Liquid Precipitation Amount")]
     LiquidPrecipitationAmount,
+
+    #[serde(rename = "Snow Amount")]
+    SnowAmount,
 
     #[serde(rename = "12 Hourly Probability of Precipitation")]
     The12HourlyProbabilityOfPrecipitation,

@@ -36,6 +36,7 @@ async fn can_create_entry_into_event() {
         total_allowed_entries: 1,
         number_of_values_per_entry: 6,
         number_of_places_win: 1,
+        scoring_fields: oracle::ScoringField::defaults(),
     };
 
     let new_entry = AddEventEntry {
@@ -47,18 +48,30 @@ async fn can_create_entry_into_event() {
                 temp_low: Some(oracle::ValueOptions::Par),
                 temp_high: None,
                 wind_speed: None,
+                wind_direction: None,
+                rain_amt: None,
+                snow_amt: None,
+                humidity: None,
             },
             WeatherChoices {
                 stations: String::from("KSAW"),
                 temp_low: Some(oracle::ValueOptions::Par),
                 temp_high: None,
                 wind_speed: Some(oracle::ValueOptions::Over),
+                wind_direction: None,
+                rain_amt: None,
+                snow_amt: None,
+                humidity: None,
             },
             WeatherChoices {
                 stations: String::from("KWMC"),
                 temp_low: Some(oracle::ValueOptions::Par),
                 temp_high: Some(oracle::ValueOptions::Under),
                 wind_speed: None,
+                wind_direction: None,
+                rain_amt: None,
+                snow_amt: None,
+                humidity: None,
             },
         ],
     };
@@ -134,6 +147,7 @@ async fn can_create_and_get_event_entry() {
         total_allowed_entries: 1,
         number_of_places_win: 1,
         number_of_values_per_entry: 6,
+        scoring_fields: oracle::ScoringField::defaults(),
     };
     let new_entry = AddEventEntry {
         id: Uuid::now_v7(),
@@ -144,18 +158,30 @@ async fn can_create_and_get_event_entry() {
                 temp_low: Some(oracle::ValueOptions::Par),
                 temp_high: None,
                 wind_speed: None,
+                wind_direction: None,
+                rain_amt: None,
+                snow_amt: None,
+                humidity: None,
             },
             WeatherChoices {
                 stations: String::from("KSAW"),
                 temp_low: Some(oracle::ValueOptions::Par),
                 temp_high: None,
                 wind_speed: Some(oracle::ValueOptions::Over),
+                wind_direction: None,
+                rain_amt: None,
+                snow_amt: None,
+                humidity: None,
             },
             WeatherChoices {
                 stations: String::from("KWMC"),
                 temp_low: Some(oracle::ValueOptions::Par),
                 temp_high: Some(oracle::ValueOptions::Under),
                 wind_speed: None,
+                wind_direction: None,
+                rain_amt: None,
+                snow_amt: None,
+                humidity: None,
             },
         ],
     };

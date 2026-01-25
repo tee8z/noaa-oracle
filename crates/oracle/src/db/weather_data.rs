@@ -180,19 +180,45 @@ impl WeatherData for WeatherAccess {
         };
 
         // Use raw SQL with UNION ALL BY NAME to handle schema differences
-        // Old files may not have twelve_hour_probability_of_precipitation column
+        // Old files may not have all columns - we define NULL defaults for backwards compatibility
+        // For precipitation, we first deduplicate by taking the latest forecast for each unique time window,
+        // then sum across time windows to get daily totals
         let query_sql = format!(
             r#"
             WITH parquet_data AS (
                 SELECT * FROM (
                     SELECT NULL::VARCHAR AS station_id, NULL::VARCHAR AS begin_time, NULL::VARCHAR AS end_time,
                            NULL::BIGINT AS min_temp, NULL::BIGINT AS max_temp, NULL::BIGINT AS wind_speed,
+                           NULL::BIGINT AS wind_direction, NULL::BIGINT AS relative_humidity_max,
+                           NULL::BIGINT AS relative_humidity_min,
                            NULL::VARCHAR AS temperature_unit_code, NULL::DOUBLE AS twelve_hour_probability_of_precipitation,
+                           NULL::DOUBLE AS liquid_precipitation_amt, NULL::DOUBLE AS snow_amt,
                            NULL::VARCHAR AS generated_at
                     WHERE false
                     UNION ALL BY NAME
                     SELECT * FROM read_parquet(['{}'], union_by_name = true)
                 )
+            ),
+            -- Deduplicate: for each station + time window, take the most recent forecast
+            deduped_forecasts AS (
+                SELECT DISTINCT ON (station_id, begin_time, end_time)
+                    station_id,
+                    begin_time,
+                    end_time,
+                    min_temp,
+                    max_temp,
+                    wind_speed,
+                    wind_direction,
+                    relative_humidity_max,
+                    relative_humidity_min,
+                    temperature_unit_code,
+                    twelve_hour_probability_of_precipitation,
+                    liquid_precipitation_amt,
+                    snow_amt,
+                    generated_at
+                FROM parquet_data
+                {} {}
+                ORDER BY station_id, begin_time, end_time, generated_at DESC
             ),
             daily_forecasts AS (
                 SELECT
@@ -203,10 +229,15 @@ impl WeatherData for WeatherAccess {
                     MIN(min_temp) FILTER (WHERE min_temp IS NOT NULL AND min_temp >= -200 AND min_temp <= 200) AS temp_low,
                     MAX(max_temp) FILTER (WHERE max_temp IS NOT NULL AND max_temp >= -200 AND max_temp <= 200) AS temp_high,
                     MAX(wind_speed) FILTER (WHERE wind_speed IS NOT NULL AND wind_speed >= 0 AND wind_speed <= 500) AS wind_speed,
+                    -- For wind direction, use mode (most common) or just take max as approximation
+                    MAX(wind_direction) FILTER (WHERE wind_direction IS NOT NULL AND wind_direction >= 0 AND wind_direction <= 360) AS wind_direction,
+                    MAX(relative_humidity_max) FILTER (WHERE relative_humidity_max IS NOT NULL AND relative_humidity_max >= 0 AND relative_humidity_max <= 100) AS humidity_max,
+                    MIN(relative_humidity_min) FILTER (WHERE relative_humidity_min IS NOT NULL AND relative_humidity_min >= 0 AND relative_humidity_min <= 100) AS humidity_min,
                     MAX(temperature_unit_code) AS temperature_unit_code,
-                    MAX(twelve_hour_probability_of_precipitation) FILTER (WHERE twelve_hour_probability_of_precipitation IS NOT NULL) AS precip_chance
-                FROM parquet_data
-                {} {}
+                    MAX(twelve_hour_probability_of_precipitation) FILTER (WHERE twelve_hour_probability_of_precipitation IS NOT NULL) AS precip_chance,
+                    SUM(liquid_precipitation_amt) FILTER (WHERE liquid_precipitation_amt IS NOT NULL AND liquid_precipitation_amt >= 0) AS rain_amt,
+                    SUM(snow_amt) FILTER (WHERE snow_amt IS NOT NULL AND snow_amt >= 0) AS snow_amt
+                FROM deduped_forecasts
                 GROUP BY station_id, DATE_TRUNC('day', begin_time::TIMESTAMP)::TEXT
             )
             SELECT
@@ -217,8 +248,13 @@ impl WeatherData for WeatherAccess {
                 MIN(temp_low) AS temp_low,
                 MAX(temp_high) AS temp_high,
                 MAX(wind_speed) AS wind_speed,
+                MAX(wind_direction) AS wind_direction,
+                MAX(humidity_max) AS humidity_max,
+                MIN(humidity_min) AS humidity_min,
                 MAX(temperature_unit_code) AS temperature_unit_code,
-                MAX(precip_chance) AS precip_chance
+                MAX(precip_chance) AS precip_chance,
+                SUM(rain_amt) AS rain_amt,
+                SUM(snow_amt) AS snow_amt
             FROM daily_forecasts
             GROUP BY station_id, date
             "#,
@@ -565,17 +601,47 @@ impl Forecasts {
             .downcast_ref::<Int64Array>()
             .expect("Expected Int64Array in column 6");
 
-        let temperature_unit_code_arr = record_batch
+        let wind_direction_arr = record_batch
             .column(7)
             .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Expected StringArray in column 7");
+            .downcast_ref::<Int64Array>()
+            .expect("Expected Int64Array in column 7");
 
-        let precip_chance_arr = record_batch
+        let humidity_max_arr = record_batch
             .column(8)
             .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Expected Int64Array in column 8");
+
+        let humidity_min_arr = record_batch
+            .column(9)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Expected Int64Array in column 9");
+
+        let temperature_unit_code_arr = record_batch
+            .column(10)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Expected StringArray in column 10");
+
+        let precip_chance_arr = record_batch
+            .column(11)
+            .as_any()
             .downcast_ref::<Float64Array>()
-            .expect("Expected Float64Array in column 8");
+            .expect("Expected Float64Array in column 11");
+
+        let rain_amt_arr = record_batch
+            .column(12)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("Expected Float64Array in column 12");
+
+        let snow_amt_arr = record_batch
+            .column(13)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("Expected Float64Array in column 13");
 
         for row_index in 0..record_batch.num_rows() {
             let station_id = station_id_arr.value(row_index).to_owned();
@@ -597,6 +663,43 @@ impl Forecasts {
                     None
                 }
             };
+
+            // Wind direction in degrees (0-360)
+            let wind_direction = if wind_direction_arr.is_null(row_index) {
+                None
+            } else {
+                let val = wind_direction_arr.value(row_index);
+                if (0..=360).contains(&val) {
+                    Some(val)
+                } else {
+                    None
+                }
+            };
+
+            // Humidity max (0-100%)
+            let humidity_max = if humidity_max_arr.is_null(row_index) {
+                None
+            } else {
+                let val = humidity_max_arr.value(row_index);
+                if (0..=100).contains(&val) {
+                    Some(val)
+                } else {
+                    None
+                }
+            };
+
+            // Humidity min (0-100%)
+            let humidity_min = if humidity_min_arr.is_null(row_index) {
+                None
+            } else {
+                let val = humidity_min_arr.value(row_index);
+                if (0..=100).contains(&val) {
+                    Some(val)
+                } else {
+                    None
+                }
+            };
+
             let temp_unit_code = temperature_unit_code_arr.value(row_index).to_owned();
 
             // Precipitation chance (0-100%)
@@ -611,6 +714,30 @@ impl Forecasts {
                 }
             };
 
+            // Rain amount in inches
+            let rain_amt = if rain_amt_arr.is_null(row_index) {
+                None
+            } else {
+                let val = rain_amt_arr.value(row_index);
+                if val >= 0.0 {
+                    Some(val)
+                } else {
+                    None
+                }
+            };
+
+            // Snow amount in inches
+            let snow_amt = if snow_amt_arr.is_null(row_index) {
+                None
+            } else {
+                let val = snow_amt_arr.value(row_index);
+                if val >= 0.0 {
+                    Some(val)
+                } else {
+                    None
+                }
+            };
+
             let mut forecast = Forecast {
                 station_id,
                 date,
@@ -619,8 +746,13 @@ impl Forecasts {
                 temp_low,
                 temp_high,
                 wind_speed,
+                wind_direction,
+                humidity_max,
+                humidity_min,
                 temp_unit_code,
                 precip_chance,
+                rain_amt,
+                snow_amt,
             };
             forecast.convert_temperature(target_unit);
             forecasts.push(forecast);
@@ -639,8 +771,18 @@ pub struct Forecast {
     pub temp_low: i64,
     pub temp_high: i64,
     pub wind_speed: Option<i64>,
+    /// Wind direction in degrees (0-360, where 0/360 = North)
+    pub wind_direction: Option<i64>,
+    /// Maximum relative humidity (percent)
+    pub humidity_max: Option<i64>,
+    /// Minimum relative humidity (percent)
+    pub humidity_min: Option<i64>,
     pub temp_unit_code: String,
     pub precip_chance: Option<i64>,
+    /// Liquid precipitation (rain) amount in inches
+    pub rain_amt: Option<f64>,
+    /// Snow amount in inches
+    pub snow_amt: Option<f64>,
 }
 
 impl Forecast {
@@ -743,6 +885,12 @@ impl Observations {
                 temp_high,
                 wind_speed,
                 temp_unit_code,
+                // These fields are not yet available in observation parquet files
+                // They will be populated when the daemon is updated to collect this data
+                wind_direction: None,
+                humidity: None,
+                rain_amt: None,
+                snow_amt: None,
             };
             observation.convert_temperature(target_unit);
             observations.push(observation);
@@ -763,6 +911,14 @@ pub struct Observation {
     pub temp_high: f64,
     pub wind_speed: i64,
     pub temp_unit_code: String,
+    /// Wind direction in degrees (0-360, where 0/360 = North)
+    pub wind_direction: Option<i64>,
+    /// Relative humidity (percent)
+    pub humidity: Option<i64>,
+    /// Liquid precipitation (rain) amount in inches
+    pub rain_amt: Option<f64>,
+    /// Snow amount in inches
+    pub snow_amt: Option<f64>,
 }
 
 impl Observation {
@@ -804,6 +960,14 @@ pub struct DailyObservation {
     pub temp_high: f64,
     pub wind_speed: i64,
     pub temp_unit_code: String,
+    /// Wind direction in degrees (0-360, where 0/360 = North)
+    pub wind_direction: Option<i64>,
+    /// Relative humidity (percent)
+    pub humidity: Option<i64>,
+    /// Liquid precipitation (rain) amount in inches
+    pub rain_amt: Option<f64>,
+    /// Snow amount in inches
+    pub snow_amt: Option<f64>,
 }
 
 impl DailyObservation {
@@ -895,6 +1059,12 @@ impl DailyObservations {
                 temp_high,
                 wind_speed,
                 temp_unit_code,
+                // These fields are not yet available in observation parquet files
+                // They will be populated when the daemon is updated to collect this data
+                wind_direction: None,
+                humidity: None,
+                rain_amt: None,
+                snow_amt: None,
             };
             observation.convert_temperature(target_unit);
             observations.push(observation);

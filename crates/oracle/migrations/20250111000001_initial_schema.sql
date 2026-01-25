@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS events (
     event_announcement BLOB NOT NULL,
     locations TEXT NOT NULL,
     coordinator_pubkey TEXT,
-    attestation_signature BLOB
+    attestation_signature BLOB,
+    scoring_fields TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_signing_date ON events(signing_date);
@@ -46,7 +47,11 @@ CREATE TABLE IF NOT EXISTS expected_observations (
     station TEXT NOT NULL,
     temp_low TEXT CHECK(temp_low IN ('over', 'par', 'under')),
     temp_high TEXT CHECK(temp_high IN ('over', 'par', 'under')),
-    wind_speed TEXT CHECK(wind_speed IN ('over', 'par', 'under'))
+    wind_speed TEXT CHECK(wind_speed IN ('over', 'par', 'under')),
+    wind_direction TEXT CHECK(wind_direction IN ('over', 'par', 'under')),
+    rain_amt TEXT CHECK(rain_amt IN ('over', 'par', 'under')),
+    snow_amt TEXT CHECK(snow_amt IN ('over', 'par', 'under')),
+    humidity TEXT CHECK(humidity IN ('over', 'par', 'under'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_expected_observations_entry_id ON expected_observations(entry_id);

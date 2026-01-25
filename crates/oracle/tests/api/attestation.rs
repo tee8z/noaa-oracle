@@ -67,6 +67,7 @@ async fn attestation_unlocks_correct_dlc_outcome() {
         total_allowed_entries: 3,
         number_of_values_per_entry: 4,
         number_of_places_win: 2,
+        scoring_fields: oracle::ScoringField::defaults(),
     };
 
     let event = test_app
@@ -85,12 +86,20 @@ async fn attestation_unlocks_correct_dlc_outcome() {
                 temp_low: Some(ValueOptions::Under),
                 temp_high: None,
                 wind_speed: Some(ValueOptions::Over),
+                wind_direction: None,
+                rain_amt: None,
+                snow_amt: None,
+                humidity: None,
             },
             WeatherChoices {
                 stations: String::from("KSAW"),
                 temp_low: None,
                 temp_high: None,
                 wind_speed: Some(ValueOptions::Over),
+                wind_direction: None,
+                rain_amt: None,
+                snow_amt: None,
+                humidity: None,
             },
         ],
     };
@@ -103,12 +112,20 @@ async fn attestation_unlocks_correct_dlc_outcome() {
                 temp_low: Some(ValueOptions::Par),
                 temp_high: None,
                 wind_speed: Some(ValueOptions::Par),
+                wind_direction: None,
+                rain_amt: None,
+                snow_amt: None,
+                humidity: None,
             },
             WeatherChoices {
                 stations: String::from("KSAW"),
                 temp_low: Some(ValueOptions::Par),
                 temp_high: None,
                 wind_speed: Some(ValueOptions::Over),
+                wind_direction: None,
+                rain_amt: None,
+                snow_amt: None,
+                humidity: None,
             },
         ],
     };
@@ -121,12 +138,20 @@ async fn attestation_unlocks_correct_dlc_outcome() {
                 temp_low: Some(ValueOptions::Over),
                 temp_high: None,
                 wind_speed: Some(ValueOptions::Under),
+                wind_direction: None,
+                rain_amt: None,
+                snow_amt: None,
+                humidity: None,
             },
             WeatherChoices {
                 stations: String::from("KSAW"),
                 temp_low: Some(ValueOptions::Over),
                 temp_high: None,
                 wind_speed: Some(ValueOptions::Under),
+                wind_direction: None,
+                rain_amt: None,
+                snow_amt: None,
+                humidity: None,
             },
         ],
     };
@@ -252,6 +277,7 @@ async fn event_not_signed_before_signing_date() {
         total_allowed_entries: 2,
         number_of_values_per_entry: 2,
         number_of_places_win: 1,
+        scoring_fields: oracle::ScoringField::defaults(),
     };
 
     let event = test_app
@@ -268,6 +294,10 @@ async fn event_not_signed_before_signing_date() {
             temp_low: Some(ValueOptions::Par),
             temp_high: None,
             wind_speed: None,
+            wind_direction: None,
+            rain_amt: None,
+            snow_amt: None,
+            humidity: None,
         }],
     };
 
@@ -279,6 +309,10 @@ async fn event_not_signed_before_signing_date() {
             temp_low: Some(ValueOptions::Over),
             temp_high: None,
             wind_speed: None,
+            wind_direction: None,
+            rain_amt: None,
+            snow_amt: None,
+            humidity: None,
         }],
     };
 
@@ -342,6 +376,7 @@ async fn each_event_has_unique_nonce() {
         total_allowed_entries: 2,
         number_of_values_per_entry: 2,
         number_of_places_win: 1,
+        scoring_fields: oracle::ScoringField::defaults(),
     };
 
     let event2 = CreateEvent {
@@ -353,6 +388,7 @@ async fn each_event_has_unique_nonce() {
         total_allowed_entries: 2,
         number_of_values_per_entry: 2,
         number_of_places_win: 1,
+        scoring_fields: oracle::ScoringField::defaults(),
     };
 
     let created1 = test_app
@@ -391,6 +427,7 @@ async fn event_announcement_has_correct_outcome_count() {
         total_allowed_entries: 5,
         number_of_values_per_entry: 2,
         number_of_places_win: 3,
+        scoring_fields: oracle::ScoringField::defaults(),
     };
 
     let created = test_app
@@ -449,6 +486,7 @@ async fn attestation_is_deterministic() {
         total_allowed_entries: 2,
         number_of_values_per_entry: 2,
         number_of_places_win: 1,
+        scoring_fields: oracle::ScoringField::defaults(),
     };
 
     let created = test_app
@@ -465,6 +503,10 @@ async fn attestation_is_deterministic() {
             temp_low: Some(ValueOptions::Under),
             temp_high: None,
             wind_speed: Some(ValueOptions::Over),
+            wind_direction: None,
+            rain_amt: None,
+            snow_amt: None,
+            humidity: None,
         }],
     };
 
@@ -476,6 +518,10 @@ async fn attestation_is_deterministic() {
             temp_low: Some(ValueOptions::Par),
             temp_high: None,
             wind_speed: Some(ValueOptions::Par),
+            wind_direction: None,
+            rain_amt: None,
+            snow_amt: None,
+            humidity: None,
         }],
     };
 
@@ -555,8 +601,13 @@ fn mock_forecast_data() -> Vec<Forecast> {
             temp_low: 9,
             temp_high: 35,
             wind_speed: Some(8),
+            wind_direction: None,
+            humidity_max: None,
+            humidity_min: None,
             temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
             precip_chance: None,
+            rain_amt: None,
+            snow_amt: None,
         },
         Forecast {
             station_id: String::from("KSAW"),
@@ -566,8 +617,13 @@ fn mock_forecast_data() -> Vec<Forecast> {
             temp_low: 17,
             temp_high: 25,
             wind_speed: Some(3),
+            wind_direction: None,
+            humidity_max: None,
+            humidity_min: None,
             temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
             precip_chance: None,
+            rain_amt: None,
+            snow_amt: None,
         },
     ]
 }
@@ -582,6 +638,10 @@ fn mock_observation_data() -> Vec<Observation> {
             temp_high: 35.0,
             wind_speed: 11,
             temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
+            wind_direction: None,
+            humidity: None,
+            rain_amt: None,
+            snow_amt: None,
         },
         Observation {
             station_id: String::from("KSAW"),
@@ -591,6 +651,10 @@ fn mock_observation_data() -> Vec<Observation> {
             temp_high: 25.0,
             wind_speed: 10,
             temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
+            wind_direction: None,
+            humidity: None,
+            rain_amt: None,
+            snow_amt: None,
         },
     ]
 }

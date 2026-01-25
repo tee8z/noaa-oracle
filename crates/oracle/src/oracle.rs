@@ -1,8 +1,8 @@
 use crate::{
     weather_data, ActiveEvent, AddEventEntry, CreateEvent, CreateEventData, Database, Event,
     EventFilter, EventStatus, EventSummary, Forecast, ForecastRequest, Observation,
-    ObservationRequest, SignEvent, TemperatureUnit, ValueOptions, Weather, WeatherData,
-    WeatherEntry,
+    ObservationRequest, ScoringField, SignEvent, TemperatureUnit, ValueOptions, Weather,
+    WeatherData, WeatherEntry,
 };
 use anyhow::anyhow;
 use base64::{engine::general_purpose, Engine};
@@ -291,6 +291,18 @@ impl Oracle {
             if weather_choice.wind_speed.is_some() {
                 choice_count += 1;
             }
+            if weather_choice.wind_direction.is_some() {
+                choice_count += 1;
+            }
+            if weather_choice.rain_amt.is_some() {
+                choice_count += 1;
+            }
+            if weather_choice.snow_amt.is_some() {
+                choice_count += 1;
+            }
+            if weather_choice.humidity.is_some() {
+                choice_count += 1;
+            }
 
             if choice_count > event.number_of_values_per_entry {
                 return Err(Error::BadEntry(format!(
@@ -480,6 +492,9 @@ impl Oracle {
         let forecast_data = self.event_forecast_data(&event).await?;
         let mut entry_scores: Vec<(Uuid, i64, i64)> = vec![];
 
+        // Get the scoring fields for this event (defaults to temp_high, temp_low, wind_speed)
+        let scoring_fields = &event.scoring_fields;
+
         for entry in entries {
             if entry.event_id != event.id {
                 warn!("entry {} not in this event {}", entry.id, event.id);
@@ -516,84 +531,204 @@ impl Oracle {
                     continue;
                 };
 
-                if let Some(high_temp) = choice.temp_high.clone() {
-                    match high_temp {
-                        ValueOptions::Over => {
-                            if forecast.temp_high < observation.temp_high.round() as i64 {
-                                base_score += OVER_OR_UNDER_POINTS;
-                            }
-                        }
-                        ValueOptions::Par => {
-                            if forecast.temp_high == observation.temp_high.round() as i64 {
-                                base_score += PAR_POINTS;
-                            }
-                        }
-                        ValueOptions::Under => {
-                            if forecast.temp_high > observation.temp_high.round() as i64 {
-                                base_score += OVER_OR_UNDER_POINTS;
-                            }
-                        }
-                    }
-                }
-
-                if let Some(temp_low) = choice.temp_low.clone() {
-                    match temp_low {
-                        ValueOptions::Over => {
-                            if forecast.temp_low < observation.temp_low.round() as i64 {
-                                base_score += OVER_OR_UNDER_POINTS;
-                            }
-                        }
-                        ValueOptions::Par => {
-                            if forecast.temp_low == observation.temp_low.round() as i64 {
-                                base_score += PAR_POINTS;
-                            }
-                        }
-                        ValueOptions::Under => {
-                            if forecast.temp_low > observation.temp_low.round() as i64 {
-                                base_score += OVER_OR_UNDER_POINTS;
-                            }
-                        }
-                    }
-                }
-
-                if let Some(wind_speed_choice) = choice.wind_speed.clone() {
-                    match forecast.wind_speed {
-                        // NOAA provided a wind forecast - normal scoring
-                        Some(forecast_wind) => match wind_speed_choice {
+                // Score temp_high if enabled for this event
+                if scoring_fields.contains(&ScoringField::TempHigh) {
+                    if let Some(high_temp) = choice.temp_high.clone() {
+                        match high_temp {
                             ValueOptions::Over => {
-                                if forecast_wind < observation.wind_speed {
+                                if forecast.temp_high < observation.temp_high.round() as i64 {
                                     base_score += OVER_OR_UNDER_POINTS;
                                 }
                             }
                             ValueOptions::Par => {
-                                if forecast_wind == observation.wind_speed {
+                                if forecast.temp_high == observation.temp_high.round() as i64 {
                                     base_score += PAR_POINTS;
                                 }
                             }
                             ValueOptions::Under => {
-                                if forecast_wind > observation.wind_speed {
+                                if forecast.temp_high > observation.temp_high.round() as i64 {
                                     base_score += OVER_OR_UNDER_POINTS;
                                 }
                             }
-                        },
-                        // NOAA didn't forecast wind (implying 0/calm) - compare against actual
-                        None => {
-                            let implicit_forecast = 0; // NOAA's implicit calm prediction
-                            match wind_speed_choice {
+                        }
+                    }
+                }
+
+                // Score temp_low if enabled for this event
+                if scoring_fields.contains(&ScoringField::TempLow) {
+                    if let Some(temp_low) = choice.temp_low.clone() {
+                        match temp_low {
+                            ValueOptions::Over => {
+                                if forecast.temp_low < observation.temp_low.round() as i64 {
+                                    base_score += OVER_OR_UNDER_POINTS;
+                                }
+                            }
+                            ValueOptions::Par => {
+                                if forecast.temp_low == observation.temp_low.round() as i64 {
+                                    base_score += PAR_POINTS;
+                                }
+                            }
+                            ValueOptions::Under => {
+                                if forecast.temp_low > observation.temp_low.round() as i64 {
+                                    base_score += OVER_OR_UNDER_POINTS;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Score wind_speed if enabled for this event
+                if scoring_fields.contains(&ScoringField::WindSpeed) {
+                    if let Some(wind_speed_choice) = choice.wind_speed.clone() {
+                        match forecast.wind_speed {
+                            // NOAA provided a wind forecast - normal scoring
+                            Some(forecast_wind) => match wind_speed_choice {
                                 ValueOptions::Over => {
-                                    if implicit_forecast < observation.wind_speed {
+                                    if forecast_wind < observation.wind_speed {
                                         base_score += OVER_OR_UNDER_POINTS;
                                     }
                                 }
                                 ValueOptions::Par => {
-                                    if implicit_forecast == observation.wind_speed {
+                                    if forecast_wind == observation.wind_speed {
                                         base_score += PAR_POINTS;
                                     }
                                 }
                                 ValueOptions::Under => {
-                                    if implicit_forecast > observation.wind_speed {
+                                    if forecast_wind > observation.wind_speed {
                                         base_score += OVER_OR_UNDER_POINTS;
                                     }
+                                }
+                            },
+                            // NOAA didn't forecast wind (implying 0/calm) - compare against actual
+                            None => {
+                                let implicit_forecast = 0; // NOAA's implicit calm prediction
+                                match wind_speed_choice {
+                                    ValueOptions::Over => {
+                                        if implicit_forecast < observation.wind_speed {
+                                            base_score += OVER_OR_UNDER_POINTS;
+                                        }
+                                    }
+                                    ValueOptions::Par => {
+                                        if implicit_forecast == observation.wind_speed {
+                                            base_score += PAR_POINTS;
+                                        }
+                                    }
+                                    ValueOptions::Under => {
+                                        if implicit_forecast > observation.wind_speed {
+                                            base_score += OVER_OR_UNDER_POINTS;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Score wind_direction if enabled
+                // Default to 0 if data is not available
+                if scoring_fields.contains(&ScoringField::WindDirection) {
+                    if let Some(wind_dir_choice) = &choice.wind_direction {
+                        let forecast_dir = forecast.wind_direction.unwrap_or(0);
+                        let observed_dir = observation.wind_direction.unwrap_or(0);
+                        // Wind direction comparison: consider "par" if within 22.5 degrees
+                        let diff = ((forecast_dir - observed_dir).abs() % 360)
+                            .min(360 - ((forecast_dir - observed_dir).abs() % 360));
+                        match wind_dir_choice {
+                            ValueOptions::Over => {
+                                if observed_dir > forecast_dir {
+                                    base_score += OVER_OR_UNDER_POINTS;
+                                }
+                            }
+                            ValueOptions::Par => {
+                                if diff <= 22 {
+                                    base_score += PAR_POINTS;
+                                }
+                            }
+                            ValueOptions::Under => {
+                                if observed_dir < forecast_dir {
+                                    base_score += OVER_OR_UNDER_POINTS;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Score rain_amt if enabled
+                // Default to 0.0 if data is not available
+                if scoring_fields.contains(&ScoringField::RainAmt) {
+                    if let Some(rain_choice) = &choice.rain_amt {
+                        let forecast_rain = forecast.rain_amt.unwrap_or(0.0);
+                        let observed_rain = observation.rain_amt.unwrap_or(0.0);
+                        match rain_choice {
+                            ValueOptions::Over => {
+                                if observed_rain > forecast_rain {
+                                    base_score += OVER_OR_UNDER_POINTS;
+                                }
+                            }
+                            ValueOptions::Par => {
+                                // Par for rain: within 0.1 inches
+                                if (observed_rain - forecast_rain).abs() <= 0.1 {
+                                    base_score += PAR_POINTS;
+                                }
+                            }
+                            ValueOptions::Under => {
+                                if observed_rain < forecast_rain {
+                                    base_score += OVER_OR_UNDER_POINTS;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Score snow_amt if enabled
+                // Default to 0.0 if data is not available
+                if scoring_fields.contains(&ScoringField::SnowAmt) {
+                    if let Some(snow_choice) = &choice.snow_amt {
+                        let forecast_snow = forecast.snow_amt.unwrap_or(0.0);
+                        let observed_snow = observation.snow_amt.unwrap_or(0.0);
+                        match snow_choice {
+                            ValueOptions::Over => {
+                                if observed_snow > forecast_snow {
+                                    base_score += OVER_OR_UNDER_POINTS;
+                                }
+                            }
+                            ValueOptions::Par => {
+                                // Par for snow: within 0.5 inches
+                                if (observed_snow - forecast_snow).abs() <= 0.5 {
+                                    base_score += PAR_POINTS;
+                                }
+                            }
+                            ValueOptions::Under => {
+                                if observed_snow < forecast_snow {
+                                    base_score += OVER_OR_UNDER_POINTS;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Score humidity if enabled
+                // Default to 0 if data is not available
+                if scoring_fields.contains(&ScoringField::Humidity) {
+                    if let Some(humidity_choice) = &choice.humidity {
+                        // Use forecast humidity_max for comparison
+                        let forecast_humidity = forecast.humidity_max.unwrap_or(0);
+                        let observed_humidity = observation.humidity.unwrap_or(0);
+                        match humidity_choice {
+                            ValueOptions::Over => {
+                                if observed_humidity > forecast_humidity {
+                                    base_score += OVER_OR_UNDER_POINTS;
+                                }
+                            }
+                            ValueOptions::Par => {
+                                // Par for humidity: within 5%
+                                if (observed_humidity - forecast_humidity).abs() <= 5 {
+                                    base_score += PAR_POINTS;
+                                }
+                            }
+                            ValueOptions::Under => {
+                                if observed_humidity < forecast_humidity {
+                                    base_score += OVER_OR_UNDER_POINTS;
                                 }
                             }
                         }
