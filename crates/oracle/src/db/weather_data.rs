@@ -183,6 +183,7 @@ impl WeatherData for WeatherAccess {
         // Old files may not have all columns - we define NULL defaults for backwards compatibility
         // For precipitation, we first deduplicate by taking the latest forecast for each unique time window,
         // then sum across time windows to get daily totals
+        // Rain is calculated as: QPF - (snow_amt / snow_ratio), or just QPF if no snow_ratio
         let query_sql = format!(
             r#"
             WITH parquet_data AS (
@@ -193,6 +194,7 @@ impl WeatherData for WeatherAccess {
                            NULL::BIGINT AS relative_humidity_min,
                            NULL::VARCHAR AS temperature_unit_code, NULL::DOUBLE AS twelve_hour_probability_of_precipitation,
                            NULL::DOUBLE AS liquid_precipitation_amt, NULL::DOUBLE AS snow_amt,
+                           NULL::DOUBLE AS snow_ratio,
                            NULL::VARCHAR AS generated_at
                     WHERE false
                     UNION ALL BY NAME
@@ -215,6 +217,7 @@ impl WeatherData for WeatherAccess {
                     twelve_hour_probability_of_precipitation,
                     liquid_precipitation_amt,
                     snow_amt,
+                    snow_ratio,
                     generated_at
                 FROM parquet_data
                 {} {}
@@ -235,8 +238,11 @@ impl WeatherData for WeatherAccess {
                     MIN(relative_humidity_min) FILTER (WHERE relative_humidity_min IS NOT NULL AND relative_humidity_min >= 0 AND relative_humidity_min <= 100) AS humidity_min,
                     MAX(temperature_unit_code) AS temperature_unit_code,
                     MAX(twelve_hour_probability_of_precipitation) FILTER (WHERE twelve_hour_probability_of_precipitation IS NOT NULL) AS precip_chance,
-                    SUM(liquid_precipitation_amt) FILTER (WHERE liquid_precipitation_amt IS NOT NULL AND liquid_precipitation_amt >= 0) AS rain_amt,
-                    SUM(snow_amt) FILTER (WHERE snow_amt IS NOT NULL AND snow_amt >= 0) AS snow_amt
+                    -- Total QPF (liquid equivalent of all precipitation)
+                    SUM(liquid_precipitation_amt) FILTER (WHERE liquid_precipitation_amt IS NOT NULL AND liquid_precipitation_amt >= 0) AS total_qpf,
+                    SUM(snow_amt) FILTER (WHERE snow_amt IS NOT NULL AND snow_amt >= 0) AS snow_amt,
+                    -- Average snow ratio for the day (typically 10-20, meaning 10-20 inches snow per inch liquid)
+                    AVG(snow_ratio) FILTER (WHERE snow_ratio IS NOT NULL AND snow_ratio > 0) AS avg_snow_ratio
                 FROM deduped_forecasts
                 GROUP BY station_id, DATE_TRUNC('day', begin_time::TIMESTAMP)::TEXT
             )
@@ -253,7 +259,12 @@ impl WeatherData for WeatherAccess {
                 MIN(humidity_min) AS humidity_min,
                 MAX(temperature_unit_code) AS temperature_unit_code,
                 MAX(precip_chance) AS precip_chance,
-                SUM(rain_amt) AS rain_amt,
+                -- Calculate rain: if no snow_ratio, treat all QPF as rain
+                -- Otherwise: rain = QPF - (snow / snow_ratio), but never negative
+                GREATEST(0, COALESCE(
+                    SUM(total_qpf) - (SUM(snow_amt) / NULLIF(AVG(avg_snow_ratio), 0)),
+                    SUM(total_qpf)
+                )) AS rain_amt,
                 SUM(snow_amt) AS snow_amt
             FROM daily_forecasts
             GROUP BY station_id, date

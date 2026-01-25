@@ -76,6 +76,10 @@ pub struct Parameter {
     // holds max and min
     pub humidity: Option<Vec<DataReading>>,
 
+    #[serde(rename = "winter-weather-outlook")]
+    // holds snow ratio (ratio of snow accumulation to liquid equivalent)
+    pub winter_weather_outlook: Option<DataReading>,
+
     #[serde(rename = "applicable-location")]
     pub applicable_location: String,
 }
@@ -199,6 +203,9 @@ pub enum Type {
 
     #[serde(rename = "snow")]
     Snow,
+
+    #[serde(rename = "ratio of snow accumulation to its melted liquid equivalent")]
+    SnowRatio,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
@@ -221,6 +228,9 @@ pub enum Name {
 
     #[serde(rename = "Snow Amount")]
     SnowAmount,
+
+    #[serde(rename = "Snow Ratio")]
+    SnowRatio,
 
     #[serde(rename = "12 Hourly Probability of Precipitation")]
     The12HourlyProbabilityOfPrecipitation,
