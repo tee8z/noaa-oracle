@@ -1,5 +1,5 @@
 use crate::Type::{
-    Liquid, Maximum, MaximumRelative, Minimum, MinimumRelative,
+    Ice, Liquid, Maximum, MaximumRelative, Minimum, MinimumRelative,
     ProbabilityOfPrecipitationWithin12Hours, Snow, SnowRatio, Sustained, Wind,
 };
 use crate::{
@@ -66,6 +66,8 @@ pub struct WeatherForecast {
     pub snow_amt_unit_code: String,
     pub snow_ratio: Option<f64>,
     pub snow_ratio_unit_code: String,
+    pub ice_amt: Option<f64>,
+    pub ice_amt_unit_code: String,
     pub twelve_hour_probability_of_precipitation: Option<i64>,
     pub twelve_hour_probability_of_precipitation_unit_code: String,
 }
@@ -101,6 +103,8 @@ pub struct Forecast {
     pub snow_amt_unit_code: String,
     pub snow_ratio: Option<f64>,
     pub snow_ratio_unit_code: String,
+    pub ice_amt: Option<f64>,
+    pub ice_amt_unit_code: String,
 }
 
 impl TryFrom<WeatherForecast> for Forecast {
@@ -146,6 +150,8 @@ impl TryFrom<WeatherForecast> for Forecast {
             snow_amt_unit_code: val.snow_amt_unit_code,
             snow_ratio: val.snow_ratio,
             snow_ratio_unit_code: val.snow_ratio_unit_code,
+            ice_amt: val.ice_amt,
+            ice_amt_unit_code: val.ice_amt_unit_code,
         };
         Ok(parquet)
     }
@@ -324,6 +330,18 @@ pub fn create_forecast_schema() -> Type {
             .build()
             .unwrap();
 
+    let ice_amt = Type::primitive_type_builder("ice_amt", PhysicalType::DOUBLE)
+        .with_repetition(Repetition::OPTIONAL)
+        .build()
+        .unwrap();
+
+    let ice_amt_unit_code =
+        Type::primitive_type_builder("ice_amt_unit_code", PhysicalType::BYTE_ARRAY)
+            .with_logical_type(Some(LogicalType::String))
+            .with_repetition(Repetition::REQUIRED)
+            .build()
+            .unwrap();
+
     let schema = Type::group_type_builder("forecast")
         .with_fields(vec![
             Arc::new(station_id),
@@ -355,6 +373,8 @@ pub fn create_forecast_schema() -> Type {
             Arc::new(snow_amt_unit_code),
             Arc::new(snow_ratio),
             Arc::new(snow_ratio_unit_code),
+            Arc::new(ice_amt),
+            Arc::new(ice_amt_unit_code),
         ])
         .build()
         .unwrap();
@@ -466,6 +486,8 @@ impl TryFrom<Dwml> for HashMap<String, Vec<WeatherForecast>> {
                         snow_amt_unit_code: Units::Inches.to_string(),
                         snow_ratio: None,
                         snow_ratio_unit_code: Units::Percent.to_string(),
+                        ice_amt: None,
+                        ice_amt_unit_code: Units::Inches.to_string(),
                         twelve_hour_probability_of_precipitation: None,
                         twelve_hour_probability_of_precipitation_unit_code: Units::Percent
                             .to_string(),
@@ -754,6 +776,21 @@ fn add_data(
                     current_data.snow_ratio = prev_weather_data.snow_ratio;
                 }
                 current_data.snow_ratio_unit_code = data.units.to_string();
+            }
+            Ice => {
+                if let Some(index) = time_interval_index {
+                    current_data.ice_amt = data
+                        .value
+                        .get(index)
+                        .and_then(|value| value.parse::<f64>().ok())
+                        .map_or(prev_weather_data.ice_amt, |parsed_value| {
+                            prev_weather_data.ice_amt = Some(parsed_value);
+                            Some(parsed_value)
+                        });
+                } else {
+                    current_data.ice_amt = prev_weather_data.ice_amt;
+                }
+                current_data.ice_amt_unit_code = data.units.to_string();
             }
         }
     }
@@ -1182,5 +1219,5 @@ fn get_url(city_weather: &CityWeather) -> String {
     let one_week_from_now = current_time.add(one_week_duration);
 
     let one_week = one_week_from_now.format(&format_description).unwrap();
-    format!("https://graphical.weather.gov/xml/sample_products/browser_interface/ndfdXMLclient.php?listLatLon={}&product=time-series&begin={}&end={}&Unit=e&maxt=maxt&mint=mint&wspd=wspd&wdir=wdir&pop12=pop12&qpf=qpf&snow=snow&snowratio=snowratio&maxrh=maxrh&minrh=minrh", city_weather.get_coordinates_url(),now,one_week)
+    format!("https://graphical.weather.gov/xml/sample_products/browser_interface/ndfdXMLclient.php?listLatLon={}&product=time-series&begin={}&end={}&Unit=e&maxt=maxt&mint=mint&wspd=wspd&wdir=wdir&pop12=pop12&qpf=qpf&snow=snow&snowratio=snowratio&iceaccum=iceaccum&maxrh=maxrh&minrh=minrh", city_weather.get_coordinates_url(),now,one_week)
 }

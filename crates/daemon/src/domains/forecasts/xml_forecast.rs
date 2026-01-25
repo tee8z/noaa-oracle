@@ -204,6 +204,9 @@ pub enum Type {
     #[serde(rename = "snow")]
     Snow,
 
+    #[serde(rename = "ice")]
+    Ice,
+
     #[serde(rename = "ratio of snow accumulation to its melted liquid equivalent")]
     SnowRatio,
 }
@@ -231,6 +234,9 @@ pub enum Name {
 
     #[serde(rename = "Snow Ratio")]
     SnowRatio,
+
+    #[serde(rename = "Ice Accumulation")]
+    IceAccumulation,
 
     #[serde(rename = "12 Hourly Probability of Precipitation")]
     The12HourlyProbabilityOfPrecipitation,

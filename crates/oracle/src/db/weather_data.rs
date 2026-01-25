@@ -194,7 +194,7 @@ impl WeatherData for WeatherAccess {
                            NULL::BIGINT AS relative_humidity_min,
                            NULL::VARCHAR AS temperature_unit_code, NULL::DOUBLE AS twelve_hour_probability_of_precipitation,
                            NULL::DOUBLE AS liquid_precipitation_amt, NULL::DOUBLE AS snow_amt,
-                           NULL::DOUBLE AS snow_ratio,
+                           NULL::DOUBLE AS snow_ratio, NULL::DOUBLE AS ice_amt,
                            NULL::VARCHAR AS generated_at
                     WHERE false
                     UNION ALL BY NAME
@@ -218,6 +218,7 @@ impl WeatherData for WeatherAccess {
                     liquid_precipitation_amt,
                     snow_amt,
                     snow_ratio,
+                    ice_amt,
                     generated_at
                 FROM parquet_data
                 {} {}
@@ -242,7 +243,9 @@ impl WeatherData for WeatherAccess {
                     SUM(liquid_precipitation_amt) FILTER (WHERE liquid_precipitation_amt IS NOT NULL AND liquid_precipitation_amt >= 0) AS total_qpf,
                     SUM(snow_amt) FILTER (WHERE snow_amt IS NOT NULL AND snow_amt >= 0) AS snow_amt,
                     -- Average snow ratio for the day (typically 10-20, meaning 10-20 inches snow per inch liquid)
-                    AVG(snow_ratio) FILTER (WHERE snow_ratio IS NOT NULL AND snow_ratio > 0) AS avg_snow_ratio
+                    AVG(snow_ratio) FILTER (WHERE snow_ratio IS NOT NULL AND snow_ratio > 0) AS avg_snow_ratio,
+                    -- Ice accumulation (already in inches, ~1:1 liquid equivalent)
+                    SUM(ice_amt) FILTER (WHERE ice_amt IS NOT NULL AND ice_amt >= 0) AS ice_amt
                 FROM deduped_forecasts
                 GROUP BY station_id, DATE_TRUNC('day', begin_time::TIMESTAMP)::TEXT
             )
@@ -259,13 +262,15 @@ impl WeatherData for WeatherAccess {
                 MIN(humidity_min) AS humidity_min,
                 MAX(temperature_unit_code) AS temperature_unit_code,
                 MAX(precip_chance) AS precip_chance,
-                -- Calculate rain: if no snow_ratio, treat all QPF as rain
-                -- Otherwise: rain = QPF - (snow / snow_ratio), but never negative
+                -- Calculate rain: QPF - (snow / snow_ratio) - ice
+                -- If no snow_ratio, treat all QPF as rain (minus ice)
+                -- Never return negative values
                 GREATEST(0, COALESCE(
-                    SUM(total_qpf) - (SUM(snow_amt) / NULLIF(AVG(avg_snow_ratio), 0)),
-                    SUM(total_qpf)
+                    SUM(total_qpf) - (SUM(snow_amt) / NULLIF(AVG(avg_snow_ratio), 0)) - COALESCE(SUM(ice_amt), 0),
+                    SUM(total_qpf) - COALESCE(SUM(ice_amt), 0)
                 )) AS rain_amt,
-                SUM(snow_amt) AS snow_amt
+                SUM(snow_amt) AS snow_amt,
+                SUM(ice_amt) AS ice_amt
             FROM daily_forecasts
             GROUP BY station_id, date
             "#,
@@ -654,6 +659,12 @@ impl Forecasts {
             .downcast_ref::<Float64Array>()
             .expect("Expected Float64Array in column 13");
 
+        let ice_amt_arr = record_batch
+            .column(14)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("Expected Float64Array in column 14");
+
         for row_index in 0..record_batch.num_rows() {
             let station_id = station_id_arr.value(row_index).to_owned();
             let date = date_arr.value(row_index).to_owned();
@@ -749,6 +760,18 @@ impl Forecasts {
                 }
             };
 
+            // Ice amount in inches
+            let ice_amt = if ice_amt_arr.is_null(row_index) {
+                None
+            } else {
+                let val = ice_amt_arr.value(row_index);
+                if val >= 0.0 {
+                    Some(val)
+                } else {
+                    None
+                }
+            };
+
             let mut forecast = Forecast {
                 station_id,
                 date,
@@ -764,6 +787,7 @@ impl Forecasts {
                 precip_chance,
                 rain_amt,
                 snow_amt,
+                ice_amt,
             };
             forecast.convert_temperature(target_unit);
             forecasts.push(forecast);
@@ -794,6 +818,8 @@ pub struct Forecast {
     pub rain_amt: Option<f64>,
     /// Snow amount in inches
     pub snow_amt: Option<f64>,
+    /// Ice accumulation in inches
+    pub ice_amt: Option<f64>,
 }
 
 impl Forecast {
