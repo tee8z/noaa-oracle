@@ -264,6 +264,7 @@ fn mock_forecast_data() -> Vec<Forecast> {
             precip_chance: None,
             rain_amt: None,
             snow_amt: None,
+            ice_amt: None,
         },
         Forecast {
             station_id: String::from("KORD"),
@@ -280,6 +281,7 @@ fn mock_forecast_data() -> Vec<Forecast> {
             precip_chance: None,
             rain_amt: None,
             snow_amt: None,
+            ice_amt: None,
         },
     ]
 }
