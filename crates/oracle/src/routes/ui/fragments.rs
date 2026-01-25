@@ -182,7 +182,12 @@ pub async fn forecast_handler(
             temp_high: f.temp_high,
             temp_low: f.temp_low,
             wind_speed: f.wind_speed,
+            wind_direction: f.wind_direction,
+            humidity_max: f.humidity_max,
+            humidity_min: f.humidity_min,
             precip_chance: f.precip_chance,
+            rain_amt: f.rain_amt,
+            snow_amt: f.snow_amt,
         })
         .collect();
 

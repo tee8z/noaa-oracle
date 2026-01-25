@@ -37,6 +37,7 @@ async fn can_create_oracle_event() {
         total_allowed_entries: 5,
         number_of_places_win: 3,
         number_of_values_per_entry: 6,
+        scoring_fields: oracle::ScoringField::defaults(),
     };
 
     let body_json = to_string(&new_event).unwrap();
@@ -113,6 +114,7 @@ async fn can_create_and_get_oracle_event() {
         total_allowed_entries: 5,
         number_of_values_per_entry: 6,
         number_of_places_win: 3,
+        scoring_fields: oracle::ScoringField::defaults(),
     };
     let body_json = to_string(&new_event).unwrap();
     let payload_hash = Sha256Hash::hash(body_json.as_bytes());

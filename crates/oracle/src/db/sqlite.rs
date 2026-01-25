@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use super::{
     ActiveEvent, CreateEventData, Event, EventFilter, EventSummary, Forecasted, Observed,
-    SignEvent, ValueOptions, Weather, WeatherChoices, WeatherEntry,
+    ScoringField, SignEvent, ValueOptions, Weather, WeatherChoices, WeatherEntry,
 };
 
 type WriteOperation = std::pin::Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -171,14 +171,16 @@ impl Database {
                 let locations_json = serde_json::to_string(&event.locations)?;
                 let nonce_bytes = serde_json::to_vec(&event.nonce)?;
                 let announcement_bytes = serde_json::to_vec(&event.event_announcement)?;
+                let scoring_fields_json = serde_json::to_string(&event.scoring_fields)?;
 
                 sqlx::query(
                     "INSERT INTO events (
                         id, total_allowed_entries, number_of_places_win,
                         number_of_values_per_entry, nonce, signing_date,
                         start_observation_date, end_observation_date,
-                        locations, event_announcement, coordinator_pubkey
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        locations, event_announcement, coordinator_pubkey,
+                        scoring_fields
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(event.id.to_string())
                 .bind(event.total_allowed_entries)
@@ -191,6 +193,7 @@ impl Database {
                 .bind(&locations_json)
                 .bind(&announcement_bytes)
                 .bind(&event.coordinator_pubkey)
+                .bind(&scoring_fields_json)
                 .execute(&pool)
                 .await?;
 
@@ -216,14 +219,19 @@ impl Database {
                     for choice in &entry.expected_observations {
                         sqlx::query(
                             "INSERT INTO expected_observations
-                             (entry_id, station, temp_low, temp_high, wind_speed)
-                             VALUES (?, ?, ?, ?, ?)",
+                             (entry_id, station, temp_low, temp_high, wind_speed,
+                              wind_direction, rain_amt, snow_amt, humidity)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         )
                         .bind(entry.id.to_string())
                         .bind(&choice.stations)
                         .bind(choice.temp_low.as_ref().map(|v| v.to_string()))
                         .bind(choice.temp_high.as_ref().map(|v| v.to_string()))
                         .bind(choice.wind_speed.as_ref().map(|v| v.to_string()))
+                        .bind(choice.wind_direction.as_ref().map(|v| v.to_string()))
+                        .bind(choice.rain_amt.as_ref().map(|v| v.to_string()))
+                        .bind(choice.snow_amt.as_ref().map(|v| v.to_string()))
+                        .bind(choice.humidity.as_ref().map(|v| v.to_string()))
                         .execute(&mut *tx)
                         .await?;
                     }
@@ -252,7 +260,7 @@ impl Database {
             "SELECT id, signing_date, start_observation_date, end_observation_date,
                     event_announcement, locations, total_allowed_entries,
                     number_of_places_win, number_of_values_per_entry,
-                    attestation_signature, nonce, coordinator_pubkey
+                    attestation_signature, nonce, coordinator_pubkey, scoring_fields
              FROM events WHERE id = ?",
         )
         .bind(id.to_string())
@@ -272,6 +280,7 @@ impl Database {
         let nonce_bytes: Vec<u8> = row.get("nonce");
         let attestation_bytes: Option<Vec<u8>> = row.get("attestation_signature");
         let coordinator_pubkey: Option<String> = row.get("coordinator_pubkey");
+        let scoring_fields_json: Option<String> = row.get("scoring_fields");
 
         let signing_date = OffsetDateTime::from_unix_timestamp(signing_ts)?;
         let start_observation_date = OffsetDateTime::from_unix_timestamp(start_ts)?;
@@ -284,6 +293,9 @@ impl Database {
         let attestation: Option<MaybeScalar> = attestation_bytes
             .as_ref()
             .and_then(|b| serde_json::from_slice(b).ok());
+        let scoring_fields: Vec<ScoringField> = scoring_fields_json
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_else(ScoringField::defaults);
 
         let status = super::get_status(attestation, start_observation_date, end_observation_date);
 
@@ -304,6 +316,7 @@ impl Database {
             event_announcement,
             attestation,
             coordinator_pubkey: coordinator_pubkey.unwrap_or_default(),
+            scoring_fields,
         })
     }
 
@@ -337,7 +350,8 @@ impl Database {
 
     async fn get_entry_choices(&self, entry_id: &Uuid) -> Result<Vec<WeatherChoices>> {
         let rows = sqlx::query(
-            "SELECT station, temp_low, temp_high, wind_speed
+            "SELECT station, temp_low, temp_high, wind_speed,
+                    wind_direction, rain_amt, snow_amt, humidity
              FROM expected_observations WHERE entry_id = ?",
         )
         .bind(entry_id.to_string())
@@ -357,6 +371,18 @@ impl Database {
                 wind_speed: row
                     .get::<Option<String>, _>("wind_speed")
                     .and_then(|s| ValueOptions::try_from(s).ok()),
+                wind_direction: row
+                    .get::<Option<String>, _>("wind_direction")
+                    .and_then(|s| ValueOptions::try_from(s).ok()),
+                rain_amt: row
+                    .get::<Option<String>, _>("rain_amt")
+                    .and_then(|s| ValueOptions::try_from(s).ok()),
+                snow_amt: row
+                    .get::<Option<String>, _>("snow_amt")
+                    .and_then(|s| ValueOptions::try_from(s).ok()),
+                humidity: row
+                    .get::<Option<String>, _>("humidity")
+                    .and_then(|s| ValueOptions::try_from(s).ok()),
             });
         }
 
@@ -368,7 +394,7 @@ impl Database {
             "SELECT e.id, e.signing_date, e.start_observation_date, e.end_observation_date,
                     e.locations, e.total_allowed_entries, e.number_of_places_win,
                     e.number_of_values_per_entry, e.attestation_signature,
-                    COUNT(ee.id) as total_entries
+                    e.scoring_fields, COUNT(ee.id) as total_entries
              FROM events e
              LEFT JOIN events_entries ee ON ee.event_id = e.id
              WHERE e.attestation_signature IS NULL
@@ -385,6 +411,7 @@ impl Database {
             let end_ts: i64 = row.get("end_observation_date");
             let locations_json: String = row.get("locations");
             let attestation_bytes: Option<Vec<u8>> = row.get("attestation_signature");
+            let scoring_fields_json: Option<String> = row.get("scoring_fields");
 
             let signing_date = OffsetDateTime::from_unix_timestamp(signing_ts)?;
             let start_observation_date = OffsetDateTime::from_unix_timestamp(start_ts)?;
@@ -393,6 +420,9 @@ impl Database {
             let attestation: Option<MaybeScalar> = attestation_bytes
                 .as_ref()
                 .and_then(|b| serde_json::from_slice(b).ok());
+            let scoring_fields: Vec<ScoringField> = scoring_fields_json
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_else(ScoringField::defaults);
 
             let status =
                 super::get_status(attestation, start_observation_date, end_observation_date);
@@ -409,6 +439,7 @@ impl Database {
                 number_of_values_per_entry: row.get("number_of_values_per_entry"),
                 number_of_places_win: row.get("number_of_places_win"),
                 attestation,
+                scoring_fields,
             });
         }
 

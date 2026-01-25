@@ -6,7 +6,17 @@ pub struct ForecastDisplay {
     pub temp_high: i64,
     pub temp_low: i64,
     pub wind_speed: Option<i64>,
+    /// Wind direction in degrees (0-360, where 0/360 = North)
+    pub wind_direction: Option<i64>,
+    /// Maximum relative humidity (percent)
+    pub humidity_max: Option<i64>,
+    /// Minimum relative humidity (percent)
+    pub humidity_min: Option<i64>,
     pub precip_chance: Option<i64>,
+    /// Rain amount in inches
+    pub rain_amt: Option<f64>,
+    /// Snow amount in inches
+    pub snow_amt: Option<f64>,
 }
 
 /// Comparison of forecast vs actual observation for a past day
@@ -84,16 +94,49 @@ pub fn forecast_detail(
                                 p class="is-size-7 has-text-weight-semibold mb-1 local-date" data-utc=(forecast.date.clone()) {
                                     (forecast.date.clone())
                                 }
+                                // Temperature
                                 p class="mb-1" {
                                     span class="weather-value temp-high" { (format!("{}°", forecast.temp_high)) }
                                     " / "
                                     span class="weather-value temp-low" { (format!("{}°", forecast.temp_low)) }
                                 }
+                                // Wind
+                                @if let Some(wind) = forecast.wind_speed {
+                                    p class="is-size-7" {
+                                        (format!("{} mph", wind))
+                                        @if let Some(dir) = forecast.wind_direction {
+                                            " "
+                                            span class="has-text-grey" { (wind_direction_label(dir)) }
+                                        }
+                                    }
+                                }
+                                // Humidity
+                                @if let (Some(hmax), Some(hmin)) = (forecast.humidity_max, forecast.humidity_min) {
+                                    p class="is-size-7 has-text-grey" {
+                                        (format!("{}%-{}% RH", hmin, hmax))
+                                    }
+                                }
+                                // Precipitation chance
                                 @if let Some(precip) = forecast.precip_chance {
                                     @if precip > 0 {
                                         p class="is-size-7 has-text-info" {
-                                            (format!("{}% ", precip))
-                                            span { "🌧️" }
+                                            (format!("{}% chance", precip))
+                                        }
+                                    }
+                                }
+                                // Rain amount
+                                @if let Some(rain) = forecast.rain_amt {
+                                    @if rain > 0.0 {
+                                        p class="is-size-7 has-text-info" {
+                                            (format!("{:.2}\" rain", rain))
+                                        }
+                                    }
+                                }
+                                // Snow amount
+                                @if let Some(snow) = forecast.snow_amt {
+                                    @if snow > 0.0 {
+                                        p class="is-size-7 has-text-link" {
+                                            (format!("{:.1}\" snow", snow))
                                         }
                                     }
                                 }
@@ -103,5 +146,20 @@ pub fn forecast_detail(
                 }
             }
         }
+    }
+}
+
+/// Convert wind direction degrees to compass label
+fn wind_direction_label(degrees: i64) -> &'static str {
+    match degrees {
+        0..=22 | 338..=360 => "N",
+        23..=67 => "NE",
+        68..=112 => "E",
+        113..=157 => "SE",
+        158..=202 => "S",
+        203..=247 => "SW",
+        248..=292 => "W",
+        293..=337 => "NW",
+        _ => "",
     }
 }

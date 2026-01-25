@@ -1,6 +1,6 @@
 use crate::Type::{
     Liquid, Maximum, MaximumRelative, Minimum, MinimumRelative,
-    ProbabilityOfPrecipitationWithin12Hours, Sustained, Wind,
+    ProbabilityOfPrecipitationWithin12Hours, Snow, Sustained, Wind,
 };
 use crate::{
     split_cityweather, CityWeather, DataReading, Dwml, Location, Units, WeatherStation, XmlFetcher,
@@ -62,6 +62,8 @@ pub struct WeatherForecast {
     pub relative_humidity_unit_code: String,
     pub liquid_precipitation_amt: Option<f64>,
     pub liquid_precipitation_unit_code: String,
+    pub snow_amt: Option<f64>,
+    pub snow_amt_unit_code: String,
     pub twelve_hour_probability_of_precipitation: Option<i64>,
     pub twelve_hour_probability_of_precipitation_unit_code: String,
 }
@@ -93,6 +95,8 @@ pub struct Forecast {
     pub state: String,
     pub iata_id: String,
     pub elevation_m: Option<f64>,
+    pub snow_amt: Option<f64>,
+    pub snow_amt_unit_code: String,
 }
 
 impl TryFrom<WeatherForecast> for Forecast {
@@ -134,6 +138,8 @@ impl TryFrom<WeatherForecast> for Forecast {
             state: String::from(""),
             iata_id: String::from(""),
             elevation_m: None,
+            snow_amt: val.snow_amt,
+            snow_amt_unit_code: val.snow_amt_unit_code,
         };
         Ok(parquet)
     }
@@ -288,6 +294,18 @@ pub fn create_forecast_schema() -> Type {
         .build()
         .unwrap();
 
+    let snow_amt = Type::primitive_type_builder("snow_amt", PhysicalType::DOUBLE)
+        .with_repetition(Repetition::OPTIONAL)
+        .build()
+        .unwrap();
+
+    let snow_amt_unit_code =
+        Type::primitive_type_builder("snow_amt_unit_code", PhysicalType::BYTE_ARRAY)
+            .with_logical_type(Some(LogicalType::String))
+            .with_repetition(Repetition::REQUIRED)
+            .build()
+            .unwrap();
+
     let schema = Type::group_type_builder("forecast")
         .with_fields(vec![
             Arc::new(station_id),
@@ -315,6 +333,8 @@ pub fn create_forecast_schema() -> Type {
             Arc::new(state),
             Arc::new(iata_id),
             Arc::new(elevation_m),
+            Arc::new(snow_amt),
+            Arc::new(snow_amt_unit_code),
         ])
         .build()
         .unwrap();
@@ -422,6 +442,8 @@ impl TryFrom<Dwml> for HashMap<String, Vec<WeatherForecast>> {
                         relative_humidity_unit_code: Units::Percent.to_string(),
                         liquid_precipitation_amt: None,
                         liquid_precipitation_unit_code: Units::Inches.to_string(),
+                        snow_amt: None,
+                        snow_amt_unit_code: Units::Inches.to_string(),
                         twelve_hour_probability_of_precipitation: None,
                         twelve_hour_probability_of_precipitation_unit_code: Units::Percent
                             .to_string(),
@@ -458,14 +480,16 @@ impl TryFrom<Dwml> for HashMap<String, Vec<WeatherForecast>> {
                 }
             }
 
-            if let Some(precipitation) = parameter_point.precipitation {
-                let precipitation_times = time_layouts.get(&precipitation.time_layout).unwrap();
-                add_data(
-                    weather_data,
-                    precipitation_times,
-                    &precipitation,
-                    prev_forecast_val,
-                )?;
+            if let Some(precipitations) = parameter_point.precipitation {
+                for precipitation in precipitations {
+                    let precipitation_times = time_layouts.get(&precipitation.time_layout).unwrap();
+                    add_data(
+                        weather_data,
+                        precipitation_times,
+                        &precipitation,
+                        prev_forecast_val,
+                    )?;
+                }
             }
 
             if let Some(probability_of_precipitation) = parameter_point.probability_of_precipitation
@@ -666,6 +690,21 @@ fn add_data(
                     current_data.wind_direction = prev_weather_data.wind_direction;
                 }
                 current_data.wind_direction_unit_code = data.units.to_string();
+            }
+            Snow => {
+                if let Some(index) = time_interval_index {
+                    current_data.snow_amt = data
+                        .value
+                        .get(index)
+                        .and_then(|value| value.parse::<f64>().ok())
+                        .map_or(prev_weather_data.snow_amt, |parsed_value| {
+                            prev_weather_data.snow_amt = Some(parsed_value);
+                            Some(parsed_value)
+                        });
+                } else {
+                    current_data.snow_amt = prev_weather_data.snow_amt;
+                }
+                current_data.snow_amt_unit_code = data.units.to_string();
             }
         }
     }
@@ -1069,5 +1108,5 @@ fn get_url(city_weather: &CityWeather) -> String {
     let one_week_from_now = current_time.add(one_week_duration);
 
     let one_week = one_week_from_now.format(&format_description).unwrap();
-    format!("https://graphical.weather.gov/xml/sample_products/browser_interface/ndfdXMLclient.php?listLatLon={}&product=time-series&begin={}&end={}&Unit=e&maxt=maxt&mint=mint&wspd=wspd&wdir=wdir&pop12=pop12&qpf=qpf&maxrh=maxrh&minrh=minrh", city_weather.get_coordinates_url(),now,one_week)
+    format!("https://graphical.weather.gov/xml/sample_products/browser_interface/ndfdXMLclient.php?listLatLon={}&product=time-series&begin={}&end={}&Unit=e&maxt=maxt&mint=mint&wspd=wspd&wdir=wdir&pop12=pop12&qpf=qpf&snow=snow&maxrh=maxrh&minrh=minrh", city_weather.get_coordinates_url(),now,one_week)
 }

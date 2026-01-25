@@ -61,7 +61,8 @@ pub fn create_initial_schema(conn: &mut Connection) -> Result<(), duckdb::Error>
           event_announcement BLOB NOT NULL,
           locations TEXT[] NOT NULL,
           coordinator_pubkey TEXT,
-          attestation_signature BLOB
+          attestation_signature BLOB,
+          scoring_fields TEXT[]
     );
 
     CREATE TYPE options AS ENUM ('over', 'par', 'under');
@@ -84,7 +85,11 @@ pub fn create_initial_schema(conn: &mut Connection) -> Result<(), duckdb::Error>
         station TEXT NOT NULL,
         temp_low options,
         temp_high options,
-        wind_speed options
+        wind_speed options,
+        wind_direction options,
+        rain_amt options,
+        snow_amt options,
+        humidity options
     );
 
     CREATE TABLE IF NOT EXISTS weather

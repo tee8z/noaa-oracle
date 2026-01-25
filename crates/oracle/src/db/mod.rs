@@ -45,6 +45,10 @@ pub struct CreateEvent {
     pub total_allowed_entries: usize,
     /// Total number of ranks can win (max 5 ranks)
     pub number_of_places_win: i64,
+    /// Which weather fields to use for scoring. Defaults to ["temp_high", "temp_low", "wind_speed"] if not specified.
+    /// Available options: temp_high, temp_low, wind_speed, wind_direction, rain_amt, snow_amt, humidity
+    #[serde(default = "ScoringField::defaults")]
+    pub scoring_fields: Vec<ScoringField>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +78,8 @@ pub struct CreateEventData {
     pub event_announcement: EventLockingConditions,
     /// The pubkey of the coordinator
     pub coordinator_pubkey: String,
+    /// Which weather fields to use for scoring
+    pub scoring_fields: Vec<ScoringField>,
 }
 
 impl CreateEventData {
@@ -106,6 +112,11 @@ impl CreateEventData {
             return Err(anyhow::anyhow!(
                 "Number of ranks can not be larger than 5, requested {}",
                 event.number_of_places_win
+            ));
+        }
+        if event.scoring_fields.is_empty() {
+            return Err(anyhow::anyhow!(
+                "At least one scoring field must be selected"
             ));
         }
         let possible_user_outcomes: Vec<Vec<usize>> = generate_ranking_permutations(
@@ -150,9 +161,10 @@ impl CreateEventData {
             total_allowed_entries: event.total_allowed_entries as i64,
             number_of_places_win: event.number_of_places_win,
             number_of_values_per_entry: event.number_of_values_per_entry as i64,
-            locations: event.clone().locations,
+            locations: event.locations.clone(),
             event_announcement,
             coordinator_pubkey,
+            scoring_fields: event.scoring_fields,
         })
     }
 }
@@ -176,6 +188,7 @@ impl From<CreateEventData> for Event {
             weather: vec![],
             attestation: None,
             coordinator_pubkey: value.coordinator_pubkey,
+            scoring_fields: value.scoring_fields,
         }
     }
 }
@@ -303,6 +316,8 @@ pub struct ActiveEvent {
     pub number_of_places_win: i64,
     #[schema(value_type = String)]
     pub attestation: Option<MaybeScalar>,
+    /// Which weather fields are used for scoring in this event
+    pub scoring_fields: Vec<ScoringField>,
 }
 
 impl ActiveEvent {
@@ -419,6 +434,28 @@ impl TryFrom<&Row<'_>> for ActiveEvent {
                     _ => None,
                 })
             })?,
+            scoring_fields: row
+                .get::<usize, Value>(10)
+                .map(|scoring| {
+                    let list_fields = match scoring {
+                        Value::List(list) => list,
+                        _ => vec![],
+                    };
+                    let mut fields_conv = vec![];
+                    for value in list_fields.iter() {
+                        if let Value::Text(field) = value {
+                            if let Ok(scoring_field) = ScoringField::try_from(field.as_str()) {
+                                fields_conv.push(scoring_field);
+                            }
+                        }
+                    }
+                    if fields_conv.is_empty() {
+                        ScoringField::defaults()
+                    } else {
+                        fields_conv
+                    }
+                })
+                .unwrap_or_else(|_| ScoringField::defaults()),
         };
         active_events.update_status();
         Ok(active_events)
@@ -599,6 +636,8 @@ pub struct Event {
     pub attestation: Option<MaybeScalar>,
     /// The pubkey of the coordinator
     pub coordinator_pubkey: String,
+    /// Which weather fields are used for scoring in this event
+    pub scoring_fields: Vec<ScoringField>,
 }
 
 impl Event {
@@ -707,6 +746,28 @@ impl TryFrom<&Row<'_>> for Event {
                 })?
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(10, Type::Any, Box::new(e)))?,
             coordinator_pubkey: row.get(11)?,
+            scoring_fields: row
+                .get::<usize, Value>(12)
+                .map(|scoring| {
+                    let list_fields = match scoring {
+                        Value::List(list) => list,
+                        _ => vec![],
+                    };
+                    let mut fields_conv = vec![];
+                    for value in list_fields.iter() {
+                        if let Value::Text(field) = value {
+                            if let Ok(scoring_field) = ScoringField::try_from(field.as_str()) {
+                                fields_conv.push(scoring_field);
+                            }
+                        }
+                    }
+                    if fields_conv.is_empty() {
+                        ScoringField::defaults()
+                    } else {
+                        fields_conv
+                    }
+                })
+                .unwrap_or_else(|_| ScoringField::defaults()),
             status: EventStatus::default(),
             //These nested values have to be made by more quries
             entry_ids: vec![],
@@ -1411,6 +1472,10 @@ pub struct WeatherChoicesWithEntry {
     pub temp_high: Option<ValueOptions>,
     pub temp_low: Option<ValueOptions>,
     pub wind_speed: Option<ValueOptions>,
+    pub wind_direction: Option<ValueOptions>,
+    pub rain_amt: Option<ValueOptions>,
+    pub snow_amt: Option<ValueOptions>,
+    pub humidity: Option<ValueOptions>,
 }
 
 impl TryFrom<&Row<'_>> for WeatherChoicesWithEntry {
@@ -1436,6 +1501,22 @@ impl TryFrom<&Row<'_>> for WeatherChoicesWithEntry {
                 .get::<usize, Option<String>>(4)
                 .map(|raw| raw.and_then(|inner| ValueOptions::try_from(inner).ok()))
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(4, Type::Any, Box::new(e)))?,
+            wind_direction: row
+                .get::<usize, Option<String>>(5)
+                .map(|raw| raw.and_then(|inner| ValueOptions::try_from(inner).ok()))
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(5, Type::Any, Box::new(e)))?,
+            rain_amt: row
+                .get::<usize, Option<String>>(6)
+                .map(|raw| raw.and_then(|inner| ValueOptions::try_from(inner).ok()))
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(6, Type::Any, Box::new(e)))?,
+            snow_amt: row
+                .get::<usize, Option<String>>(7)
+                .map(|raw| raw.and_then(|inner| ValueOptions::try_from(inner).ok()))
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(7, Type::Any, Box::new(e)))?,
+            humidity: row
+                .get::<usize, Option<String>>(8)
+                .map(|raw| raw.and_then(|inner| ValueOptions::try_from(inner).ok()))
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(8, Type::Any, Box::new(e)))?,
         })
     }
 }
@@ -1447,6 +1528,10 @@ pub struct WeatherChoices {
     pub temp_high: Option<ValueOptions>,
     pub temp_low: Option<ValueOptions>,
     pub wind_speed: Option<ValueOptions>,
+    pub wind_direction: Option<ValueOptions>,
+    pub rain_amt: Option<ValueOptions>,
+    pub snow_amt: Option<ValueOptions>,
+    pub humidity: Option<ValueOptions>,
 }
 
 impl From<WeatherChoicesWithEntry> for WeatherChoices {
@@ -1456,6 +1541,10 @@ impl From<WeatherChoicesWithEntry> for WeatherChoices {
             temp_high: value.temp_high,
             temp_low: value.temp_low,
             wind_speed: value.wind_speed,
+            wind_direction: value.wind_direction,
+            rain_amt: value.rain_amt,
+            snow_amt: value.snow_amt,
+            humidity: value.humidity,
         }
     }
 }
@@ -1480,6 +1569,22 @@ impl TryFrom<&Row<'_>> for WeatherChoices {
                 .get::<usize, Option<String>>(3)
                 .map(|raw| raw.and_then(|inner| ValueOptions::try_from(inner).ok()))
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(3, Type::Any, Box::new(e)))?,
+            wind_direction: row
+                .get::<usize, Option<String>>(4)
+                .map(|raw| raw.and_then(|inner| ValueOptions::try_from(inner).ok()))
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(4, Type::Any, Box::new(e)))?,
+            rain_amt: row
+                .get::<usize, Option<String>>(5)
+                .map(|raw| raw.and_then(|inner| ValueOptions::try_from(inner).ok()))
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(5, Type::Any, Box::new(e)))?,
+            snow_amt: row
+                .get::<usize, Option<String>>(6)
+                .map(|raw| raw.and_then(|inner| ValueOptions::try_from(inner).ok()))
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(6, Type::Any, Box::new(e)))?,
+            humidity: row
+                .get::<usize, Option<String>>(7)
+                .map(|raw| raw.and_then(|inner| ValueOptions::try_from(inner).ok()))
+                .map_err(|e| duckdb::Error::FromSqlConversionFailure(7, Type::Any, Box::new(e)))?,
         })
     }
 }
@@ -1507,17 +1612,35 @@ impl TryInto<WeatherChoices> for &OrderedMap<String, Value> {
             Value::Text(temp) => ValueOptions::try_from(temp.clone()).ok(),
             _ => None,
         });
-        let wind_speed = values
-            .get(3)
-            .and_then(|raw_wind_speed| match raw_wind_speed {
-                Value::Text(wind_speed) => ValueOptions::try_from(wind_speed.clone()).ok(),
-                _ => None,
-            });
+        let wind_speed = values.get(3).and_then(|raw_val| match raw_val {
+            Value::Text(val) => ValueOptions::try_from(val.clone()).ok(),
+            _ => None,
+        });
+        let wind_direction = values.get(4).and_then(|raw_val| match raw_val {
+            Value::Text(val) => ValueOptions::try_from(val.clone()).ok(),
+            _ => None,
+        });
+        let rain_amt = values.get(5).and_then(|raw_val| match raw_val {
+            Value::Text(val) => ValueOptions::try_from(val.clone()).ok(),
+            _ => None,
+        });
+        let snow_amt = values.get(6).and_then(|raw_val| match raw_val {
+            Value::Text(val) => ValueOptions::try_from(val.clone()).ok(),
+            _ => None,
+        });
+        let humidity = values.get(7).and_then(|raw_val| match raw_val {
+            Value::Text(val) => ValueOptions::try_from(val.clone()).ok(),
+            _ => None,
+        });
         Ok(WeatherChoices {
             stations,
             temp_low,
             temp_high,
             wind_speed,
+            wind_direction,
+            rain_amt,
+            snow_amt,
+            humidity,
         })
     }
 }
@@ -1537,13 +1660,96 @@ impl Into<Value> for &WeatherChoices {
             Some(val) => Value::Text(val.to_string()),
             None => Value::Null,
         };
+        let wind_direction = match self.wind_direction.clone() {
+            Some(val) => Value::Text(val.to_string()),
+            None => Value::Null,
+        };
+        let rain_amt = match self.rain_amt.clone() {
+            Some(val) => Value::Text(val.to_string()),
+            None => Value::Null,
+        };
+        let snow_amt = match self.snow_amt.clone() {
+            Some(val) => Value::Text(val.to_string()),
+            None => Value::Null,
+        };
+        let humidity = match self.humidity.clone() {
+            Some(val) => Value::Text(val.to_string()),
+            None => Value::Null,
+        };
         let ordered_struct: OrderedMap<String, Value> = OrderedMap::from(vec![
             (String::from("stations"), Value::Text(self.stations.clone())),
             (String::from("temp_low"), temp_low),
             (String::from("temp_high"), temp_high),
             (String::from("wind_speed"), wind_speed),
+            (String::from("wind_direction"), wind_direction),
+            (String::from("rain_amt"), rain_amt),
+            (String::from("snow_amt"), snow_amt),
+            (String::from("humidity"), humidity),
         ]);
         Value::Struct(ordered_struct)
+    }
+}
+
+/// Available fields that can be used for scoring in an event
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoringField {
+    TempHigh,
+    TempLow,
+    WindSpeed,
+    WindDirection,
+    RainAmt,
+    SnowAmt,
+    Humidity,
+}
+
+impl std::fmt::Display for ScoringField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TempHigh => write!(f, "temp_high"),
+            Self::TempLow => write!(f, "temp_low"),
+            Self::WindSpeed => write!(f, "wind_speed"),
+            Self::WindDirection => write!(f, "wind_direction"),
+            Self::RainAmt => write!(f, "rain_amt"),
+            Self::SnowAmt => write!(f, "snow_amt"),
+            Self::Humidity => write!(f, "humidity"),
+        }
+    }
+}
+
+impl TryFrom<&str> for ScoringField {
+    type Error = anyhow::Error;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s {
+            "temp_high" => Ok(ScoringField::TempHigh),
+            "temp_low" => Ok(ScoringField::TempLow),
+            "wind_speed" => Ok(ScoringField::WindSpeed),
+            "wind_direction" => Ok(ScoringField::WindDirection),
+            "rain_amt" => Ok(ScoringField::RainAmt),
+            "snow_amt" => Ok(ScoringField::SnowAmt),
+            "humidity" => Ok(ScoringField::Humidity),
+            val => Err(anyhow!("invalid scoring field: {}", val)),
+        }
+    }
+}
+
+impl TryFrom<String> for ScoringField {
+    type Error = anyhow::Error;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        ScoringField::try_from(s.as_str())
+    }
+}
+
+impl ScoringField {
+    /// Returns the default scoring fields (original behavior)
+    pub fn defaults() -> Vec<ScoringField> {
+        vec![
+            ScoringField::TempHigh,
+            ScoringField::TempLow,
+            ScoringField::WindSpeed,
+        ]
     }
 }
 

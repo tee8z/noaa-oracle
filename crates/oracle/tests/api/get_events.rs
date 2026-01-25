@@ -32,6 +32,7 @@ async fn can_get_all_events() {
         total_allowed_entries: 5,
         number_of_values_per_entry: 6,
         number_of_places_win: 1,
+        scoring_fields: oracle::ScoringField::defaults(),
     };
     let new_event_2 = CreateEvent {
         id: Uuid::now_v7(),
@@ -47,6 +48,7 @@ async fn can_get_all_events() {
         total_allowed_entries: 5,
         number_of_values_per_entry: 6,
         number_of_places_win: 1,
+        scoring_fields: oracle::ScoringField::defaults(),
     };
     let new_event_3 = CreateEvent {
         id: Uuid::now_v7(),
@@ -62,6 +64,7 @@ async fn can_get_all_events() {
         total_allowed_entries: 5,
         number_of_values_per_entry: 6,
         number_of_places_win: 1,
+        scoring_fields: oracle::ScoringField::defaults(),
     };
     let expected = [
         new_event_1.clone(),
