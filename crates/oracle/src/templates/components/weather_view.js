@@ -179,10 +179,30 @@ async function fetchStationForecast(stationId, popup) {
       return null;
     };
 
-    // Helper to format precip
+    // Helper to format precip chance
     const formatPrecip = (chance) => {
       if (chance != null) {
         return `${chance}%`;
+      }
+      return null;
+    };
+
+    // Helper to format rain/snow amount in inches
+    const formatAmount = (amount) => {
+      if (amount != null && amount > 0) {
+        return `${amount.toFixed(2)}"`;
+      }
+      return null;
+    };
+
+    // Helper to format humidity
+    const formatHumidity = (max, min) => {
+      if (max != null && min != null) {
+        return `${min}-${max}%`;
+      } else if (max != null) {
+        return `${max}%`;
+      } else if (min != null) {
+        return `${min}%`;
       }
       return null;
     };
@@ -217,7 +237,7 @@ async function fetchStationForecast(stationId, popup) {
           : null,
     );
     setValue(
-      "yesterday-precip",
+      "yesterday-precip-chance",
       yesterdayForecast ? formatPrecip(yesterdayForecast.precip_chance) : null,
     );
 
@@ -243,7 +263,7 @@ async function fetchStationForecast(stationId, popup) {
           : null,
     );
     setValue(
-      "today-precip",
+      "today-precip-chance",
       todayForecast ? formatPrecip(todayForecast.precip_chance) : null,
     );
 
@@ -260,8 +280,85 @@ async function fetchStationForecast(stationId, popup) {
       tomorrowForecast ? formatWind(tomorrowForecast.wind_speed) : null,
     );
     setValue(
-      "tomorrow-precip",
+      "tomorrow-precip-chance",
       tomorrowForecast ? formatPrecip(tomorrowForecast.precip_chance) : null,
+    );
+
+    // Rain amounts
+    setValue(
+      "yesterday-rain",
+      yesterdayObs
+        ? formatAmount(yesterdayObs.rain_amt)
+        : yesterdayForecast
+          ? formatAmount(yesterdayForecast.rain_amt)
+          : null,
+    );
+    setValue(
+      "today-rain",
+      todayObs
+        ? formatAmount(todayObs.rain_amt)
+        : todayForecast
+          ? formatAmount(todayForecast.rain_amt)
+          : null,
+    );
+    setValue(
+      "tomorrow-rain",
+      tomorrowForecast ? formatAmount(tomorrowForecast.rain_amt) : null,
+    );
+
+    // Snow amounts
+    setValue(
+      "yesterday-snow",
+      yesterdayObs
+        ? formatAmount(yesterdayObs.snow_amt)
+        : yesterdayForecast
+          ? formatAmount(yesterdayForecast.snow_amt)
+          : null,
+    );
+    setValue(
+      "today-snow",
+      todayObs
+        ? formatAmount(todayObs.snow_amt)
+        : todayForecast
+          ? formatAmount(todayForecast.snow_amt)
+          : null,
+    );
+    setValue(
+      "tomorrow-snow",
+      tomorrowForecast ? formatAmount(tomorrowForecast.snow_amt) : null,
+    );
+
+    // Humidity
+    setValue(
+      "yesterday-humidity",
+      yesterdayObs
+        ? formatHumidity(yesterdayObs.humidity, yesterdayObs.humidity)
+        : yesterdayForecast
+          ? formatHumidity(
+              yesterdayForecast.humidity_max,
+              yesterdayForecast.humidity_min,
+            )
+          : null,
+    );
+    setValue(
+      "today-humidity",
+      todayObs
+        ? formatHumidity(todayObs.humidity, todayObs.humidity)
+        : todayForecast
+          ? formatHumidity(
+              todayForecast.humidity_max,
+              todayForecast.humidity_min,
+            )
+          : null,
+    );
+    setValue(
+      "tomorrow-humidity",
+      tomorrowForecast
+        ? formatHumidity(
+            tomorrowForecast.humidity_max,
+            tomorrowForecast.humidity_min,
+          )
+        : null,
     );
   } catch (err) {
     console.error("Error fetching forecast:", err);

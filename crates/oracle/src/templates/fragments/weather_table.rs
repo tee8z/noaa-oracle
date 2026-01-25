@@ -12,6 +12,10 @@ pub struct WeatherDisplay {
     pub temp_high: Option<f64>,
     pub temp_low: Option<f64>,
     pub wind_speed: Option<i64>,
+    pub wind_direction: Option<i64>,
+    pub humidity: Option<i64>,
+    pub rain_amt: Option<f64>,
+    pub snow_amt: Option<f64>,
     pub observed_start: String,
     pub observed_end: String,
     pub updated_at: String,
@@ -129,9 +133,11 @@ pub fn weather_table_body(weather_data: &[WeatherDisplay]) -> Markup {
                                 th { "Station" }
                                 th class="has-text-right" { "Temp High" }
                                 th class="has-text-right" { "Temp Low" }
-                                th class="has-text-right" { "Wind (mph)" }
+                                th class="has-text-right" { "Wind" }
+                                th class="has-text-right" { "Humidity" }
+                                th class="has-text-right" { "Rain" }
+                                th class="has-text-right" { "Snow" }
                                 th { "Observed" }
-                                th { "Updated" }
                             }
                         }
                         tbody hx-get="/fragments/weather"
@@ -169,7 +175,7 @@ fn render_weather_rows_with_regions(weather_data: &[WeatherDisplay]) -> Markup {
         @for (region, stations) in &by_region {
             // Region header row
             tr class={"region-header " (region_class(*region))} {
-                td colspan="6" {
+                td colspan="8" {
                     (region_name(*region))
                 }
             }
@@ -178,7 +184,7 @@ fn render_weather_rows_with_regions(weather_data: &[WeatherDisplay]) -> Markup {
                 (render_weather_row(weather))
                 // Hidden forecast row
                 tr class="forecast-row" id=(format!("forecast-row-{}", weather.station_id)) style="display: none;" {
-                    td colspan="6" {
+                    td colspan="8" {
                         div id=(format!("forecast-{}", weather.station_id)) {}
                     }
                 }
@@ -239,7 +245,45 @@ fn render_weather_row(weather: &WeatherDisplay) -> Markup {
             td class="has-text-right" {
                 @if let Some(wind) = weather.wind_speed {
                     span class="weather-value wind" {
-                        (wind)
+                        (format!("{}", wind))
+                        @if let Some(dir) = weather.wind_direction {
+                            span class="has-text-grey is-size-7" { (format!(" {}", wind_direction_label(dir))) }
+                        }
+                    }
+                } @else {
+                    span class="has-text-grey" { "-" }
+                }
+            }
+            td class="has-text-right" {
+                @if let Some(humidity) = weather.humidity {
+                    span class="weather-value" {
+                        (format!("{}%", humidity))
+                    }
+                } @else {
+                    span class="has-text-grey" { "-" }
+                }
+            }
+            td class="has-text-right" {
+                @if let Some(rain) = weather.rain_amt {
+                    @if rain > 0.0 {
+                        span class="weather-value has-text-info" {
+                            (format!("{:.2}\"", rain))
+                        }
+                    } @else {
+                        span class="has-text-grey" { "-" }
+                    }
+                } @else {
+                    span class="has-text-grey" { "-" }
+                }
+            }
+            td class="has-text-right" {
+                @if let Some(snow) = weather.snow_amt {
+                    @if snow > 0.0 {
+                        span class="weather-value has-text-link" {
+                            (format!("{:.1}\"", snow))
+                        }
+                    } @else {
+                        span class="has-text-grey" { "-" }
                     }
                 } @else {
                     span class="has-text-grey" { "-" }
@@ -252,12 +296,22 @@ fn render_weather_row(weather: &WeatherDisplay) -> Markup {
                     (weather.observed_start.clone()) " - " (weather.observed_end.clone())
                 }
             }
-            td {
-                span class="is-size-7 local-time" data-utc=(weather.updated_at.clone()) {
-                    (weather.updated_at.clone())
-                }
-            }
         }
+    }
+}
+
+/// Convert wind direction degrees to compass label
+fn wind_direction_label(degrees: i64) -> &'static str {
+    match degrees {
+        0..=22 | 338..=360 => "N",
+        23..=67 => "NE",
+        68..=112 => "E",
+        113..=157 => "SE",
+        158..=202 => "S",
+        203..=247 => "SW",
+        248..=292 => "W",
+        293..=337 => "NW",
+        _ => "",
     }
 }
 

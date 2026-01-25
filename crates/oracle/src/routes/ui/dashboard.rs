@@ -268,6 +268,10 @@ async fn get_latest_weather(
                 temp_high: Some(obs.temp_high),
                 temp_low: Some(obs.temp_low),
                 wind_speed: Some(obs.wind_speed),
+                wind_direction: obs.wind_direction,
+                humidity: obs.humidity,
+                rain_amt: obs.rain_amt,
+                snow_amt: obs.snow_amt,
                 observed_start: obs.start_time.clone(),
                 observed_end: obs.end_time.clone(),
                 updated_at: updated_at.clone(),
@@ -277,12 +281,12 @@ async fn get_latest_weather(
         }
     }
 
-    // Sort by geographic region (West to East), then by latitude (North to South) within each region
+    // Sort by geographic region (East to West), then by latitude (North to South) within each region
     weather_data.sort_by(|a, b| {
         let region_a = get_region(a.longitude);
         let region_b = get_region(b.longitude);
 
-        match region_a.cmp(&region_b) {
+        match region_b.cmp(&region_a) {
             std::cmp::Ordering::Equal => {
                 // Within same region, sort north to south (descending latitude)
                 b.latitude
@@ -313,6 +317,10 @@ async fn get_latest_weather(
                 temp_high: Some(obs.temp_high),
                 temp_low: Some(obs.temp_low),
                 wind_speed: Some(obs.wind_speed),
+                wind_direction: obs.wind_direction,
+                humidity: obs.humidity,
+                rain_amt: obs.rain_amt,
+                snow_amt: obs.snow_amt,
                 observed_start: obs.start_time,
                 observed_end: obs.end_time,
                 updated_at: updated_at.clone(),
