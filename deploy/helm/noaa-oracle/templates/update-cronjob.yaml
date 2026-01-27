@@ -1,0 +1,48 @@
+{{- if .Values.updateCron.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "noaa-oracle.fullname" . }}-update
+  labels:
+    {{- include "noaa-oracle.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.updateCron.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: {{ .Values.updateCron.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.updateCron.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ .Values.updateCron.backoffLimit }}
+      activeDeadlineSeconds: 300
+      ttlSecondsAfterFinished: 3600
+      template:
+        metadata:
+          labels:
+            {{- include "noaa-oracle.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: update
+        spec:
+          serviceAccountName: {{ include "noaa-oracle.serviceAccountName" . }}
+          restartPolicy: OnFailure
+          containers:
+            - name: curl
+              image: "{{ .Values.updateCron.image.repository }}:{{ .Values.updateCron.image.tag }}"
+              imagePullPolicy: {{ .Values.updateCron.image.pullPolicy }}
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  echo "Triggering oracle update at $(date)"
+                  curl -sf -X POST \
+                    "http://{{ include "noaa-oracle.fullname" . }}:{{ .Values.service.port }}/oracle/update" \
+                    --connect-timeout 10 \
+                    --max-time 30
+                  EXIT_CODE=$?
+                  if [ $EXIT_CODE -eq 0 ]; then
+                    echo "Oracle update triggered successfully"
+                  else
+                    echo "Failed to trigger oracle update (exit code: $EXIT_CODE)"
+                    exit $EXIT_CODE
+                  fi
+              resources:
+                {{- toYaml .Values.updateCron.resources | nindent 16 }}
+{{- end }}
