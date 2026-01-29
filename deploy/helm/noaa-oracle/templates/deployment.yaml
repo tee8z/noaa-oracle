@@ -6,6 +6,8 @@ metadata:
     {{- include "noaa-oracle.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "noaa-oracle.selectorLabels" . | nindent 6 }}
