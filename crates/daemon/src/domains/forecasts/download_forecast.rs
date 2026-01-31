@@ -926,7 +926,8 @@ impl ForecastRetry {
                         return Ok(());
                     }
 
-                    let converted_xml: Dwml = match from_str(&xml) {
+                    let grouped_xml = group_parameter_elements(&xml);
+                    let converted_xml: Dwml = match from_str(&grouped_xml) {
                         Ok(xml) => xml,
                         Err(err) => {
                             error!(
@@ -1220,4 +1221,105 @@ fn get_url(city_weather: &CityWeather) -> String {
 
     let one_week = one_week_from_now.format(&format_description).unwrap();
     format!("https://graphical.weather.gov/xml/sample_products/browser_interface/ndfdXMLclient.php?listLatLon={}&product=time-series&begin={}&end={}&Unit=e&maxt=maxt&mint=mint&wspd=wspd&wdir=wdir&pop12=pop12&qpf=qpf&snow=snow&snowratio=snowratio&iceaccum=iceaccum&maxrh=maxrh&minrh=minrh", city_weather.get_coordinates_url(),now,one_week)
+}
+
+/// Reorder child elements within `<parameters>` blocks so that elements with
+/// the same tag name are adjacent. This is needed because `serde-xml-rs` cannot
+/// collect non-adjacent sibling elements with the same name into a Vec, and
+/// NOAA's forecast XML interleaves precipitation types (liquid, snow, ice) with
+/// other elements like wind-speed and direction between them.
+fn group_parameter_elements(xml: &str) -> String {
+    let mut result = String::with_capacity(xml.len());
+    let mut remaining = xml;
+
+    while let Some(params_start) = remaining.find("<parameters ") {
+        // Copy everything before <parameters>
+        result.push_str(&remaining[..params_start]);
+
+        // Find the closing </parameters>
+        let after_params = &remaining[params_start..];
+        let params_end = match after_params.find("</parameters>") {
+            Some(pos) => pos + "</parameters>".len(),
+            None => {
+                // No closing tag found, just copy the rest
+                result.push_str(after_params);
+                return result;
+            }
+        };
+
+        let params_block = &after_params[..params_end];
+
+        // Find the opening tag end
+        let open_tag_end = match params_block.find('>') {
+            Some(pos) => pos + 1,
+            None => {
+                result.push_str(params_block);
+                remaining = &after_params[params_end..];
+                continue;
+            }
+        };
+
+        let opening_tag = &params_block[..open_tag_end];
+        let inner = &params_block[open_tag_end..params_block.len() - "</parameters>".len()];
+
+        // Extract child elements with their full content
+        let mut elements: Vec<(String, String)> = Vec::new(); // (tag_name, full_element)
+        let mut pos = 0;
+        let inner_bytes = inner.as_bytes();
+
+        while pos < inner.len() {
+            // Skip whitespace
+            if inner_bytes[pos].is_ascii_whitespace() {
+                pos += 1;
+                continue;
+            }
+
+            if inner_bytes[pos] != b'<' {
+                pos += 1;
+                continue;
+            }
+
+            // Find tag name
+            let tag_start = pos;
+            let after_lt = &inner[pos + 1..];
+            let tag_name_end = after_lt
+                .find(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')
+                .unwrap_or(after_lt.len());
+            let tag_name = after_lt[..tag_name_end].to_string();
+
+            // Find the closing tag for this element
+            let closing_tag = format!("</{}>", tag_name);
+            let element_end = match inner[tag_start..].find(&closing_tag) {
+                Some(close_pos) => tag_start + close_pos + closing_tag.len(),
+                None => {
+                    // Self-closing or malformed, skip
+                    pos += 1;
+                    continue;
+                }
+            };
+
+            let element = inner[tag_start..element_end].to_string();
+            elements.push((tag_name, element));
+            pos = element_end;
+        }
+
+        // Sort elements by tag name to group same-named elements
+        elements.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Rebuild the parameters block
+        result.push_str(opening_tag);
+        result.push('\n');
+        for (_, element) in &elements {
+            result.push_str("      ");
+            result.push_str(element);
+            result.push('\n');
+        }
+        result.push_str("    </parameters>");
+
+        remaining = &after_params[params_end..];
+    }
+
+    // Copy anything after the last parameters block
+    result.push_str(remaining);
+    result
 }
