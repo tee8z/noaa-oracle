@@ -32,38 +32,38 @@ spec:
                   echo "Starting weather data cleanup..."
                   WEATHER_DATA_DIR="{{ .Values.cleanup.weatherDataDir }}"
                   CUTOFF_DAYS="{{ .Values.cleanup.retentionDays }}"
-                  
+
                   CUTOFF_DATE=$(date -d "-${CUTOFF_DAYS} days" +%Y-%m-%d 2>/dev/null || date -v-${CUTOFF_DAYS}d +%Y-%m-%d)
                   echo "Cutoff date: $CUTOFF_DATE (removing directories older than this)"
-                  
+
                   if [ ! -d "$WEATHER_DATA_DIR" ]; then
                     echo "Weather data directory does not exist: $WEATHER_DATA_DIR"
                     exit 0
                   fi
-                  
+
                   cd "$WEATHER_DATA_DIR" || exit 1
-                  
+
                   BEFORE_COUNT=$(find . -maxdepth 1 -type d -name "????-??-??" | wc -l)
                   echo "Found $BEFORE_COUNT date directories"
-                  
+
                   REMOVED=0
                   for dir in */; do
                     dir=${dir%/}
                     if [ ! -d "$dir" ]; then
                       continue
                     fi
-                    
+
                     if ! echo "$dir" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
                       continue
                     fi
-                    
+
                     if [ "$dir" \< "$CUTOFF_DATE" ]; then
                       echo "Removing directory: $dir"
                       rm -rf "$dir"
                       REMOVED=$((REMOVED + 1))
                     fi
                   done
-                  
+
                   echo "Cleanup complete. Removed $REMOVED directories."
                   echo "Current disk usage:"
                   df -h "$WEATHER_DATA_DIR" || true
@@ -79,5 +79,9 @@ spec:
           volumes:
             - name: data
               persistentVolumeClaim:
+                {{- if .Values.blueGreen.enabled }}
+                claimName: {{ include "noaa-oracle.fullname" . }}-{{ .Values.blueGreen.activeSlot }}
+                {{- else }}
                 claimName: {{ include "noaa-oracle.fullname" . }}
+                {{- end }}
 {{- end }}

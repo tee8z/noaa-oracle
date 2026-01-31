@@ -3,6 +3,13 @@
 
 replicaCount: 1
 
+# Blue/Green deployment support
+# When enabled, deployments and PVCs are suffixed with the slot name (blue/green)
+# The Service selector uses activeSlot to route traffic to the active deployment
+blueGreen:
+  enabled: false
+  activeSlot: blue    # Which slot the Service routes traffic to
+
 image:
   repository: ghcr.io/tee8z/noaa-oracle
   tag: ""  # Defaults to appVersion

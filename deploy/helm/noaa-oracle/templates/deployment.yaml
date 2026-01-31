@@ -1,3 +1,192 @@
+{{- if .Values.blueGreen.enabled }}
+{{- range $slot := list "blue" "green" }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "noaa-oracle.fullname" $ }}-{{ $slot }}
+  labels:
+    {{- include "noaa-oracle.labels" $ | nindent 4 }}
+spec:
+  replicas: {{ $.Values.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "noaa-oracle.selectorLabels" $ | nindent 6 }}
+      app.kubernetes.io/slot: {{ $slot }}
+  template:
+    metadata:
+      labels:
+        {{- include "noaa-oracle.selectorLabels" $ | nindent 8 }}
+        app.kubernetes.io/slot: {{ $slot }}
+    spec:
+      serviceAccountName: {{ include "noaa-oracle.serviceAccountName" $ }}
+      {{- if $.Values.litestream.enabled }}
+      initContainers:
+        - name: litestream-restore
+          image: "{{ $.Values.litestream.image.repository }}:{{ $.Values.litestream.image.tag }}"
+          args: ["restore", "-if-db-not-exists", "-if-replica-exists", "{{ $.Values.config.eventDb }}/events.sqlite"]
+          volumeMounts:
+            - name: data
+              mountPath: {{ $.Values.persistence.mountPath }}
+            - name: litestream-config
+              mountPath: /etc/litestream.yml
+              subPath: litestream.yml
+          env:
+            {{- if or $.Values.litestream.s3AccessKeyId $.Values.litestream.existingSecret }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.litestream.existingSecret | default (printf "%s-s3" (include "noaa-oracle.fullname" $)) }}
+                  key: access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.litestream.existingSecret | default (printf "%s-s3" (include "noaa-oracle.fullname" $)) }}
+                  key: secret-access-key
+            {{- end }}
+            {{- if $.Values.litestream.s3Region }}
+            - name: AWS_REGION
+              value: {{ $.Values.litestream.s3Region | quote }}
+            {{- end }}
+            {{- if $.Values.litestream.encryptionKeySecret.enabled }}
+            - name: LITESTREAM_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.litestream.encryptionKeySecret.name }}
+                  key: {{ $.Values.litestream.encryptionKeySecret.key }}
+            {{- end }}
+      {{- end }}
+      containers:
+        - name: {{ $.Chart.Name }}
+          {{- if $.Values.devMode.enabled }}
+          image: {{ $.Values.devMode.baseImage }}
+          command: ["/app/oracle"]
+          {{- else }}
+          image: "{{ $.Values.image.repository }}:{{ $.Values.image.tag | default $.Chart.AppVersion }}"
+          {{- end }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ $.Values.config.port }}
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: {{ $.Values.config.level }}
+            - name: NOAA_ORACLE_HOST
+              value: {{ $.Values.config.host | quote }}
+            - name: NOAA_ORACLE_PORT
+              value: {{ $.Values.config.port | quote }}
+            - name: NOAA_ORACLE_DATA_DIR
+              value: {{ $.Values.config.dataDir }}
+            - name: NOAA_ORACLE_EVENT_DB
+              value: {{ $.Values.config.eventDb }}
+            {{- if $.Values.devMode.enabled }}
+            - name: NOAA_ORACLE_UI_DIR
+              value: {{ $.Values.config.uiDir }}
+            - name: LD_LIBRARY_PATH
+              value: /lib/duckdb
+            {{- end }}
+            - name: NOAA_ORACLE_PRIVATE_KEY
+              value: {{ $.Values.config.privateKeyPath }}
+            {{- if $.Values.config.remoteUrl }}
+            - name: NOAA_ORACLE_REMOTE_URL
+              value: {{ $.Values.config.remoteUrl | quote }}
+            {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ $.Values.persistence.mountPath }}
+            {{- if or $.Values.secrets.privateKey.create $.Values.secrets.privateKey.external $.Values.secrets.privateKey.generate }}
+            - name: keys
+              mountPath: /etc/noaa-oracle/keys
+              readOnly: true
+            {{- end }}
+            {{- if $.Values.devMode.enabled }}
+            - name: dev-binary
+              mountPath: /app
+              readOnly: true
+            - name: duckdb-lib
+              mountPath: /lib/duckdb
+              readOnly: true
+            {{- end }}
+          resources:
+            {{- toYaml $.Values.resources | nindent 12 }}
+          livenessProbe:
+            {{- toYaml $.Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml $.Values.readinessProbe | nindent 12 }}
+        {{- if $.Values.litestream.enabled }}
+        - name: litestream
+          image: "{{ $.Values.litestream.image.repository }}:{{ $.Values.litestream.image.tag }}"
+          args: ["replicate"]
+          volumeMounts:
+            - name: data
+              mountPath: {{ $.Values.persistence.mountPath }}
+            - name: litestream-config
+              mountPath: /etc/litestream.yml
+              subPath: litestream.yml
+          env:
+            {{- if or $.Values.litestream.s3AccessKeyId $.Values.litestream.existingSecret }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.litestream.existingSecret | default (printf "%s-s3" (include "noaa-oracle.fullname" $)) }}
+                  key: access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.litestream.existingSecret | default (printf "%s-s3" (include "noaa-oracle.fullname" $)) }}
+                  key: secret-access-key
+            {{- end }}
+            {{- if $.Values.litestream.s3Region }}
+            - name: AWS_REGION
+              value: {{ $.Values.litestream.s3Region | quote }}
+            {{- end }}
+            {{- if $.Values.litestream.encryptionKeySecret.enabled }}
+            - name: LITESTREAM_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.litestream.encryptionKeySecret.name }}
+                  key: {{ $.Values.litestream.encryptionKeySecret.key }}
+            {{- end }}
+          resources:
+            requests:
+              memory: 32Mi
+              cpu: 10m
+            limits:
+              memory: 64Mi
+        {{- end }}
+      volumes:
+        - name: data
+          {{- if $.Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "noaa-oracle.fullname" $ }}-{{ $slot }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- if or $.Values.secrets.privateKey.create $.Values.secrets.privateKey.external $.Values.secrets.privateKey.generate }}
+        - name: keys
+          secret:
+            secretName: {{ include "noaa-oracle.fullname" $ }}-keys
+        {{- end }}
+        {{- if $.Values.devMode.enabled }}
+        - name: dev-binary
+          hostPath:
+            path: {{ $.Values.devMode.hostPath | dir }}
+            type: Directory
+        - name: duckdb-lib
+          hostPath:
+            path: {{ $.Values.devMode.duckdbLibPath | default "/mnt/duckdb_lib" }}
+            type: Directory
+        {{- end }}
+        {{- if $.Values.litestream.enabled }}
+        - name: litestream-config
+          configMap:
+            name: {{ include "noaa-oracle.fullname" $ }}-litestream
+        {{- end }}
+{{- end }}
+{{- else }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -180,3 +369,4 @@ spec:
           configMap:
             name: {{ include "noaa-oracle.fullname" . }}-litestream
         {{- end }}
+{{- end }}

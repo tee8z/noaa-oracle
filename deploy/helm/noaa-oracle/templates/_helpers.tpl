@@ -66,3 +66,13 @@ Return the image name
 {{- $tag := default .Chart.AppVersion .Values.image.tag -}}
 {{- printf "%s:%s" .Values.image.repository $tag -}}
 {{- end }}
+
+{{/*
+Service selector labels - uses activeSlot when blue/green is enabled
+*/}}
+{{- define "noaa-oracle.serviceSelectorLabels" -}}
+{{ include "noaa-oracle.selectorLabels" . }}
+{{- if .Values.blueGreen.enabled }}
+app.kubernetes.io/slot: {{ .Values.blueGreen.activeSlot }}
+{{- end }}
+{{- end }}
