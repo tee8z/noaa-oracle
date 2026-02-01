@@ -244,6 +244,7 @@ fn mock_observation_data() -> Vec<Observation> {
         humidity: None,
         rain_amt: None,
         snow_amt: None,
+        ice_amt: None,
     }]
 }
 

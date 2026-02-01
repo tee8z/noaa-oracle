@@ -644,6 +644,7 @@ fn mock_observation_data() -> Vec<Observation> {
             humidity: None,
             rain_amt: None,
             snow_amt: None,
+            ice_amt: None,
         },
         Observation {
             station_id: String::from("KSAW"),
@@ -657,6 +658,7 @@ fn mock_observation_data() -> Vec<Observation> {
             humidity: None,
             rain_amt: None,
             snow_amt: None,
+            ice_amt: None,
         },
     ]
 }
