@@ -228,8 +228,9 @@ fn render_weather_cards_with_regions(weather_data: &[WeatherDisplay]) -> Markup 
 /// Render a single weather card (mobile)
 fn render_weather_card(weather: &WeatherDisplay) -> Markup {
     html! {
-        div class="weather-card box mb-3"
-            data-station=(weather.station_id.clone()) {
+        div class="weather-card box mb-3 is-clickable"
+            data-station=(weather.station_id.clone())
+            onclick=(format!("toggleCardForecast('{}')", weather.station_id)) {
             // Header: station ID + name
             div class="is-flex is-justify-content-space-between is-align-items-center mb-2" {
                 div {
@@ -333,6 +334,12 @@ fn render_weather_card(weather: &WeatherDisplay) -> Markup {
                         (weather.observed_start.clone()) " - " (weather.observed_end.clone())
                     }
                 }
+            }
+
+            // Forecast container (hidden until clicked)
+            div class="card-forecast"
+                id=(format!("card-forecast-{}", weather.station_id))
+                style="display: none;" {
             }
         }
     }

@@ -49,6 +49,40 @@ window.loadForecast = function loadForecast(stationId) {
 // Legacy function for backwards compatibility
 window.showForecast = window.loadForecast;
 
+// Toggle forecast inside a mobile weather card
+window.toggleCardForecast = function toggleCardForecast(stationId) {
+  var container = document.getElementById("card-forecast-" + stationId);
+  var card = container && container.closest(".weather-card");
+
+  if (!container) return;
+
+  // If already loaded, just toggle
+  if (container.dataset.loaded === "true") {
+    var isHidden = container.style.display === "none";
+    container.style.display = isHidden ? "block" : "none";
+    if (card) card.classList.toggle("is-expanded", isHidden);
+    return;
+  }
+
+  // First time - fetch forecast
+  fetch("/fragments/forecast/" + stationId)
+    .then(function (response) {
+      return response.text();
+    })
+    .then(function (html) {
+      container.innerHTML = html;
+      container.dataset.loaded = "true";
+      container.style.display = "block";
+      if (card) card.classList.add("is-expanded");
+      if (typeof convertToLocalTime === "function") {
+        convertToLocalTime();
+      }
+    })
+    .catch(function (error) {
+      console.error("Failed to load forecast:", error);
+    });
+};
+
 // Toggle forecast visibility only if already loaded
 // Called from onclick - does nothing on first click (HTMX handles that)
 window.toggleForecastIfLoaded = function toggleForecastIfLoaded(stationId) {

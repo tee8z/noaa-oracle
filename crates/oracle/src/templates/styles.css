@@ -278,6 +278,16 @@
     margin-bottom: 0.1rem;
 }
 
+.weather-card.is-expanded {
+    background-color: var(--bulma-scheme-main-bis);
+}
+
+.card-forecast {
+    margin-top: 0.75rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--bulma-border);
+}
+
 .weather-region-header {
     font-weight: 600;
     font-size: 0.875rem;
