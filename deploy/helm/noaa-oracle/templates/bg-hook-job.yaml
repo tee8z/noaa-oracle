@@ -32,8 +32,7 @@ spec:
               SERVICE="{{ include "noaa-oracle.fullname" . }}"
               DEPLOY_PREFIX="{{ include "noaa-oracle.fullname" . }}"
               CONTAINER="{{ .Chart.Name }}"
-              NEW_IMAGE="{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
-              DESIRED_SLOT="{{ .Values.blueGreen.activeSlot | default "blue" }}"
+              NEW_IMAGE="{{ .Values.image.repository }}:{{ .Values.image.tag }}"
 
               echo "=== Blue/Green PreSync Switchover ==="
               echo "Namespace: $NAMESPACE"
@@ -59,6 +58,7 @@ spec:
                 exit 0
               fi
 
+              # Determine standby
               if [[ "$ACTIVE" == "blue" ]]; then STANDBY="green"; else STANDBY="blue"; fi
 
               ACTIVE_DEPLOY="${DEPLOY_PREFIX}-${ACTIVE}"
@@ -67,54 +67,73 @@ spec:
               echo "Active: $ACTIVE ($ACTIVE_DEPLOY)"
               echo "Standby: $STANDBY ($STANDBY_DEPLOY)"
 
+              # Check if active is already running the new image
               CURRENT_IMAGE=$(kubectl -n "$NAMESPACE" get deployment "$ACTIVE_DEPLOY" \
                 -o jsonpath="{.spec.template.spec.containers[?(@.name=='$CONTAINER')].image}" 2>/dev/null || echo "")
-
               echo "Current active image: $CURRENT_IMAGE"
 
-              if [[ "$CURRENT_IMAGE" == "$NEW_IMAGE" && "$ACTIVE" == "$DESIRED_SLOT" ]]; then
-                echo "Active deployment already running $NEW_IMAGE and active slot matches desired ($DESIRED_SLOT). No switchover needed."
+              if [[ "$CURRENT_IMAGE" == "$NEW_IMAGE" ]]; then
+                echo "Active deployment already running $NEW_IMAGE. No switchover needed."
                 kubectl -n "$NAMESPACE" scale deployment "$STANDBY_DEPLOY" --replicas=0 2>/dev/null || true
                 exit 0
-              fi
-
-              if [[ "$CURRENT_IMAGE" == "$NEW_IMAGE" && "$ACTIVE" != "$DESIRED_SLOT" ]]; then
-                echo "Image unchanged but active slot ($ACTIVE) differs from desired ($DESIRED_SLOT). Switching."
-                # Ensure standby has the same image before switching
-                kubectl -n "$NAMESPACE" set image "deployment/$STANDBY_DEPLOY" "$CONTAINER=$NEW_IMAGE"
               fi
 
               echo ""
               echo "=== Starting switchover: $ACTIVE -> $STANDBY ==="
 
-              echo "Step 1/5: Setting $STANDBY_DEPLOY image to $NEW_IMAGE"
+              # Step 1: Update standby image
+              echo "Step 1/7: Setting $STANDBY_DEPLOY image to $NEW_IMAGE"
               kubectl -n "$NAMESPACE" set image "deployment/$STANDBY_DEPLOY" "$CONTAINER=$NEW_IMAGE"
 
-              echo "Step 2/5: Scaling up $STANDBY_DEPLOY"
-              kubectl -n "$NAMESPACE" scale deployment "$STANDBY_DEPLOY" --replicas=1
-
-              echo "Step 3/5: Waiting for $STANDBY_DEPLOY to be ready..."
-              if ! kubectl -n "$NAMESPACE" rollout status deployment "$STANDBY_DEPLOY" --timeout=300s; then
-                echo "ERROR: Standby deployment failed readiness check"
-                echo "Rolling back: scaling down standby"
-                kubectl -n "$NAMESPACE" scale deployment "$STANDBY_DEPLOY" --replicas=0
-                exit 1
-              fi
-
-              echo "Step 4/5: Flipping Service selector to $STANDBY"
+              # Step 2: Scale down active so Litestream flushes WAL to S3 on SIGTERM
+              echo "Step 2/7: Scaling down $ACTIVE_DEPLOY (Litestream will flush WAL to S3)"
               kubectl -n "$NAMESPACE" scale deployment "$ACTIVE_DEPLOY" --replicas=0
-              sleep 2
-              kubectl -n "$NAMESPACE" patch svc "$SERVICE" --type=json \
-                -p "[{\"op\": \"replace\", \"path\": \"/spec/selector/app.kubernetes.io~1slot\", \"value\": \"$STANDBY\"}]"
 
-              echo "Step 5/5: Verifying switchover"
-              NEW_ACTIVE=$(kubectl -n "$NAMESPACE" get svc "$SERVICE" \
-                -o jsonpath='{.spec.selector.app\.kubernetes\.io/slot}')
-              echo "Service now pointing to: $NEW_ACTIVE"
-
+              # Step 3: Wait for active pods to terminate
+              echo "Step 3/7: Waiting for $ACTIVE_DEPLOY pods to terminate"
               kubectl -n "$NAMESPACE" wait --for=delete pod \
                 -l "app.kubernetes.io/slot=$ACTIVE,app.kubernetes.io/name={{ include "noaa-oracle.name" . }}" \
                 --timeout=60s 2>/dev/null || true
+              echo "$ACTIVE_DEPLOY terminated, S3 backups should be up to date"
+
+              # Step 4: Clean standby PVC so litestream-restore init container does a full restore
+              echo "Step 4/7: Cleaning standby PVC (${DEPLOY_PREFIX}-${STANDBY})"
+              kubectl -n "$NAMESPACE" run "pvc-cleanup-$$" --rm -i --restart=Never \
+                --image=alpine:latest \
+                --overrides="{
+                  \"spec\": {
+                    \"containers\": [{
+                      \"name\": \"cleanup\",
+                      \"image\": \"alpine:latest\",
+                      \"command\": [\"sh\", \"-c\", \"rm -fv {{ .Values.persistence.mountPath }}/*.db {{ .Values.persistence.mountPath }}/*.db-shm {{ .Values.persistence.mountPath }}/*.db-wal {{ .Values.persistence.mountPath }}/*.sqlite {{ .Values.persistence.mountPath }}/*.sqlite-shm {{ .Values.persistence.mountPath }}/*.sqlite-wal && rm -rfv {{ .Values.persistence.mountPath }}/.*-litestream && echo PVC cleaned\"],
+                      \"volumeMounts\": [{\"name\": \"data\", \"mountPath\": \"{{ .Values.persistence.mountPath }}\"}]
+                    }],
+                    \"volumes\": [{\"name\": \"data\", \"persistentVolumeClaim\": {\"claimName\": \"${DEPLOY_PREFIX}-${STANDBY}\"}}]
+                  }
+                }" 2>/dev/null || echo "PVC cleanup completed (or PVC was already clean)"
+
+              # Step 5: Scale up standby (triggers Litestream restore from fresh S3 data)
+              echo "Step 5/7: Scaling up $STANDBY_DEPLOY (will restore DB from S3)"
+              kubectl -n "$NAMESPACE" scale deployment "$STANDBY_DEPLOY" --replicas=1
+
+              # Step 6: Wait for readiness
+              echo "Step 6/7: Waiting for $STANDBY_DEPLOY to be ready..."
+              if ! kubectl -n "$NAMESPACE" rollout status deployment "$STANDBY_DEPLOY" --timeout=300s; then
+                echo "ERROR: Standby deployment failed readiness check"
+                echo "Rolling back: scaling down standby, scaling up previous active"
+                kubectl -n "$NAMESPACE" scale deployment "$STANDBY_DEPLOY" --replicas=0
+                kubectl -n "$NAMESPACE" scale deployment "$ACTIVE_DEPLOY" --replicas=1
+                exit 1
+              fi
+
+              # Step 7: Flip Service selector
+              echo "Step 7/7: Flipping Service selector to $STANDBY"
+              kubectl -n "$NAMESPACE" patch svc "$SERVICE" --type=json \
+                -p "[{\"op\": \"replace\", \"path\": \"/spec/selector/app.kubernetes.io~1slot\", \"value\": \"$STANDBY\"}]"
+
+              NEW_ACTIVE=$(kubectl -n "$NAMESPACE" get svc "$SERVICE" \
+                -o jsonpath='{.spec.selector.app\.kubernetes\.io/slot}')
+              echo "Service now pointing to: $NEW_ACTIVE"
 
               echo ""
               echo "=== Switchover complete ==="
