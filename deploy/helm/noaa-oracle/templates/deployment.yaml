@@ -8,7 +8,7 @@ metadata:
   labels:
     {{- include "noaa-oracle.labels" $ | nindent 4 }}
 spec:
-  replicas: {{ $.Values.replicaCount }}
+  replicas: {{ if eq $slot $.Values.blueGreen.activeSlot }}{{ $.Values.replicaCount }}{{ else }}0{{ end }}
   strategy:
     type: Recreate
   selector:
