@@ -30,6 +30,7 @@ pub struct CurrentWeather {
     pub dewpoint_unit_code: String,
     pub precip_in: Option<f64>,
     pub precip_unit_code: String,
+    pub wx_string: String,
 }
 
 impl TryFrom<Metar> for CurrentWeather {
@@ -87,6 +88,7 @@ impl TryFrom<Metar> for CurrentWeather {
                 .map(Some)
                 .unwrap_or(None),
             precip_unit_code: Units::Inches.to_string(),
+            wx_string: val.wx_string.unwrap_or_default(),
         })
     }
 }
@@ -112,6 +114,7 @@ pub struct Observation {
     pub elevation_m: Option<f64>,
     pub precip_in: Option<f64>,
     pub precip_unit_code: String,
+    pub wx_string: String,
 }
 
 impl TryFrom<CurrentWeather> for Observation {
@@ -142,6 +145,7 @@ impl TryFrom<CurrentWeather> for Observation {
             elevation_m: None,
             precip_in: val.precip_in,
             precip_unit_code: val.precip_unit_code,
+            wx_string: val.wx_string,
         };
         Ok(parquet)
     }
@@ -254,6 +258,12 @@ pub fn create_observation_schema() -> Type {
             .build()
             .unwrap();
 
+    let wx_string = Type::primitive_type_builder("wx_string", PhysicalType::BYTE_ARRAY)
+        .with_repetition(Repetition::REQUIRED)
+        .with_logical_type(Some(LogicalType::String))
+        .build()
+        .unwrap();
+
     let schema = Type::group_type_builder("observation")
         .with_fields(vec![
             Arc::new(station_id),
@@ -275,6 +285,7 @@ pub fn create_observation_schema() -> Type {
             Arc::new(elevation_m),
             Arc::new(precip_in),
             Arc::new(precip_unit_code),
+            Arc::new(wx_string),
         ])
         .build()
         .unwrap();
