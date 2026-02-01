@@ -136,7 +136,7 @@ impl WeatherData for WeatherAccess {
                 if let Some(start) = req.start {
                     let threshold = now + Duration::days(1);
                     if start <= threshold {
-                        (Some(start.saturating_sub(Duration::days(1))), Some(start))
+                        (Some(start.saturating_sub(Duration::days(1))), Some(now))
                     } else {
                         (Some(now.saturating_sub(Duration::days(1))), Some(now))
                     }
