@@ -101,37 +101,12 @@ spec:
               # Without this, stale DB files on the standby PVC would be used as-is.
               echo "Step 4/8: Cleaning standby PVC (${DEPLOY_PREFIX}-${STANDBY})"
               CLEANUP_POD="pvc-cleanup-${STANDBY}-$(date +%s)"
-              kubectl -n "$NAMESPACE" apply -f - <<CLEANUP_EOF
-apiVersion: v1
-kind: Pod
-metadata:
-  name: ${CLEANUP_POD}
-spec:
-  restartPolicy: Never
-  containers:
-    - name: cleanup
-      image: alpine:latest
-      command:
-        - sh
-        - -c
-        - |
-          echo 'Cleaning PVC files...'
-          find {{ .Values.persistence.mountPath }} -type f -name '*.db' -exec rm -fv {} +
-          find {{ .Values.persistence.mountPath }} -type f -name '*.db-shm' -exec rm -fv {} +
-          find {{ .Values.persistence.mountPath }} -type f -name '*.db-wal' -exec rm -fv {} +
-          find {{ .Values.persistence.mountPath }} -type f -name '*.sqlite' -exec rm -fv {} +
-          find {{ .Values.persistence.mountPath }} -type f -name '*.sqlite-shm' -exec rm -fv {} +
-          find {{ .Values.persistence.mountPath }} -type f -name '*.sqlite-wal' -exec rm -fv {} +
-          find {{ .Values.persistence.mountPath }} -type d -name '*-litestream' -exec rm -rfv {} + 2>/dev/null
-          echo 'PVC cleaned'
-      volumeMounts:
-        - name: data
-          mountPath: {{ .Values.persistence.mountPath }}
-  volumes:
-    - name: data
-      persistentVolumeClaim:
-        claimName: ${DEPLOY_PREFIX}-${STANDBY}
-CLEANUP_EOF
+              MOUNT_PATH="{{ .Values.persistence.mountPath }}"
+              CLEANUP_CMD="echo Cleaning PVC files...; find $MOUNT_PATH -type f -name '*.db' -exec rm -fv {} +; find $MOUNT_PATH -type f -name '*.db-shm' -exec rm -fv {} +; find $MOUNT_PATH -type f -name '*.db-wal' -exec rm -fv {} +; find $MOUNT_PATH -type f -name '*.sqlite' -exec rm -fv {} +; find $MOUNT_PATH -type f -name '*.sqlite-shm' -exec rm -fv {} +; find $MOUNT_PATH -type f -name '*.sqlite-wal' -exec rm -fv {} +; find $MOUNT_PATH -type d -name '*-litestream' -exec rm -rfv {} + 2>/dev/null; echo PVC cleaned"
+              # Create cleanup pod via JSON to avoid Helm YAML parser issues with heredocs
+              printf '{"apiVersion":"v1","kind":"Pod","metadata":{"name":"%s"},"spec":{"restartPolicy":"Never","containers":[{"name":"cleanup","image":"alpine:latest","command":["sh","-c","%s"],"volumeMounts":[{"name":"data","mountPath":"%s"}]}],"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"%s"}}]}}' \
+                "$CLEANUP_POD" "$CLEANUP_CMD" "$MOUNT_PATH" "${DEPLOY_PREFIX}-${STANDBY}" \
+                | kubectl -n "$NAMESPACE" apply -f - 2>/dev/null || echo "WARNING: Failed to create cleanup pod"
               echo "Waiting for cleanup pod to complete..."
               # Poll until pod reaches a terminal phase (Succeeded/Failed)
               for i in $(seq 1 60); do
