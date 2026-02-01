@@ -5,7 +5,7 @@ use crate::templates::layouts::CurrentPage;
 /// Responsive navigation bar with HTMX-powered navigation
 pub fn navbar(current_page: CurrentPage) -> Markup {
     html! {
-        nav class="navbar is-light mb-4" role="navigation" aria-label="main navigation" {
+        nav class="navbar mb-4" role="navigation" aria-label="main navigation" {
             div class="navbar-brand" {
                 // Hamburger menu for mobile
                 a role="button" class="navbar-burger" aria-label="menu"
@@ -61,7 +61,7 @@ pub fn navbar(current_page: CurrentPage) -> Markup {
 
 fn nav_item_class(current: CurrentPage, page: CurrentPage) -> &'static str {
     if current == page {
-        "navbar-item is-active has-background-primary-light"
+        "navbar-item is-active"
     } else {
         "navbar-item"
     }

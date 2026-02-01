@@ -299,6 +299,65 @@
 /* Active navbar item styling */
 .navbar-item.is-active {
     font-weight: 600;
+    background-color: var(--bulma-primary);
+    color: #fff !important;
+    border-radius: 4px;
+}
+
+.navbar-item.is-active .icon {
+    color: #fff !important;
+}
+
+.navbar-item.is-active:hover {
+    background-color: var(--bulma-primary) !important;
+    color: #fff !important;
+}
+
+/* Dark mode overrides */
+[data-theme="dark"] .navbar {
+    background-color: var(--bulma-scheme-main-bis);
+}
+
+[data-theme="dark"] .tag.is-light {
+    background-color: rgba(255, 255, 255, 0.1);
+    color: var(--bulma-text);
+}
+
+[data-theme="dark"] .button.is-light,
+[data-theme="dark"] .button.is-info.is-light,
+[data-theme="dark"] .button.is-link.is-light {
+    background-color: rgba(255, 255, 255, 0.08);
+    color: var(--bulma-text);
+    border-color: var(--bulma-border);
+}
+
+[data-theme="dark"] .button.is-light:hover,
+[data-theme="dark"] .button.is-info.is-light:hover,
+[data-theme="dark"] .button.is-link.is-light:hover {
+    background-color: rgba(255, 255, 255, 0.15);
+    color: var(--bulma-text);
+}
+
+[data-theme="dark"] code {
+    background-color: rgba(255, 255, 255, 0.08);
+    color: #b86bff;
+}
+
+[data-theme="dark"]
+    .table.is-striped
+    tbody
+    tr:not(.is-selected):nth-child(even) {
+    background-color: rgba(255, 255, 255, 0.03);
+}
+
+[data-theme="dark"] .box:hover {
+    box-shadow:
+        0 0.5em 1em -0.125em rgba(0, 0, 0, 0.3),
+        0 0px 0 1px rgba(255, 255, 255, 0.05);
+}
+
+[data-theme="dark"] .navbar-burger span {
+    color: var(--bulma-text);
 }
 
 /* Smooth transitions for HTMX content swaps */
