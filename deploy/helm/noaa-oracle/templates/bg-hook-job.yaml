@@ -33,6 +33,7 @@ spec:
               DEPLOY_PREFIX="{{ include "noaa-oracle.fullname" . }}"
               CONTAINER="{{ .Chart.Name }}"
               NEW_IMAGE="{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+              DESIRED_SLOT="{{ .Values.blueGreen.activeSlot | default "blue" }}"
 
               echo "=== Blue/Green PreSync Switchover ==="
               echo "Namespace: $NAMESPACE"
@@ -71,10 +72,16 @@ spec:
 
               echo "Current active image: $CURRENT_IMAGE"
 
-              if [[ "$CURRENT_IMAGE" == "$NEW_IMAGE" ]]; then
-                echo "Active deployment already running $NEW_IMAGE. No switchover needed."
+              if [[ "$CURRENT_IMAGE" == "$NEW_IMAGE" && "$ACTIVE" == "$DESIRED_SLOT" ]]; then
+                echo "Active deployment already running $NEW_IMAGE and active slot matches desired ($DESIRED_SLOT). No switchover needed."
                 kubectl -n "$NAMESPACE" scale deployment "$STANDBY_DEPLOY" --replicas=0 2>/dev/null || true
                 exit 0
+              fi
+
+              if [[ "$CURRENT_IMAGE" == "$NEW_IMAGE" && "$ACTIVE" != "$DESIRED_SLOT" ]]; then
+                echo "Image unchanged but active slot ($ACTIVE) differs from desired ($DESIRED_SLOT). Switching."
+                # Ensure standby has the same image before switching
+                kubectl -n "$NAMESPACE" set image "deployment/$STANDBY_DEPLOY" "$CONTAINER=$NEW_IMAGE"
               fi
 
               echo ""
