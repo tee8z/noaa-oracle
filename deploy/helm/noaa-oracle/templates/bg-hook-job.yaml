@@ -82,42 +82,75 @@ spec:
               echo "=== Starting switchover: $ACTIVE -> $STANDBY ==="
 
               # Step 1: Update standby image
-              echo "Step 1/7: Setting $STANDBY_DEPLOY image to $NEW_IMAGE"
+              echo "Step 1/8: Setting $STANDBY_DEPLOY image to $NEW_IMAGE"
               kubectl -n "$NAMESPACE" set image "deployment/$STANDBY_DEPLOY" "$CONTAINER=$NEW_IMAGE"
 
               # Step 2: Scale down active so Litestream flushes WAL to S3 on SIGTERM
-              echo "Step 2/7: Scaling down $ACTIVE_DEPLOY (Litestream will flush WAL to S3)"
+              echo "Step 2/8: Scaling down $ACTIVE_DEPLOY (Litestream will flush WAL to S3)"
               kubectl -n "$NAMESPACE" scale deployment "$ACTIVE_DEPLOY" --replicas=0
 
               # Step 3: Wait for active pods to terminate
-              echo "Step 3/7: Waiting for $ACTIVE_DEPLOY pods to terminate"
+              echo "Step 3/8: Waiting for $ACTIVE_DEPLOY pods to terminate"
               kubectl -n "$NAMESPACE" wait --for=delete pod \
                 -l "app.kubernetes.io/slot=$ACTIVE,app.kubernetes.io/name={{ include "noaa-oracle.name" . }}" \
                 --timeout=60s 2>/dev/null || true
               echo "$ACTIVE_DEPLOY terminated, S3 backups should be up to date"
 
-              # Step 4: Clean standby PVC so litestream-restore init container does a full restore
-              echo "Step 4/7: Cleaning standby PVC (${DEPLOY_PREFIX}-${STANDBY})"
-              kubectl -n "$NAMESPACE" run "pvc-cleanup-$$" --rm -i --restart=Never \
-                --image=alpine:latest \
-                --overrides="{
-                  \"spec\": {
-                    \"containers\": [{
-                      \"name\": \"cleanup\",
-                      \"image\": \"alpine:latest\",
-                      \"command\": [\"sh\", \"-c\", \"find {{ .Values.persistence.mountPath }} -type f -name '*.db' -exec rm -fv {} + ; find {{ .Values.persistence.mountPath }} -type f -name '*.db-shm' -exec rm -fv {} + ; find {{ .Values.persistence.mountPath }} -type f -name '*.db-wal' -exec rm -fv {} + ; find {{ .Values.persistence.mountPath }} -type f -name '*.sqlite' -exec rm -fv {} + ; find {{ .Values.persistence.mountPath }} -type f -name '*.sqlite-shm' -exec rm -fv {} + ; find {{ .Values.persistence.mountPath }} -type f -name '*.sqlite-wal' -exec rm -fv {} + ; find {{ .Values.persistence.mountPath }} -type d -name '*-litestream' -exec rm -rfv {} + 2>/dev/null; echo PVC cleaned\"],
-                      \"volumeMounts\": [{\"name\": \"data\", \"mountPath\": \"{{ .Values.persistence.mountPath }}\"}]
-                    }],
-                    \"volumes\": [{\"name\": \"data\", \"persistentVolumeClaim\": {\"claimName\": \"${DEPLOY_PREFIX}-${STANDBY}\"}}]
-                  }
-                }" 2>/dev/null || echo "PVC cleanup completed (or PVC was already clean)"
+              # Step 4: Clean standby PVC so the litestream-restore init container
+              # does a full restore from S3 instead of skipping (it uses -if-db-not-exists).
+              # Without this, stale DB files on the standby PVC would be used as-is.
+              echo "Step 4/8: Cleaning standby PVC (${DEPLOY_PREFIX}-${STANDBY})"
+              CLEANUP_POD="pvc-cleanup-${STANDBY}-$(date +%s)"
+              kubectl -n "$NAMESPACE" apply -f - <<CLEANUP_EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${CLEANUP_POD}
+spec:
+  restartPolicy: Never
+  containers:
+    - name: cleanup
+      image: alpine:latest
+      command:
+        - sh
+        - -c
+        - |
+          echo 'Cleaning PVC files...'
+          find {{ .Values.persistence.mountPath }} -type f -name '*.db' -exec rm -fv {} +
+          find {{ .Values.persistence.mountPath }} -type f -name '*.db-shm' -exec rm -fv {} +
+          find {{ .Values.persistence.mountPath }} -type f -name '*.db-wal' -exec rm -fv {} +
+          find {{ .Values.persistence.mountPath }} -type f -name '*.sqlite' -exec rm -fv {} +
+          find {{ .Values.persistence.mountPath }} -type f -name '*.sqlite-shm' -exec rm -fv {} +
+          find {{ .Values.persistence.mountPath }} -type f -name '*.sqlite-wal' -exec rm -fv {} +
+          find {{ .Values.persistence.mountPath }} -type d -name '*-litestream' -exec rm -rfv {} + 2>/dev/null
+          echo 'PVC cleaned'
+      volumeMounts:
+        - name: data
+          mountPath: {{ .Values.persistence.mountPath }}
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: ${DEPLOY_PREFIX}-${STANDBY}
+CLEANUP_EOF
+              echo "Waiting for cleanup pod to complete..."
+              # Poll until pod reaches a terminal phase (Succeeded/Failed)
+              for i in $(seq 1 60); do
+                PHASE=$(kubectl -n "$NAMESPACE" get pod "$CLEANUP_POD" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+                if [[ "$PHASE" == "Succeeded" || "$PHASE" == "Failed" ]]; then
+                  echo "Cleanup pod finished with phase: $PHASE"
+                  break
+                fi
+                sleep 1
+              done
+              kubectl -n "$NAMESPACE" logs "$CLEANUP_POD" 2>/dev/null || true
+              kubectl -n "$NAMESPACE" delete pod "$CLEANUP_POD" --ignore-not-found 2>/dev/null || true
 
               # Step 5: Scale up standby (triggers Litestream restore from fresh S3 data)
-              echo "Step 5/7: Scaling up $STANDBY_DEPLOY (will restore DB from S3)"
+              echo "Step 5/8: Scaling up $STANDBY_DEPLOY (will restore DB from S3)"
               kubectl -n "$NAMESPACE" scale deployment "$STANDBY_DEPLOY" --replicas=1
 
               # Step 6: Wait for readiness
-              echo "Step 6/7: Waiting for $STANDBY_DEPLOY to be ready..."
+              echo "Step 6/8: Waiting for $STANDBY_DEPLOY to be ready..."
               if ! kubectl -n "$NAMESPACE" rollout status deployment "$STANDBY_DEPLOY" --timeout=300s; then
                 echo "ERROR: Standby deployment failed readiness check"
                 echo "Rolling back: scaling down standby, scaling up previous active"
@@ -127,13 +160,67 @@ spec:
               fi
 
               # Step 7: Flip Service selector
-              echo "Step 7/7: Flipping Service selector to $STANDBY"
+              echo "Step 7/8: Flipping Service selector to $STANDBY"
               kubectl -n "$NAMESPACE" patch svc "$SERVICE" --type=json \
                 -p "[{\"op\": \"replace\", \"path\": \"/spec/selector/app.kubernetes.io~1slot\", \"value\": \"$STANDBY\"}]"
 
               NEW_ACTIVE=$(kubectl -n "$NAMESPACE" get svc "$SERVICE" \
                 -o jsonpath='{.spec.selector.app\.kubernetes\.io/slot}')
               echo "Service now pointing to: $NEW_ACTIVE"
+
+
+              # Step 8: Update activeSlot in infrastructure values via GitHub API.
+              # This keeps the git values file in sync with the runtime state so
+              # future Helm renders are correct. Uses the ghcr-pull-secret token.
+              echo "Step 8/8: Updating activeSlot in infrastructure repo"
+              GITHUB_TOKEN=""
+              # Try to get token from ghcr-pull-secret in current namespace
+              DOCKER_CONFIG=$(kubectl -n "$NAMESPACE" get secret ghcr-pull-secret -o jsonpath='{.data.\.dockerconfigjson}' 2>/dev/null || echo "")
+              if [[ -n "$DOCKER_CONFIG" ]]; then
+                GITHUB_TOKEN=$(echo "$DOCKER_CONFIG" | base64 -d | jq -r '.auths["ghcr.io"].auth' | base64 -d | cut -d: -f2)
+              fi
+              if [[ -z "$GITHUB_TOKEN" ]]; then
+                echo "WARNING: Could not extract GitHub token from ghcr-pull-secret. Skipping git write-back."
+              else
+                VALUES_PATH="k8s/values/apps/staging/noaa-oracle.yaml"
+                GITHUB_API="https://api.github.com/repos/5day4cast/infrastructure/contents/$VALUES_PATH"
+                
+                # Get current file content and SHA
+                FILE_RESP=$(curl -sf -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "$GITHUB_API" 2>/dev/null)
+                if [[ -n "$FILE_RESP" ]]; then
+                  FILE_SHA=$(echo "$FILE_RESP" | jq -r '.sha')
+                  FILE_CONTENT=$(echo "$FILE_RESP" | jq -r '.content' | base64 -d)
+                  
+                  # Update activeSlot value using sed
+                  NEW_CONTENT=$(echo "$FILE_CONTENT" | sed "s/activeSlot: .*/activeSlot: $STANDBY/")
+                  
+                  # Only commit if the value actually changed
+                  if [[ "$FILE_CONTENT" != "$NEW_CONTENT" ]]; then
+                    NEW_CONTENT_B64=$(echo "$NEW_CONTENT" | base64 -w 0)
+                    COMMIT_MSG="chore: update noaa-oracle activeSlot to $STANDBY after blue/green switchover"
+                    
+                    RESP=$(curl -sf -X PUT -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" \
+                      "$GITHUB_API" \
+                      -d "$(jq -n --arg msg "$COMMIT_MSG" --arg content "$NEW_CONTENT_B64" --arg sha "$FILE_SHA" \
+                        '{message: $msg, content: $content, sha: $sha}')" 2>/dev/null)
+                    
+                    if [[ -n "$RESP" ]]; then
+                      COMMIT_SHA=$(echo "$RESP" | jq -r '.commit.sha // empty')
+                      if [[ -n "$COMMIT_SHA" ]]; then
+                        echo "Successfully updated activeSlot to $STANDBY (commit: $COMMIT_SHA)"
+                      else
+                        echo "WARNING: GitHub API response did not contain commit SHA. Write-back may have failed."
+                      fi
+                    else
+                      echo "WARNING: GitHub API write-back failed. activeSlot in git may be stale."
+                    fi
+                  else
+                    echo "activeSlot already set to $STANDBY in git. No update needed."
+                  fi
+                else
+                  echo "WARNING: Could not fetch values file from GitHub API. Skipping git write-back."
+                fi
+              fi
 
               echo ""
               echo "=== Switchover complete ==="
