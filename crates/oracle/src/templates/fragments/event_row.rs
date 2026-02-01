@@ -46,7 +46,7 @@ pub fn event_row(event: &EventView) -> Markup {
             }
 
             // Observation window
-            td class="is-hidden-mobile" {
+            td {
                 span class="is-size-7 local-time" data-utc=(event.start_observation.clone()) {
                     (event.start_observation.clone())
                 }
@@ -59,7 +59,7 @@ pub fn event_row(event: &EventView) -> Markup {
             }
 
             // Signing date
-            td class="is-hidden-mobile" {
+            td {
                 span class="is-size-7 local-time" data-utc=(event.signing_date.clone()) {
                     (event.signing_date.clone())
                 }
@@ -73,12 +73,78 @@ pub fn event_row(event: &EventView) -> Markup {
             }
 
             // Winners
-            td class="has-text-centered is-hidden-mobile" {
+            td class="has-text-centered" {
                 (event.number_of_places_win)
             }
 
             // Action button
             td {
+                button class="button is-small is-info is-light" {
+                    "View"
+                }
+            }
+        }
+    }
+}
+
+/// Single event card for mobile view
+pub fn event_card(event: &EventView) -> Markup {
+    html! {
+        div class="event-card box mb-3 is-clickable"
+            hx-get=(format!("/events/{}", event.id))
+            hx-target="#main-content"
+            hx-push-url="true" {
+            div class="is-flex is-justify-content-space-between is-align-items-center mb-2" {
+                code class="is-size-7" title=(event.id.clone()) {
+                    (truncate_id(&event.id))
+                }
+                span class=(status_class(&event.status)) {
+                    (status_text(&event.status))
+                }
+            }
+
+            div class="tags are-small mb-2" {
+                @for location in &event.locations {
+                    span class="tag is-light" { (location) }
+                }
+            }
+
+            div class="is-flex is-flex-wrap-wrap" style="gap: 0.75rem;" {
+                div {
+                    p class="event-card-label" { "Observation" }
+                    p class="is-size-7" {
+                        span class="local-time" data-utc=(event.start_observation.clone()) {
+                            (event.start_observation.clone())
+                        }
+                    }
+                    p class="is-size-7" {
+                        "to "
+                        span class="local-time" data-utc=(event.end_observation.clone()) {
+                            (event.end_observation.clone())
+                        }
+                    }
+                }
+                div {
+                    p class="event-card-label" { "Signing" }
+                    p class="is-size-7" {
+                        span class="local-time" data-utc=(event.signing_date.clone()) {
+                            (event.signing_date.clone())
+                        }
+                    }
+                }
+            }
+
+            div class="is-flex is-justify-content-space-between is-align-items-center mt-2 pt-2" style="border-top: 1px solid var(--bulma-border);" {
+                div class="is-flex" style="gap: 1rem;" {
+                    span class="is-size-7" {
+                        strong { "Entries: " }
+                        (event.total_entries) " / " (event.total_allowed_entries)
+                    }
+                    span class="is-size-7" {
+                        strong { "Winners: " }
+                        (event.number_of_places_win)
+                    }
+                }
                 button class="button is-small is-info is-light" {
                     "View"
                 }

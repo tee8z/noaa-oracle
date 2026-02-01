@@ -96,8 +96,8 @@ pub fn weather_table(weather_data: &[WeatherDisplay], all_stations: &[(String, S
                     }
                     li data-view="table" onclick="switchWeatherView('table')" {
                         a {
-                            span class="icon is-small" { (table_icon()) }
-                            span { "Table" }
+                            span class="icon is-small" { (list_icon()) }
+                            span { "List" }
                         }
                     }
                 }
@@ -124,9 +124,9 @@ pub fn weather_table_body(weather_data: &[WeatherDisplay]) -> Markup {
                 (weather_map(weather_data))
             }
 
-            // Table view (hidden by default)
+            // Table view - desktop only (hidden by default)
             div id="weather-table-view" style="display: none;" {
-                div class="table-container" {
+                div class="table-container is-hidden-mobile" {
                     table class="table is-fullwidth is-hoverable" {
                         thead {
                             tr {
@@ -148,6 +148,11 @@ pub fn weather_table_body(weather_data: &[WeatherDisplay]) -> Markup {
                             (render_weather_rows_with_regions(weather_data))
                         }
                     }
+                }
+
+                // Card view - mobile only
+                div class="weather-cards is-hidden-tablet" {
+                    (render_weather_cards_with_regions(weather_data))
                 }
             }
         }
@@ -186,6 +191,146 @@ fn render_weather_rows_with_regions(weather_data: &[WeatherDisplay]) -> Markup {
                 tr class="forecast-row" id=(format!("forecast-row-{}", weather.station_id)) style="display: none;" {
                     td colspan="8" {
                         div id=(format!("forecast-{}", weather.station_id)) {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render weather cards grouped by region (mobile view)
+fn render_weather_cards_with_regions(weather_data: &[WeatherDisplay]) -> Markup {
+    let mut by_region: Vec<(u8, Vec<&WeatherDisplay>)> = Vec::new();
+
+    for weather in weather_data {
+        let region = get_region(weather.longitude);
+        if let Some((_, stations)) = by_region.iter_mut().find(|(r, _)| *r == region) {
+            stations.push(weather);
+        } else {
+            by_region.push((region, vec![weather]));
+        }
+    }
+
+    by_region.sort_by_key(|(r, _)| *r);
+
+    html! {
+        @for (region, stations) in &by_region {
+            div class={"weather-region-header " (region_class(*region))} {
+                (region_name(*region))
+            }
+            @for weather in stations {
+                (render_weather_card(weather))
+            }
+        }
+    }
+}
+
+/// Render a single weather card (mobile)
+fn render_weather_card(weather: &WeatherDisplay) -> Markup {
+    html! {
+        div class="weather-card box mb-3"
+            data-station=(weather.station_id.clone()) {
+            // Header: station ID + name
+            div class="is-flex is-justify-content-space-between is-align-items-center mb-2" {
+                div {
+                    strong { (weather.station_id.clone()) }
+                    @if !weather.iata_id.is_empty() {
+                        " "
+                        span class="tag is-iata is-small" { (weather.iata_id.clone()) }
+                    }
+                }
+            }
+            @if !weather.station_name.is_empty() || !weather.state.is_empty() {
+                p class="is-size-7 has-text-grey mb-2" {
+                    @if !weather.station_name.is_empty() {
+                        (weather.station_name.clone())
+                    }
+                    @if !weather.station_name.is_empty() && !weather.state.is_empty() {
+                        ", "
+                    }
+                    @if !weather.state.is_empty() {
+                        (weather.state.clone())
+                    }
+                    @if let Some(elev) = weather.elevation_m {
+                        " "
+                        span class="has-text-grey-light" { (format!("({:.0}m)", elev)) }
+                    }
+                }
+            }
+
+            // Weather values in a grid
+            div class="weather-card-grid" {
+                div class="weather-card-item" {
+                    span class="weather-card-label" { "High" }
+                    @if let Some(temp) = weather.temp_high {
+                        span class="weather-value temp-high" { (format!("{:.0}°F", temp)) }
+                    } @else {
+                        span class="has-text-grey" { "-" }
+                    }
+                }
+                div class="weather-card-item" {
+                    span class="weather-card-label" { "Low" }
+                    @if let Some(temp) = weather.temp_low {
+                        span class="weather-value temp-low" { (format!("{:.0}°F", temp)) }
+                    } @else {
+                        span class="has-text-grey" { "-" }
+                    }
+                }
+                div class="weather-card-item" {
+                    span class="weather-card-label" { "Wind" }
+                    @if let Some(wind) = weather.wind_speed {
+                        span class="weather-value wind" {
+                            (format!("{}", wind))
+                            @if let Some(dir) = weather.wind_direction {
+                                span class="has-text-grey is-size-7" { (format!(" {}", wind_direction_label(dir))) }
+                            }
+                        }
+                    } @else {
+                        span class="has-text-grey" { "-" }
+                    }
+                }
+                div class="weather-card-item" {
+                    span class="weather-card-label" { "Humidity" }
+                    @if let Some(humidity) = weather.humidity {
+                        span class="weather-value" { (format!("{}%", humidity)) }
+                    } @else {
+                        span class="has-text-grey" { "-" }
+                    }
+                }
+                div class="weather-card-item" {
+                    span class="weather-card-label" { "Precip" }
+                    @if let Some(rain) = weather.rain_amt {
+                        @if rain > 0.0 {
+                            span class="weather-value has-text-info" { (format!("{:.2}\"", rain)) }
+                        } @else {
+                            span class="has-text-grey" { "-" }
+                        }
+                    } @else {
+                        span class="has-text-grey" { "-" }
+                    }
+                }
+                div class="weather-card-item" {
+                    span class="weather-card-label" { "Snow" }
+                    @if let Some(snow) = weather.snow_amt {
+                        @if snow > 0.0 {
+                            span class="weather-value has-text-link" { (format!("{:.1}\"", snow)) }
+                        } @else {
+                            span class="has-text-grey" { "-" }
+                        }
+                    } @else {
+                        span class="has-text-grey" { "-" }
+                    }
+                }
+            }
+
+            // Observed time
+            div class="mt-2 pt-2" style="border-top: 1px solid var(--bulma-border);" {
+                span class="is-size-7 has-text-grey" {
+                    "Observed: "
+                    span class="local-time-range"
+                         data-utc-start=(weather.observed_start.clone())
+                         data-utc-end=(weather.observed_end.clone()) {
+                        (weather.observed_start.clone()) " - " (weather.observed_end.clone())
                     }
                 }
             }
@@ -335,14 +480,16 @@ fn map_icon() -> Markup {
     }
 }
 
-fn table_icon() -> Markup {
+fn list_icon() -> Markup {
     html! {
         svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"
             fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" {
-            rect x="3" y="3" width="18" height="18" rx="2" ry="2" {}
-            line x1="3" y1="9" x2="21" y2="9" {}
-            line x1="3" y1="15" x2="21" y2="15" {}
-            line x1="9" y1="3" x2="9" y2="21" {}
+            line x1="8" y1="6" x2="21" y2="6" {}
+            line x1="8" y1="12" x2="21" y2="12" {}
+            line x1="8" y1="18" x2="21" y2="18" {}
+            line x1="3" y1="6" x2="3.01" y2="6" {}
+            line x1="3" y1="12" x2="3.01" y2="12" {}
+            line x1="3" y1="18" x2="3.01" y2="18" {}
         }
     }
 }

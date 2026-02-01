@@ -1,6 +1,6 @@
 use maud::{html, Markup};
 
-use super::event_row::{event_row, EventView};
+use super::event_row::{event_card, event_row, EventView};
 
 /// Events table fragment
 /// Shows all events with auto-refresh capability
@@ -28,17 +28,18 @@ pub fn events_table(events: &[EventView]) -> Markup {
                     p class="is-size-7" { "Events will appear here when created by coordinators." }
                 }
             } @else {
-                div class="table-container" {
+                // Desktop table view (hidden on mobile)
+                div class="table-container is-hidden-mobile" {
                     table class="table is-fullwidth is-striped is-hoverable" {
                         thead {
                             tr {
                                 th { "ID" }
                                 th { "Locations" }
                                 th { "Status" }
-                                th class="is-hidden-mobile" { "Observation Window" }
-                                th class="is-hidden-mobile" { "Signing Date" }
+                                th { "Observation Window" }
+                                th { "Signing Date" }
                                 th class="has-text-centered" { "Entries" }
-                                th class="has-text-centered is-hidden-mobile" { "Winners" }
+                                th class="has-text-centered" { "Winners" }
                                 th { "" }
                             }
                         }
@@ -52,6 +53,17 @@ pub fn events_table(events: &[EventView]) -> Markup {
                         }
                     }
                 }
+
+                // Mobile card view (hidden on tablet+)
+                div class="events-cards is-hidden-tablet"
+                    id="events-cards"
+                    hx-get="/fragments/events-cards"
+                    hx-trigger="every 30s"
+                    hx-swap="innerHTML" {
+                    @for event in events {
+                        (event_card(event))
+                    }
+                }
             }
         }
     }
@@ -62,6 +74,15 @@ pub fn events_table_rows(events: &[EventView]) -> Markup {
     html! {
         @for event in events {
             (event_row(event))
+        }
+    }
+}
+
+/// Just the cards - used for HTMX partial updates on mobile
+pub fn events_table_cards(events: &[EventView]) -> Markup {
+    html! {
+        @for event in events {
+            (event_card(event))
         }
     }
 }

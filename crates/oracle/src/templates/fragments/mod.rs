@@ -6,9 +6,9 @@ mod oracle_info;
 mod weather_map;
 mod weather_table;
 
-pub use event_row::{event_row, EventView};
+pub use event_row::{event_card, event_row, EventView};
 pub use event_stats::{event_stats, EventStats};
-pub use events_table::{events_table, events_table_rows};
+pub use events_table::{events_table, events_table_cards, events_table_rows};
 pub use forecast_detail::{forecast_detail, ForecastComparison, ForecastDisplay};
 pub use oracle_info::oracle_info;
 pub use weather_table::{weather_table, weather_table_body, WeatherDisplay};

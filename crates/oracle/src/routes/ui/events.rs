@@ -5,7 +5,10 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::{
     db::EventFilter,
-    templates::{events_page, events_table_rows, pages::events::events_content, EventView},
+    templates::{
+        events_page, events_table_cards, events_table_rows, pages::events::events_content,
+        EventView,
+    },
     AppState,
 };
 
@@ -31,6 +34,12 @@ pub async fn events_handler(
 pub async fn events_rows_handler(State(state): State<Arc<AppState>>) -> Html<String> {
     let events = build_events_view(&state).await;
     Html(events_table_rows(&events).into_string())
+}
+
+/// Handler for events cards (mobile view) - HTMX partial for auto-refresh
+pub async fn events_cards_handler(State(state): State<Arc<AppState>>) -> Html<String> {
+    let events = build_events_view(&state).await;
+    Html(events_table_cards(&events).into_string())
 }
 
 async fn build_events_view(state: &Arc<AppState>) -> Vec<EventView> {

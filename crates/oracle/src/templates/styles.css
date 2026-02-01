@@ -239,6 +239,81 @@
     display: none;
 }
 
+/* Mobile event cards */
+.event-card {
+    padding: 0.75rem;
+}
+
+.event-card-label {
+    font-size: 0.7rem;
+    color: var(--bulma-text-weak);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.15rem;
+}
+
+/* Weather station cards (mobile) */
+.weather-card {
+    padding: 0.75rem;
+}
+
+.weather-card-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 0.5rem;
+}
+
+.weather-card-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+}
+
+.weather-card-label {
+    font-size: 0.65rem;
+    color: var(--bulma-text-weak);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.1rem;
+}
+
+.weather-region-header {
+    font-weight: 600;
+    font-size: 0.875rem;
+    padding: 0.5rem 0.75rem;
+    margin-top: 0.5rem;
+    margin-bottom: 0.5rem;
+    border-left: 4px solid;
+    border-radius: 2px;
+    background-color: var(--bulma-scheme-main-bis);
+}
+
+.weather-region-header.region-alaska-hawaii {
+    border-left-color: #8b5cf6;
+    background-color: rgba(139, 92, 246, 0.1);
+}
+
+.weather-region-header.region-pacific {
+    border-left-color: #a855f7;
+    background-color: rgba(168, 85, 247, 0.1);
+}
+
+.weather-region-header.region-mountain {
+    border-left-color: #10b981;
+    background-color: rgba(16, 185, 129, 0.1);
+}
+
+.weather-region-header.region-central {
+    border-left-color: #f59e0b;
+    background-color: rgba(245, 158, 11, 0.1);
+}
+
+.weather-region-header.region-eastern {
+    border-left-color: #06b6d4;
+    background-color: rgba(6, 182, 212, 0.1);
+}
+
 /* Mobile-specific adjustments */
 @media screen and (max-width: 768px) {
     /* Reduce padding on mobile */
@@ -316,6 +391,11 @@
 /* Dark mode overrides */
 [data-theme="dark"] .navbar {
     background-color: var(--bulma-scheme-main-bis);
+}
+
+[data-theme="dark"] .tag.is-running {
+    background-color: #b45309;
+    color: #fef3c7;
 }
 
 [data-theme="dark"] .tag.is-light {
