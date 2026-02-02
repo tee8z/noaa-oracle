@@ -157,7 +157,7 @@ async fn get_weather_for_stations(
     }
 
     // Batch-fetch yesterday's forecast for today to show accuracy
-    populate_forecast_accuracy(&state, &mut weather_data).await;
+    populate_forecast_accuracy(state, &mut weather_data).await;
 
     weather_data
 }
