@@ -899,7 +899,6 @@ impl Oracle {
     }
 }
 
-
 pub fn get_winning_bytes(winners: Vec<usize>) -> Vec<u8> {
     winners
         .iter()

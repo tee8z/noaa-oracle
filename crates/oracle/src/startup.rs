@@ -102,10 +102,7 @@ pub async fn build_app_state(
     })
 }
 
-
-pub async fn health_check(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+pub async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.oracle.health_check().await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => {

@@ -148,7 +148,10 @@ impl Database {
             .await
             .context("Database integrity check failed")?;
         if result != "ok" {
-            return Err(anyhow::anyhow!("Database integrity check failed: {}", result));
+            return Err(anyhow::anyhow!(
+                "Database integrity check failed: {}",
+                result
+            ));
         }
 
         Ok(())
