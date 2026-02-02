@@ -29,6 +29,12 @@ async fn dashboard_returns_current_day_observations() {
         .times(1)
         .returning(|| Ok(mock_stations()));
 
+    // Dashboard now batch-fetches forecast accuracy for displayed stations
+    weather_data
+        .expect_forecasts_data()
+        .times(1)
+        .returning(|_, _| Ok(vec![]));
+
     let test_app = spawn_app(Arc::new(weather_data)).await;
 
     let request = Request::builder()
@@ -80,6 +86,12 @@ async fn weather_fragment_uses_3_day_window() {
         .expect_stations()
         .times(1)
         .returning(|| Ok(mock_stations()));
+
+    // Weather fragment now batch-fetches forecast accuracy
+    weather_data
+        .expect_forecasts_data()
+        .times(1)
+        .returning(|_, _| Ok(vec![]));
 
     let test_app = spawn_app(Arc::new(weather_data)).await;
 
