@@ -7,6 +7,8 @@ use axum::{
 use serde::Deserialize;
 use time::OffsetDateTime;
 
+use std::collections::HashMap;
+
 use crate::{
     db::EventStatus,
     templates::{
@@ -148,11 +150,56 @@ async fn get_weather_for_stations(
                 updated_at: updated_at.clone(),
                 latitude: station.map(|s| s.latitude).unwrap_or(0.0),
                 longitude: station.map(|s| s.longitude).unwrap_or(0.0),
+                forecast_high: None,
+                forecast_low: None,
             });
         }
     }
 
+    // Batch-fetch yesterday's forecast for today to show accuracy
+    populate_forecast_accuracy(&state, &mut weather_data).await;
+
     weather_data
+}
+
+/// Batch-fetch yesterday's forecast for today and populate forecast_high/forecast_low
+async fn populate_forecast_accuracy(state: &Arc<AppState>, weather_data: &mut [WeatherDisplay]) {
+    if weather_data.is_empty() {
+        return;
+    }
+
+    let station_ids: Vec<String> = weather_data.iter().map(|w| w.station_id.clone()).collect();
+    let now = OffsetDateTime::now_utc();
+    let today_start = now.replace_time(time::Time::MIDNIGHT);
+    let today_end = today_start + time::Duration::days(1);
+    let yesterday_start = today_start - time::Duration::days(1);
+
+    let forecast_req = ForecastRequest {
+        start: Some(today_start),
+        end: Some(today_end),
+        generated_start: Some(yesterday_start),
+        generated_end: Some(today_start),
+        station_ids: station_ids.join(","),
+        temperature_unit: TemperatureUnit::Fahrenheit,
+    };
+
+    if let Ok(forecasts) = state
+        .weather_db
+        .forecasts_data(&forecast_req, station_ids)
+        .await
+    {
+        let forecast_map: HashMap<String, _> = forecasts
+            .into_iter()
+            .map(|f| (f.station_id.clone(), f))
+            .collect();
+
+        for weather in weather_data.iter_mut() {
+            if let Some(forecast) = forecast_map.get(&weather.station_id) {
+                weather.forecast_high = Some(forecast.temp_high);
+                weather.forecast_low = Some(forecast.temp_low);
+            }
+        }
+    }
 }
 
 /// Handler for forecast detail fragment (GET /fragments/forecast/:station_id)
@@ -198,13 +245,13 @@ pub async fn forecast_handler(
     // Sort by date chronologically
     forecast_displays.sort_by(|a, b| a.date.cmp(&b.date));
 
-    // Fetch past forecasts for comparison - use forecasts generated before the period started
-    let past_start = now - time::Duration::days(3);
+    // Fetch past forecasts for comparison (last 7 days)
+    let past_start = now - time::Duration::days(7);
     let past_req = ForecastRequest {
         start: Some(past_start),
         end: Some(now),
         generated_start: Some(past_start - time::Duration::days(1)),
-        generated_end: Some(past_start),
+        generated_end: Some(now),
         station_ids: station_id.clone(),
         temperature_unit: TemperatureUnit::Fahrenheit,
     };
@@ -233,14 +280,29 @@ pub async fn forecast_handler(
     let mut comparisons: Vec<ForecastComparison> = past_forecasts
         .into_iter()
         .map(|f| {
-            // Find matching observation for this date
             let obs = daily_obs.iter().find(|o| o.date == f.date);
             ForecastComparison {
                 date: f.date,
                 forecast_high: f.temp_high,
                 forecast_low: f.temp_low,
+                forecast_wind: f.wind_speed,
+                forecast_humidity_max: f.humidity_max,
+                forecast_humidity_min: f.humidity_min,
+                forecast_precip_chance: f.precip_chance,
+                forecast_rain: f.rain_amt,
+                forecast_snow: f.snow_amt,
                 actual_high: obs.map(|o| o.temp_high),
                 actual_low: obs.map(|o| o.temp_low),
+                actual_wind: obs.and_then(|o| {
+                    if o.wind_speed >= 0 {
+                        Some(o.wind_speed)
+                    } else {
+                        None
+                    }
+                }),
+                actual_humidity: obs.and_then(|o| o.humidity),
+                actual_rain: obs.and_then(|o| o.rain_amt),
+                actual_snow: obs.and_then(|o| o.snow_amt),
             }
         })
         .collect();

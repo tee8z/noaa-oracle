@@ -21,6 +21,10 @@ pub struct WeatherDisplay {
     pub updated_at: String,
     pub latitude: f64,
     pub longitude: f64,
+    /// Yesterday's forecast high for today (what was predicted)
+    pub forecast_high: Option<i64>,
+    /// Yesterday's forecast low for today (what was predicted)
+    pub forecast_low: Option<i64>,
 }
 
 /// Geographic region based on longitude (matches dashboard.rs get_region)
@@ -133,6 +137,7 @@ pub fn weather_table_body(weather_data: &[WeatherDisplay]) -> Markup {
                                 th { "Station" }
                                 th class="has-text-right" { "Temp High" }
                                 th class="has-text-right" { "Temp Low" }
+                                th class="has-text-right" { "Forecast" }
                                 th class="has-text-right" { "Wind" }
                                 th class="has-text-right" { "Humidity" }
                                 th class="has-text-right" { "Precip" }
@@ -180,7 +185,7 @@ fn render_weather_rows_with_regions(weather_data: &[WeatherDisplay]) -> Markup {
         @for (region, stations) in &by_region {
             // Region header row
             tr class={"region-header " (region_class(*region))} {
-                td colspan="8" {
+                td colspan="9" {
                     (region_name(*region))
                 }
             }
@@ -189,7 +194,7 @@ fn render_weather_rows_with_regions(weather_data: &[WeatherDisplay]) -> Markup {
                 (render_weather_row(weather))
                 // Hidden forecast row
                 tr class="forecast-row" id=(format!("forecast-row-{}", weather.station_id)) style="display: none;" {
-                    td colspan="8" {
+                    td colspan="9" {
                         div id=(format!("forecast-{}", weather.station_id)) {}
                     }
                 }
@@ -324,6 +329,53 @@ fn render_weather_card(weather: &WeatherDisplay) -> Markup {
                 }
             }
 
+            // Forecast accuracy
+            @if weather.forecast_high.is_some() || weather.forecast_low.is_some() {
+                div class="weather-card-forecast mt-2 pt-2" {
+                    span class="is-size-7 has-text-grey" { "Yesterday's Forecast:" }
+                    div class="is-flex is-justify-content-space-around mt-1" {
+                        @if let Some(fh) = weather.forecast_high {
+                            div class="has-text-centered" {
+                                span class="weather-card-label" { "Fcst High" }
+                                div {
+                                    span class="weather-value temp-high" { (format!("{}°F", fh)) }
+                                    @if let Some(actual) = weather.temp_high {
+                                        {
+                                            @let diff = fh as f64 - actual;
+                                            @if diff.abs() > 0.5 {
+                                                " "
+                                                span class=(format!("is-size-7 {}", accuracy_class(diff))) {
+                                                    (format!("{:+.0}°", diff))
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        @if let Some(fl) = weather.forecast_low {
+                            div class="has-text-centered" {
+                                span class="weather-card-label" { "Fcst Low" }
+                                div {
+                                    span class="weather-value temp-low" { (format!("{}°F", fl)) }
+                                    @if let Some(actual) = weather.temp_low {
+                                        {
+                                            @let diff = fl as f64 - actual;
+                                            @if diff.abs() > 0.5 {
+                                                " "
+                                                span class=(format!("is-size-7 {}", accuracy_class(diff))) {
+                                                    (format!("{:+.0}°", diff))
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Observed time
             div class="mt-2 pt-2" style="border-top: 1px solid var(--bulma-border);" {
                 span class="is-size-7 has-text-grey" {
@@ -395,6 +447,28 @@ fn render_weather_row(weather: &WeatherDisplay) -> Markup {
                 }
             }
             td class="has-text-right" {
+                @if let (Some(fh), Some(fl)) = (weather.forecast_high, weather.forecast_low) {
+                    span class="is-size-7" {
+                        span class="weather-value temp-high" { (format!("{}°", fh)) }
+                        " / "
+                        span class="weather-value temp-low" { (format!("{}°", fl)) }
+                    }
+                    @if let Some(actual_high) = weather.temp_high {
+                        {
+                            @let diff = fh as f64 - actual_high;
+                            @if diff.abs() > 0.5 {
+                                br;
+                                span class=(format!("is-size-7 {}", accuracy_class(diff))) {
+                                    (format!("{:+.0}°", diff))
+                                }
+                            }
+                        }
+                    }
+                } @else {
+                    span class="has-text-grey" { "-" }
+                }
+            }
+            td class="has-text-right" {
                 @if let Some(wind) = weather.wind_speed {
                     span class="weather-value wind" {
                         (format!("{}", wind))
@@ -449,6 +523,19 @@ fn render_weather_row(weather: &WeatherDisplay) -> Markup {
                 }
             }
         }
+    }
+}
+
+/// CSS class for forecast accuracy difference
+/// Green: within 3°, Yellow: 4-6° off, Red: >6° off
+fn accuracy_class(diff: f64) -> &'static str {
+    let abs_diff = diff.abs();
+    if abs_diff <= 3.0 {
+        "has-text-success"
+    } else if abs_diff <= 6.0 {
+        "has-text-warning"
+    } else {
+        "has-text-danger"
     }
 }
 

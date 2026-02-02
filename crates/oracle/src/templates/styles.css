@@ -76,6 +76,34 @@
     background-color: var(--bulma-scheme-main) !important;
 }
 
+/* Past performance section */
+.past-performance {
+    border-left: 4px solid #f59e0b;
+    padding-left: 0.75rem;
+}
+
+.past-performance .table th {
+    white-space: nowrap;
+    font-size: 0.7rem;
+}
+
+.past-performance .table td {
+    white-space: nowrap;
+}
+
+.past-subheader th {
+    color: var(--bulma-text-weak) !important;
+    font-weight: 400 !important;
+    font-size: 0.65rem !important;
+    padding-top: 0 !important;
+}
+
+/* Upcoming forecast section */
+.upcoming-forecast {
+    border-left: 4px solid #10b981;
+    padding-left: 0.75rem;
+}
+
 /* Card improvements */
 .box {
     transition: box-shadow 0.2s ease;
@@ -280,6 +308,10 @@
 
 .weather-card.is-expanded {
     background-color: var(--bulma-scheme-main-bis);
+}
+
+.weather-card-forecast {
+    border-top: 1px solid var(--bulma-border);
 }
 
 .card-forecast {

@@ -8,6 +8,8 @@ use axum::{
 use serde::Deserialize;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
+use std::collections::HashMap;
+
 use crate::{
     db::EventStatus,
     templates::{
@@ -15,7 +17,7 @@ use crate::{
         pages::dashboard::{dashboard_content, DashboardData},
         EventStats, WeatherDisplay,
     },
-    AppState, ObservationRequest, TemperatureUnit,
+    AppState, ForecastRequest, ObservationRequest, TemperatureUnit,
 };
 
 #[derive(Debug, Deserialize, Default)]
@@ -277,6 +279,8 @@ async fn get_latest_weather(
                 updated_at: updated_at.clone(),
                 latitude: station.map(|s| s.latitude).unwrap_or(0.0),
                 longitude: station.map(|s| s.longitude).unwrap_or(0.0),
+                forecast_high: None,
+                forecast_low: None,
             });
         }
     }
@@ -297,8 +301,41 @@ async fn get_latest_weather(
         }
     });
 
-    // If we found major airports, return those
+    // Batch-fetch yesterday's forecast for today to show accuracy
     if !weather_data.is_empty() {
+        let station_ids: Vec<String> = weather_data.iter().map(|w| w.station_id.clone()).collect();
+        let now = OffsetDateTime::now_utc();
+        let today_start = now.replace_time(time::Time::MIDNIGHT);
+        let today_end = today_start + time::Duration::days(1);
+        let yesterday_start = today_start - time::Duration::days(1);
+
+        let forecast_req = ForecastRequest {
+            start: Some(today_start),
+            end: Some(today_end),
+            generated_start: Some(yesterday_start),
+            generated_end: Some(today_start),
+            station_ids: station_ids.join(","),
+            temperature_unit: TemperatureUnit::Fahrenheit,
+        };
+
+        if let Ok(forecasts) = state
+            .weather_db
+            .forecasts_data(&forecast_req, station_ids)
+            .await
+        {
+            let forecast_map: HashMap<String, _> = forecasts
+                .into_iter()
+                .map(|f| (f.station_id.clone(), f))
+                .collect();
+
+            for weather in &mut weather_data {
+                if let Some(forecast) = forecast_map.get(&weather.station_id) {
+                    weather.forecast_high = Some(forecast.temp_high);
+                    weather.forecast_low = Some(forecast.temp_low);
+                }
+            }
+        }
+
         return weather_data;
     }
 
@@ -326,6 +363,8 @@ async fn get_latest_weather(
                 updated_at: updated_at.clone(),
                 latitude: station.map(|s| s.latitude).unwrap_or(0.0),
                 longitude: station.map(|s| s.longitude).unwrap_or(0.0),
+                forecast_high: None,
+                forecast_low: None,
             }
         })
         .collect();
