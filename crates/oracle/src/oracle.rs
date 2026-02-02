@@ -887,7 +887,18 @@ impl Oracle {
             .await
             .map_err(Error::WeatherData)
     }
+
+    /// Check database health and integrity.
+    pub async fn health_check(&self) -> anyhow::Result<()> {
+        self.db.health_check().await
+    }
+
+    /// Checkpoint WAL to main database file before shutdown.
+    pub async fn checkpoint(&self) {
+        self.db.checkpoint().await;
+    }
 }
+
 
 pub fn get_winning_bytes(winners: Vec<usize>) -> Vec<u8> {
     winners

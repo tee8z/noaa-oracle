@@ -102,6 +102,18 @@ pub async fn build_app_state(
     })
 }
 
+
+pub async fn health_check(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    match state.oracle.health_check().await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => {
+            log::error!("Health check failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
 pub fn app(app_state: AppState) -> Router {
     let api_docs = ApiDoc::openapi();
     let cors = CorsLayer::new()

@@ -134,6 +134,39 @@ impl Database {
         &self.pool
     }
 
+    /// Check database connectivity and integrity.
+    pub async fn health_check(&self) -> Result<()> {
+        // Basic connectivity
+        sqlx::query("SELECT 1")
+            .fetch_one(&self.pool)
+            .await
+            .context("Database connectivity check failed")?;
+
+        // Page structure integrity
+        let result: String = sqlx::query_scalar("PRAGMA quick_check;")
+            .fetch_one(&self.pool)
+            .await
+            .context("Database integrity check failed")?;
+        if result != "ok" {
+            return Err(anyhow::anyhow!("Database integrity check failed: {}", result));
+        }
+
+        Ok(())
+    }
+
+    /// Checkpoint WAL to main database file before shutdown.
+    /// This ensures all pending writes are flushed so Litestream
+    /// can replicate a complete database to S3.
+    pub async fn checkpoint(&self) {
+        match sqlx::query("PRAGMA wal_checkpoint(TRUNCATE);")
+            .execute(&self.pool)
+            .await
+        {
+            Ok(_) => info!("WAL checkpoint completed successfully"),
+            Err(e) => log::error!("WAL checkpoint failed: {}", e),
+        }
+    }
+
     pub async fn add_oracle_metadata(&self, pubkey: XOnlyPublicKey) -> Result<()> {
         let pool = self.pool.clone();
         let pubkey_bytes = pubkey.serialize().to_vec();

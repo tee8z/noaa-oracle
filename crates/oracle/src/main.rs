@@ -59,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
         e
     })?;
 
+    let oracle = app_state.oracle.clone();
     let app = app(app_state);
 
     serve(
@@ -67,6 +68,12 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;
+
+    // Checkpoint WAL before exit so Litestream replicates a complete database.
+    // This runs after the server stops accepting requests but before the
+    // process exits and Litestream receives SIGTERM.
+    info!("Checkpointing WAL before shutdown...");
+    oracle.checkpoint().await;
 
     Ok(())
 }
