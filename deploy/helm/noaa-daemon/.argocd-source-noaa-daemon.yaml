@@ -4,5 +4,5 @@ helm:
     value: ghcr.io/tee8z/noaa-oracle/daemon
     forcestring: true
   - name: image.tag
-    value: 1.16.8
+    value: 1.16.9
     forcestring: true
