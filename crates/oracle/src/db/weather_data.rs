@@ -138,7 +138,10 @@ impl WeatherData for WeatherAccess {
                     if start <= threshold {
                         // Use start of the previous day to ensure we capture all relevant forecast files
                         // The DISTINCT ON ... ORDER BY generated_at DESC in SQL ensures we use the latest forecast
-                        let prev_day_start = start.date().previous_day().map(|d| d.with_time(Time::MIDNIGHT).assume_utc());
+                        let prev_day_start = start
+                            .date()
+                            .previous_day()
+                            .map(|d| d.with_time(Time::MIDNIGHT).assume_utc());
                         (prev_day_start, Some(now))
                     } else {
                         (Some(now.saturating_sub(Duration::days(1))), Some(now))
