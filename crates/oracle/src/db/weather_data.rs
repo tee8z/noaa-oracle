@@ -11,7 +11,7 @@ use regex::Regex;
 use scooby::postgres::Select;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
+use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime, Time};
 use utoipa::ToSchema;
 
 pub struct WeatherAccess {
@@ -136,7 +136,10 @@ impl WeatherData for WeatherAccess {
                 if let Some(start) = req.start {
                     let threshold = now + Duration::days(1);
                     if start <= threshold {
-                        (Some(start.saturating_sub(Duration::days(1))), Some(now))
+                        // Use start of the previous day to ensure we capture all relevant forecast files
+                        // The DISTINCT ON ... ORDER BY generated_at DESC in SQL ensures we use the latest forecast
+                        let prev_day_start = start.date().previous_day().map(|d| d.with_time(Time::MIDNIGHT).assume_utc());
+                        (prev_day_start, Some(now))
                     } else {
                         (Some(now.saturating_sub(Duration::days(1))), Some(now))
                     }
