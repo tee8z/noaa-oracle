@@ -154,9 +154,9 @@ impl CreateEventData {
 
         Ok(Self {
             id: event.id,
-            start_observation_date: event.start_observation_date,
-            end_observation_date: event.end_observation_date,
-            signing_date: event.signing_date,
+            start_observation_date: event.start_observation_date.to_offset(UtcOffset::UTC),
+            end_observation_date: event.end_observation_date.to_offset(UtcOffset::UTC),
+            signing_date: event.signing_date.to_offset(UtcOffset::UTC),
             nonce,
             total_allowed_entries: event.total_allowed_entries as i64,
             number_of_places_win: event.number_of_places_win,
@@ -254,6 +254,7 @@ impl TryFrom<&Row<'_>> for SignEvent {
             signing_date: row
                 .get::<usize, String>(1)
                 .map(|val| OffsetDateTime::parse(&val, &sql_time_format))?
+                .map(|val| val.to_offset(UtcOffset::UTC))
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(1, Type::Any, Box::new(e)))?,
             start_observation_date: row
                 .get::<usize, String>(2)
@@ -398,14 +399,17 @@ impl TryFrom<&Row<'_>> for ActiveEvent {
             signing_date: row
                 .get::<usize, String>(1)
                 .map(|val| OffsetDateTime::parse(&val, &sql_time_format))?
+                .map(|val| val.to_offset(UtcOffset::UTC))
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(1, Type::Any, Box::new(e)))?,
             start_observation_date: row
                 .get::<usize, String>(2)
                 .map(|val| OffsetDateTime::parse(&val, &sql_time_format))?
+                .map(|val| val.to_offset(UtcOffset::UTC))
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(2, Type::Any, Box::new(e)))?,
             end_observation_date: row
                 .get::<usize, String>(3)
                 .map(|val| OffsetDateTime::parse(&val, &sql_time_format))?
+                .map(|val| val.to_offset(UtcOffset::UTC))
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(3, Type::Any, Box::new(e)))?,
             locations: row
                 .get::<usize, Value>(4)
@@ -544,14 +548,17 @@ impl TryFrom<&Row<'_>> for EventSummary {
             signing_date: row
                 .get::<usize, String>(1)
                 .map(|val| OffsetDateTime::parse(&val, &sql_time_format))?
+                .map(|val| val.to_offset(UtcOffset::UTC))
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(1, Type::Any, Box::new(e)))?,
             start_observation_date: row
                 .get::<usize, String>(2)
                 .map(|val| OffsetDateTime::parse(&val, &sql_time_format))?
+                .map(|val| val.to_offset(UtcOffset::UTC))
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(2, Type::Any, Box::new(e)))?,
             end_observation_date: row
                 .get::<usize, String>(3)
                 .map(|val| OffsetDateTime::parse(&val, &sql_time_format))?
+                .map(|val| val.to_offset(UtcOffset::UTC))
                 .map_err(|e| duckdb::Error::FromSqlConversionFailure(3, Type::Any, Box::new(e)))?,
             status: EventStatus::default(),
             locations: row
