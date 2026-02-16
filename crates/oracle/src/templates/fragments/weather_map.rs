@@ -140,24 +140,20 @@ pub fn weather_map(weather_data: &[WeatherDisplay]) -> Markup {
                             div class="forecast-col" { "Today" }
                             div class="forecast-col" { "Tomorrow" }
                         }
-                        // Temp row - Actual
+                        // Temp row - combined observed + forecast
                         div class="forecast-data-row" {
                             div class="forecast-col-label" {
                                 span class="icon is-small" { i class="fas fa-temperature-high" {} }
-                                " Actual"
+                                " Temp"
                             }
-                            div class="forecast-col" data-field="yesterday-temp-actual" { "-" }
-                            div class="forecast-col" data-field="today-temp-actual" { "-" }
-                            div class="forecast-col forecast-na" { "-" }
-                        }
-                        // Temp row - Forecast
-                        div class="forecast-data-row" {
-                            div class="forecast-col-label" {
-                                span class="icon is-small" { i class="fas fa-crystal-ball" {} }
-                                " Forecast"
+                            div class="forecast-col" {
+                                div class="temp-observed" data-field="yesterday-temp-observed" { "-" }
+                                div class="temp-forecast-sub" data-field="yesterday-temp-forecast" { }
                             }
-                            div class="forecast-col" data-field="yesterday-temp-forecast" { "-" }
-                            div class="forecast-col" data-field="today-temp-forecast" { "-" }
+                            div class="forecast-col" {
+                                div class="temp-observed" data-field="today-temp-observed" { "-" }
+                                div class="temp-forecast-sub" data-field="today-temp-forecast" { }
+                            }
                             div class="forecast-col" data-field="tomorrow-temp-forecast" { "-" }
                         }
                         // Wind row

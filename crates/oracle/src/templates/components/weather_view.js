@@ -213,19 +213,23 @@ async function fetchStationForecast(stationId, popup) {
       if (el) el.textContent = value || "-";
     };
 
-    // Yesterday
+    // Yesterday - show observed as primary, forecast as sub-label
     const yesterdayObs = obsByDate[yesterdayKey];
     const yesterdayForecast = forecastByDate[yesterdayKey];
     setValue(
-      "yesterday-temp-actual",
+      "yesterday-temp-observed",
       yesterdayObs
         ? formatTemp(yesterdayObs.temp_high, yesterdayObs.temp_low)
-        : null,
+        : yesterdayForecast
+          ? formatTemp(yesterdayForecast.temp_high, yesterdayForecast.temp_low)
+          : null,
     );
+    // Show forecast as sub-text only if we have both observed and forecast
     setValue(
       "yesterday-temp-forecast",
-      yesterdayForecast
-        ? formatTemp(yesterdayForecast.temp_high, yesterdayForecast.temp_low)
+      yesterdayObs && yesterdayForecast
+        ? "fcst: " +
+            formatTemp(yesterdayForecast.temp_high, yesterdayForecast.temp_low)
         : null,
     );
     setValue(
@@ -241,17 +245,22 @@ async function fetchStationForecast(stationId, popup) {
       yesterdayForecast ? formatPrecip(yesterdayForecast.precip_chance) : null,
     );
 
-    // Today
+    // Today - show observed as primary (partial), forecast as sub-label
     const todayObs = obsByDate[todayKey];
     const todayForecast = forecastByDate[todayKey];
     setValue(
-      "today-temp-actual",
-      todayObs ? formatTemp(todayObs.temp_high, todayObs.temp_low) : null,
+      "today-temp-observed",
+      todayObs
+        ? formatTemp(todayObs.temp_high, todayObs.temp_low)
+        : todayForecast
+          ? formatTemp(todayForecast.temp_high, todayForecast.temp_low)
+          : null,
     );
+    // Show forecast as sub-text only if we have both observed and forecast
     setValue(
       "today-temp-forecast",
-      todayForecast
-        ? formatTemp(todayForecast.temp_high, todayForecast.temp_low)
+      todayObs && todayForecast
+        ? "fcst: " + formatTemp(todayForecast.temp_high, todayForecast.temp_low)
         : null,
     );
     setValue(
