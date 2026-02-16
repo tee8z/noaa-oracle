@@ -207,6 +207,33 @@ pub async fn forecast_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(station_id): axum::extract::Path<String>,
 ) -> Html<String> {
+    // Check cache first (keyed by station_id, refreshed every 30 min by background task)
+    {
+        let cache = state.forecast_cache.lock().unwrap();
+        if let Some(cached) = cache.get(&station_id) {
+            return Html(cached.html.clone());
+        }
+    }
+
+    // Cache miss (non-default station or first request before warming completes)
+    let html = build_forecast_html(&state, &station_id).await;
+
+    {
+        let mut cache = state.forecast_cache.lock().unwrap();
+        cache.insert(
+            station_id,
+            crate::CachedFragment {
+                html: html.clone(),
+                created_at: std::time::Instant::now(),
+            },
+        );
+    }
+
+    Html(html)
+}
+
+/// Build the forecast detail HTML for a station (used by handler and cache warming)
+pub async fn build_forecast_html(state: &Arc<AppState>, station_id: &str) -> String {
     let now = OffsetDateTime::now_utc();
 
     // Fetch upcoming forecasts (today + 7 days)
@@ -216,13 +243,13 @@ pub async fn forecast_handler(
         end: Some(future_end),
         generated_start: None,
         generated_end: None,
-        station_ids: station_id.clone(),
+        station_ids: station_id.to_string(),
         temperature_unit: TemperatureUnit::Fahrenheit,
     };
 
     let forecasts = state
         .weather_db
-        .forecasts_data(&future_req, vec![station_id.clone()])
+        .forecasts_data(&future_req, vec![station_id.to_string()])
         .await
         .unwrap_or_default();
 
@@ -245,36 +272,35 @@ pub async fn forecast_handler(
     // Sort by date chronologically
     forecast_displays.sort_by(|a, b| a.date.cmp(&b.date));
 
-    // Fetch past forecasts for comparison (last 7 days)
+    // Fetch past forecasts and daily observations in parallel (last 7 days)
     let past_start = now - time::Duration::days(7);
     let past_req = ForecastRequest {
         start: Some(past_start),
         end: Some(now),
         generated_start: Some(past_start - time::Duration::days(1)),
         generated_end: Some(now),
-        station_ids: station_id.clone(),
+        station_ids: station_id.to_string(),
         temperature_unit: TemperatureUnit::Fahrenheit,
     };
 
-    let past_forecasts = state
-        .weather_db
-        .forecasts_data(&past_req, vec![station_id.clone()])
-        .await
-        .unwrap_or_default();
-
-    // Fetch daily observations for the same period
     let obs_req = ObservationRequest {
         start: Some(past_start),
         end: Some(now),
-        station_ids: station_id.clone(),
+        station_ids: station_id.to_string(),
         temperature_unit: TemperatureUnit::Fahrenheit,
     };
 
-    let daily_obs = state
-        .weather_db
-        .daily_observations(&obs_req, vec![station_id.clone()])
-        .await
-        .unwrap_or_default();
+    let (past_forecasts, daily_obs) = tokio::join!(
+        state
+            .weather_db
+            .forecasts_data(&past_req, vec![station_id.to_string()]),
+        state
+            .weather_db
+            .daily_observations(&obs_req, vec![station_id.to_string()])
+    );
+
+    let past_forecasts = past_forecasts.unwrap_or_default();
+    let daily_obs = daily_obs.unwrap_or_default();
 
     // Build comparison data by matching forecast dates to observation dates
     let mut comparisons: Vec<ForecastComparison> = past_forecasts
@@ -310,5 +336,31 @@ pub async fn forecast_handler(
     // Sort comparisons by date (most recent first)
     comparisons.sort_by(|a, b| b.date.cmp(&a.date));
 
-    Html(forecast_detail(&station_id, &comparisons, &forecast_displays).into_string())
+    forecast_detail(station_id, &comparisons, &forecast_displays).into_string()
+}
+
+/// Pre-warm the forecast cache for all default stations.
+/// Called at startup and every 30 minutes by the background refresh task.
+pub async fn warm_forecast_cache(state: &Arc<AppState>) {
+    log::info!(
+        "Warming forecast cache for {} stations...",
+        DEFAULT_MAJOR_AIRPORTS.len()
+    );
+
+    for station_id in DEFAULT_MAJOR_AIRPORTS {
+        let html = build_forecast_html(state, station_id).await;
+
+        {
+            let mut cache = state.forecast_cache.lock().unwrap();
+            cache.insert(
+                station_id.to_string(),
+                crate::CachedFragment {
+                    html,
+                    created_at: std::time::Instant::now(),
+                },
+            );
+        }
+    }
+
+    log::info!("Forecast cache warming complete.");
 }

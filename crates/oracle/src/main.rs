@@ -2,8 +2,11 @@ use anyhow::anyhow;
 use axum::serve;
 use futures::TryFutureExt;
 use log::{error, info};
-use oracle::{app, build_app_state, create_folder, get_config_info, get_log_level, setup_logger};
-use std::{net::SocketAddr, str::FromStr};
+use oracle::{
+    app, build_app_state, create_folder, get_config_info, get_log_level, setup_logger,
+    warm_forecast_cache,
+};
+use std::{net::SocketAddr, str::FromStr, sync::Arc};
 use tokio::{net::TcpListener, signal};
 
 #[tokio::main]
@@ -62,6 +65,27 @@ async fn main() -> anyhow::Result<()> {
     })?;
 
     let oracle = app_state.oracle.clone();
+
+    // Spawn background task to pre-warm and periodically refresh the forecast cache
+    let cache_state = Arc::new(app_state.clone());
+    tokio::spawn(async move {
+        // Initial warm-up
+        warm_forecast_cache(&cache_state).await;
+
+        // Refresh every 30 minutes (source data arrives hourly, so at most 30 min stale)
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1800));
+        interval.tick().await; // skip the first immediate tick (already warmed)
+        loop {
+            interval.tick().await;
+            // Clear old entries before re-warming
+            {
+                let mut cache = cache_state.forecast_cache.lock().unwrap();
+                cache.clear();
+            }
+            warm_forecast_cache(&cache_state).await;
+        }
+    });
+
     let app = app(app_state);
 
     serve(
