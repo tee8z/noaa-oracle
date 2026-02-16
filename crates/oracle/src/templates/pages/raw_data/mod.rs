@@ -91,6 +91,17 @@ pub fn raw_data_content() -> Markup {
                 }
             }
 
+            // Example queries
+            div class="field mb-4" {
+                label class="label is-small" { "Example Queries" }
+                div class="tags" {
+                    span class="tag is-link is-light is-clickable" onclick="loadExampleQuery('daily_observations')" { "Daily Observations" }
+                    span class="tag is-link is-light is-clickable" onclick="loadExampleQuery('daily_forecast')" { "Daily Forecast" }
+                    span class="tag is-link is-light is-clickable" onclick="loadExampleQuery('forecast_vs_observed')" { "Forecast vs Observed" }
+                    span class="tag is-link is-light is-clickable" onclick="loadExampleQuery('stations')" { "Station List" }
+                }
+            }
+
             // Custom query
             div class="field" {
                 label class="label" { "Custom Query" }
