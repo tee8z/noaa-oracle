@@ -71,6 +71,15 @@ pub struct Cli {
     #[arg(short, long, env = "NOAA_ORACLE_PRIVATE_KEY")]
     #[serde(alias = "private_key_path")]
     pub oracle_private_key: Option<String>,
+
+    /// S3 bucket name for fetching weather data files
+    /// When set, files are listed and served from S3 instead of local disk
+    #[arg(long, env = "NOAA_ORACLE_S3_BUCKET")]
+    pub s3_bucket: Option<String>,
+
+    /// Custom S3 endpoint URL (for MinIO or other S3-compatible storage)
+    #[arg(long, env = "NOAA_ORACLE_S3_ENDPOINT")]
+    pub s3_endpoint: Option<String>,
 }
 
 impl Cli {
@@ -151,6 +160,8 @@ pub fn get_config_info() -> Cli {
         oracle_private_key: cli_args
             .oracle_private_key
             .or(file_config.oracle_private_key),
+        s3_bucket: cli_args.s3_bucket.or(file_config.s3_bucket),
+        s3_endpoint: cli_args.s3_endpoint.or(file_config.s3_endpoint),
     }
 }
 

@@ -73,6 +73,10 @@ utoipa = { version = "5.4", features = [
 ] }
 utoipa-scalar = { version = "0.3", features = ["axum"] }
 
+# S3 (optional, for fetching data from S3)
+aws-sdk-s3 = "1.65"
+aws-config = { version = "1.5", features = ["behavior-version-latest"] }
+
 # Other
 uuid = { version = "1.19", features = ["v7", "serde"] }
 regex = "1.12"

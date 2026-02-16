@@ -23,10 +23,19 @@ use hyper::{
     Method,
 };
 use log::info;
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 use tower_http::cors::{Any, CorsLayer};
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
+
+pub struct CachedFragment {
+    pub html: String,
+    pub created_at: Instant,
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -35,6 +44,7 @@ pub struct AppState {
     pub file_access: Arc<dyn FileData>,
     pub weather_db: Arc<dyn WeatherData>,
     pub oracle: Arc<Oracle>,
+    pub forecast_cache: Arc<Mutex<HashMap<String, CachedFragment>>>,
 }
 
 #[derive(OpenApi)]
@@ -79,10 +89,20 @@ pub async fn build_app_state(
     data_dir: String,
     event_dir: String,
     private_key_file_path: String,
+    s3_bucket: Option<String>,
+    s3_endpoint: Option<String>,
 ) -> Result<AppState, anyhow::Error> {
-    let file_access = Arc::new(FileAccess::new(data_dir));
+    let file_access: Arc<dyn FileData> = if let Some(bucket) = s3_bucket {
+        info!("Using S3 bucket '{}' for file access", bucket);
+        Arc::new(crate::S3FileAccess::new(bucket, s3_endpoint).await)
+    } else {
+        Arc::new(FileAccess::new(data_dir.clone()))
+    };
+
+    // WeatherAccess always uses local files (for DuckDB parquet queries)
+    let local_file_access = Arc::new(FileAccess::new(data_dir));
     let weather_db = Arc::new(
-        WeatherAccess::new(file_access.clone())
+        WeatherAccess::new(local_file_access)
             .map_err(|e| anyhow!("error setting up weather data: {}", e))?,
     );
 
@@ -99,6 +119,7 @@ pub async fn build_app_state(
         weather_db,
         file_access,
         oracle,
+        forecast_cache: Arc::new(Mutex::new(HashMap::new())),
     })
 }
 

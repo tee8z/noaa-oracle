@@ -3352,6 +3352,8 @@ version = "1.9.2"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
  "axum",
  "base64",
  "clap",

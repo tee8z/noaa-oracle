@@ -52,6 +52,8 @@ async fn main() -> anyhow::Result<()> {
         weather_data,
         event_data,
         private_key,
+        cli.s3_bucket,
+        cli.s3_endpoint,
     )
     .await
     .map_err(|e| {

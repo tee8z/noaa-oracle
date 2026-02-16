@@ -10,7 +10,7 @@ mod utils;
 
 pub use app_error::AppError;
 pub use db::*;
-pub use file_access::{drop_suffix, Error, FileAccess, FileData, FileParams};
+pub use file_access::{drop_suffix, Error, FileAccess, FileData, FileParams, S3FileAccess};
 pub use nostr_extractor::{AuthError, NostrAuth};
 pub use routes::*;
 pub use startup::*;

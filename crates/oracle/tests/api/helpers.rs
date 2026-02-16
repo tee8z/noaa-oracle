@@ -12,8 +12,9 @@ use oracle::{
 };
 use rand::Rng;
 use std::{
+    collections::HashMap,
     str::FromStr,
-    sync::{Arc, Once},
+    sync::{Arc, Mutex, Once},
 };
 
 pub struct TestApp {
@@ -56,6 +57,7 @@ pub async fn spawn_app(weather_db: Arc<dyn WeatherData>) -> TestApp {
         weather_db,
         file_access: Arc::new(MockFileAccess::new()),
         oracle: oracle.clone(),
+        forecast_cache: Arc::new(Mutex::new(HashMap::new())),
     };
     let app = app(app_state);
 
@@ -70,6 +72,7 @@ mock! {
         fn current_folder(&self) -> String;
         fn build_file_paths(&self, file_names: Vec<String>) -> Vec<String>;
         fn build_file_path(&self, filename: &str, file_generated_at: time::OffsetDateTime) -> String;
+        async fn download_file(&self, filename: &str, file_generated_at: time::OffsetDateTime) -> Result<axum::body::Body, oracle::Error>;
     }
 }
 

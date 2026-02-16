@@ -10,8 +10,6 @@ use hyper::{
 use log::error;
 use std::sync::Arc;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tokio::fs::File;
-use tokio_util::io::ReaderStream;
 
 use crate::{drop_suffix, AppState};
 
@@ -46,20 +44,16 @@ pub async fn download(
             ),
         )
     })?;
-    // split filename for the date, add that to the path
-    let file_path = state
+
+    let body = state
         .file_access
-        .build_file_path(&filename, file_generated_at);
+        .download_file(&filename, file_generated_at)
+        .await
+        .map_err(|err| {
+            error!("error downloading file: {}", err);
+            (StatusCode::NOT_FOUND, format!("File not found: {}", err))
+        })?;
 
-    let file = File::open(file_path).await.map_err(|err| {
-        error!("error opening file: {}", err);
-        (StatusCode::NOT_FOUND, format!("File not found: {}", err))
-    })?;
-
-    // convert the `AsyncRead` into a `Stream`
-    let stream = ReaderStream::new(file);
-    // convert the `Stream` into an `axum::body::HttpBody`
-    let body = Body::from_stream(stream);
     let mut headers = HeaderMap::new();
     headers.insert(
         CONTENT_TYPE,
