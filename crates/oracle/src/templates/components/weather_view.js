@@ -139,7 +139,7 @@ async function fetchStationForecast(stationId, popup) {
         `/stations/forecasts?station_ids=${stationId}&start=${encodeURIComponent(startDate)}&end=${encodeURIComponent(endDate)}`,
       ),
       fetch(
-        `/stations/observations?station_ids=${stationId}&start=${encodeURIComponent(startDate)}&end=${encodeURIComponent(endDate)}`,
+        `/stations/daily-observations?station_ids=${stationId}&start=${encodeURIComponent(startDate)}&end=${encodeURIComponent(endDate)}`,
       ),
     ]);
 
@@ -154,9 +154,7 @@ async function fetchStationForecast(stationId, popup) {
 
     const obsByDate = {};
     observations.forEach((o) => {
-      // Observations have start_time, extract date from it
-      const date = o.date || o.start_time?.split("T")[0];
-      if (date) obsByDate[date] = o;
+      if (o.date) obsByDate[o.date] = o;
     });
 
     // Helper to format temp display

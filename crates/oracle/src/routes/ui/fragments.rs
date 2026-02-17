@@ -342,25 +342,36 @@ pub async fn build_forecast_html(state: &Arc<AppState>, station_id: &str) -> Str
 /// Pre-warm the forecast cache for all default stations.
 /// Called at startup and every 30 minutes by the background refresh task.
 pub async fn warm_forecast_cache(state: &Arc<AppState>) {
+    use futures::stream::{self, StreamExt};
+
     log::info!(
         "Warming forecast cache for {} stations...",
         DEFAULT_MAJOR_AIRPORTS.len()
     );
 
-    for station_id in DEFAULT_MAJOR_AIRPORTS {
-        let html = build_forecast_html(state, station_id).await;
+    let futs: Vec<_> = DEFAULT_MAJOR_AIRPORTS
+        .iter()
+        .map(|station_id| {
+            let state = state.clone();
+            let station_id = station_id.to_string();
+            async move {
+                let html = build_forecast_html(&state, &station_id).await;
+                let mut cache = state.forecast_cache.lock().unwrap();
+                cache.insert(
+                    station_id,
+                    crate::CachedFragment {
+                        html,
+                        created_at: std::time::Instant::now(),
+                    },
+                );
+            }
+        })
+        .collect();
 
-        {
-            let mut cache = state.forecast_cache.lock().unwrap();
-            cache.insert(
-                station_id.to_string(),
-                crate::CachedFragment {
-                    html,
-                    created_at: std::time::Instant::now(),
-                },
-            );
-        }
-    }
+    stream::iter(futs)
+        .buffer_unordered(10)
+        .collect::<Vec<()>>()
+        .await;
 
     log::info!("Forecast cache warming complete.");
 }

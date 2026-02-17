@@ -1,8 +1,8 @@
 use crate::{
-    add_event_entries, create_event, dashboard_handler, db, download, event_detail_handler,
-    event_stats_handler, events_cards_handler, events_handler, events_rows_handler, files,
-    forecast_handler, forecasts, get_event, get_event_entry, get_npub, get_pubkey, get_stations,
-    list_events, observations,
+    add_event_entries, create_event, daily_observations, dashboard_handler, db, download,
+    event_detail_handler, event_stats_handler, events_cards_handler, events_handler,
+    events_rows_handler, files, forecast_handler, forecasts, get_event, get_event_entry, get_npub,
+    get_pubkey, get_stations, list_events, observations,
     oracle::{self, Oracle},
     oracle_info_handler, raw_data_handler, routes, update_data, upload,
     weather_data::WeatherAccess,
@@ -159,6 +159,7 @@ pub fn app(app_state: AppState) -> Router {
         .route("/stations", get(get_stations))
         .route("/stations/forecasts", get(forecasts))
         .route("/stations/observations", get(observations))
+        .route("/stations/daily-observations", get(daily_observations))
         .route("/oracle/npub", get(get_npub))
         .route("/oracle/pubkey", get(get_pubkey))
         .route("/oracle/update", post(update_data))

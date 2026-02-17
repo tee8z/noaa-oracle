@@ -9,7 +9,7 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use utoipa::{IntoParams, ToSchema};
 
-use crate::{AppError, AppState, FileParams, Forecast, Observation, Station};
+use crate::{AppError, AppState, DailyObservation, FileParams, Forecast, Observation, Station};
 
 #[utoipa::path(
     get,
@@ -145,6 +145,29 @@ pub async fn observations(
     let observations = state
         .weather_db
         .observation_data(&req, req.station_ids())
+        .await?;
+
+    Ok(Json(observations))
+}
+
+#[utoipa::path(
+    get,
+    path = "stations/daily-observations",
+    params(
+        ObservationRequest
+    ),
+    responses(
+        (status = OK, description = "Successfully retrieved daily observation data", body = Vec<DailyObservation>),
+        (status = BAD_REQUEST, description = "Times are not in RFC3339 format"),
+        (status = INTERNAL_SERVER_ERROR, description = "Failed to retrieved weather data")
+    ))]
+pub async fn daily_observations(
+    State(state): State<Arc<AppState>>,
+    Query(req): Query<ObservationRequest>,
+) -> Result<Json<Vec<DailyObservation>>, AppError> {
+    let observations = state
+        .weather_db
+        .daily_observations(&req, req.station_ids())
         .await?;
 
     Ok(Json(observations))
