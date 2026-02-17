@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::{collections::HashMap, ops::Add};
 use time::{
     format_description::well_known::Rfc3339, macros::format_description, Duration, OffsetDateTime,
+    UtcOffset,
 };
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
@@ -420,9 +421,14 @@ impl TryFrom<Dwml> for HashMap<String, Vec<WeatherForecast>> {
         for time_range_set in time_layouts.values() {
             for time_range in time_range_set {
                 if let Some(end_time) = time_range.end_time {
+                    // Compare as UTC instants to deduplicate cross-timezone duplicates
+                    // (e.g., 07:00-06:00 CST and 08:00-05:00 EST are the same UTC instant)
+                    let start_utc = time_range.start_time.to_offset(UtcOffset::UTC);
+                    let end_utc = end_time.to_offset(UtcOffset::UTC);
                     if !all_time_ranges.iter().any(|existing| {
-                        existing.start_time == time_range.start_time
-                            && existing.end_time == Some(end_time)
+                        existing.start_time.to_offset(UtcOffset::UTC) == start_utc
+                            && existing.end_time.map(|e| e.to_offset(UtcOffset::UTC))
+                                == Some(end_utc)
                     }) {
                         all_time_ranges.push(time_range.clone());
                     }
@@ -438,9 +444,12 @@ impl TryFrom<Dwml> for HashMap<String, Vec<WeatherForecast>> {
                             end_time: Some(end_time),
                         };
 
+                        let start_utc = estimated_range.start_time.to_offset(UtcOffset::UTC);
+                        let end_utc = end_time.to_offset(UtcOffset::UTC);
                         if !all_time_ranges.iter().any(|existing| {
-                            existing.start_time == estimated_range.start_time
-                                && existing.end_time == Some(end_time)
+                            existing.start_time.to_offset(UtcOffset::UTC) == start_utc
+                                && existing.end_time.map(|e| e.to_offset(UtcOffset::UTC))
+                                    == Some(end_utc)
                         }) {
                             all_time_ranges.push(estimated_range);
                         }

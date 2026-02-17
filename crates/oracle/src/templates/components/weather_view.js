@@ -157,220 +157,83 @@ async function fetchStationForecast(stationId, popup) {
       if (o.date) obsByDate[o.date] = o;
     });
 
-    // Helper to format temp display
+    // Formatting helpers
     const formatTemp = (high, low) => {
-      if (high != null && low != null) {
+      if (high != null && low != null)
         return `${Math.round(high)}° / ${Math.round(low)}°`;
-      } else if (high != null) {
-        return `${Math.round(high)}°`;
-      } else if (low != null) {
-        return `${Math.round(low)}°`;
-      }
+      if (high != null) return `${Math.round(high)}°`;
+      if (low != null) return `${Math.round(low)}°`;
       return null;
     };
-
-    // Helper to format wind
-    const formatWind = (speed) => {
-      if (speed != null) {
-        return `${Math.round(speed)} mph`;
-      }
-      return null;
-    };
-
-    // Helper to format precip chance
-    const formatPrecip = (chance) => {
-      if (chance != null) {
-        return `${chance}%`;
-      }
-      return null;
-    };
-
-    // Helper to format rain/snow amount in inches
-    const formatAmount = (amount) => {
-      if (amount != null && amount > 0) {
-        return `${amount.toFixed(2)}"`;
-      }
-      return null;
-    };
-
-    // Helper to format humidity
+    const formatWind = (speed) =>
+      speed != null ? `${Math.round(speed)} mph` : null;
+    const formatChance = (chance) => (chance != null ? `${chance}%` : null);
+    const formatAmount = (amount) =>
+      amount != null && amount > 0 ? `${amount.toFixed(2)}"` : null;
     const formatHumidity = (max, min) => {
-      if (max != null && min != null) {
-        return `${min}-${max}%`;
-      } else if (max != null) {
-        return `${max}%`;
-      } else if (min != null) {
-        return `${min}%`;
-      }
+      if (max != null && min != null) return `${min}-${max}%`;
+      if (max != null) return `${max}%`;
+      if (min != null) return `${min}%`;
       return null;
     };
 
-    // Update popup with data
+    // Set a single data-field element's text
     const setValue = (field, value) => {
       const el = popup.querySelector(`[data-field="${field}"]`);
       if (el) el.textContent = value ?? "-";
     };
 
-    // Yesterday - show observed as primary, forecast as sub-label
+    // Set both obs and fcst values for a cell
+    const setCell = (day, metric, obsVal, fcstVal) => {
+      setValue(`${day}-${metric}-obs`, obsVal ?? "-");
+      setValue(`${day}-${metric}-fcst`, fcstVal ? `fcst: ${fcstVal}` : "");
+    };
+
+    // Populate a full day column for all metrics
+    const populateDay = (day, obs, fcst) => {
+      // Temp
+      const obsTemp = obs ? formatTemp(obs.temp_high, obs.temp_low) : null;
+      const fcstTemp = fcst ? formatTemp(fcst.temp_high, fcst.temp_low) : null;
+      setCell(day, "temp", obsTemp, fcstTemp);
+
+      // Wind
+      const obsWind = obs ? formatWind(obs.wind_speed) : null;
+      const fcstWind = fcst ? formatWind(fcst.wind_speed) : null;
+      setCell(day, "wind", obsWind, fcstWind);
+
+      // Chance (forecast-only, observations don't have precip_chance)
+      const fcstChance = fcst ? formatChance(fcst.precip_chance) : null;
+      setCell(day, "chance", null, fcstChance);
+
+      // Rain
+      const obsRain = obs ? formatAmount(obs.rain_amt) : null;
+      const fcstRain = fcst ? formatAmount(fcst.rain_amt) : null;
+      setCell(day, "rain", obsRain, fcstRain);
+
+      // Snow
+      const obsSnow = obs ? formatAmount(obs.snow_amt) : null;
+      const fcstSnow = fcst ? formatAmount(fcst.snow_amt) : null;
+      setCell(day, "snow", obsSnow, fcstSnow);
+
+      // Humidity (obs has single value, forecast has min/max)
+      const obsHumidity = obs
+        ? formatHumidity(obs.humidity, obs.humidity)
+        : null;
+      const fcstHumidity = fcst
+        ? formatHumidity(fcst.humidity_max, fcst.humidity_min)
+        : null;
+      setCell(day, "humidity", obsHumidity, fcstHumidity);
+    };
+
     const yesterdayObs = obsByDate[yesterdayKey];
     const yesterdayForecast = forecastByDate[yesterdayKey];
-    setValue(
-      "yesterday-temp-observed",
-      yesterdayObs
-        ? formatTemp(yesterdayObs.temp_high, yesterdayObs.temp_low)
-        : yesterdayForecast
-          ? formatTemp(yesterdayForecast.temp_high, yesterdayForecast.temp_low)
-          : null,
-    );
-    // Show forecast as sub-text only if we have both observed and forecast
-    setValue(
-      "yesterday-temp-forecast",
-      yesterdayObs && yesterdayForecast
-        ? "fcst: " +
-            formatTemp(yesterdayForecast.temp_high, yesterdayForecast.temp_low)
-        : "",
-    );
-    setValue(
-      "yesterday-wind",
-      yesterdayObs
-        ? formatWind(yesterdayObs.wind_speed)
-        : yesterdayForecast
-          ? formatWind(yesterdayForecast.wind_speed)
-          : null,
-    );
-    setValue(
-      "yesterday-precip-chance",
-      yesterdayForecast ? formatPrecip(yesterdayForecast.precip_chance) : null,
-    );
-
-    // Today - show observed and forecast independently
     const todayObs = obsByDate[todayKey];
     const todayForecast = forecastByDate[todayKey];
-    const todayObsTemp = todayObs
-      ? formatTemp(todayObs.temp_high, todayObs.temp_low)
-      : null;
-    const todayFcstTemp = todayForecast
-      ? formatTemp(todayForecast.temp_high, todayForecast.temp_low)
-      : null;
-    if (todayObsTemp) {
-      // Have observations: show observed as primary, forecast as sub-label
-      setValue("today-temp-observed", todayObsTemp);
-      setValue(
-        "today-temp-forecast",
-        todayFcstTemp ? "fcst: " + todayFcstTemp : "",
-      );
-    } else {
-      // No observations yet: show forecast as primary with "fcst" indicator
-      setValue("today-temp-observed", todayFcstTemp);
-      setValue("today-temp-forecast", todayFcstTemp ? "fcst" : "");
-    }
-    setValue(
-      "today-wind",
-      todayObs
-        ? formatWind(todayObs.wind_speed)
-        : todayForecast
-          ? formatWind(todayForecast.wind_speed)
-          : null,
-    );
-    setValue(
-      "today-precip-chance",
-      todayForecast ? formatPrecip(todayForecast.precip_chance) : null,
-    );
-
-    // Tomorrow - forecast only
     const tomorrowForecast = forecastByDate[tomorrowKey];
-    setValue(
-      "tomorrow-temp-observed",
-      tomorrowForecast
-        ? formatTemp(tomorrowForecast.temp_high, tomorrowForecast.temp_low)
-        : null,
-    );
-    setValue("tomorrow-temp-forecast", tomorrowForecast ? "fcst" : "");
-    setValue(
-      "tomorrow-wind",
-      tomorrowForecast ? formatWind(tomorrowForecast.wind_speed) : null,
-    );
-    setValue(
-      "tomorrow-precip-chance",
-      tomorrowForecast ? formatPrecip(tomorrowForecast.precip_chance) : null,
-    );
 
-    // Rain amounts
-    setValue(
-      "yesterday-rain",
-      yesterdayObs
-        ? formatAmount(yesterdayObs.rain_amt)
-        : yesterdayForecast
-          ? formatAmount(yesterdayForecast.rain_amt)
-          : null,
-    );
-    setValue(
-      "today-rain",
-      todayObs
-        ? formatAmount(todayObs.rain_amt)
-        : todayForecast
-          ? formatAmount(todayForecast.rain_amt)
-          : null,
-    );
-    setValue(
-      "tomorrow-rain",
-      tomorrowForecast ? formatAmount(tomorrowForecast.rain_amt) : null,
-    );
-
-    // Snow amounts
-    setValue(
-      "yesterday-snow",
-      yesterdayObs
-        ? formatAmount(yesterdayObs.snow_amt)
-        : yesterdayForecast
-          ? formatAmount(yesterdayForecast.snow_amt)
-          : null,
-    );
-    setValue(
-      "today-snow",
-      todayObs
-        ? formatAmount(todayObs.snow_amt)
-        : todayForecast
-          ? formatAmount(todayForecast.snow_amt)
-          : null,
-    );
-    setValue(
-      "tomorrow-snow",
-      tomorrowForecast ? formatAmount(tomorrowForecast.snow_amt) : null,
-    );
-
-    // Humidity
-    setValue(
-      "yesterday-humidity",
-      yesterdayObs
-        ? formatHumidity(yesterdayObs.humidity, yesterdayObs.humidity)
-        : yesterdayForecast
-          ? formatHumidity(
-              yesterdayForecast.humidity_max,
-              yesterdayForecast.humidity_min,
-            )
-          : null,
-    );
-    setValue(
-      "today-humidity",
-      todayObs
-        ? formatHumidity(todayObs.humidity, todayObs.humidity)
-        : todayForecast
-          ? formatHumidity(
-              todayForecast.humidity_max,
-              todayForecast.humidity_min,
-            )
-          : null,
-    );
-    setValue(
-      "tomorrow-humidity",
-      tomorrowForecast
-        ? formatHumidity(
-            tomorrowForecast.humidity_max,
-            tomorrowForecast.humidity_min,
-          )
-        : null,
-    );
+    populateDay("yesterday", yesterdayObs, yesterdayForecast);
+    populateDay("today", todayObs, todayForecast);
+    populateDay("tomorrow", null, tomorrowForecast);
   } catch (err) {
     console.error("Error fetching forecast:", err);
     // Show error state

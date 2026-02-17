@@ -210,9 +210,9 @@ impl WeatherData for WeatherAccess {
                     SELECT * FROM read_parquet(['{}'], union_by_name = true)
                 )
             ),
-            -- Deduplicate: for each station + time window, take the most recent forecast
+            -- Deduplicate: for each station + time window (normalized to UTC), take the most recent forecast
             deduped_forecasts AS (
-                SELECT DISTINCT ON (station_id, begin_time, end_time)
+                SELECT DISTINCT ON (station_id, begin_time::TIMESTAMPTZ, end_time::TIMESTAMPTZ)
                     station_id,
                     begin_time,
                     end_time,
@@ -231,7 +231,7 @@ impl WeatherData for WeatherAccess {
                     generated_at
                 FROM parquet_data
                 {} {}
-                ORDER BY station_id, begin_time, end_time, generated_at DESC
+                ORDER BY station_id, begin_time::TIMESTAMPTZ, end_time::TIMESTAMPTZ, generated_at DESC
             ),
             -- Precipitation bucketing: rows exist at multiple interval durations (1h, 3h, 6h, 12h, 24h)
             -- Precipitation rows with duration info. Each precip field (QPF, snow, ice)
@@ -239,7 +239,7 @@ impl WeatherData for WeatherAccess {
             precip_rows AS (
                 SELECT
                     station_id,
-                    DATE_TRUNC('day', begin_time::TIMESTAMP)::TEXT AS date,
+                    DATE_TRUNC('day', begin_time::TIMESTAMPTZ AT TIME ZONE 'UTC')::TEXT AS date,
                     begin_time::TIMESTAMPTZ AS begin_ts,
                     end_time::TIMESTAMPTZ AS end_ts,
                     EXTRACT(EPOCH FROM (end_time::TIMESTAMPTZ - begin_time::TIMESTAMPTZ)) AS duration_secs,
@@ -359,7 +359,7 @@ impl WeatherData for WeatherAccess {
             daily_forecasts AS (
                 SELECT
                     station_id,
-                    DATE_TRUNC('day', begin_time::TIMESTAMP)::TEXT AS date,
+                    DATE_TRUNC('day', begin_time::TIMESTAMPTZ AT TIME ZONE 'UTC')::TEXT AS date,
                     MIN(begin_time) AS start_time,
                     MAX(end_time) AS end_time,
                     MIN(min_temp) FILTER (WHERE min_temp IS NOT NULL AND min_temp >= -200 AND min_temp <= 200) AS temp_low,
@@ -372,7 +372,7 @@ impl WeatherData for WeatherAccess {
                     MAX(temperature_unit_code) AS temperature_unit_code,
                     MAX(twelve_hour_probability_of_precipitation) FILTER (WHERE twelve_hour_probability_of_precipitation IS NOT NULL) AS precip_chance
                 FROM deduped_forecasts
-                GROUP BY station_id, DATE_TRUNC('day', begin_time::TIMESTAMP)::TEXT
+                GROUP BY station_id, DATE_TRUNC('day', begin_time::TIMESTAMPTZ AT TIME ZONE 'UTC')::TEXT
             )
             SELECT
                 df.station_id,

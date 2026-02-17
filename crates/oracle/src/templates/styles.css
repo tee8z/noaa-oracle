@@ -785,11 +785,11 @@ textarea.schema-content:focus {
     color: var(--bulma-text-weak);
 }
 
-.temp-observed {
+.obs-value {
     font-weight: 500;
 }
 
-.temp-forecast-sub {
+.fcst-value {
     font-size: 0.65rem;
     color: var(--bulma-text-weak);
     opacity: 0.7;
