@@ -208,7 +208,7 @@ async function fetchStationForecast(stationId, popup) {
     // Update popup with data
     const setValue = (field, value) => {
       const el = popup.querySelector(`[data-field="${field}"]`);
-      if (el) el.textContent = value || "-";
+      if (el) el.textContent = value ?? "-";
     };
 
     // Yesterday - show observed as primary, forecast as sub-label
@@ -228,7 +228,7 @@ async function fetchStationForecast(stationId, popup) {
       yesterdayObs && yesterdayForecast
         ? "fcst: " +
             formatTemp(yesterdayForecast.temp_high, yesterdayForecast.temp_low)
-        : null,
+        : "",
     );
     setValue(
       "yesterday-wind",
@@ -243,24 +243,27 @@ async function fetchStationForecast(stationId, popup) {
       yesterdayForecast ? formatPrecip(yesterdayForecast.precip_chance) : null,
     );
 
-    // Today - show observed as primary (partial), forecast as sub-label
+    // Today - show observed and forecast independently
     const todayObs = obsByDate[todayKey];
     const todayForecast = forecastByDate[todayKey];
-    setValue(
-      "today-temp-observed",
-      todayObs
-        ? formatTemp(todayObs.temp_high, todayObs.temp_low)
-        : todayForecast
-          ? formatTemp(todayForecast.temp_high, todayForecast.temp_low)
-          : null,
-    );
-    // Show forecast as sub-text only if we have both observed and forecast
-    setValue(
-      "today-temp-forecast",
-      todayObs && todayForecast
-        ? "fcst: " + formatTemp(todayForecast.temp_high, todayForecast.temp_low)
-        : null,
-    );
+    const todayObsTemp = todayObs
+      ? formatTemp(todayObs.temp_high, todayObs.temp_low)
+      : null;
+    const todayFcstTemp = todayForecast
+      ? formatTemp(todayForecast.temp_high, todayForecast.temp_low)
+      : null;
+    if (todayObsTemp) {
+      // Have observations: show observed as primary, forecast as sub-label
+      setValue("today-temp-observed", todayObsTemp);
+      setValue(
+        "today-temp-forecast",
+        todayFcstTemp ? "fcst: " + todayFcstTemp : "",
+      );
+    } else {
+      // No observations yet: show forecast as primary with "fcst" indicator
+      setValue("today-temp-observed", todayFcstTemp);
+      setValue("today-temp-forecast", todayFcstTemp ? "fcst" : "");
+    }
     setValue(
       "today-wind",
       todayObs
@@ -274,14 +277,15 @@ async function fetchStationForecast(stationId, popup) {
       todayForecast ? formatPrecip(todayForecast.precip_chance) : null,
     );
 
-    // Tomorrow
+    // Tomorrow - forecast only
     const tomorrowForecast = forecastByDate[tomorrowKey];
     setValue(
-      "tomorrow-temp-forecast",
+      "tomorrow-temp-observed",
       tomorrowForecast
         ? formatTemp(tomorrowForecast.temp_high, tomorrowForecast.temp_low)
         : null,
     );
+    setValue("tomorrow-temp-forecast", tomorrowForecast ? "fcst" : "");
     setValue(
       "tomorrow-wind",
       tomorrowForecast ? formatWind(tomorrowForecast.wind_speed) : null,

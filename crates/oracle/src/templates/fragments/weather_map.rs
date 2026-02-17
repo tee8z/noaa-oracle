@@ -154,7 +154,10 @@ pub fn weather_map(weather_data: &[WeatherDisplay]) -> Markup {
                                 div class="temp-observed" data-field="today-temp-observed" { "-" }
                                 div class="temp-forecast-sub" data-field="today-temp-forecast" { }
                             }
-                            div class="forecast-col" data-field="tomorrow-temp-forecast" { "-" }
+                            div class="forecast-col" {
+                                div class="temp-observed" data-field="tomorrow-temp-observed" { "-" }
+                                div class="temp-forecast-sub" data-field="tomorrow-temp-forecast" { }
+                            }
                         }
                         // Wind row
                         div class="forecast-data-row" {
