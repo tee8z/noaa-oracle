@@ -175,14 +175,17 @@ impl WeatherData for WeatherAccess {
 
         // Build start/end time expressions for final select
         let start_time_expr = if let Some(start) = &req.start {
-            format!("GREATEST('{}', MIN(start_time))", start.format(&Rfc3339)?)
+            format!(
+                "GREATEST('{}', MIN(df.start_time))",
+                start.format(&Rfc3339)?
+            )
         } else {
-            "MIN(start_time)".to_string()
+            "MIN(df.start_time)".to_string()
         };
         let end_time_expr = if let Some(end) = &req.end {
-            format!("LEAST('{}', MAX(end_time))", end.format(&Rfc3339)?)
+            format!("LEAST('{}', MAX(df.end_time))", end.format(&Rfc3339)?)
         } else {
-            "MAX(end_time)".to_string()
+            "MAX(df.end_time)".to_string()
         };
 
         // Use raw SQL with UNION ALL BY NAME to handle schema differences
@@ -230,6 +233,77 @@ impl WeatherData for WeatherAccess {
                 {} {}
                 ORDER BY station_id, begin_time, end_time, generated_at DESC
             ),
+            -- Precipitation bucketing: rows exist at multiple interval durations (1h, 3h, 6h, 12h, 24h)
+            -- all carrying the same precip value due to carry-forward. We dynamically detect the
+            -- native precipitation interval (the one whose rows tile without gaps/overlaps) and
+            -- only sum from those rows to avoid counting the same value multiple times.
+            precip_rows AS (
+                SELECT
+                    station_id,
+                    DATE_TRUNC('day', begin_time::TIMESTAMP)::TEXT AS date,
+                    begin_time::TIMESTAMPTZ AS begin_ts,
+                    end_time::TIMESTAMPTZ AS end_ts,
+                    EXTRACT(EPOCH FROM (end_time::TIMESTAMPTZ - begin_time::TIMESTAMPTZ)) AS duration_secs,
+                    liquid_precipitation_amt,
+                    snow_amt,
+                    snow_ratio,
+                    ice_amt
+                FROM deduped_forecasts
+                WHERE liquid_precipitation_amt IS NOT NULL
+                   OR snow_amt IS NOT NULL
+                   OR ice_amt IS NOT NULL
+            ),
+            -- For each station+day+duration, check if rows tile (each end_ts = next begin_ts)
+            precip_duration AS (
+                SELECT
+                    station_id,
+                    date,
+                    duration_secs,
+                    COUNT(*) AS row_count,
+                    SUM(CASE WHEN next_begin IS NOT NULL AND end_ts = next_begin THEN 1 ELSE 0 END) AS chain_count
+                FROM (
+                    SELECT
+                        station_id,
+                        date,
+                        duration_secs,
+                        begin_ts,
+                        end_ts,
+                        LEAD(begin_ts) OVER (
+                            PARTITION BY station_id, date, duration_secs
+                            ORDER BY begin_ts
+                        ) AS next_begin
+                    FROM precip_rows
+                ) sub
+                GROUP BY station_id, date, duration_secs
+                HAVING COUNT(*) > 1
+            ),
+            -- Pick the best duration per station+day: highest chain ratio (most tiling),
+            -- then shortest duration as tiebreaker. This tolerates gaps at day boundaries
+            -- while still identifying the native precipitation interval.
+            best_precip_duration AS (
+                SELECT DISTINCT ON (station_id, date)
+                    station_id,
+                    date,
+                    duration_secs
+                FROM precip_duration
+                ORDER BY station_id, date, chain_count::FLOAT / row_count DESC, duration_secs ASC
+            ),
+            -- Sum precipitation only from rows matching the native duration
+            daily_precip AS (
+                SELECT
+                    pr.station_id,
+                    pr.date,
+                    SUM(pr.liquid_precipitation_amt) FILTER (WHERE pr.liquid_precipitation_amt IS NOT NULL AND pr.liquid_precipitation_amt >= 0) AS total_qpf,
+                    SUM(pr.snow_amt) FILTER (WHERE pr.snow_amt IS NOT NULL AND pr.snow_amt >= 0) AS snow_amt,
+                    AVG(pr.snow_ratio) FILTER (WHERE pr.snow_ratio IS NOT NULL AND pr.snow_ratio > 0) AS avg_snow_ratio,
+                    SUM(pr.ice_amt) FILTER (WHERE pr.ice_amt IS NOT NULL AND pr.ice_amt >= 0) AS ice_amt
+                FROM precip_rows pr
+                INNER JOIN best_precip_duration bpd
+                    ON pr.station_id = bpd.station_id
+                    AND pr.date = bpd.date
+                    AND pr.duration_secs = bpd.duration_secs
+                GROUP BY pr.station_id, pr.date
+            ),
             daily_forecasts AS (
                 SELECT
                     station_id,
@@ -244,41 +318,35 @@ impl WeatherData for WeatherAccess {
                     MAX(relative_humidity_max) FILTER (WHERE relative_humidity_max IS NOT NULL AND relative_humidity_max >= 0 AND relative_humidity_max <= 100) AS humidity_max,
                     MIN(relative_humidity_min) FILTER (WHERE relative_humidity_min IS NOT NULL AND relative_humidity_min >= 0 AND relative_humidity_min <= 100) AS humidity_min,
                     MAX(temperature_unit_code) AS temperature_unit_code,
-                    MAX(twelve_hour_probability_of_precipitation) FILTER (WHERE twelve_hour_probability_of_precipitation IS NOT NULL) AS precip_chance,
-                    -- Total QPF (liquid equivalent of all precipitation)
-                    SUM(liquid_precipitation_amt) FILTER (WHERE liquid_precipitation_amt IS NOT NULL AND liquid_precipitation_amt >= 0) AS total_qpf,
-                    SUM(snow_amt) FILTER (WHERE snow_amt IS NOT NULL AND snow_amt >= 0) AS snow_amt,
-                    -- Average snow ratio for the day (typically 10-20, meaning 10-20 inches snow per inch liquid)
-                    AVG(snow_ratio) FILTER (WHERE snow_ratio IS NOT NULL AND snow_ratio > 0) AS avg_snow_ratio,
-                    -- Ice accumulation (already in inches, ~1:1 liquid equivalent)
-                    SUM(ice_amt) FILTER (WHERE ice_amt IS NOT NULL AND ice_amt >= 0) AS ice_amt
+                    MAX(twelve_hour_probability_of_precipitation) FILTER (WHERE twelve_hour_probability_of_precipitation IS NOT NULL) AS precip_chance
                 FROM deduped_forecasts
                 GROUP BY station_id, DATE_TRUNC('day', begin_time::TIMESTAMP)::TEXT
             )
             SELECT
-                station_id,
-                date,
+                df.station_id,
+                df.date,
                 {} AS start_time,
                 {} AS end_time,
-                MIN(temp_low) AS temp_low,
-                MAX(temp_high) AS temp_high,
-                MAX(wind_speed) AS wind_speed,
-                MAX(wind_direction) AS wind_direction,
-                MAX(humidity_max) AS humidity_max,
-                MIN(humidity_min) AS humidity_min,
-                MAX(temperature_unit_code) AS temperature_unit_code,
-                MAX(precip_chance) AS precip_chance,
+                MIN(df.temp_low) AS temp_low,
+                MAX(df.temp_high) AS temp_high,
+                MAX(df.wind_speed) AS wind_speed,
+                MAX(df.wind_direction) AS wind_direction,
+                MAX(df.humidity_max) AS humidity_max,
+                MIN(df.humidity_min) AS humidity_min,
+                MAX(df.temperature_unit_code) AS temperature_unit_code,
+                MAX(df.precip_chance) AS precip_chance,
                 -- Calculate rain: QPF - (snow / snow_ratio) - ice
                 -- If no snow_ratio, treat all QPF as rain (minus ice)
                 -- Never return negative values
                 GREATEST(0, COALESCE(
-                    SUM(total_qpf) - (SUM(snow_amt) / NULLIF(AVG(avg_snow_ratio), 0)) - COALESCE(SUM(ice_amt), 0),
-                    SUM(total_qpf) - COALESCE(SUM(ice_amt), 0)
+                    dp.total_qpf - (dp.snow_amt / NULLIF(dp.avg_snow_ratio, 0)) - COALESCE(dp.ice_amt, 0),
+                    dp.total_qpf - COALESCE(dp.ice_amt, 0)
                 )) AS rain_amt,
-                SUM(snow_amt) AS snow_amt,
-                SUM(ice_amt) AS ice_amt
-            FROM daily_forecasts
-            GROUP BY station_id, date
+                dp.snow_amt AS snow_amt,
+                dp.ice_amt AS ice_amt
+            FROM daily_forecasts df
+            LEFT JOIN daily_precip dp ON df.station_id = dp.station_id AND df.date = dp.date
+            GROUP BY df.station_id, df.date, dp.total_qpf, dp.snow_amt, dp.avg_snow_ratio, dp.ice_amt
             "#,
             file_paths.join("', '"),
             station_filter,
