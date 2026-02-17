@@ -10,7 +10,7 @@ metadata:
     argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
 spec:
   backoffLimit: 0
-  activeDeadlineSeconds: 600
+  activeDeadlineSeconds: 900
   ttlSecondsAfterFinished: 300
   template:
     metadata:
@@ -34,6 +34,10 @@ spec:
               CONTAINER="{{ .Chart.Name }}"
               NEW_IMAGE="{{ .Values.image.repository }}:{{ .Values.image.tag }}"
               MOUNT_PATH="{{ .Values.persistence.mountPath }}"
+              WEATHER_DIR="{{ .Values.config.dataDir }}"
+              S3_BUCKET="{{ .Values.litestream.s3Bucket }}"
+              S3_REGION="{{ .Values.litestream.s3Region }}"
+              RETENTION_DAYS="{{ .Values.cleanup.retentionDays | default 32 }}"
 
               echo "=== Blue/Green PreSync Switchover ==="
               echo "Namespace: $NAMESPACE"
@@ -83,15 +87,15 @@ spec:
               echo "=== Starting switchover: $ACTIVE -> $STANDBY ==="
 
               # Step 1: Update standby image
-              echo "Step 1/12: Setting $STANDBY_DEPLOY image to $NEW_IMAGE"
+              echo "Step 1/13: Setting $STANDBY_DEPLOY image to $NEW_IMAGE"
               kubectl -n "$NAMESPACE" set image "deployment/$STANDBY_DEPLOY" "$CONTAINER=$NEW_IMAGE"
 
               # Step 2: Scale down active so Litestream flushes WAL to S3 on SIGTERM
-              echo "Step 2/12: Scaling down $ACTIVE_DEPLOY (Litestream will flush WAL to S3)"
+              echo "Step 2/13: Scaling down $ACTIVE_DEPLOY (Litestream will flush WAL to S3)"
               kubectl -n "$NAMESPACE" scale deployment "$ACTIVE_DEPLOY" --replicas=0
 
               # Step 3: Wait for active pods to terminate
-              echo "Step 3/12: Waiting for $ACTIVE_DEPLOY pods to terminate"
+              echo "Step 3/13: Waiting for $ACTIVE_DEPLOY pods to terminate"
               kubectl -n "$NAMESPACE" wait --for=delete pod \
                 -l "app.kubernetes.io/slot=$ACTIVE,app.kubernetes.io/name={{ include "noaa-oracle.name" . }}" \
                 --timeout=60s 2>/dev/null || true
@@ -99,14 +103,14 @@ spec:
 
               # Step 4: Wait for Litestream S3 sync to propagate.
               # The pod is gone but the S3 PUT may still be in-flight or eventually-consistent.
-              echo "Step 4/12: Waiting for Litestream S3 sync to propagate"
+              echo "Step 4/13: Waiting for Litestream S3 sync to propagate"
               sleep 10
               echo "S3 sync propagation window complete"
 
               # Step 5: Clean standby PVC so the litestream-restore init container
               # does a full restore from S3 instead of skipping (it uses -if-db-not-exists).
               # Without this, stale DB files on the standby PVC would be used as-is.
-              echo "Step 5/12: Cleaning standby PVC (${DEPLOY_PREFIX}-${STANDBY})"
+              echo "Step 5/13: Cleaning standby PVC (${DEPLOY_PREFIX}-${STANDBY})"
               CLEANUP_POD="pvc-cleanup-${STANDBY}-$(date +%s)"
               CLEANUP_CMD="echo Cleaning PVC files...; find $MOUNT_PATH -type f -name '*.db' -exec rm -fv {} +; find $MOUNT_PATH -type f -name '*.db-shm' -exec rm -fv {} +; find $MOUNT_PATH -type f -name '*.db-wal' -exec rm -fv {} +; find $MOUNT_PATH -type f -name '*.sqlite' -exec rm -fv {} +; find $MOUNT_PATH -type f -name '*.sqlite-shm' -exec rm -fv {} +; find $MOUNT_PATH -type f -name '*.sqlite-wal' -exec rm -fv {} +; find $MOUNT_PATH -type d -name '*-litestream' -exec rm -rfv {} + 2>/dev/null; rm -fv $MOUNT_PATH/events/*.db $MOUNT_PATH/events/*.sqlite $MOUNT_PATH/events/*.sqlite-shm $MOUNT_PATH/events/*.sqlite-wal 2>/dev/null; rm -rfv $MOUNT_PATH/events/.*-litestream 2>/dev/null; echo PVC cleaned"
               # Create cleanup pod via JSON to avoid Helm YAML parser issues with heredocs
@@ -129,7 +133,7 @@ spec:
               # Step 6: Verify standby PVC is clean. If stale DB files remain,
               # the litestream-restore init container will skip restore (-if-db-not-exists)
               # and the standby starts with old/corrupt data.
-              echo "Step 6/12: Verifying standby PVC is clean"
+              echo "Step 6/13: Verifying standby PVC is clean"
               VERIFY_POD="pvc-verify-${STANDBY}-$(date +%s)"
               printf '{"apiVersion":"v1","kind":"Pod","metadata":{"name":"%s"},"spec":{"restartPolicy":"Never","containers":[{"name":"verify","image":"alpine:latest","command":["sh","-c","find %s -name '"'"'*.db'"'"' -o -name '"'"'*.sqlite'"'"' -o -name '"'"'*-litestream'"'"' 2>/dev/null | wc -l"],"volumeMounts":[{"name":"data","mountPath":"%s"}]}],"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"%s"}}]}}' \
                 "$VERIFY_POD" "$MOUNT_PATH" "$MOUNT_PATH" "${DEPLOY_PREFIX}-${STANDBY}" \
@@ -150,11 +154,11 @@ spec:
               echo "Standby PVC is clean, restore will fetch fresh data from S3"
 
               # Step 7: Scale up standby (triggers Litestream restore from fresh S3 data)
-              echo "Step 7/12: Scaling up $STANDBY_DEPLOY (will restore DB from S3)"
+              echo "Step 7/13: Scaling up $STANDBY_DEPLOY (will restore DB from S3)"
               kubectl -n "$NAMESPACE" scale deployment "$STANDBY_DEPLOY" --replicas=1
 
               # Step 8: Wait for readiness
-              echo "Step 8/12: Waiting for $STANDBY_DEPLOY to be ready..."
+              echo "Step 8/13: Waiting for $STANDBY_DEPLOY to be ready..."
               if ! kubectl -n "$NAMESPACE" rollout status deployment "$STANDBY_DEPLOY" --timeout=300s; then
                 echo "ERROR: Standby deployment failed readiness check"
                 echo "Rolling back: scaling down standby, scaling up previous active"
@@ -165,7 +169,7 @@ spec:
 
               # Step 9: Verify restored database integrity before routing traffic.
               # Uses a temporary pod pinned to the standby node for RWO PVC access.
-              echo "Step 9/12: Verifying database integrity on standby"
+              echo "Step 9/13: Verifying database integrity on standby"
               STANDBY_NODE=$(kubectl -n "$NAMESPACE" get pod \
                 -l "app.kubernetes.io/slot=$STANDBY,app.kubernetes.io/name={{ include "noaa-oracle.name" . }}" \
                 -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null)
@@ -223,8 +227,69 @@ spec:
                 echo "Database integrity check passed"
               fi
 
-              # Step 10: Flip Service selector
-              echo "Step 10/12: Flipping Service selector to $STANDBY"
+
+              # Step 10/13: Restore weather parquet data from S3 if standby PVC is empty.
+              # On normal switchovers the weather dir survives Step 5 (which only deletes
+              # DB files). But on a fresh/recreated PVC, the weather dir is empty and only
+              # the SQLite DB gets restored via Litestream.
+              echo "Step 10/13: Checking weather data on standby PVC"
+              WEATHER_CHECK_POD="weather-check-${STANDBY}-$(date +%s)"
+              printf '{"apiVersion":"v1","kind":"Pod","metadata":{"name":"%s"},"spec":{"nodeName":"%s","restartPolicy":"Never","containers":[{"name":"check","image":"alpine:latest","command":["sh","-c","find %s -name '"'"'*.parquet'"'"' 2>/dev/null | wc -l"],"volumeMounts":[{"name":"data","mountPath":"%s"}]}],"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"%s"}}]}}' \
+                "$WEATHER_CHECK_POD" "$STANDBY_NODE" "$WEATHER_DIR" "$MOUNT_PATH" "${DEPLOY_PREFIX}-${STANDBY}" \
+                | kubectl -n "$NAMESPACE" apply -f - 2>/dev/null || echo "WARNING: Failed to create weather check pod"
+              for i in $(seq 1 30); do
+                PHASE=$(kubectl -n "$NAMESPACE" get pod "$WEATHER_CHECK_POD" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+                if [[ "$PHASE" == "Succeeded" || "$PHASE" == "Failed" ]]; then break; fi
+                sleep 1
+              done
+              PARQUET_COUNT=$(kubectl -n "$NAMESPACE" logs "$WEATHER_CHECK_POD" 2>/dev/null | tr -d '[:space:]')
+              kubectl -n "$NAMESPACE" delete pod "$WEATHER_CHECK_POD" --ignore-not-found 2>/dev/null || true
+
+              if [[ -n "$PARQUET_COUNT" && "$PARQUET_COUNT" -gt 0 ]] 2>/dev/null; then
+                echo "Weather data present ($PARQUET_COUNT parquet files). Skipping S3 restore."
+              else
+                echo "No weather data found on standby PVC. Restoring from S3..."
+
+                # Scale down standby to release RWO PVC for the restore pod
+                kubectl -n "$NAMESPACE" scale deployment "$STANDBY_DEPLOY" --replicas=0
+                kubectl -n "$NAMESPACE" wait --for=delete pod \
+                  -l "app.kubernetes.io/slot=$STANDBY,app.kubernetes.io/name={{ include "noaa-oracle.name" . }}" \
+                  --timeout=60s 2>/dev/null || true
+
+                RESTORE_POD="weather-restore-${STANDBY}-$(date +%s)"
+                RESTORE_CMD="mkdir -p ${WEATHER_DIR} && aws s3 sync s3://${S3_BUCKET}/weather_data/ ${WEATHER_DIR}/ --region ${S3_REGION} --only-show-errors && TOTAL=\$(find ${WEATHER_DIR} -name '*.parquet' 2>/dev/null | wc -l) && echo \"Restored \$TOTAL parquet files\""
+                printf '{"apiVersion":"v1","kind":"Pod","metadata":{"name":"%s"},"spec":{"nodeName":"%s","restartPolicy":"Never","containers":[{"name":"restore","image":"amazon/aws-cli:latest","command":["sh","-c","%s"],"volumeMounts":[{"name":"data","mountPath":"%s"}]}],"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"%s"}}]}}' \
+                  "$RESTORE_POD" "$STANDBY_NODE" "$RESTORE_CMD" "$MOUNT_PATH" "${DEPLOY_PREFIX}-${STANDBY}" \
+                  | kubectl -n "$NAMESPACE" apply -f - 2>/dev/null || echo "WARNING: Failed to create weather restore pod"
+
+                RESTORE_OK=false
+                for i in $(seq 1 300); do
+                  PHASE=$(kubectl -n "$NAMESPACE" get pod "$RESTORE_POD" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+                  if [[ "$PHASE" == "Succeeded" ]]; then RESTORE_OK=true; break; fi
+                  if [[ "$PHASE" == "Failed" ]]; then break; fi
+                  sleep 1
+                done
+                kubectl -n "$NAMESPACE" logs "$RESTORE_POD" 2>/dev/null || true
+                kubectl -n "$NAMESPACE" delete pod "$RESTORE_POD" --ignore-not-found 2>/dev/null || true
+
+                if [[ "$RESTORE_OK" == "true" ]]; then
+                  echo "Weather data restore from S3 completed successfully"
+                else
+                  echo "WARNING: Weather data restore failed. Run 'just restore-oracle-data' manually after switchover."
+                fi
+
+                # Scale standby back up
+                kubectl -n "$NAMESPACE" scale deployment "$STANDBY_DEPLOY" --replicas=1
+                if ! kubectl -n "$NAMESPACE" rollout status deployment "$STANDBY_DEPLOY" --timeout=300s; then
+                  echo "ERROR: Standby failed to restart after weather restore, rolling back"
+                  kubectl -n "$NAMESPACE" scale deployment "$STANDBY_DEPLOY" --replicas=0
+                  kubectl -n "$NAMESPACE" scale deployment "$ACTIVE_DEPLOY" --replicas=1
+                  exit 1
+                fi
+              fi
+
+              # Step 11: Flip Service selector
+              echo "Step 11/13: Flipping Service selector to $STANDBY"
               kubectl -n "$NAMESPACE" patch svc "$SERVICE" --type=json \
                 -p "[{\"op\": \"replace\", \"path\": \"/spec/selector/app.kubernetes.io~1slot\", \"value\": \"$STANDBY\"}]"
 
@@ -232,14 +297,14 @@ spec:
                 -o jsonpath='{.spec.selector.app\.kubernetes\.io/slot}')
               echo "Service now pointing to: $NEW_ACTIVE"
 
-              # Step 11: Scale down old active
-              echo "Step 11/12: Scaling down old active $ACTIVE_DEPLOY"
+              # Step 12: Scale down old active
+              echo "Step 12/13: Scaling down old active $ACTIVE_DEPLOY"
               kubectl -n "$NAMESPACE" scale deployment "$ACTIVE_DEPLOY" --replicas=0 2>/dev/null || true
 
-              # Step 12: Update activeSlot in infrastructure values via GitHub API.
+              # Step 13: Update activeSlot in infrastructure values via GitHub API.
               # This keeps the git values file in sync with the runtime state so
               # future Helm renders are correct. Uses the ghcr-pull-secret token.
-              echo "Step 12/12: Updating activeSlot in infrastructure repo"
+              echo "Step 13/13: Updating activeSlot in infrastructure repo"
               GITHUB_TOKEN=""
               # Try to get token from ghcr-pull-secret in current namespace
               DOCKER_CONFIG=$(kubectl -n "$NAMESPACE" get secret ghcr-pull-secret -o jsonpath='{.data.\.dockerconfigjson}' 2>/dev/null || echo "")
