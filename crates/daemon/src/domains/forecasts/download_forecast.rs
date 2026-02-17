@@ -618,10 +618,13 @@ fn add_data(
 ) -> Result<(), Error> {
     for current_data in weather_data.iter_mut() {
         let time_interval_index = get_interval(current_data, time_ranges);
+        // For accumulative fields, use strict matching to avoid writing the same
+        // value to overlapping sub-windows (e.g., a 12h snow value to four 3h windows)
+        let exact_interval_index = get_interval_exact(current_data, time_ranges);
 
         match data.reading_type {
             Liquid => {
-                if let Some(index) = time_interval_index {
+                if let Some(index) = exact_interval_index {
                     current_data.liquid_precipitation_amt = data
                         .value
                         .get(index)
@@ -630,10 +633,8 @@ fn add_data(
                             prev_weather_data.liquid_precipitation_amt = Some(parsed_value);
                             Some(parsed_value)
                         });
-                } else {
-                    current_data.liquid_precipitation_amt =
-                        prev_weather_data.liquid_precipitation_amt;
                 }
+                // No carry-forward for accumulative fields
                 current_data.liquid_precipitation_unit_code = data.units.to_string();
             }
             Maximum => {
@@ -748,7 +749,7 @@ fn add_data(
                 current_data.wind_direction_unit_code = data.units.to_string();
             }
             Snow => {
-                if let Some(index) = time_interval_index {
+                if let Some(index) = exact_interval_index {
                     current_data.snow_amt = data
                         .value
                         .get(index)
@@ -757,13 +758,12 @@ fn add_data(
                             prev_weather_data.snow_amt = Some(parsed_value);
                             Some(parsed_value)
                         });
-                } else {
-                    current_data.snow_amt = prev_weather_data.snow_amt;
                 }
+                // No carry-forward for accumulative fields
                 current_data.snow_amt_unit_code = data.units.to_string();
             }
             SnowRatio => {
-                if let Some(index) = time_interval_index {
+                if let Some(index) = exact_interval_index {
                     current_data.snow_ratio = data
                         .value
                         .get(index)
@@ -772,13 +772,12 @@ fn add_data(
                             prev_weather_data.snow_ratio = Some(parsed_value);
                             Some(parsed_value)
                         });
-                } else {
-                    current_data.snow_ratio = prev_weather_data.snow_ratio;
                 }
+                // No carry-forward for accumulative fields
                 current_data.snow_ratio_unit_code = data.units.to_string();
             }
             Ice => {
-                if let Some(index) = time_interval_index {
+                if let Some(index) = exact_interval_index {
                     current_data.ice_amt = data
                         .value
                         .get(index)
@@ -787,9 +786,8 @@ fn add_data(
                             prev_weather_data.ice_amt = Some(parsed_value);
                             Some(parsed_value)
                         });
-                } else {
-                    current_data.ice_amt = prev_weather_data.ice_amt;
                 }
+                // No carry-forward for accumulative fields
                 current_data.ice_amt_unit_code = data.units.to_string();
             }
         }
@@ -875,6 +873,31 @@ fn get_interval(current_data: &WeatherForecast, time_ranges: &[TimeRange]) -> Op
             {
                 return Some(index);
             }
+        }
+    }
+
+    None
+}
+
+/// Strict interval matching for accumulative fields (QPF, snow, ice).
+/// Only matches exact time range (begin+end) or exact start time.
+/// Does NOT match sub-windows within larger NOAA ranges, preventing
+/// the same accumulative value from being written to multiple overlapping windows.
+fn get_interval_exact(current_data: &WeatherForecast, time_ranges: &[TimeRange]) -> Option<usize> {
+    // Exact match: both begin and end times match
+    for (index, time_range) in time_ranges.iter().enumerate() {
+        if let Some(end_time) = time_range.end_time {
+            if time_range.start_time == current_data.begin_time && end_time == current_data.end_time
+            {
+                return Some(index);
+            }
+        }
+    }
+
+    // Start time match only (for time ranges without end_time)
+    for (index, time_range) in time_ranges.iter().enumerate() {
+        if time_range.end_time.is_none() && time_range.start_time == current_data.begin_time {
+            return Some(index);
         }
     }
 

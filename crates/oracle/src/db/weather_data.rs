@@ -234,9 +234,8 @@ impl WeatherData for WeatherAccess {
                 ORDER BY station_id, begin_time, end_time, generated_at DESC
             ),
             -- Precipitation bucketing: rows exist at multiple interval durations (1h, 3h, 6h, 12h, 24h)
-            -- all carrying the same precip value due to carry-forward. We dynamically detect the
-            -- native precipitation interval (the one whose rows tile without gaps/overlaps) and
-            -- only sum from those rows to avoid counting the same value multiple times.
+            -- Precipitation rows with duration info. Each precip field (QPF, snow, ice)
+            -- may have a different native interval from NOAA, so we detect intervals per-field.
             precip_rows AS (
                 SELECT
                     station_id,
@@ -253,56 +252,109 @@ impl WeatherData for WeatherAccess {
                    OR snow_amt IS NOT NULL
                    OR ice_amt IS NOT NULL
             ),
-            -- For each station+day+duration, check if rows tile (each end_ts = next begin_ts)
-            precip_duration AS (
-                SELECT
-                    station_id,
-                    date,
-                    duration_secs,
-                    COUNT(*) AS row_count,
+            -- QPF: detect native interval for liquid precipitation
+            qpf_duration AS (
+                SELECT station_id, date, duration_secs, COUNT(*) AS row_count,
                     SUM(CASE WHEN next_begin IS NOT NULL AND end_ts = next_begin THEN 1 ELSE 0 END) AS chain_count
                 FROM (
-                    SELECT
-                        station_id,
-                        date,
-                        duration_secs,
-                        begin_ts,
-                        end_ts,
-                        LEAD(begin_ts) OVER (
-                            PARTITION BY station_id, date, duration_secs
-                            ORDER BY begin_ts
-                        ) AS next_begin
-                    FROM precip_rows
+                    SELECT station_id, date, duration_secs, begin_ts, end_ts,
+                        LEAD(begin_ts) OVER (PARTITION BY station_id, date, duration_secs ORDER BY begin_ts) AS next_begin
+                    FROM precip_rows WHERE liquid_precipitation_amt IS NOT NULL
                 ) sub
                 GROUP BY station_id, date, duration_secs
                 HAVING COUNT(*) > 1
             ),
-            -- Pick the best duration per station+day: highest chain ratio (most tiling),
-            -- then shortest duration as tiebreaker. This tolerates gaps at day boundaries
-            -- while still identifying the native precipitation interval.
-            best_precip_duration AS (
-                SELECT DISTINCT ON (station_id, date)
-                    station_id,
-                    date,
-                    duration_secs
-                FROM precip_duration
+            best_qpf_duration AS (
+                SELECT DISTINCT ON (station_id, date) station_id, date, duration_secs
+                FROM qpf_duration
                 ORDER BY station_id, date, chain_count::FLOAT / row_count DESC, duration_secs ASC
             ),
-            -- Sum precipitation only from rows matching the native duration
-            daily_precip AS (
-                SELECT
-                    pr.station_id,
-                    pr.date,
-                    SUM(pr.liquid_precipitation_amt) FILTER (WHERE pr.liquid_precipitation_amt IS NOT NULL AND pr.liquid_precipitation_amt >= 0) AS total_qpf,
+            -- Snow: detect native interval for snow amount
+            snow_duration AS (
+                SELECT station_id, date, duration_secs, COUNT(*) AS row_count,
+                    SUM(CASE WHEN next_begin IS NOT NULL AND end_ts = next_begin THEN 1 ELSE 0 END) AS chain_count
+                FROM (
+                    SELECT station_id, date, duration_secs, begin_ts, end_ts,
+                        LEAD(begin_ts) OVER (PARTITION BY station_id, date, duration_secs ORDER BY begin_ts) AS next_begin
+                    FROM precip_rows WHERE snow_amt IS NOT NULL
+                ) sub
+                GROUP BY station_id, date, duration_secs
+                HAVING COUNT(*) > 1
+            ),
+            best_snow_duration AS (
+                SELECT DISTINCT ON (station_id, date) station_id, date, duration_secs
+                FROM snow_duration
+                ORDER BY station_id, date, chain_count::FLOAT / row_count DESC, duration_secs ASC
+            ),
+            -- Ice: detect native interval for ice amount
+            ice_duration AS (
+                SELECT station_id, date, duration_secs, COUNT(*) AS row_count,
+                    SUM(CASE WHEN next_begin IS NOT NULL AND end_ts = next_begin THEN 1 ELSE 0 END) AS chain_count
+                FROM (
+                    SELECT station_id, date, duration_secs, begin_ts, end_ts,
+                        LEAD(begin_ts) OVER (PARTITION BY station_id, date, duration_secs ORDER BY begin_ts) AS next_begin
+                    FROM precip_rows WHERE ice_amt IS NOT NULL
+                ) sub
+                GROUP BY station_id, date, duration_secs
+                HAVING COUNT(*) > 1
+            ),
+            best_ice_duration AS (
+                SELECT DISTINCT ON (station_id, date) station_id, date, duration_secs
+                FROM ice_duration
+                ORDER BY station_id, date, chain_count::FLOAT / row_count DESC, duration_secs ASC
+            ),
+            -- Sum each field using its own native duration.
+            -- Fallback: when best_*_duration has no match (single-row days filtered by HAVING > 1),
+            -- use the shortest available duration for that field.
+            daily_qpf AS (
+                SELECT pr.station_id, pr.date,
+                    SUM(pr.liquid_precipitation_amt) FILTER (WHERE pr.liquid_precipitation_amt IS NOT NULL AND pr.liquid_precipitation_amt >= 0) AS total_qpf
+                FROM precip_rows pr
+                LEFT JOIN best_qpf_duration bqd ON pr.station_id = bqd.station_id AND pr.date = bqd.date
+                WHERE pr.liquid_precipitation_amt IS NOT NULL
+                  AND pr.duration_secs = COALESCE(bqd.duration_secs, (
+                      SELECT MIN(p2.duration_secs) FROM precip_rows p2
+                      WHERE p2.station_id = pr.station_id AND p2.date = pr.date AND p2.liquid_precipitation_amt IS NOT NULL
+                  ))
+                GROUP BY pr.station_id, pr.date
+            ),
+            daily_snow AS (
+                SELECT pr.station_id, pr.date,
                     SUM(pr.snow_amt) FILTER (WHERE pr.snow_amt IS NOT NULL AND pr.snow_amt >= 0) AS snow_amt,
-                    AVG(pr.snow_ratio) FILTER (WHERE pr.snow_ratio IS NOT NULL AND pr.snow_ratio > 0) AS avg_snow_ratio,
+                    AVG(pr.snow_ratio) FILTER (WHERE pr.snow_ratio IS NOT NULL AND pr.snow_ratio > 0) AS avg_snow_ratio
+                FROM precip_rows pr
+                LEFT JOIN best_snow_duration bsd ON pr.station_id = bsd.station_id AND pr.date = bsd.date
+                WHERE pr.snow_amt IS NOT NULL
+                  AND pr.duration_secs = COALESCE(bsd.duration_secs, (
+                      SELECT MIN(p2.duration_secs) FROM precip_rows p2
+                      WHERE p2.station_id = pr.station_id AND p2.date = pr.date AND p2.snow_amt IS NOT NULL
+                  ))
+                GROUP BY pr.station_id, pr.date
+            ),
+            daily_ice AS (
+                SELECT pr.station_id, pr.date,
                     SUM(pr.ice_amt) FILTER (WHERE pr.ice_amt IS NOT NULL AND pr.ice_amt >= 0) AS ice_amt
                 FROM precip_rows pr
-                INNER JOIN best_precip_duration bpd
-                    ON pr.station_id = bpd.station_id
-                    AND pr.date = bpd.date
-                    AND pr.duration_secs = bpd.duration_secs
+                LEFT JOIN best_ice_duration bid ON pr.station_id = bid.station_id AND pr.date = bid.date
+                WHERE pr.ice_amt IS NOT NULL
+                  AND pr.duration_secs = COALESCE(bid.duration_secs, (
+                      SELECT MIN(p2.duration_secs) FROM precip_rows p2
+                      WHERE p2.station_id = pr.station_id AND p2.date = pr.date AND p2.ice_amt IS NOT NULL
+                  ))
                 GROUP BY pr.station_id, pr.date
+            ),
+            -- Combine per-field daily sums
+            daily_precip AS (
+                SELECT
+                    COALESCE(q.station_id, s.station_id, i.station_id) AS station_id,
+                    COALESCE(q.date, s.date, i.date) AS date,
+                    q.total_qpf,
+                    s.snow_amt,
+                    s.avg_snow_ratio,
+                    i.ice_amt
+                FROM daily_qpf q
+                FULL OUTER JOIN daily_snow s ON q.station_id = s.station_id AND q.date = s.date
+                FULL OUTER JOIN daily_ice i ON COALESCE(q.station_id, s.station_id) = i.station_id AND COALESCE(q.date, s.date) = i.date
             ),
             daily_forecasts AS (
                 SELECT
