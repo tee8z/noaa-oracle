@@ -308,10 +308,10 @@ impl FileData for S3FileAccess {
                     if let Some(key) = obj.key() {
                         // Extract filename from key: weather_data/2026-02-16/forecasts_2026-02-16T10:00:00Z.parquet
                         if let Some(filename) = key.rsplit('/').next() {
-                            if filename.ends_with(".parquet") {
-                                if matches_file_params(filename, &params)? {
-                                    file_names.push(filename.to_string());
-                                }
+                            if filename.ends_with(".parquet")
+                                && matches_file_params(filename, &params)?
+                            {
+                                file_names.push(filename.to_string());
                             }
                         }
                     }
