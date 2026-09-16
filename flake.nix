@@ -173,6 +173,13 @@
             fi
             cp -r config $out/share/noaa-oracle/
           '';
+
+          # The binary loads DuckDB and the C++ runtime dynamically. Record
+          # both in its rpath so it runs anywhere without LD_LIBRARY_PATH
+          # (systemd services, NixOS containers), not only inside the image.
+          postFixup = ''
+            patchelf --add-rpath "${duckdb-lib}/lib:${pkgs.stdenv.cc.cc.lib}/lib" $out/bin/oracle
+          '';
         } // commonEnv);
 
         # Daemon
