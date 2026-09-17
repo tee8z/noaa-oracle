@@ -17,10 +17,10 @@ A data pipeline system that fetches weather data from NOAA and serves it via a R
 - **ui** - Browser interface using DuckDB-WASM for client-side querying of parquet files
 - **core** - Shared library for configuration loading and utilities
 
-**Event storage:** the oracle keeps DLC events in one SQLite database. A
-single writer task owns the only writable connection and runs commands from
-a bounded queue; HTTP handlers read through a read-only pool and receive a
-reply only after a commit. A full queue answers HTTP 503 so the coordinator
+**Event storage:** the oracle keeps DLC events in one SQLite database. One
+writer task owns the only writable connection and runs commands from a
+bounded queue. HTTP handlers read through a read-only pool and receive a
+reply only after a commit. A full queue answers HTTP 503, so the coordinator
 retries later. On shutdown the oracle stops readiness, drains HTTP and
 background work, then drains and closes the writer. Litestream (optional)
 replicates the file asynchronously, so a successful write confirms a local
@@ -47,7 +47,7 @@ just build
 
 ### Without Nix
 
-The oracle crate links against the DuckDB C library. Download the library matching the `duckdb` crate version in `crates/oracle/Cargo.toml` from [DuckDB releases](https://github.com/duckdb/duckdb/releases) (e.g., `libduckdb-linux-amd64.zip`) and point to it:
+The oracle crate links against the DuckDB C library. Find the required DuckDB version in the `duckdb` line of `crates/oracle/Cargo.toml`. Download that release (for example `libduckdb-linux-amd64.zip`) from [DuckDB releases](https://github.com/duckdb/duckdb/releases) and point to it:
 
 ```bash
 # Extract and set environment variables
