@@ -1,12 +1,12 @@
 use std::path::Path;
 
-use anyhow::{anyhow, Error};
-use reqwest::{multipart, Body, Client};
-use slog::{error, info, Logger};
+use anyhow::{Error, anyhow};
+use reqwest::{Body, Client, multipart};
+use slog::{Logger, error, info};
 use tokio::fs::File as TokioFile;
 use tokio_util::codec::{BytesCodec, FramedRead};
 
-use crate::{get_full_path, Cli, S3Storage};
+use crate::{Cli, S3Storage, get_full_path};
 
 pub async fn upload_to_s3(
     s3: &S3Storage,

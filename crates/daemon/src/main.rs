@@ -1,11 +1,11 @@
 use daemon::{
-    create_folder, get_config_info, get_coordinates, send_parquet_files, setup_logger,
-    subfolder_exists, upload_to_s3, Cli, ForecastService, ObservationService, RateLimiter,
-    S3Storage, XmlFetcher,
+    Cli, ForecastService, ObservationService, RateLimiter, S3Storage, XmlFetcher, create_folder,
+    get_config_info, get_coordinates, send_parquet_files, setup_logger, subfolder_exists,
+    upload_to_s3,
 };
-use slog::{debug, error, info, Logger};
+use slog::{Logger, debug, error, info};
 use std::{sync::Arc, time::Duration};
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Mutex;
 use tokio::time::interval;
 

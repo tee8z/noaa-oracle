@@ -4,12 +4,12 @@ use axum::{extract::State, http::HeaderMap, response::Html};
 use time::format_description::well_known::Rfc3339;
 
 use crate::{
-    db::EventFilter,
-    templates::{
-        events_page, events_table_cards, events_table_rows, pages::events::events_content,
-        EventView,
-    },
     AppState,
+    events::EventFilter,
+    templates::{
+        EventView, events_page, events_table_cards, events_table_rows,
+        pages::events::events_content,
+    },
 };
 
 /// Handler for the events page (GET /events)

@@ -1,4 +1,5 @@
 mod attestation;
+mod coordinator_contract;
 mod create_event;
 mod create_event_entry;
 mod etl_workflow;

@@ -1,6 +1,6 @@
-use maud::{html, Markup};
+use maud::{Markup, html};
 
-use crate::templates::layouts::{base, CurrentPage, PageConfig};
+use crate::templates::layouts::{CurrentPage, PageConfig, base};
 
 /// Raw data page - wrapper for the existing DuckDB-WASM parquet analyzer
 pub fn raw_data_page(api_base: &str) -> Markup {

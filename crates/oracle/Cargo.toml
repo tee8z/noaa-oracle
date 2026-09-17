@@ -2,6 +2,7 @@
 name = "oracle"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "NOAA Oracle REST API server and DLC attestation service"
@@ -28,33 +29,30 @@ serde_json.workspace = true
 clap.workspace = true
 
 # Async
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
-tokio-util.workspace = true
+tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { workspace = true, features = ["io", "rt"] }
 futures.workspace = true
 
 # Web framework
-axum = { version = "0.8", features = [
-    "http1",
-    "macros",
-    "multipart",
-    "tokio",
-    "tracing",
-    "original-uri",
-] }
-tower-http = { version = "0.6", features = ["fs", "cors"] }
-hyper = "1.8"
-maud = { version = "0.26", features = ["axum"] }
+axum = { version = "0.8", features = ["http1", "json", "multipart", "query", "tokio", "original-uri"] }
+tower-http = { version = "0.7", default-features = false, features = ["cors"] }
+maud = { version = "0.27", features = ["axum"] }
 
-# Database
-duckdb = "1.4"
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
+# Weather data (parquet files queried in-process)
+duckdb = "1.10505"
+
+# Event database. Keep in step with rust-toolchain.toml and the flake
+# (`sqlite` in the dev shell) when bumping.
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 
 # DLC / Crypto
-dlctix = "0.0.8"
-nostr-sdk = "0.38"
-pem-rfc7468 = { version = "0.7", features = ["alloc"] }
-base64 = "0.22"
-rand = "0.8"
+dlctix = "0.0.9"
+nostr = { version = "0.45", default-features = false, features = ["std", "nip98"] }
+pem-rfc7468 = { version = "1.0", features = ["alloc"] }
+base64 = "0.23"
+# Match the rand version enabled by dlctix's secp256k1 so key and nonce
+# generation share one RNG API.
+rand = "0.9"
 
 # Logging
 log.workspace = true
@@ -64,35 +62,33 @@ fern.workspace = true
 time.workspace = true
 
 # API docs
-utoipa = { version = "5.4", features = [
-    "axum_extras",
-    "time",
-    "uuid",
-    "preserve_order",
-    "preserve_path_order",
-] }
+utoipa = { version = "5.5", features = ["axum_extras", "time", "uuid", "preserve_order", "preserve_path_order"] }
 utoipa-scalar = { version = "0.3", features = ["axum"] }
 
-# S3 (optional, for fetching data from S3)
-aws-sdk-s3 = "1.65"
-aws-config = { version = "1.5", features = ["behavior-version-latest"] }
+# S3 (optional at runtime, for serving parquet files from a bucket)
+aws-sdk-s3.workspace = true
+aws-config.workspace = true
 
 # Other
-uuid = { version = "1.19", features = ["v7", "serde"] }
-regex = "1.12"
-itertools = "0.14"
-scooby = "0.5"
+uuid = { version = "1.26", features = ["v7", "serde"] }
+itertools = "0.15"
 async-trait = "0.1"
 
 [build-dependencies]
 minify-js = "0.6"
 walkdir = "2.5"
-sha2 = "0.10"
+sha2 = "0.11"
+futures = { workspace = true, features = ["async-await"] }
 hex = "0.4"
 
 [dev-dependencies]
-tower = "0.5"
-mockall = "0.14"
+tower = { version = "0.5", features = ["util"] }
+mockall = "0.15"
+tempfile.workspace = true
+# Tests generate keys and sign NIP-98 events; the server only verifies them.
+nostr = { version = "0.45", features = ["os-rng"] }
+sha2 = "0.11"
+futures = { workspace = true, features = ["async-await"] }
 
 [package.metadata.cargo-machete]
 ignored = ["hex", "minify-js", "sha2", "walkdir"]

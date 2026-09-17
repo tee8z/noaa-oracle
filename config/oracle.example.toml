@@ -68,3 +68,11 @@ ui_dir = "./static"
 # Used to sign DLC attestations - keep this secure!
 # Will be generated automatically if it doesn't exist
 private_key_path = "./oracle_private_key.pem"
+
+# =============================================================================
+# Shutdown
+# =============================================================================
+# Seconds allowed for in-flight requests, background work, and accepted
+# database writes to finish after SIGTERM. Keep this below the container's
+# termination grace period.
+shutdown_timeout = 25

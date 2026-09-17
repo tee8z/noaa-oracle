@@ -1,9 +1,9 @@
-use crate::helpers::{spawn_app, MockWeatherAccess};
+use crate::helpers::{MockWeatherAccess, spawn_app};
+use axum::http::{Method, header};
 use axum::{
-    body::{to_bytes, Body},
+    body::{Body, to_bytes},
     http::Request,
 };
-use hyper::{header, Method};
 use oracle::{Forecast, Observation, Station, TemperatureUnit};
 use std::sync::Arc;
 use tower::ServiceExt;

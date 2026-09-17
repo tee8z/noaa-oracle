@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Error};
+use anyhow::{Error, anyhow};
 use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
 use parquet::record::RecordWriter;
@@ -7,10 +7,10 @@ use parquet::{
     schema::types::Type,
 };
 use parquet_derive::ParquetRecordWriter;
-use slog::{info, Logger};
+use slog::{Logger, info};
 use std::fs::File;
 use std::sync::Arc;
-use time::{format_description::well_known::Rfc3339, macros::format_description, OffsetDateTime};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339, macros::format_description};
 
 use crate::{CityWeather, Metar, ObservationData, Units, XmlFetcher};
 
@@ -264,7 +264,7 @@ pub fn create_observation_schema() -> Type {
         .build()
         .unwrap();
 
-    let schema = Type::group_type_builder("observation")
+    Type::group_type_builder("observation")
         .with_fields(vec![
             Arc::new(station_id),
             Arc::new(station_name),
@@ -288,9 +288,7 @@ pub fn create_observation_schema() -> Type {
             Arc::new(wx_string),
         ])
         .build()
-        .unwrap();
-
-    schema
+        .unwrap()
 }
 
 pub struct ObservationService {
@@ -312,7 +310,7 @@ impl ObservationService {
         let url = "https://aviationweather.gov/data/cache/metars.cache.xml.gz";
         info!(self.logger, "fetching observations from {}", url);
         let raw_observation = self.fetcher.fetch_xml_gzip(url).await?;
-        let converted_xml: ObservationData = serde_xml_rs::from_str(&raw_observation)?;
+        let converted_xml: ObservationData = crate::parse_xml(&raw_observation)?;
 
         // Create parquet writer
         let file = File::create(output_path)

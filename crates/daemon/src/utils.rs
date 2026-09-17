@@ -1,15 +1,15 @@
-use anyhow::{anyhow, Error};
+use anyhow::{Error, anyhow};
 use async_compression::tokio::bufread::GzipDecoder;
 use clap::Parser;
 use futures::TryStreamExt;
 use noaa_oracle_core::{
-    find_config_file, load_config, ConfigSource, DEFAULT_FETCH_INTERVAL, DEFAULT_ORACLE_PORT,
-    DEFAULT_USER_AGENT,
+    ConfigSource, DEFAULT_FETCH_INTERVAL, DEFAULT_ORACLE_PORT, DEFAULT_USER_AGENT,
+    find_config_file, load_config,
 };
 use reqwest::Client;
 use reqwest_middleware::ClientBuilder;
-use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
-use slog::{debug, error, info, o, Drain, Level, Logger};
+use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
+use slog::{Drain, Level, Logger, debug, error, info, o};
 use std::{
     env, fs,
     path::Path,
@@ -291,6 +291,15 @@ impl XmlFetcher {
 
         Ok(content)
     }
+}
+
+/// Parses NOAA XML. Same-named siblings are not always adjacent in NOAA
+/// documents (precipitation types interleave with wind elements), so
+/// overlapping sequences are enabled.
+pub fn parse_xml<'de, T: serde::Deserialize<'de>>(xml: &str) -> Result<T, serde_xml_rs::Error> {
+    serde_xml_rs::SerdeXml::new()
+        .overlapping_sequences(true)
+        .from_str(xml)
 }
 
 pub fn get_full_path(relative_path: String) -> String {

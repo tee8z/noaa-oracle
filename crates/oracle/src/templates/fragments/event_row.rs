@@ -1,6 +1,6 @@
-use maud::{html, Markup};
+use maud::{Markup, html};
 
-use crate::db::EventStatus;
+use crate::events::EventStatus;
 
 /// Event view data for table display
 pub struct EventView {

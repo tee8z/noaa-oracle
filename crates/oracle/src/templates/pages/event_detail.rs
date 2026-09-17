@@ -1,7 +1,7 @@
-use maud::{html, Markup};
+use maud::{Markup, html};
 
-use crate::db::{Event, EventStatus, Weather, WeatherEntry};
-use crate::templates::layouts::{base, CurrentPage, PageConfig};
+use crate::events::{Event, EventStatus, Weather, WeatherEntry};
+use crate::templates::layouts::{CurrentPage, PageConfig, base};
 
 /// Event detail page - shows full information about a single event
 pub fn event_detail_page(api_base: &str, event: &Event) -> Markup {

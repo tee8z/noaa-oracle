@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::{Point, XmlFetcher};
+use crate::{Point, XmlFetcher, parse_xml};
 use anyhow::Error;
 use serde::{Deserialize, Serialize};
 
@@ -23,7 +23,13 @@ impl fmt::Display for WeatherStation {
         write!(
             f,
             "Station ID: {}, Station Name: {}, State: {}, IATA: {}, Elevation: {:?}m, Latitude: {}, Longitude: {}",
-            self.station_id, self.station_name, self.state, self.iata_id, self.elevation_m, self.latitude, self.longitude
+            self.station_id,
+            self.station_name,
+            self.state,
+            self.iata_id,
+            self.elevation_m,
+            self.latitude,
+            self.longitude
         )
     }
 }
@@ -151,26 +157,25 @@ static STATE_ABBERVIATIONS: &[&str] = &[
 ];
 
 pub async fn get_coordinates(fetcher: Arc<XmlFetcher>) -> Result<CityWeather, Error> {
-    let mut city_data: HashMap<String, WeatherStation> = HashMap::new();
     // Broken @ NOAA: https://forecast.weather.gov/xml/current_obs/index.xml
-
     let raw_xml = fetcher
         .fetch_xml_gzip("https://aviationweather.gov/data/cache/stations.cache.xml.gz")
         .await?;
-    let converted_xml: WxStationIndex = serde_xml_rs::from_str(&raw_xml)?;
+    let converted_xml: WxStationIndex = parse_xml(&raw_xml)?;
+    Ok(us_stations(converted_xml))
+}
 
-    for station in converted_xml.data.station {
-        // Skip any place not in the US
-        if let Some(country) = &station.country {
-            if country != "US" {
-                continue;
-            }
+/// Keeps stations in a US state with usable coordinates.
+fn us_stations(index: WxStationIndex) -> CityWeather {
+    let mut city_data: HashMap<String, WeatherStation> = HashMap::new();
+    for station in index.data.station {
+        if station.country.as_deref() != Some("US") {
+            continue;
         }
-        if let Some(state) = &station.state {
-            if !STATE_ABBERVIATIONS.contains(&state.as_str()) {
-                continue;
-            }
-        } else {
+        let Some(state) = &station.state else {
+            continue;
+        };
+        if !STATE_ABBERVIATIONS.contains(&state.as_str()) {
             continue;
         }
         let station_id = station.station_id.clone();
@@ -178,8 +183,36 @@ pub async fn get_coordinates(fetcher: Arc<XmlFetcher>) -> Result<CityWeather, Er
             city_data.insert(station_id, weather_station);
         }
     }
+    CityWeather { city_data }
+}
 
-    Ok(CityWeather { city_data })
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STATIONS: &str = include_str!("testdata/stations.xml");
+
+    #[test]
+    fn keeps_only_us_stations_with_a_state_and_coordinates() {
+        let index: WxStationIndex = parse_xml(STATIONS).unwrap();
+        assert_eq!(index.data.station.len(), 3);
+        assert_eq!(index.data.num_results.as_deref(), Some("9875"));
+        assert_eq!(index.data_source.name, "station");
+        assert!(
+            index.data.station[0]
+                .site_type
+                .as_ref()
+                .unwrap()
+                .metar
+                .is_some()
+        );
+        let weather = us_stations(index);
+        assert_eq!(weather.city_data.len(), 1);
+        let station = weather.city_data.get("K00U").unwrap();
+        assert_eq!(station.state, "MT");
+        assert_eq!(station.get_latitude(), "45.75");
+        assert_eq!(station.elevation_m, Some(922.0));
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -212,8 +245,7 @@ pub struct StationData {
     #[serde(rename = "Station")]
     station: Vec<Station>,
 
-    // num_results is now an attribute on the data element, not a child element
-    #[serde(rename = "num_results", default)]
+    #[serde(rename = "@num_results", default)]
     num_results: Option<String>,
 }
 
@@ -273,12 +305,12 @@ pub struct EmptyElement;
 
 #[derive(Serialize, Deserialize)]
 pub struct DataSource {
-    #[serde(rename = "name")]
-    name: String,
+    #[serde(rename = "@name")]
+    pub name: String,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct Request {
-    #[serde(rename = "type")]
-    request_type: String,
+    #[serde(rename = "@type")]
+    pub request_type: String,
 }

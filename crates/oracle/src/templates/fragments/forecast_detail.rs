@@ -1,4 +1,4 @@
-use maud::{html, Markup};
+use maud::{Markup, html};
 
 /// Forecast data for display
 pub struct ForecastDisplay {
@@ -28,7 +28,6 @@ pub struct ForecastComparison {
     pub forecast_wind: Option<i64>,
     pub forecast_humidity_max: Option<i64>,
     pub forecast_humidity_min: Option<i64>,
-    pub forecast_precip_chance: Option<i64>,
     pub forecast_rain: Option<f64>,
     pub forecast_snow: Option<f64>,
     // Actual observed values

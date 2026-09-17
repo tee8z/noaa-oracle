@@ -46,14 +46,12 @@ resources:
 podSecurityContext: {}
 securityContext: {}
 
-# Health check configuration
-healthCheck:
-  path: /oracle/pubkey
-  port: 9800
-
+# /healthy answers whenever HTTP is up; /health also requires the SQLite
+# writer to accept commands and a read to succeed, and turns 503 during
+# shutdown so traffic drains before the pod stops.
 livenessProbe:
   httpGet:
-    path: /health
+    path: /healthy
     port: http
   initialDelaySeconds: 10
   periodSeconds: 30
@@ -68,6 +66,10 @@ readinessProbe:
   periodSeconds: 10
   timeoutSeconds: 5
   failureThreshold: 3
+
+# Must exceed the oracle's shutdown timeout (NOAA_ORACLE_SHUTDOWN_TIMEOUT,
+# default 25s) so accepted writes commit before the pod is killed.
+terminationGracePeriodSeconds: 40
 
 # Persistence for weather data and event database
 persistence:

@@ -3,9 +3,9 @@ use crate::Type::{
     ProbabilityOfPrecipitationWithin12Hours, Snow, SnowRatio, Sustained, Wind,
 };
 use crate::{
-    split_cityweather, CityWeather, DataReading, Dwml, Location, Units, WeatherStation, XmlFetcher,
+    CityWeather, DataReading, Dwml, Location, Units, WeatherStation, XmlFetcher, split_cityweather,
 };
-use anyhow::{anyhow, Error};
+use anyhow::{Error, anyhow};
 use core::time::Duration as StdDuration;
 use parquet::basic::LogicalType;
 use parquet::file::properties::WriterProperties;
@@ -16,17 +16,16 @@ use parquet::{
     schema::types::Type,
 };
 use parquet_derive::ParquetRecordWriter;
-use serde_xml_rs::from_str;
-use slog::{error, info, Logger};
+use slog::{Logger, error, info};
 use std::fs::File;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{collections::HashMap, ops::Add};
 use time::{
-    format_description::well_known::Rfc3339, macros::format_description, Duration, OffsetDateTime,
-    UtcOffset,
+    Duration, OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339,
+    macros::format_description,
 };
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 /*
@@ -343,7 +342,7 @@ pub fn create_forecast_schema() -> Type {
             .build()
             .unwrap();
 
-    let schema = Type::group_type_builder("forecast")
+    Type::group_type_builder("forecast")
         .with_fields(vec![
             Arc::new(station_id),
             Arc::new(station_name),
@@ -378,9 +377,7 @@ pub fn create_forecast_schema() -> Type {
             Arc::new(ice_amt_unit_code),
         ])
         .build()
-        .unwrap();
-
-    schema
+        .unwrap()
 }
 
 #[derive(Debug, Clone)]
@@ -460,7 +457,7 @@ impl TryFrom<Dwml> for HashMap<String, Vec<WeatherForecast>> {
         }
 
         // Sort by start time to ensure consistent ordering
-        all_time_ranges.sort_by(|a, b| a.start_time.cmp(&b.start_time));
+        all_time_ranges.sort_by_key(|range| range.start_time);
 
         let generated_at = get_generated_at(&raw_data);
 
@@ -593,10 +590,10 @@ impl TryFrom<Dwml> for HashMap<String, Vec<WeatherForecast>> {
         // The `station_id` is the key for each hashmap entry, if location doesn't have station_id, we skip
         let mut weather_by_station: HashMap<String, Vec<WeatherForecast>> = HashMap::new();
         raw_data.data.location.iter().for_each(|location| {
-            if let Some(weather_forecast) = weather.get(&location.location_key) {
-                if let Some(station_id) = &location.station_id {
-                    weather_by_station.insert(station_id.clone(), weather_forecast.clone());
-                }
+            if let Some(weather_forecast) = weather.get(&location.location_key)
+                && let Some(station_id) = &location.station_id
+            {
+                weather_by_station.insert(station_id.clone(), weather_forecast.clone());
             }
         });
 
@@ -605,17 +602,13 @@ impl TryFrom<Dwml> for HashMap<String, Vec<WeatherForecast>> {
 }
 
 fn get_generated_at(raw_data: &Dwml) -> OffsetDateTime {
-    if let Some(head) = raw_data.head.clone() {
-        if let Some(product) = head.product {
-            if let Some(creation_date) = product.creation_date {
-                return match OffsetDateTime::parse(&creation_date, &Rfc3339) {
-                    Ok(time) => time,
-                    Err(_) => OffsetDateTime::now_utc(),
-                };
-            }
-        }
-    }
-    OffsetDateTime::now_utc()
+    raw_data
+        .head
+        .as_ref()
+        .and_then(|head| head.product.as_ref())
+        .and_then(|product| product.creation_date.as_ref())
+        .and_then(|creation_date| OffsetDateTime::parse(&creation_date.value, &Rfc3339).ok())
+        .unwrap_or_else(OffsetDateTime::now_utc)
 }
 
 // weather_data is always in 3 hour intervals, time_ranges can be in 3,6,12,24 ranges
@@ -828,11 +821,11 @@ fn estimate_end_time(
 fn get_interval(current_data: &WeatherForecast, time_ranges: &[TimeRange]) -> Option<usize> {
     // First, try to find an exact match for the time range (when end_time is available)
     for (index, time_range) in time_ranges.iter().enumerate() {
-        if let Some(end_time) = time_range.end_time {
-            if time_range.start_time == current_data.begin_time && end_time == current_data.end_time
-            {
-                return Some(index);
-            }
+        if let Some(end_time) = time_range.end_time
+            && time_range.start_time == current_data.begin_time
+            && end_time == current_data.end_time
+        {
+            return Some(index);
         }
     }
 
@@ -845,12 +838,11 @@ fn get_interval(current_data: &WeatherForecast, time_ranges: &[TimeRange]) -> Op
 
     // If no exact match, find the time range that contains this forecast's begin_time
     for (index, time_range) in time_ranges.iter().enumerate() {
-        if let Some(end_time) = time_range.end_time {
-            if time_range.start_time <= current_data.begin_time
-                && current_data.begin_time < end_time
-            {
-                return Some(index);
-            }
+        if let Some(end_time) = time_range.end_time
+            && time_range.start_time <= current_data.begin_time
+            && current_data.begin_time < end_time
+        {
+            return Some(index);
         }
     }
 
@@ -874,14 +866,13 @@ fn get_interval(current_data: &WeatherForecast, time_ranges: &[TimeRange]) -> Op
 
     // If still no match, try to find overlap between time ranges
     for (index, time_range) in time_ranges.iter().enumerate() {
-        if let Some(end_time) = time_range.end_time {
-            if (time_range.start_time <= current_data.begin_time
+        if let Some(end_time) = time_range.end_time
+            && ((time_range.start_time <= current_data.begin_time
                 && current_data.begin_time < end_time)
                 || (current_data.begin_time <= time_range.start_time
-                    && time_range.start_time < current_data.end_time)
-            {
-                return Some(index);
-            }
+                    && time_range.start_time < current_data.end_time))
+        {
+            return Some(index);
         }
     }
 
@@ -895,11 +886,11 @@ fn get_interval(current_data: &WeatherForecast, time_ranges: &[TimeRange]) -> Op
 fn get_interval_exact(current_data: &WeatherForecast, time_ranges: &[TimeRange]) -> Option<usize> {
     // Exact match: both begin and end times match
     for (index, time_range) in time_ranges.iter().enumerate() {
-        if let Some(end_time) = time_range.end_time {
-            if time_range.start_time == current_data.begin_time && end_time == current_data.end_time
-            {
-                return Some(index);
-            }
+        if let Some(end_time) = time_range.end_time
+            && time_range.start_time == current_data.begin_time
+            && end_time == current_data.end_time
+        {
+            return Some(index);
         }
     }
 
@@ -958,8 +949,7 @@ impl ForecastRetry {
                         return Ok(());
                     }
 
-                    let grouped_xml = group_parameter_elements(&xml);
-                    let converted_xml: Dwml = match from_str(&grouped_xml) {
+                    let converted_xml: Dwml = match crate::parse_xml(&xml) {
                         Ok(xml) => xml,
                         Err(err) => {
                             error!(
@@ -1105,16 +1095,14 @@ impl ForecastService {
                             for weather_forecast in all_forecasts {
                                 if let Ok(mut forecast) =
                                     Forecast::try_from(weather_forecast.clone())
-                                {
-                                    if let Some(city) =
+                                    && let Some(city) =
                                         city_weather_clone.city_data.get(&forecast.station_id)
-                                    {
-                                        forecast.station_name = city.station_name.clone();
-                                        forecast.state = city.state.clone();
-                                        forecast.iata_id = city.iata_id.clone();
-                                        forecast.elevation_m = city.elevation_m;
-                                        batch_forecasts.push(forecast);
-                                    }
+                                {
+                                    forecast.station_name = city.station_name.clone();
+                                    forecast.state = city.state.clone();
+                                    forecast.iata_id = city.iata_id.clone();
+                                    forecast.elevation_m = city.elevation_m;
+                                    batch_forecasts.push(forecast);
                                 }
                             }
                         }
@@ -1244,7 +1232,9 @@ fn get_url(city_weather: &CityWeather) -> String {
     }
 
     // Format the rounded current time
-    let format_description = format_description!("[year]-[month padding:zero]-[day padding:zero]T[hour padding:zero]:[minute padding:zero]:[second padding:zero]");
+    let format_description = format_description!(
+        "[year]-[month padding:zero]-[day padding:zero]T[hour padding:zero]:[minute padding:zero]:[second padding:zero]"
+    );
     let now = current_time.format(&format_description).unwrap();
 
     // Define the duration of one week (7 days)
@@ -1252,106 +1242,10 @@ fn get_url(city_weather: &CityWeather) -> String {
     let one_week_from_now = current_time.add(one_week_duration);
 
     let one_week = one_week_from_now.format(&format_description).unwrap();
-    format!("https://graphical.weather.gov/xml/sample_products/browser_interface/ndfdXMLclient.php?listLatLon={}&product=time-series&begin={}&end={}&Unit=e&maxt=maxt&mint=mint&wspd=wspd&wdir=wdir&pop12=pop12&qpf=qpf&snow=snow&snowratio=snowratio&iceaccum=iceaccum&maxrh=maxrh&minrh=minrh", city_weather.get_coordinates_url(),now,one_week)
-}
-
-/// Reorder child elements within `<parameters>` blocks so that elements with
-/// the same tag name are adjacent. This is needed because `serde-xml-rs` cannot
-/// collect non-adjacent sibling elements with the same name into a Vec, and
-/// NOAA's forecast XML interleaves precipitation types (liquid, snow, ice) with
-/// other elements like wind-speed and direction between them.
-fn group_parameter_elements(xml: &str) -> String {
-    let mut result = String::with_capacity(xml.len());
-    let mut remaining = xml;
-
-    while let Some(params_start) = remaining.find("<parameters ") {
-        // Copy everything before <parameters>
-        result.push_str(&remaining[..params_start]);
-
-        // Find the closing </parameters>
-        let after_params = &remaining[params_start..];
-        let params_end = match after_params.find("</parameters>") {
-            Some(pos) => pos + "</parameters>".len(),
-            None => {
-                // No closing tag found, just copy the rest
-                result.push_str(after_params);
-                return result;
-            }
-        };
-
-        let params_block = &after_params[..params_end];
-
-        // Find the opening tag end
-        let open_tag_end = match params_block.find('>') {
-            Some(pos) => pos + 1,
-            None => {
-                result.push_str(params_block);
-                remaining = &after_params[params_end..];
-                continue;
-            }
-        };
-
-        let opening_tag = &params_block[..open_tag_end];
-        let inner = &params_block[open_tag_end..params_block.len() - "</parameters>".len()];
-
-        // Extract child elements with their full content
-        let mut elements: Vec<(String, String)> = Vec::new(); // (tag_name, full_element)
-        let mut pos = 0;
-        let inner_bytes = inner.as_bytes();
-
-        while pos < inner.len() {
-            // Skip whitespace
-            if inner_bytes[pos].is_ascii_whitespace() {
-                pos += 1;
-                continue;
-            }
-
-            if inner_bytes[pos] != b'<' {
-                pos += 1;
-                continue;
-            }
-
-            // Find tag name
-            let tag_start = pos;
-            let after_lt = &inner[pos + 1..];
-            let tag_name_end = after_lt
-                .find(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')
-                .unwrap_or(after_lt.len());
-            let tag_name = after_lt[..tag_name_end].to_string();
-
-            // Find the closing tag for this element
-            let closing_tag = format!("</{}>", tag_name);
-            let element_end = match inner[tag_start..].find(&closing_tag) {
-                Some(close_pos) => tag_start + close_pos + closing_tag.len(),
-                None => {
-                    // Self-closing or malformed, skip
-                    pos += 1;
-                    continue;
-                }
-            };
-
-            let element = inner[tag_start..element_end].to_string();
-            elements.push((tag_name, element));
-            pos = element_end;
-        }
-
-        // Sort elements by tag name to group same-named elements
-        elements.sort_by(|a, b| a.0.cmp(&b.0));
-
-        // Rebuild the parameters block
-        result.push_str(opening_tag);
-        result.push('\n');
-        for (_, element) in &elements {
-            result.push_str("      ");
-            result.push_str(element);
-            result.push('\n');
-        }
-        result.push_str("    </parameters>");
-
-        remaining = &after_params[params_end..];
-    }
-
-    // Copy anything after the last parameters block
-    result.push_str(remaining);
-    result
+    format!(
+        "https://graphical.weather.gov/xml/sample_products/browser_interface/ndfdXMLclient.php?listLatLon={}&product=time-series&begin={}&end={}&Unit=e&maxt=maxt&mint=mint&wspd=wspd&wdir=wdir&pop12=pop12&qpf=qpf&snow=snow&snowratio=snowratio&iceaccum=iceaccum&maxrh=maxrh&minrh=minrh",
+        city_weather.get_coordinates_url(),
+        now,
+        one_week
+    )
 }

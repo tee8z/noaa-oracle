@@ -10,12 +10,12 @@ use time::OffsetDateTime;
 use std::collections::HashMap;
 
 use crate::{
-    db::EventStatus,
-    templates::{
-        fragments::{event_stats, forecast_detail, oracle_info, weather_table_body},
-        EventStats, ForecastComparison, ForecastDisplay, WeatherDisplay,
-    },
     AppState, ForecastRequest, ObservationRequest, TemperatureUnit,
+    events::EventStatus,
+    templates::{
+        EventStats, ForecastComparison, ForecastDisplay, WeatherDisplay,
+        fragments::{event_stats, forecast_detail, oracle_info, weather_table_body},
+    },
 };
 
 /// Top 100 major US airport station IDs to show by default
@@ -47,7 +47,7 @@ pub async fn oracle_info_handler(State(state): State<Arc<AppState>>) -> Html<Str
 pub async fn event_stats_handler(State(state): State<Arc<AppState>>) -> Html<String> {
     let events = state
         .oracle
-        .list_events(crate::db::EventFilter::default())
+        .list_events(crate::events::EventFilter::default())
         .await
         .unwrap_or_default();
 
@@ -81,10 +81,10 @@ pub async fn weather_handler(
     };
 
     // Add station if requested
-    if let Some(add_station) = &query.add_station {
-        if !station_ids.contains(add_station) {
-            station_ids.push(add_station.clone());
-        }
+    if let Some(add_station) = &query.add_station
+        && !station_ids.contains(add_station)
+    {
+        station_ids.push(add_station.clone());
     }
 
     let weather = get_weather_for_stations(&state, &station_ids).await;
@@ -106,11 +106,6 @@ async fn get_weather_for_stations(
     // Return last 3 days of data - frontend will filter by user's local calendar day
     // This ensures we have enough data for any timezone
     let start = now - time::Duration::days(3);
-
-    // Current time for "updated_at" field
-    let updated_at = now
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default();
 
     let req = ObservationRequest {
         start: Some(start),
@@ -147,7 +142,6 @@ async fn get_weather_for_stations(
                 snow_amt: obs.snow_amt,
                 observed_start: obs.start_time.clone(),
                 observed_end: obs.end_time.clone(),
-                updated_at: updated_at.clone(),
                 latitude: station.map(|s| s.latitude).unwrap_or(0.0),
                 longitude: station.map(|s| s.longitude).unwrap_or(0.0),
                 forecast_high: None,
@@ -208,26 +202,13 @@ pub async fn forecast_handler(
     axum::extract::Path(station_id): axum::extract::Path<String>,
 ) -> Html<String> {
     // Check cache first (keyed by station_id, refreshed every 30 min by background task)
-    {
-        let cache = state.forecast_cache.lock().unwrap();
-        if let Some(cached) = cache.get(&station_id) {
-            return Html(cached.html.clone());
-        }
+    if let Some(cached) = state.cached_forecast(&station_id) {
+        return Html(cached);
     }
 
     // Cache miss (non-default station or first request before warming completes)
     let html = build_forecast_html(&state, &station_id).await;
-
-    {
-        let mut cache = state.forecast_cache.lock().unwrap();
-        cache.insert(
-            station_id,
-            crate::CachedFragment {
-                html: html.clone(),
-                created_at: std::time::Instant::now(),
-            },
-        );
-    }
+    state.cache_forecast(station_id, html.clone());
 
     Html(html)
 }
@@ -314,7 +295,6 @@ pub async fn build_forecast_html(state: &Arc<AppState>, station_id: &str) -> Str
                 forecast_wind: f.wind_speed,
                 forecast_humidity_max: f.humidity_max,
                 forecast_humidity_min: f.humidity_min,
-                forecast_precip_chance: f.precip_chance,
                 forecast_rain: f.rain_amt,
                 forecast_snow: f.snow_amt,
                 actual_high: obs.map(|o| o.temp_high),
@@ -356,14 +336,7 @@ pub async fn warm_forecast_cache(state: &Arc<AppState>) {
             let station_id = station_id.to_string();
             async move {
                 let html = build_forecast_html(&state, &station_id).await;
-                let mut cache = state.forecast_cache.lock().unwrap();
-                cache.insert(
-                    station_id,
-                    crate::CachedFragment {
-                        html,
-                        created_at: std::time::Instant::now(),
-                    },
-                );
+                state.cache_forecast(station_id, html);
             }
         })
         .collect();

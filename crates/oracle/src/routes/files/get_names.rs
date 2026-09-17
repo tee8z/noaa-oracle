@@ -1,9 +1,8 @@
-use crate::{AppError, AppState, FileParams};
+use crate::{AppError, AppState, file_access::FileParams};
 use axum::{
-    extract::{Query, State},
     Json,
+    extract::{Query, State},
 };
-use log::error;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
@@ -15,7 +14,7 @@ pub struct Files {
 
 #[utoipa::path(
     get,
-    path = "file/{filename}",
+    path = "/files",
     params(
          FileParams
     ),
@@ -28,14 +27,6 @@ pub async fn files(
     State(state): State<Arc<AppState>>,
     Query(params): Query<FileParams>,
 ) -> Result<Json<Files>, AppError> {
-    let file_names = state
-        .file_access
-        .grab_file_names(params)
-        .await
-        .map_err(|e| {
-            error!("error getting filenames: {}", e);
-            e
-        })?;
-    let files = Files { file_names };
-    Ok(Json(files))
+    let file_names = state.file_access.grab_file_names(params).await?;
+    Ok(Json(Files { file_names }))
 }

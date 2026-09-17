@@ -1,20 +1,31 @@
+//! NIP-98 HTTP authentication extractor.
+//!
+//! The coordinator signs a kind 27235 event over the request method and URL
+//! (and a payload hash for bodies). The extractor verifies the signature,
+//! the freshness window, and that the signed URL matches the request URL as
+//! seen behind the proxy.
+
 use axum::{
-    extract::{FromRequestParts, OriginalUri},
-    http::request::Parts,
-    response::IntoResponse,
     Json,
+    extract::{FromRequestParts, OriginalUri},
+    http::{StatusCode, header::AUTHORIZATION, request::Parts},
+    response::IntoResponse,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use hyper::{header::AUTHORIZATION, StatusCode};
-use log::{info, warn};
-use nostr_sdk::{
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use log::{debug, warn};
+use nostr::{
+    event::{Event, Kind},
+    key::PublicKey,
     nips::nip98::{HttpData, HttpMethod},
-    Event, Kind, PublicKey, Url,
+    types::Url,
 };
-use serde::{ser::SerializeStruct, Serialize, Serializer};
+use serde::{Serialize, Serializer, ser::SerializeStruct};
 use serde_json::json;
 use std::str::FromStr;
 use time::OffsetDateTime;
+
+/// Accepted clock skew between the signed event and the server, in seconds.
+const MAX_EVENT_AGE_SECONDS: i64 = 60;
 
 #[derive(Clone, Debug)]
 pub struct NostrAuth {
@@ -58,42 +69,31 @@ where
         }
 
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        if (now - (event.created_at.as_u64() as i64)).abs() > 60 {
+        let created_at = i64::try_from(event.created_at.as_secs()).unwrap_or(i64::MAX);
+        if (now - created_at).abs() > MAX_EVENT_AGE_SECONDS {
             return Err(AuthError::ExpiredTimestamp);
         }
 
-        let tags = event.tags.clone().to_vec();
-        let http_data =
-            HttpData::try_from(tags).map_err(|e| AuthError::InvalidHttpData(e.to_string()))?;
-        info!("Received request URI: {}", original_uri);
-        let reconstructed_url = format!(
-            "{}://{}{}",
-            if parts.headers.contains_key("x-forwarded-proto") {
-                "https"
-            } else {
-                "http"
-            },
-            parts
-                .headers
-                .get("host")
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or(""),
-            original_uri
+        let http_data = HttpData::try_from(event.tags.clone().to_vec())
+            .map_err(|e| AuthError::InvalidHttpData(e.to_string()))?;
+        let scheme = if parts.headers.contains_key("x-forwarded-proto") {
+            "https"
+        } else {
+            "http"
+        };
+        let host = parts
+            .headers
+            .get("host")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+        let reconstructed_url = format!("{scheme}://{host}{original_uri}");
+        debug!(
+            "nip-98 request {} {} signed for {} {}",
+            parts.method, reconstructed_url, http_data.method, http_data.url
         );
-        info!(
-            "reconstructed_url: {}, http_data.url: {}",
-            reconstructed_url, http_data.url
-        );
-        info!(
-            "http_data.method: {}, parts.method: {}",
-            http_data.method,
-            parts.method.as_str()
-        );
-        if http_data.url != Url::from_str(&reconstructed_url)?
-            || http_data.method
-                != HttpMethod::from_str(parts.method.as_str())
-                    .map_err(|e| AuthError::InvalidMethod(e.to_string()))?
-        {
+        let method = HttpMethod::from_str(parts.method.as_str())
+            .map_err(|e| AuthError::InvalidMethod(e.to_string()))?;
+        if http_data.url != Url::from_str(&reconstructed_url)? || http_data.method != method {
             return Err(AuthError::UrlMethodMismatch);
         }
 
@@ -117,8 +117,6 @@ where
 pub enum AuthError {
     #[error("No authorization header found")]
     NoAuthHeader,
-    #[error("Invalid login")]
-    InvalidLogin,
     #[error("Invalid authorization format")]
     InvalidAuthFormat,
     #[error("Invalid base64 encoding: {0}")]
@@ -143,8 +141,8 @@ pub enum AuthError {
     NonEmptyContent,
 }
 
-impl From<nostr_sdk::types::ParseError> for AuthError {
-    fn from(err: nostr_sdk::types::ParseError) -> Self {
+impl From<nostr::types::ParseError> for AuthError {
+    fn from(err: nostr::types::ParseError) -> Self {
         AuthError::InvalidUrl(err.to_string())
     }
 }
@@ -158,7 +156,6 @@ impl Serialize for AuthError {
 
         let type_str = match self {
             Self::NoAuthHeader => "no_auth_header",
-            Self::InvalidLogin => "invalid_login",
             Self::InvalidAuthFormat => "invalid_auth_format",
             Self::InvalidBase64(_) => "invalid_base_64",
             Self::InvalidEventJson(_) => "invalid_event_json",
@@ -180,28 +177,22 @@ impl Serialize for AuthError {
 
 impl IntoResponse for AuthError {
     fn into_response(self) -> axum::response::Response {
-        let (body, code) = match &self {
-            Self::InvalidSignature(_) => {
-                warn!("{}", self);
-                (json!({ "error": self }), StatusCode::FORBIDDEN)
-            }
+        warn!("{}", self);
+        let code = match &self {
+            Self::InvalidSignature(_) => StatusCode::FORBIDDEN,
             Self::NoAuthHeader
             | Self::InvalidEventKind
             | Self::ExpiredTimestamp
             | Self::UrlMethodMismatch
             | Self::InvalidUrl(_)
-            | Self::InvalidLogin
-            | Self::InvalidMethod(_) => {
-                warn!("{}", self);
-                (json!({ "error": self }), StatusCode::UNAUTHORIZED)
-            }
-            _ => {
-                warn!("{}", self);
-                (json!({ "error": self }), StatusCode::BAD_REQUEST)
-            }
+            | Self::InvalidMethod(_) => StatusCode::UNAUTHORIZED,
+            Self::InvalidAuthFormat
+            | Self::InvalidBase64(_)
+            | Self::InvalidEventJson(_)
+            | Self::InvalidHttpData(_)
+            | Self::NonEmptyContent => StatusCode::BAD_REQUEST,
         };
-
-        (code, Json(body)).into_response()
+        (code, Json(json!({ "error": self }))).into_response()
     }
 }
 
@@ -209,361 +200,163 @@ impl IntoResponse for AuthError {
 mod tests {
     use super::*;
     use axum::http::Request;
-    use nostr_sdk::{
-        hashes::{sha256::Hash as Sha256Hash, Hash},
-        Alphabet, EventBuilder, Keys, SingleLetterTag, Tag, TagKind, Timestamp,
+    use nostr::{
+        event::{EventBuilder, FinalizeEvent, IntoEventBuilder, Tag},
+        key::Keys,
+        nips::nip98::Sha256Hash,
+        types::Timestamp,
     };
-    use std::{str::FromStr, sync::Arc};
-    #[derive(Clone)]
-    pub struct AppState;
+    use sha2::{Digest, Sha256};
 
-    async fn create_auth_event(
-        method: &str,
-        url: &str,
-        payload_hash: Option<Sha256Hash>,
-        keys: &Keys,
-    ) -> Event {
+    fn payload_hash(body: &[u8]) -> Sha256Hash {
+        Sha256Hash::from_byte_array(Sha256::digest(body).into())
+    }
+
+    fn auth_event(method: &str, url: &str, payload_hash: Option<Sha256Hash>, keys: &Keys) -> Event {
         let http_method = HttpMethod::from_str(method).unwrap();
         let http_url = Url::from_str(url).unwrap();
         let mut http_data = HttpData::new(http_url, http_method);
-
         if let Some(hash) = payload_hash {
             http_data = http_data.payload(hash);
         }
-
-        EventBuilder::http_auth(http_data)
-            .sign_with_keys(keys)
+        http_data
+            .into_event_builder()
+            .finalize(keys)
             .expect("Failed to sign event")
     }
 
-    #[tokio::test]
-    async fn test_valid_get_request() {
-        let keys = Keys::generate();
-        let state = AppState;
-
-        let event = create_auth_event("GET", "http://localhost/test", None, &keys).await;
-
-        let auth_header = format!(
+    fn auth_header(event: &Event) -> String {
+        format!(
             "Nostr {}",
-            BASE64.encode(serde_json::to_string(&event).unwrap())
-        );
+            BASE64.encode(serde_json::to_string(event).unwrap())
+        )
+    }
 
-        let req = Request::builder()
-            .method("GET")
-            .uri("/test")
-            .header("host", "localhost")
-            .header(AUTHORIZATION, auth_header)
-            .body(())
+    fn request(method: &str, uri: &str, auth: Option<String>) -> Parts {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "localhost");
+        if let Some(auth) = auth {
+            builder = builder.header(AUTHORIZATION, auth);
+        }
+        builder.body(()).unwrap().into_parts().0
+    }
+
+    async fn extract(mut parts: Parts) -> Result<NostrAuth, AuthError> {
+        NostrAuth::from_request_parts(&mut parts, &()).await
+    }
+
+    #[tokio::test]
+    async fn valid_get_request_is_accepted() {
+        let keys = Keys::generate();
+        let event = auth_event("GET", "http://localhost/test", None, &keys);
+        let auth = extract(request("GET", "/test", Some(auth_header(&event))))
+            .await
             .unwrap();
-
-        let result = NostrAuth::from_request_parts(&mut req.into_parts().0, &state).await;
-
-        assert!(result.is_ok());
-        let auth = result.unwrap();
         assert_eq!(auth.pubkey, keys.public_key());
         assert_eq!(auth.http_data.method, HttpMethod::GET);
     }
 
     #[tokio::test]
-    async fn test_valid_post_with_payload() {
+    async fn valid_post_with_payload_keeps_payload_hash() {
         let keys = Keys::generate();
-        let state = Arc::new(AppState);
-
-        let body = r#"{"test": "data"}"#;
-        let payload_hash = Sha256Hash::hash(body.as_bytes());
-
-        let event =
-            create_auth_event("POST", "http://localhost/test", Some(payload_hash), &keys).await;
-
-        let auth_header = format!(
-            "Nostr {}",
-            BASE64.encode(serde_json::to_string(&event).unwrap())
-        );
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/test")
-            .header("host", "localhost")
-            .header(AUTHORIZATION, auth_header)
-            .body(())
+        let payload_hash = payload_hash(br#"{"test": "data"}"#);
+        let event = auth_event("POST", "http://localhost/test", Some(payload_hash), &keys);
+        let auth = extract(request("POST", "/test", Some(auth_header(&event))))
+            .await
             .unwrap();
-
-        let result = NostrAuth::from_request_parts(&mut req.into_parts().0, &state).await;
-
-        assert!(result.is_ok());
-        let auth = result.unwrap();
-        assert_eq!(auth.pubkey, keys.public_key());
         assert_eq!(auth.http_data.method, HttpMethod::POST);
         assert_eq!(auth.http_data.payload, Some(payload_hash));
     }
 
     #[tokio::test]
-    async fn test_missing_auth_header() {
-        let state = Arc::new(AppState);
-
-        let req = Request::builder()
-            .method("GET")
-            .uri("/test")
-            .header("host", "localhost")
-            .body(())
-            .unwrap();
-
-        let result = NostrAuth::from_request_parts(&mut req.into_parts().0, &state).await;
-
-        assert!(matches!(result, Err(AuthError::NoAuthHeader)));
+    async fn missing_and_malformed_headers_are_rejected() {
+        assert!(matches!(
+            extract(request("GET", "/test", None)).await,
+            Err(AuthError::NoAuthHeader)
+        ));
+        assert!(matches!(
+            extract(request("GET", "/test", Some("InvalidFormat".into()))).await,
+            Err(AuthError::InvalidAuthFormat)
+        ));
+        assert!(matches!(
+            extract(request(
+                "GET",
+                "/test",
+                Some("Nostr invalid-base64!".into())
+            ))
+            .await,
+            Err(AuthError::InvalidBase64(_))
+        ));
+        let invalid_json = format!("Nostr {}", BASE64.encode("not valid json"));
+        assert!(matches!(
+            extract(request("GET", "/test", Some(invalid_json))).await,
+            Err(AuthError::InvalidEventJson(_))
+        ));
     }
 
     #[tokio::test]
-    async fn test_invalid_auth_format() {
-        let state = Arc::new(AppState);
-
-        let req = Request::builder()
-            .method("GET")
-            .uri("/test")
-            .header("host", "localhost")
-            .header(AUTHORIZATION, "InvalidFormat")
-            .body(())
-            .unwrap();
-
-        let result = NostrAuth::from_request_parts(&mut req.into_parts().0, &state).await;
-
-        assert!(matches!(result, Err(AuthError::InvalidAuthFormat)));
-    }
-
-    #[tokio::test]
-    async fn test_invalid_base64() {
-        let state = Arc::new(AppState);
-
-        let req = Request::builder()
-            .method("GET")
-            .uri("/test")
-            .header("host", "localhost")
-            .header(AUTHORIZATION, "Nostr invalid-base64!")
-            .body(())
-            .unwrap();
-
-        let result = NostrAuth::from_request_parts(&mut req.into_parts().0, &state).await;
-
-        assert!(matches!(result, Err(AuthError::InvalidBase64(_))));
-    }
-
-    #[tokio::test]
-    async fn test_invalid_event_json() {
-        let state = Arc::new(AppState);
-
-        let invalid_json = BASE64.encode("not valid json");
-        let req = Request::builder()
-            .method("GET")
-            .uri("/test")
-            .header("host", "localhost")
-            .header(AUTHORIZATION, format!("Nostr {invalid_json}"))
-            .body(())
-            .unwrap();
-
-        let result = NostrAuth::from_request_parts(&mut req.into_parts().0, &state).await;
-
-        assert!(matches!(result, Err(AuthError::InvalidEventJson(_))));
-    }
-
-    #[tokio::test]
-    async fn test_non_auth_event_kind() {
+    async fn non_auth_event_kind_is_rejected() {
         let keys = Keys::generate();
-        let state = Arc::new(AppState);
-        let http_method = HttpMethod::from_str("GET").unwrap();
-        let http_url = Url::from_str("http://localhost/test").unwrap();
-
         let tags = vec![
-            Tag::custom(TagKind::Method, [http_method.to_string()]),
-            Tag::custom(
-                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::U)),
-                [http_url.to_string()],
-            ),
+            Tag::parse(["method", "GET"]).unwrap(),
+            Tag::parse(["u", "http://localhost/test"]).unwrap(),
         ];
-
-        let created_at = OffsetDateTime::now_utc().unix_timestamp() as u64;
-
-        // Create a regular text note instead of auth event
         let event = EventBuilder::new(Kind::TextNote, "")
-            .custom_created_at(Timestamp::from(created_at))
             .tags(tags)
-            .sign_with_keys(&keys)
+            .finalize(&keys)
             .expect("Failed to sign event");
-
-        let auth_header = format!(
-            "Nostr {}",
-            BASE64.encode(serde_json::to_string(&event).unwrap())
-        );
-
-        let req = Request::builder()
-            .method("GET")
-            .uri("/test")
-            .header("host", "localhost")
-            .header(AUTHORIZATION, auth_header)
-            .body(())
-            .unwrap();
-
-        let result = NostrAuth::from_request_parts(&mut req.into_parts().0, &state).await;
-
-        assert!(matches!(result, Err(AuthError::InvalidEventKind)));
+        assert!(matches!(
+            extract(request("GET", "/test", Some(auth_header(&event)))).await,
+            Err(AuthError::InvalidEventKind)
+        ));
     }
 
     #[tokio::test]
-    async fn test_expired_timestamp() {
+    async fn expired_timestamp_is_rejected() {
         let keys = Keys::generate();
-        let state = Arc::new(AppState);
-
-        let expired_time =
-            (OffsetDateTime::now_utc() - time::Duration::hours(1)).unix_timestamp() as u64;
+        let expired = (OffsetDateTime::now_utc() - time::Duration::hours(1)).unix_timestamp();
         let http_data = HttpData::new(
             Url::from_str("http://localhost/test").unwrap(),
             HttpMethod::GET,
         );
-
-        let event = EventBuilder::http_auth(http_data)
-            .custom_created_at(Timestamp::from(expired_time))
-            .sign_with_keys(&keys)
+        let event = http_data
+            .into_event_builder()
+            .custom_created_at(Timestamp::from(expired as u64))
+            .finalize(&keys)
             .unwrap();
-
-        let auth_header = format!(
-            "Nostr {}",
-            BASE64.encode(serde_json::to_string(&event).unwrap())
-        );
-
-        let req = Request::builder()
-            .method("GET")
-            .uri("/test")
-            .header("host", "localhost")
-            .header(AUTHORIZATION, auth_header)
-            .body(())
-            .unwrap();
-
-        let result = NostrAuth::from_request_parts(&mut req.into_parts().0, &state).await;
-
-        assert!(matches!(result, Err(AuthError::ExpiredTimestamp)));
+        assert!(matches!(
+            extract(request("GET", "/test", Some(auth_header(&event)))).await,
+            Err(AuthError::ExpiredTimestamp)
+        ));
     }
 
     #[tokio::test]
-    async fn test_url_mismatch() {
+    async fn url_and_method_mismatches_are_rejected() {
         let keys = Keys::generate();
-        let state = Arc::new(AppState);
-
-        let event = create_auth_event("GET", "http://localhost/different-path", None, &keys).await;
-
-        let auth_header = format!(
-            "Nostr {}",
-            BASE64.encode(serde_json::to_string(&event).unwrap())
-        );
-
-        let req = Request::builder()
-            .method("GET")
-            .uri("/test")
-            .header("host", "localhost")
-            .header(AUTHORIZATION, auth_header)
-            .body(())
-            .unwrap();
-
-        let result = NostrAuth::from_request_parts(&mut req.into_parts().0, &state).await;
-
-        assert!(matches!(result, Err(AuthError::UrlMethodMismatch)));
+        let event = auth_event("GET", "http://localhost/different-path", None, &keys);
+        assert!(matches!(
+            extract(request("GET", "/test", Some(auth_header(&event)))).await,
+            Err(AuthError::UrlMethodMismatch)
+        ));
+        let event = auth_event("POST", "http://localhost/test", None, &keys);
+        assert!(matches!(
+            extract(request("GET", "/test", Some(auth_header(&event)))).await,
+            Err(AuthError::UrlMethodMismatch)
+        ));
     }
 
     #[tokio::test]
-    async fn test_method_mismatch() {
+    async fn tampered_event_fails_signature_verification() {
         let keys = Keys::generate();
-        let state = Arc::new(AppState);
-
-        let event = create_auth_event("POST", "http://localhost/test", None, &keys).await;
-
-        let auth_header = format!(
-            "Nostr {}",
-            BASE64.encode(serde_json::to_string(&event).unwrap())
-        );
-
-        let req = Request::builder()
-            .method("GET") // Different method from event
-            .uri("/test")
-            .header("host", "localhost")
-            .header(AUTHORIZATION, auth_header)
-            .body(())
-            .unwrap();
-
-        let result = NostrAuth::from_request_parts(&mut req.into_parts().0, &state).await;
-
-        assert!(matches!(result, Err(AuthError::UrlMethodMismatch)));
-    }
-
-    #[tokio::test]
-    async fn test_non_empty_content() {
-        let keys = Keys::generate();
-        let state = Arc::new(AppState);
-
-        let http_method = HttpMethod::from_str("GET").unwrap();
-        let http_url = Url::from_str("http://localhost/test").unwrap();
-
-        let tags = vec![
-            Tag::custom(TagKind::Method, [http_method.to_string()]),
-            Tag::custom(
-                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::U)),
-                [http_url.to_string()],
-            ),
-        ];
-
-        let created_at = OffsetDateTime::now_utc().unix_timestamp() as u64;
-
-        // Create event with non-empty content (invalid per NIP-98)
-        let event = EventBuilder::new(Kind::HttpAuth, "non-empty content")
-            .custom_created_at(Timestamp::from(created_at))
-            .tags(tags)
-            .sign_with_keys(&keys)
-            .expect("Failed to sign event");
-
-        let auth_header = format!(
-            "Nostr {}",
-            BASE64.encode(serde_json::to_string(&event).unwrap())
-        );
-
-        let req = Request::builder()
-            .method("GET")
-            .uri("/test")
-            .header("host", "localhost")
-            .header(AUTHORIZATION, auth_header)
-            .body(())
-            .unwrap();
-
-        let result = NostrAuth::from_request_parts(&mut req.into_parts().0, &state).await;
-
-        assert!(matches!(result, Err(AuthError::NonEmptyContent)));
-    }
-
-    #[tokio::test]
-    async fn test_forwarded_proto() {
-        let keys = Keys::generate();
-        let state = Arc::new(AppState);
-
-        let event = create_auth_event(
-            "GET",
-            "https://localhost/test", // Note https
-            None,
-            &keys,
-        )
-        .await;
-
-        let auth_header = format!(
-            "Nostr {}",
-            BASE64.encode(serde_json::to_string(&event).unwrap())
-        );
-
-        let req = Request::builder()
-            .method("GET")
-            .uri("/test")
-            .header("host", "localhost")
-            .header("x-forwarded-proto", "https")
-            .header(AUTHORIZATION, auth_header)
-            .body(())
-            .unwrap();
-
-        let result = NostrAuth::from_request_parts(&mut req.into_parts().0, &state).await;
-
-        assert!(result.is_ok());
+        let event = auth_event("GET", "http://localhost/test", None, &keys);
+        let mut value: serde_json::Value = serde_json::to_value(&event).unwrap();
+        value["pubkey"] = serde_json::Value::String(Keys::generate().public_key().to_hex());
+        let header = format!("Nostr {}", BASE64.encode(value.to_string()));
+        assert!(matches!(
+            extract(request("GET", "/test", Some(header))).await,
+            Err(AuthError::InvalidSignature(_))
+        ));
     }
 }

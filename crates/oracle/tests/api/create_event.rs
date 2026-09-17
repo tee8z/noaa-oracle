@@ -1,15 +1,12 @@
-use crate::helpers::{create_auth_event, spawn_app, MockWeatherAccess};
+use crate::helpers::{MockWeatherAccess, create_auth_event, payload_hash, spawn_app};
+use axum::http::{Method, header};
 use axum::{
-    body::{to_bytes, Body},
+    body::{Body, to_bytes},
     http::Request,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use dlctix::Outcome;
-use hyper::{header, Method};
-use nostr_sdk::{
-    hashes::{sha256::Hash as Sha256Hash, Hash},
-    Keys,
-};
+use nostr::key::Keys;
 use oracle::{CreateEvent, Event};
 use serde_json::{from_slice, to_string};
 use std::sync::Arc;
@@ -41,15 +38,14 @@ async fn can_create_oracle_event() {
     };
 
     let body_json = to_string(&new_event).unwrap();
-    let payload_hash = Sha256Hash::hash(body_json.as_bytes());
+    let payload_hash = payload_hash(body_json.as_bytes());
 
     let event = create_auth_event(
         "POST",
         &format!("{}{}", base_url, path),
         Some(payload_hash),
         &keys,
-    )
-    .await;
+    );
     let auth_header = format!(
         "Nostr {}",
         BASE64.encode(serde_json::to_string(&event).unwrap())
@@ -88,9 +84,10 @@ async fn can_create_oracle_event() {
     assert!(res.weather.is_empty());
     assert!(!res.nonce.serialize().is_empty());
     assert!(res.attestation.is_none());
-    assert!(res
-        .event_announcement
-        .is_valid_outcome(&Outcome::Attestation(1)));
+    assert!(
+        res.event_announcement
+            .is_valid_outcome(&Outcome::Attestation(1))
+    );
 }
 
 #[tokio::test]
@@ -117,15 +114,14 @@ async fn can_create_and_get_oracle_event() {
         scoring_fields: oracle::ScoringField::defaults(),
     };
     let body_json = to_string(&new_event).unwrap();
-    let payload_hash = Sha256Hash::hash(body_json.as_bytes());
+    let payload_hash = payload_hash(body_json.as_bytes());
 
     let event = create_auth_event(
         "POST",
         &format!("{}{}", base_url, path),
         Some(payload_hash),
         &keys,
-    )
-    .await;
+    );
     let auth_header = format!(
         "Nostr {}",
         BASE64.encode(serde_json::to_string(&event).unwrap())
@@ -196,7 +192,8 @@ async fn can_create_and_get_oracle_event() {
     assert!(res.weather.is_empty());
     assert!(!res.nonce.serialize().is_empty());
     assert!(res.attestation.is_none());
-    assert!(res
-        .event_announcement
-        .is_valid_outcome(&Outcome::Attestation(1)));
+    assert!(
+        res.event_announcement
+            .is_valid_outcome(&Outcome::Attestation(1))
+    );
 }

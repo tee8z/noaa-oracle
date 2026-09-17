@@ -1,10 +1,10 @@
-use crate::helpers::{spawn_app, MockWeatherAccess};
+use crate::helpers::{MockWeatherAccess, spawn_app};
+use axum::http::{Method, header};
 use axum::{
-    body::{to_bytes, Body},
+    body::{Body, to_bytes},
     http::Request,
 };
-use hyper::{header, Method};
-use nostr_sdk::Keys;
+use nostr::key::Keys;
 use oracle::{CreateEvent, EventSummary};
 use serde_json::from_slice;
 use std::sync::Arc;
@@ -73,17 +73,17 @@ async fn can_get_all_events() {
     ];
     test_app
         .oracle
-        .create_event(keys.public_key, new_event_1)
+        .create_event(keys.public_key(), new_event_1)
         .await
         .unwrap();
     test_app
         .oracle
-        .create_event(keys.public_key, new_event_2)
+        .create_event(keys.public_key(), new_event_2)
         .await
         .unwrap();
     test_app
         .oracle
-        .create_event(keys.public_key, new_event_3)
+        .create_event(keys.public_key(), new_event_3)
         .await
         .unwrap();
 

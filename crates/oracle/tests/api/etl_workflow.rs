@@ -1,20 +1,19 @@
-use crate::helpers::{spawn_app, MockWeatherAccess};
+use crate::helpers::{MockWeatherAccess, spawn_app};
+use axum::http::{Method, header};
 use axum::{
-    body::{to_bytes, Body},
+    body::{Body, to_bytes},
     http::Request,
 };
-use dlctix::attestation_secret;
-use hyper::{header, Method};
+use dlctix::attestation_locking_point;
 use log::info;
-use nostr_sdk::Keys;
+use nostr::key::Keys;
 use oracle::{
-    oracle::get_winning_bytes, AddEventEntries, AddEventEntry, CreateEvent, Event, EventStatus,
-    Forecast, Observation, TemperatureUnit, WeatherChoices,
+    AddEventEntries, AddEventEntry, CreateEvent, Event, EventStatus, Forecast, Observation,
+    TemperatureUnit, WeatherChoices, oracle::get_winning_bytes,
 };
 use serde_json::from_slice;
 use std::{cmp, sync::Arc};
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tokio::time::sleep;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tower::ServiceExt;
 use uuid::{ClockSequence, Timestamp, Uuid};
 
@@ -54,7 +53,7 @@ async fn can_handle_no_events() {
         .oneshot(request)
         .await
         .expect("Failed to execute request.");
-    sleep(std::time::Duration::from_secs(1)).await;
+    test_app.state.wait_for_etl().await;
     assert!(response.status().is_success());
 }
 
@@ -101,7 +100,7 @@ async fn can_get_event_run_etl_and_see_it_signed() {
     info!("above create event");
     let event = test_app
         .oracle
-        .create_event(keys.public_key, new_event_1)
+        .create_event(keys.public_key(), new_event_1)
         .await
         .unwrap();
 
@@ -261,7 +260,7 @@ async fn can_get_event_run_etl_and_see_it_signed() {
     test_app
         .oracle
         .add_event_entries(
-            keys.public_key,
+            keys.public_key(),
             event_entries.event_id,
             event_entries.entries,
         )
@@ -305,7 +304,7 @@ async fn can_get_event_run_etl_and_see_it_signed() {
     assert!(response.status().is_success());
 
     // wait for etl to run in background
-    sleep(std::time::Duration::from_secs(1)).await;
+    test_app.state.wait_for_etl().await;
 
     // 3) get event after etl
     let request = Request::builder()
@@ -381,14 +380,17 @@ async fn can_get_event_run_etl_and_see_it_signed() {
 
     let winners = vec![first_place_index, second_place_index, third_place_index];
 
-    let winning_bytes = get_winning_bytes(winners);
+    let winning_bytes = get_winning_bytes(&winners);
     println!("winning_bytes in test: {:?}", winning_bytes);
 
-    let attested_outcome =
-        attestation_secret(test_app.oracle.raw_private_key(), res.nonce, &winning_bytes);
+    let locking_point = attestation_locking_point(
+        test_app.oracle.raw_public_key(),
+        res.nonce.base_point_mul(),
+        &winning_bytes,
+    );
 
-    // Verify the attestation matches what we calculate in the test
-    assert_eq!(attested_outcome, res.attestation.unwrap());
+    // Verify the attestation unlocks the outcome we calculate in the test
+    assert_eq!(res.attestation.unwrap().base_point_mul(), locking_point);
 }
 
 fn mock_forecast_data() -> Vec<Forecast> {

@@ -28,7 +28,7 @@ jobs:
           components: rustfmt
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: cargo fmt --all --check
 
   # Machete unused deps checking (no Nix needed)
   machete:
@@ -149,7 +149,7 @@ jobs:
             ${{ runner.os }}-cargo-registry-
 
       - name: Run Clippy
-        run: nix develop -c cargo clippy --workspace --all-targets -- -D warnings
+        run: nix develop -c cargo clippy --workspace --all-targets --locked -- -D warnings
 
   # Unit tests (needs Nix for DuckDB)
   test:
@@ -227,22 +227,9 @@ jobs:
       - name: Make binaries executable
         run: chmod +x target/debug/oracle target/debug/daemon
 
-      - name: Setup test environment
-        run: |
-          mkdir -p weather_data event_data data logs test_data
-          # Generate test signing key in the format expected by the oracle
-          # (raw 32-byte secp256k1 secret key, not SEC1/ASN.1 format)
-          openssl rand -base64 32 | tr -d '\n' > /tmp/raw_key.txt
-          echo "-----BEGIN EC PRIVATE KEY-----" > oracle_private_key.pem
-          cat /tmp/raw_key.txt >> oracle_private_key.pem
-          echo "" >> oracle_private_key.pem
-          echo "-----END EC PRIVATE KEY-----" >> oracle_private_key.pem
-          rm /tmp/raw_key.txt
-          chmod 600 oracle_private_key.pem
-
       - name: Run E2E tests
         run: |
-          nix develop -c cargo test --package oracle --test api -- --test-threads=1
+          nix develop -c cargo test --package oracle --test api --locked
         env:
           RUST_LOG: debug
 
@@ -253,7 +240,6 @@ jobs:
           name: e2e-logs-${{ github.run_id }}
           path: |
             logs/
-            test_data/
             *.log
           retention-days: 7
 

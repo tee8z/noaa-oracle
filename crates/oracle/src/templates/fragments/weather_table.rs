@@ -1,4 +1,4 @@
-use maud::{html, Markup};
+use maud::{Markup, html};
 
 use super::weather_map::{region_name, weather_map};
 
@@ -18,7 +18,6 @@ pub struct WeatherDisplay {
     pub snow_amt: Option<f64>,
     pub observed_start: String,
     pub observed_end: String,
-    pub updated_at: String,
     pub latitude: f64,
     pub longitude: f64,
     /// Yesterday's forecast high for today (what was predicted)
