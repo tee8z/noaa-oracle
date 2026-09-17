@@ -91,7 +91,7 @@ mod tests {
     use super::*;
     use crate::parse_xml;
 
-    const METARS: &str = include_str!("testdata/metars.xml");
+    const METARS: &str = include_str!("testdata/metars.cache.xml");
 
     #[test]
     fn parses_aviation_weather_metar_cache() {

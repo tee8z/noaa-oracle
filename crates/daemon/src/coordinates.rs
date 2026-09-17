@@ -190,7 +190,7 @@ fn us_stations(index: WxStationIndex) -> CityWeather {
 mod tests {
     use super::*;
 
-    const STATIONS: &str = include_str!("testdata/stations.xml");
+    const STATIONS: &str = include_str!("testdata/stations.cache.xml");
 
     #[test]
     fn keeps_only_us_stations_with_a_state_and_coordinates() {
