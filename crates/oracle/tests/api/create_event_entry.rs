@@ -1,15 +1,12 @@
-use crate::helpers::{create_auth_event, spawn_app, MockWeatherAccess};
+use crate::helpers::{MockWeatherAccess, create_auth_event, payload_hash, spawn_app};
+use axum::http::{Method, header};
 use axum::{
-    body::{to_bytes, Body},
+    body::{Body, to_bytes},
     http::Request,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use hyper::{header, Method};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use log::{debug, info};
-use nostr_sdk::{
-    hashes::{sha256::Hash as Sha256Hash, Hash},
-    Keys,
-};
+use nostr::key::Keys;
 use oracle::{AddEventEntries, AddEventEntry, CreateEvent, WeatherChoices, WeatherEntry};
 use serde_json::{from_slice, to_string};
 use std::sync::Arc;
@@ -80,11 +77,11 @@ async fn can_create_entry_into_event() {
         entries: vec![new_entry.clone()],
     };
     let body_json = to_string(&entries).unwrap();
-    let payload_hash = Sha256Hash::hash(body_json.as_bytes());
+    let payload_hash = payload_hash(body_json.as_bytes());
 
     let oracle_event = test_app
         .oracle
-        .create_event(keys.public_key, new_event)
+        .create_event(keys.public_key(), new_event)
         .await
         .unwrap();
 
@@ -95,8 +92,7 @@ async fn can_create_entry_into_event() {
         &format!("{}{}", base_url, path),
         Some(payload_hash),
         &keys,
-    )
-    .await;
+    );
 
     let auth_header = format!(
         "Nostr {}",
@@ -190,7 +186,7 @@ async fn can_create_and_get_event_entry() {
         entries: vec![new_entry],
     };
     let body_json = to_string(&entries).unwrap();
-    let payload_hash = Sha256Hash::hash(body_json.as_bytes());
+    let payload_hash = payload_hash(body_json.as_bytes());
     let base_url = "http://localhost:3000";
     let path = format!("/oracle/events/{}/entries", new_event.id);
     let event = create_auth_event(
@@ -198,8 +194,7 @@ async fn can_create_and_get_event_entry() {
         &format!("{}{}", base_url, path),
         Some(payload_hash),
         &keys,
-    )
-    .await;
+    );
     let auth_header = format!(
         "Nostr {}",
         BASE64.encode(serde_json::to_string(&event).unwrap())

@@ -1,4 +1,4 @@
-use maud::{html, Markup};
+use maud::{Markup, html};
 
 /// Theme toggle button for dark/light mode
 pub fn theme_toggle() -> Markup {

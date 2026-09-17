@@ -1,19 +1,18 @@
-use crate::helpers::{spawn_app, MockWeatherAccess};
+use crate::helpers::{MockWeatherAccess, spawn_app};
+use axum::http::{Method, header};
 use axum::{
-    body::{to_bytes, Body},
+    body::{Body, to_bytes},
     http::Request,
 };
-use dlctix::{attestation_locking_point, attestation_secret, Outcome};
-use hyper::{header, Method};
-use nostr_sdk::Keys;
+use dlctix::{Outcome, attestation_locking_point};
+use nostr::key::Keys;
 use oracle::{
-    oracle::get_winning_bytes, AddEventEntries, AddEventEntry, CreateEvent, Event, EventStatus,
-    Forecast, Observation, TemperatureUnit, ValueOptions, WeatherChoices,
+    AddEventEntries, AddEventEntry, CreateEvent, Event, EventStatus, Forecast, Observation,
+    TemperatureUnit, ValueOptions, WeatherChoices, oracle::get_winning_bytes,
 };
 use serde_json::from_slice;
 use std::{cmp, sync::Arc};
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tokio::time::sleep;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tower::ServiceExt;
 use uuid::{ClockSequence, Timestamp, Uuid};
 
@@ -72,7 +71,7 @@ async fn attestation_unlocks_correct_dlc_outcome() {
 
     let event = test_app
         .oracle
-        .create_event(keys.public_key, new_event)
+        .create_event(keys.public_key(), new_event)
         .await
         .unwrap();
 
@@ -162,7 +161,7 @@ async fn attestation_unlocks_correct_dlc_outcome() {
     };
     test_app
         .oracle
-        .add_event_entries(keys.public_key, event.id, event_entries.entries)
+        .add_event_entries(keys.public_key(), event.id, event_entries.entries)
         .await
         .unwrap();
 
@@ -181,7 +180,7 @@ async fn attestation_unlocks_correct_dlc_outcome() {
         .await
         .expect("Failed to execute request.");
     assert!(response.status().is_success());
-    sleep(std::time::Duration::from_secs(1)).await;
+    test_app.state.wait_for_etl().await;
 
     // Get the signed event
     let request = Request::builder()
@@ -222,29 +221,24 @@ async fn attestation_unlocks_correct_dlc_outcome() {
         })
         .collect();
 
-    let winning_bytes = get_winning_bytes(winners);
+    let winning_bytes = get_winning_bytes(&winners);
 
-    // Verify the attestation was computed correctly
-    let expected_attestation = attestation_secret(
-        test_app.oracle.raw_private_key(),
-        signed_event.nonce,
-        &winning_bytes,
-    );
-    assert_eq!(attestation, expected_attestation);
-
-    // Verify the locking point matches
+    // The attestation is the discrete log of the locking point for this outcome
     let nonce_point = signed_event.nonce.base_point_mul();
     let locking_point = attestation_locking_point(
         test_app.oracle.raw_public_key(),
         nonce_point,
         &winning_bytes,
     );
+    assert_eq!(attestation.base_point_mul(), locking_point);
 
     // The attestation should unlock this specific locking point
-    assert!(signed_event
-        .event_announcement
-        .locking_points
-        .contains(&locking_point));
+    assert!(
+        signed_event
+            .event_announcement
+            .locking_points
+            .contains(&locking_point)
+    );
 }
 
 /// Verifies that events before signing date are not signed
@@ -282,7 +276,7 @@ async fn event_not_signed_before_signing_date() {
 
     let event = test_app
         .oracle
-        .create_event(keys.public_key, new_event)
+        .create_event(keys.public_key(), new_event)
         .await
         .unwrap();
 
@@ -318,7 +312,7 @@ async fn event_not_signed_before_signing_date() {
 
     test_app
         .oracle
-        .add_event_entries(keys.public_key, event.id, vec![entry_1, entry_2])
+        .add_event_entries(keys.public_key(), event.id, vec![entry_1, entry_2])
         .await
         .unwrap();
 
@@ -336,7 +330,7 @@ async fn event_not_signed_before_signing_date() {
         .oneshot(request)
         .await
         .expect("Failed to execute request.");
-    sleep(std::time::Duration::from_secs(1)).await;
+    test_app.state.wait_for_etl().await;
 
     // Get event - should NOT be signed yet
     let request = Request::builder()
@@ -393,12 +387,12 @@ async fn each_event_has_unique_nonce() {
 
     let created1 = test_app
         .oracle
-        .create_event(keys.public_key, event1)
+        .create_event(keys.public_key(), event1)
         .await
         .unwrap();
     let created2 = test_app
         .oracle
-        .create_event(keys.public_key, event2)
+        .create_event(keys.public_key(), event2)
         .await
         .unwrap();
 
@@ -432,7 +426,7 @@ async fn event_announcement_has_correct_outcome_count() {
 
     let created = test_app
         .oracle
-        .create_event(keys.public_key, event)
+        .create_event(keys.public_key(), event)
         .await
         .unwrap();
 
@@ -448,12 +442,16 @@ async fn event_announcement_has_correct_outcome_count() {
     );
 
     // Verify attestation outcomes are valid
-    assert!(created
-        .event_announcement
-        .is_valid_outcome(&Outcome::Attestation(0)));
-    assert!(created
-        .event_announcement
-        .is_valid_outcome(&Outcome::Attestation(1)));
+    assert!(
+        created
+            .event_announcement
+            .is_valid_outcome(&Outcome::Attestation(0))
+    );
+    assert!(
+        created
+            .event_announcement
+            .is_valid_outcome(&Outcome::Attestation(1))
+    );
 }
 
 /// Verifies attestation is deterministic for same inputs
@@ -491,7 +489,7 @@ async fn attestation_is_deterministic() {
 
     let created = test_app
         .oracle
-        .create_event(keys.public_key, event)
+        .create_event(keys.public_key(), event)
         .await
         .unwrap();
 
@@ -528,7 +526,7 @@ async fn attestation_is_deterministic() {
     test_app
         .oracle
         .add_event_entries(
-            keys.public_key,
+            keys.public_key(),
             created.id,
             vec![entry_1.clone(), entry_2.clone()],
         )
@@ -542,7 +540,7 @@ async fn attestation_is_deterministic() {
         .body(Body::empty())
         .unwrap();
     test_app.app.clone().oneshot(request).await.unwrap();
-    sleep(std::time::Duration::from_secs(1)).await;
+    test_app.state.wait_for_etl().await;
 
     // Get the signed event
     let request = Request::builder()
@@ -577,16 +575,15 @@ async fn attestation_is_deterministic() {
         })
         .collect();
 
-    let winning_bytes = get_winning_bytes(winners);
-    let expected_attestation = attestation_secret(
-        test_app.oracle.raw_private_key(),
-        after_etl.nonce,
+    let winning_bytes = get_winning_bytes(&winners);
+    let locking_point = attestation_locking_point(
+        test_app.oracle.raw_public_key(),
+        after_etl.nonce.base_point_mul(),
         &winning_bytes,
     );
-
     assert_eq!(
-        after_etl.attestation.unwrap(),
-        expected_attestation,
+        after_etl.attestation.unwrap().base_point_mul(),
+        locking_point,
         "Attestation should be deterministic"
     );
 }

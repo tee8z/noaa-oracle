@@ -1,3 +1,3 @@
 mod base;
 
-pub use base::{base, CurrentPage, PageConfig};
+pub use base::{CurrentPage, PageConfig, base};

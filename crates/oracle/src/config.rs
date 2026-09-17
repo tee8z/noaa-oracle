@@ -1,26 +1,20 @@
+//! Configuration from CLI flags, environment variables, and a TOML file,
+//! plus process logging setup.
+
 use clap::Parser;
 use fern::{
-    colors::{Color, ColoredLevelConfig},
     Dispatch,
+    colors::{Color, ColoredLevelConfig},
 };
 use log::LevelFilter;
-use noaa_oracle_core::{
-    find_config_file, load_config, path_exists, ConfigSource, DEFAULT_ORACLE_PORT,
+use noaa_oracle_core::{ConfigSource, DEFAULT_ORACLE_PORT, find_config_file, load_config};
+use std::{
+    env,
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    time::Duration,
 };
-use std::env;
-use time::{format_description::well_known::Iso8601, OffsetDateTime};
-
-pub use noaa_oracle_core::{create_dir_all, ensure_dir_exists};
-
-/// Create a folder (legacy wrapper for compatibility)
-pub fn create_folder(root_path: &str) {
-    let _ = create_dir_all(root_path);
-}
-
-/// Check if a subfolder exists (legacy wrapper)
-pub fn subfolder_exists(subfolder_path: &str) -> bool {
-    path_exists(subfolder_path)
-}
+use time::{OffsetDateTime, format_description::well_known::Iso8601};
 
 #[derive(Parser, Clone, Debug, serde::Deserialize, Default)]
 #[command(
@@ -80,6 +74,25 @@ pub struct Cli {
     /// Custom S3 endpoint URL (for MinIO or other S3-compatible storage)
     #[arg(long, env = "NOAA_ORACLE_S3_ENDPOINT")]
     pub s3_endpoint: Option<String>,
+
+    /// Seconds to wait for HTTP requests, background work, and accepted
+    /// writes to finish after a stop signal before giving up
+    #[arg(long, env = "NOAA_ORACLE_SHUTDOWN_TIMEOUT")]
+    pub shutdown_timeout: Option<u64>,
+}
+
+/// Validated settings the application starts from.
+#[derive(Clone, Debug)]
+pub struct Configuration {
+    pub listen: SocketAddr,
+    pub remote_url: String,
+    pub weather_dir: PathBuf,
+    pub event_dir: PathBuf,
+    pub static_dir: PathBuf,
+    pub private_key: PathBuf,
+    pub s3_bucket: Option<String>,
+    pub s3_endpoint: Option<String>,
+    pub shutdown_timeout: Duration,
 }
 
 impl Cli {
@@ -126,6 +139,38 @@ impl Cli {
             .clone()
             .unwrap_or_else(|| "./oracle_private_key.pem".to_string())
     }
+
+    pub fn shutdown_timeout(&self) -> u64 {
+        self.shutdown_timeout.unwrap_or(25)
+    }
+
+    /// Validates addresses and bounds before anything is opened.
+    pub fn configuration(&self) -> anyhow::Result<Configuration> {
+        let host: IpAddr = self
+            .host()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid host {:?}: {e}", self.host()))?;
+        let port: u16 = self
+            .port()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid port {:?}: {e}", self.port()))?;
+        let shutdown_timeout = self.shutdown_timeout();
+        anyhow::ensure!(shutdown_timeout > 0, "shutdown timeout must be positive");
+        Ok(Configuration {
+            listen: SocketAddr::new(host, port),
+            remote_url: self.remote_url(),
+            weather_dir: PathBuf::from(self.weather_dir()),
+            event_dir: PathBuf::from(self.event_db()),
+            static_dir: PathBuf::from(self.static_dir()),
+            private_key: PathBuf::from(self.private_key()),
+            s3_bucket: self.s3_bucket.clone().filter(|bucket| !bucket.is_empty()),
+            s3_endpoint: self
+                .s3_endpoint
+                .clone()
+                .filter(|endpoint| !endpoint.is_empty()),
+            shutdown_timeout: Duration::from_secs(shutdown_timeout),
+        })
+    }
 }
 
 /// Load configuration from CLI args, config file, and environment
@@ -162,6 +207,7 @@ pub fn get_config_info() -> Cli {
             .or(file_config.oracle_private_key),
         s3_bucket: cli_args.s3_bucket.or(file_config.s3_bucket),
         s3_endpoint: cli_args.s3_endpoint.or(file_config.s3_endpoint),
+        shutdown_timeout: cli_args.shutdown_timeout.or(file_config.shutdown_timeout),
     }
 }
 
@@ -194,11 +240,46 @@ pub fn setup_logger() -> Dispatch {
         .format(move |out, message, record| {
             out.finish(format_args!(
                 "[{} {}] {}: {}",
-                OffsetDateTime::now_utc().format(&Iso8601::DEFAULT).unwrap(),
+                OffsetDateTime::now_utc()
+                    .format(&Iso8601::DEFAULT)
+                    .unwrap_or_default(),
                 colors.color(record.level()),
                 record.target(),
                 message
             ));
         })
         .chain(std::io::stdout())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_produce_a_local_listener() {
+        let configuration = Cli::default().configuration().unwrap();
+        assert_eq!(configuration.listen.to_string(), "127.0.0.1:9800");
+        assert_eq!(configuration.remote_url, "http://127.0.0.1:9800");
+        assert_eq!(configuration.shutdown_timeout, Duration::from_secs(25));
+        assert!(configuration.s3_bucket.is_none());
+    }
+
+    #[test]
+    fn invalid_values_are_rejected_before_startup() {
+        let bad_port = Cli {
+            port: Some("http".into()),
+            ..Cli::default()
+        };
+        assert!(bad_port.configuration().is_err());
+        let bad_host = Cli {
+            domain: Some("localhost".into()),
+            ..Cli::default()
+        };
+        assert!(bad_host.configuration().is_err());
+        let bad_timeout = Cli {
+            shutdown_timeout: Some(0),
+            ..Cli::default()
+        };
+        assert!(bad_timeout.configuration().is_err());
+    }
 }

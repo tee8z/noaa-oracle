@@ -1,4 +1,4 @@
-use maud::{html, Markup, PreEscaped};
+use maud::{Markup, PreEscaped, html};
 
 /// Oracle information display fragment
 /// Shows the oracle's public key and npub with copy functionality

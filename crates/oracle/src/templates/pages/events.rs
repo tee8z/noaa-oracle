@@ -1,8 +1,8 @@
-use maud::{html, Markup};
+use maud::{Markup, html};
 
 use crate::templates::{
-    fragments::{events_table, EventView},
-    layouts::{base, CurrentPage, PageConfig},
+    fragments::{EventView, events_table},
+    layouts::{CurrentPage, PageConfig, base},
 };
 
 /// Events page - shows list of all oracle events

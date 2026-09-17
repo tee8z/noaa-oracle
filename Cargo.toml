@@ -1,10 +1,11 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = ["crates/core", "crates/daemon", "crates/oracle"]
 
 [workspace.package]
 version = "1.9.2"
-edition = "2021"
+edition = "2024"
+rust-version = "1.98"
 license = "MIT"
 repository = "https://github.com/tee8z/noaa-oracle"
 authors = ["tee8z"]
@@ -13,41 +14,45 @@ authors = ["tee8z"]
 # Internal crates
 noaa-oracle-core = { path = "crates/core" }
 
-# Core dependencies
+# Errors and serialization
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
+toml = { version = "1.1", default-features = false, features = ["parse", "serde"] }
 
-# CLI & Config
-clap = { version = "4.3", features = ["derive", "env"] }
-config = "0.14"
+# CLI
+clap = { version = "4.6", features = ["derive", "env"] }
 
-# Async runtime
-tokio = { version = "1.35", features = ["full"] }
-tokio-util = "0.7"
-futures = "0.3"
+# Async runtime; each crate enables only the features it uses
+tokio = { version = "1.53", default-features = false }
+tokio-util = { version = "0.7", default-features = false }
+futures = { version = "0.3", default-features = false, features = ["std"] }
 
-# HTTP
-reqwest = { version = "0.12", features = ["stream", "json", "multipart"] }
+# HTTP client
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 
 # Logging
 log = "0.4"
 fern = { version = "0.7", features = ["colored"] }
-slog = "2.7"
+slog = "2.8"
 slog-term = "2.9"
-slog-async = "2.7"
+slog-async = "2.8"
 
 # Time
 time = { version = "0.3", features = ["parsing", "formatting", "macros", "serde"] }
 
-# Data
-parquet = "54.0"
-arrow = "54.0"
-parquet_derive = "54.0"
+# Parquet. Keep in step with the arrow version re-exported by the `duckdb`
+# crate so the workspace builds one copy of arrow.
+parquet = { version = "58", default-features = false }
+parquet_derive = "58"
 
+# S3
+aws-sdk-s3 = "1.148"
+aws-config = { version = "1.12", features = ["behavior-version-latest"] }
 
+# Testing
+tempfile = "3.27"
 
 # Suppress warnings from dependencies using non-standard cfg values
 [workspace.lints.rust]

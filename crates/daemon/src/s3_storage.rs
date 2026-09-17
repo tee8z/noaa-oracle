@@ -1,5 +1,5 @@
 use aws_sdk_s3::Client;
-use slog::{error, info, Logger};
+use slog::{Logger, error, info};
 use std::path::Path;
 
 pub struct S3Storage {

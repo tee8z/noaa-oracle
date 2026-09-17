@@ -1,6 +1,6 @@
-use maud::{html, Markup};
+use maud::{Markup, html};
 
-use super::event_row::{event_card, event_row, EventView};
+use super::event_row::{EventView, event_card, event_row};
 
 /// Events table fragment
 /// Shows all events with auto-refresh capability

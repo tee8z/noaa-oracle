@@ -1,15 +1,20 @@
+//! Parquet file discovery and streaming from local disk or S3.
+//!
+//! File names follow `<observations|forecasts>_<rfc3339>.parquet` and are
+//! stored under a `YYYY-MM-DD` directory of their generation date. Names that
+//! do not match are ignored on listing and rejected on upload, because the
+//! oracle interpolates them into DuckDB `read_parquet` calls.
+
 use async_trait::async_trait;
 use axum::body::Body;
 use log::trace;
 use serde::{Deserialize, Serialize};
 use time::{
-    format_description::well_known::Rfc3339, macros::format_description, Date, OffsetDateTime,
+    Date, OffsetDateTime, format_description::well_known::Rfc3339, macros::format_description,
 };
 use tokio::fs;
 use tokio_util::io::ReaderStream;
 use utoipa::IntoParams;
-
-use crate::{create_folder, subfolder_exists};
 
 #[derive(Clone, Deserialize, Serialize, IntoParams)]
 pub struct FileParams {
@@ -25,6 +30,70 @@ pub struct FileAccess {
     data_dir: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileKind {
+    Observations,
+    Forecasts,
+}
+
+impl FileKind {
+    fn prefix(self) -> &'static str {
+        match self {
+            FileKind::Observations => "observations",
+            FileKind::Forecasts => "forecasts",
+        }
+    }
+}
+
+/// A validated parquet file name: `<kind>_<rfc3339>.parquet`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParquetFileName {
+    pub kind: FileKind,
+    pub generated_at: OffsetDateTime,
+}
+
+impl ParquetFileName {
+    /// Accepts only the daemon's naming scheme. Anything else, including
+    /// path separators, quotes, or unknown prefixes, is rejected.
+    pub fn parse(name: &str) -> Result<Self, Error> {
+        let invalid = || Error::InvalidFileName(name.to_string());
+        let stem = name.strip_suffix(".parquet").ok_or_else(invalid)?;
+        let (prefix, timestamp) = stem.split_once('_').ok_or_else(invalid)?;
+        let kind = match prefix {
+            "observations" => FileKind::Observations,
+            "forecasts" => FileKind::Forecasts,
+            _ => return Err(invalid()),
+        };
+        if !timestamp
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b':' | b'.' | b'+'))
+        {
+            return Err(invalid());
+        }
+        let generated_at = OffsetDateTime::parse(timestamp, &Rfc3339).map_err(|_| invalid())?;
+        Ok(Self { kind, generated_at })
+    }
+
+    fn matches(&self, params: &FileParams) -> bool {
+        let wanted = match self.kind {
+            FileKind::Observations => params.observations,
+            FileKind::Forecasts => params.forecasts,
+        };
+        let any_kind = params.forecasts.is_none() && params.observations.is_none();
+        (any_kind || wanted == Some(true)) && is_time_in_range(self.generated_at, params)
+    }
+}
+
+impl std::fmt::Display for ParquetFileName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let timestamp = self
+            .generated_at
+            .format(&Rfc3339)
+            .map_err(|_| std::fmt::Error)?;
+        write!(f, "{}_{}.parquet", self.kind.prefix(), timestamp)
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("Failed to format time string: {0}")]
@@ -35,59 +104,24 @@ pub enum Error {
     NotFound(String),
     #[error("IO error: {0}")]
     Io(String),
+    #[error("Invalid parquet file name: {0:?}")]
+    InvalidFileName(String),
 }
 
+/// Where parquet files live. Implementations return only validated file
+/// names, so callers can pass them straight to [`FileData::build_file_paths`].
 #[async_trait]
 pub trait FileData: Send + Sync {
     async fn grab_file_names(&self, params: FileParams) -> Result<Vec<String>, Error>;
-    fn current_folder(&self) -> String;
     fn build_file_paths(&self, file_names: Vec<String>) -> Vec<String>;
-    fn build_file_path(&self, filename: &str, file_generated_at: OffsetDateTime) -> String;
+    fn build_file_path(&self, file: &ParquetFileName) -> String;
     /// Download a file and return its contents as an axum Body stream
-    async fn download_file(
-        &self,
-        filename: &str,
-        file_generated_at: OffsetDateTime,
-    ) -> Result<Body, Error>;
+    async fn download_file(&self, file: &ParquetFileName) -> Result<Body, Error>;
 }
 
 impl FileAccess {
     pub fn new(data_dir: String) -> Self {
         Self { data_dir }
-    }
-
-    fn add_filename(
-        &self,
-        entry: tokio::fs::DirEntry,
-        params: &FileParams,
-    ) -> Result<Option<String>, Error> {
-        if let Some(filename) = entry.file_name().to_str() {
-            let file_pieces: Vec<String> = filename.split('_').map(|f| f.to_owned()).collect();
-            let created_time = drop_suffix(file_pieces.last().unwrap(), ".parquet");
-            trace!("parsed file time:{}", created_time);
-
-            let file_generated_at = OffsetDateTime::parse(&created_time, &Rfc3339)?;
-            let valid_time_range = is_time_in_range(file_generated_at, params);
-            let file_data_type = file_pieces.first().unwrap();
-            trace!("parsed file type:{}", file_data_type);
-
-            if let Some(observations) = params.observations {
-                if observations && file_data_type.eq("observations") && valid_time_range {
-                    return Ok(Some(filename.to_owned()));
-                }
-            }
-
-            if let Some(forecasts) = params.forecasts {
-                if forecasts && file_data_type.eq("forecasts") && valid_time_range {
-                    return Ok(Some(filename.to_owned()));
-                }
-            }
-
-            if params.forecasts.is_none() && params.observations.is_none() && valid_time_range {
-                return Ok(Some(filename.to_owned()));
-            }
-        }
-        Ok(None)
     }
 }
 
@@ -96,44 +130,17 @@ impl FileData for FileAccess {
     fn build_file_paths(&self, file_names: Vec<String>) -> Vec<String> {
         file_names
             .iter()
-            .map(|file_name| {
-                let file_pieces: Vec<String> = file_name.split('_').map(|f| f.to_owned()).collect();
-                let created_time = drop_suffix(file_pieces.last().unwrap(), ".parquet");
-                let file_generated_at = OffsetDateTime::parse(&created_time, &Rfc3339).unwrap();
-                format!(
-                    "{}/{}/{}",
-                    self.data_dir,
-                    file_generated_at.date(),
-                    file_name
-                )
-            })
+            .filter_map(|file_name| ParquetFileName::parse(file_name).ok())
+            .map(|file| self.build_file_path(&file))
             .collect()
     }
 
-    fn current_folder(&self) -> String {
-        let current_date = OffsetDateTime::now_utc().date();
-        let subfolder = format!("{}/{}", self.data_dir, current_date);
-        if !subfolder_exists(&subfolder) {
-            create_folder(&subfolder)
-        }
-        subfolder
+    fn build_file_path(&self, file: &ParquetFileName) -> String {
+        format!("{}/{}/{}", self.data_dir, file.generated_at.date(), file)
     }
 
-    fn build_file_path(&self, filename: &str, file_generated_at: OffsetDateTime) -> String {
-        format!(
-            "{}/{}/{}",
-            self.data_dir,
-            file_generated_at.date(),
-            filename
-        )
-    }
-
-    async fn download_file(
-        &self,
-        filename: &str,
-        file_generated_at: OffsetDateTime,
-    ) -> Result<Body, Error> {
-        let file_path = self.build_file_path(filename, file_generated_at);
+    async fn download_file(&self, file: &ParquetFileName) -> Result<Body, Error> {
+        let file_path = self.build_file_path(file);
         let file = tokio::fs::File::open(&file_path)
             .await
             .map_err(|e| Error::NotFound(format!("{}: {}", file_path, e)))?;
@@ -142,39 +149,42 @@ impl FileData for FileAccess {
     }
 
     async fn grab_file_names(&self, params: FileParams) -> Result<Vec<String>, Error> {
-        let mut files_names = vec![];
-        if let Ok(mut entries) = fs::read_dir(self.data_dir.clone()).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-                if !path.is_dir() {
+        let mut file_names = vec![];
+        let Ok(mut entries) = fs::read_dir(&self.data_dir).await else {
+            return Ok(file_names);
+        };
+        let date_format = format_description!("[year]-[month]-[day]");
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(date) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(directory_date) = Date::parse(&date, &date_format) else {
+                trace!("skipping non-date directory {date}");
+                continue;
+            };
+            if !is_date_in_range(directory_date, &params) {
+                continue;
+            }
+            let Ok(mut files) = fs::read_dir(path).await else {
+                continue;
+            };
+            while let Ok(Some(file)) = files.next_entry().await {
+                let name = file.file_name();
+                let Some(name) = name.to_str() else {
                     continue;
-                }
-                if let Some(date) = entry.file_name().to_str() {
-                    let format = format_description!("[year]-[month]-[day]");
-                    let directory_date = Date::parse(date, &format)?;
-                    if !is_date_in_range(directory_date, &params) {
-                        continue;
-                    }
-
-                    if let Ok(mut subentries) = fs::read_dir(path).await {
-                        while let Ok(Some(subentries)) = subentries.next_entry().await {
-                            if let Some(filename) = self.add_filename(subentries, &params)? {
-                                files_names.push(filename);
-                            }
-                        }
-                    }
+                };
+                match ParquetFileName::parse(name) {
+                    Ok(parsed) if parsed.matches(&params) => file_names.push(name.to_owned()),
+                    Ok(_) => {}
+                    Err(_) => trace!("skipping unrecognised file {name}"),
                 }
             }
         }
-        Ok(files_names)
-    }
-}
-
-pub fn drop_suffix(input: &str, suffix: &str) -> String {
-    if let Some(stripped) = input.strip_suffix(suffix) {
-        stripped.to_string()
-    } else {
-        input.to_string()
+        Ok(file_names)
     }
 }
 
@@ -199,39 +209,6 @@ fn is_time_in_range(compare_to: OffsetDateTime, params: &FileParams) -> bool {
     after_start && before_end
 }
 
-/// Checks if a filename matches the requested file type and time range filters.
-/// Shared between FileAccess and S3FileAccess.
-fn matches_file_params(filename: &str, params: &FileParams) -> Result<bool, Error> {
-    let file_pieces: Vec<&str> = filename.split('_').collect();
-    let Some(last_piece) = file_pieces.last() else {
-        return Ok(false);
-    };
-    let created_time = drop_suffix(last_piece, ".parquet");
-    let file_generated_at = OffsetDateTime::parse(&created_time, &Rfc3339)?;
-    let valid_time_range = is_time_in_range(file_generated_at, params);
-    let Some(file_data_type) = file_pieces.first() else {
-        return Ok(false);
-    };
-
-    if let Some(true) = params.observations {
-        if *file_data_type == "observations" && valid_time_range {
-            return Ok(true);
-        }
-    }
-
-    if let Some(true) = params.forecasts {
-        if *file_data_type == "forecasts" && valid_time_range {
-            return Ok(true);
-        }
-    }
-
-    if params.forecasts.is_none() && params.observations.is_none() && valid_time_range {
-        return Ok(true);
-    }
-
-    Ok(false)
-}
-
 /// S3-backed file access for listing and downloading parquet files.
 /// S3 key format: weather_data/{YYYY-MM-DD}/{filename}
 pub struct S3FileAccess {
@@ -253,8 +230,8 @@ impl S3FileAccess {
     }
 
     /// Build the S3 key for a file
-    fn s3_key(filename: &str, file_generated_at: OffsetDateTime) -> String {
-        format!("weather_data/{}/{}", file_generated_at.date(), filename)
+    fn s3_key(file: &ParquetFileName) -> String {
+        format!("weather_data/{}/{}", file.generated_at.date(), file)
     }
 }
 
@@ -305,15 +282,16 @@ impl FileData for S3FileAccess {
                 })?;
 
                 for obj in resp.contents() {
-                    if let Some(key) = obj.key() {
-                        // Extract filename from key: weather_data/2026-02-16/forecasts_2026-02-16T10:00:00Z.parquet
-                        if let Some(filename) = key.rsplit('/').next() {
-                            if filename.ends_with(".parquet")
-                                && matches_file_params(filename, &params)?
-                            {
-                                file_names.push(filename.to_string());
-                            }
+                    // Key layout: weather_data/2026-02-16/forecasts_2026-02-16T10:00:00Z.parquet
+                    let Some(filename) = obj.key().and_then(|key| key.rsplit('/').next()) else {
+                        continue;
+                    };
+                    match ParquetFileName::parse(filename) {
+                        Ok(parsed) if parsed.matches(&params) => {
+                            file_names.push(filename.to_string());
                         }
+                        Ok(_) => {}
+                        Err(_) => trace!("skipping unrecognised S3 object {filename}"),
                     }
                 }
 
@@ -328,33 +306,20 @@ impl FileData for S3FileAccess {
         Ok(file_names)
     }
 
-    fn current_folder(&self) -> String {
-        let current_date = OffsetDateTime::now_utc().date();
-        format!("weather_data/{}", current_date)
-    }
-
     fn build_file_paths(&self, file_names: Vec<String>) -> Vec<String> {
         file_names
             .iter()
-            .map(|file_name| {
-                let file_pieces: Vec<String> = file_name.split('_').map(|f| f.to_owned()).collect();
-                let created_time = drop_suffix(file_pieces.last().unwrap(), ".parquet");
-                let file_generated_at = OffsetDateTime::parse(&created_time, &Rfc3339).unwrap();
-                format!("weather_data/{}/{}", file_generated_at.date(), file_name)
-            })
+            .filter_map(|file_name| ParquetFileName::parse(file_name).ok())
+            .map(|file| Self::s3_key(&file))
             .collect()
     }
 
-    fn build_file_path(&self, filename: &str, file_generated_at: OffsetDateTime) -> String {
-        Self::s3_key(filename, file_generated_at)
+    fn build_file_path(&self, file: &ParquetFileName) -> String {
+        Self::s3_key(file)
     }
 
-    async fn download_file(
-        &self,
-        filename: &str,
-        file_generated_at: OffsetDateTime,
-    ) -> Result<Body, Error> {
-        let key = Self::s3_key(filename, file_generated_at);
+    async fn download_file(&self, file: &ParquetFileName) -> Result<Body, Error> {
+        let key = Self::s3_key(file);
         let resp = self
             .client
             .get_object()
@@ -372,5 +337,87 @@ impl FileData for S3FileAccess {
             .into_bytes();
 
         Ok(Body::from(bytes))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_daemon_file_names_and_rejects_everything_else() {
+        let name = "observations_2026-01-21T23:59:43.269662415Z.parquet";
+        let parsed = ParquetFileName::parse(name).unwrap();
+        assert_eq!(parsed.kind, FileKind::Observations);
+        assert_eq!(parsed.generated_at.date().to_string(), "2026-01-21");
+        assert_eq!(parsed.to_string(), name);
+        assert_eq!(
+            ParquetFileName::parse("forecasts_2026-01-21T15:59:43.858149618Z.parquet")
+                .unwrap()
+                .kind,
+            FileKind::Forecasts
+        );
+        for invalid in [
+            "invalid.parquet",
+            "observations_notadate.parquet",
+            "../observations_2026-01-21T23:59:43Z.parquet",
+            "observations_2026-01-21T23:59:43Z.parquet']) UNION SELECT 1 --",
+            "metrics_2026-01-21T23:59:43Z.parquet",
+            "observations_2026-01-21T23:59:43Z.csv",
+        ] {
+            assert!(ParquetFileName::parse(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[tokio::test]
+    async fn lists_only_matching_files_from_dated_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let day = directory.path().join("2026-01-21");
+        std::fs::create_dir_all(&day).unwrap();
+        for name in [
+            "observations_2026-01-21T10:00:00Z.parquet",
+            "forecasts_2026-01-21T10:00:00Z.parquet",
+            "notes.txt",
+            "forecasts_2026-01-21T10:00:00Z.parquet.tmp",
+        ] {
+            std::fs::write(day.join(name), b"").unwrap();
+        }
+        std::fs::create_dir_all(directory.path().join("scratch")).unwrap();
+        let access = FileAccess::new(directory.path().to_string_lossy().into_owned());
+        let mut all = access
+            .grab_file_names(FileParams {
+                start: None,
+                end: None,
+                observations: None,
+                forecasts: None,
+            })
+            .await
+            .unwrap();
+        all.sort();
+        assert_eq!(
+            all,
+            vec![
+                "forecasts_2026-01-21T10:00:00Z.parquet",
+                "observations_2026-01-21T10:00:00Z.parquet"
+            ]
+        );
+        let forecasts = access
+            .grab_file_names(FileParams {
+                start: Some(OffsetDateTime::parse("2026-01-21T00:00:00Z", &Rfc3339).unwrap()),
+                end: Some(OffsetDateTime::parse("2026-01-22T00:00:00Z", &Rfc3339).unwrap()),
+                observations: Some(false),
+                forecasts: Some(true),
+            })
+            .await
+            .unwrap();
+        assert_eq!(forecasts, vec!["forecasts_2026-01-21T10:00:00Z.parquet"]);
+        let paths = access.build_file_paths(forecasts);
+        assert_eq!(
+            paths,
+            vec![format!(
+                "{}/2026-01-21/forecasts_2026-01-21T10:00:00Z.parquet",
+                directory.path().display()
+            )]
+        );
     }
 }

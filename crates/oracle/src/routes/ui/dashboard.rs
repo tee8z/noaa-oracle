@@ -6,18 +6,17 @@ use axum::{
     response::Html,
 };
 use serde::Deserialize;
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use std::collections::HashMap;
 
 use crate::{
-    db::EventStatus,
-    templates::{
-        dashboard_page,
-        pages::dashboard::{dashboard_content, DashboardData},
-        EventStats, WeatherDisplay,
-    },
     AppState, ForecastRequest, ObservationRequest, TemperatureUnit,
+    events::EventStatus,
+    templates::{
+        EventStats, WeatherDisplay, dashboard_page,
+        pages::dashboard::{DashboardData, dashboard_content},
+    },
 };
 
 #[derive(Debug, Deserialize, Default)]
@@ -70,7 +69,7 @@ async fn build_dashboard_data(
     // Get event statistics
     let events = state
         .oracle
-        .list_events(crate::db::EventFilter::default())
+        .list_events(crate::events::EventFilter::default())
         .await
         .unwrap_or_default();
 
@@ -247,12 +246,6 @@ async fn get_latest_weather(
     // Get station names for lookup
     let all_stations = state.weather_db.stations().await.unwrap_or_default();
 
-    // Current time for "updated_at" field
-    let now = OffsetDateTime::now_utc();
-    let updated_at = now
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default();
-
     // First, try to get data for major airports
     let mut weather_data: Vec<WeatherDisplay> = Vec::new();
 
@@ -276,7 +269,6 @@ async fn get_latest_weather(
                 snow_amt: obs.snow_amt,
                 observed_start: obs.start_time.clone(),
                 observed_end: obs.end_time.clone(),
-                updated_at: updated_at.clone(),
                 latitude: station.map(|s| s.latitude).unwrap_or(0.0),
                 longitude: station.map(|s| s.longitude).unwrap_or(0.0),
                 forecast_high: None,
@@ -360,7 +352,6 @@ async fn get_latest_weather(
                 snow_amt: obs.snow_amt,
                 observed_start: obs.start_time,
                 observed_end: obs.end_time,
-                updated_at: updated_at.clone(),
                 latitude: station.map(|s| s.latitude).unwrap_or(0.0),
                 longitude: station.map(|s| s.longitude).unwrap_or(0.0),
                 forecast_high: None,

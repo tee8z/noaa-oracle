@@ -1,4 +1,4 @@
-use maud::{html, Markup};
+use maud::{Markup, html};
 
 use crate::templates::layouts::CurrentPage;
 

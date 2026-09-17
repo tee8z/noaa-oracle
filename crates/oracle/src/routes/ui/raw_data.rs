@@ -3,8 +3,8 @@ use std::sync::Arc;
 use axum::{extract::State, http::HeaderMap, response::Html};
 
 use crate::{
-    templates::{pages::raw_data::raw_data_content, raw_data_page},
     AppState,
+    templates::{pages::raw_data::raw_data_content, raw_data_page},
 };
 
 /// Handler for the raw data page (GET /raw)

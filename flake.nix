@@ -19,31 +19,33 @@
           inherit system overlays;
         };
 
-        # Use latest stable Rust
-        rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-          extensions = [ "rust-src" "rust-analyzer" ];
+        # One toolchain for rustup and Nix: rust-toolchain.toml selects the
+        # channel, profile, and components.
+        rustToolchain = (pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml).override {
+          extensions = [ "clippy" "rustfmt" "rust-src" "rust-analyzer" ];
         };
 
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        # DuckDB version
-        duckdbVersion = "1.1.3";
+        # DuckDB library version. Keep in step with the `duckdb` crate in
+        # crates/oracle/Cargo.toml: duckdb-rs 1.MMmmpp.x binds DuckDB MM.mm.pp.
+        duckdbVersion = "1.5.5";
 
         # Architecture-specific DuckDB download
-        duckdbArch = if system == "aarch64-linux" then "aarch64"
+        duckdbArch = if system == "aarch64-linux" then "arm64"
                      else if system == "x86_64-linux" then "amd64"
                      else if system == "aarch64-darwin" then "osx-universal"
                      else if system == "x86_64-darwin" then "osx-universal"
                      else throw "Unsupported system: ${system}";
 
-        duckdbUrl = if pkgs.stdenv.isDarwin
+        duckdbUrl = if pkgs.stdenv.hostPlatform.isDarwin
           then "https://github.com/duckdb/duckdb/releases/download/v${duckdbVersion}/libduckdb-${duckdbArch}.zip"
           else "https://github.com/duckdb/duckdb/releases/download/v${duckdbVersion}/libduckdb-linux-${duckdbArch}.zip";
 
         # SHA256 hashes for each architecture (nix-prefetch-url output)
         duckdbSha256 = {
-          "x86_64-linux" = "02z4qwzxb5w0xmjrlxhz7zacrhbk1vbcl9pl70d98jbd3gq9n6c1";
-          "aarch64-linux" = "00bqmn5s2zhmglcjnfy93cxqdishskc3r9wr8fqvhsj54wvdnsch";
+          "x86_64-linux" = "1fvsdrvgv65k9f79c88q6800rw0baaiai1g6mcjlmn2ph4wcxf0z";
+          "aarch64-linux" = "174fiybszvkrgdiv8ymgdwdvvd446lkg88l30n5482zf0pqgdr5b";
           # Darwin hashes - will need to be updated if macOS support is needed
           "x86_64-darwin" = "0000000000000000000000000000000000000000000000000000";
           "aarch64-darwin" = "0000000000000000000000000000000000000000000000000000";
@@ -106,6 +108,7 @@
             (builtins.match ".*config/.*" path != null) ||
             (builtins.match ".*migrations/.*" path != null) ||
             (builtins.match ".*templates/.*" path != null) ||
+            (builtins.match ".*testdata/.*" path != null) ||
             (builtins.match ".*\.toml$" path != null);
         };
 
@@ -212,7 +215,7 @@
               "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
             ];
             ExposedPorts = {
-              "9100/tcp" = {};
+              "9800/tcp" = {};
             };
             WorkingDir = "/data";
             Volumes = {
@@ -318,6 +321,7 @@
             rustToolchain
             pkgs.just
             pkgs.cargo-edit
+            pkgs.cargo-machete
             pkgs.lld
             pkgs.stdenv.cc.cc.lib  # Provides libstdc++ for DuckDB
             # S3 and backup tools
@@ -349,7 +353,7 @@
             echo "  just build        - Build all crates"
             echo "  just run-oracle   - Run oracle server"
             echo "  just run-daemon   - Run data daemon"
-            echo "  just check        - Run fmt, clippy, tests"
+            echo "  just check        - Run fmt, clippy, tests, machete"
             echo ""
             echo "S3/Backup tools:"
             echo "  nix run .#moto       - Start moto S3 server"

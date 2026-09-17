@@ -1,78 +1,93 @@
+//! Shared fixtures: a temporary SQLite database with its writer, a fresh
+//! signing key, a router, and mocks for the file and weather layers.
+
 use async_trait::async_trait;
 use axum::Router;
-use log::{info, LevelFilter};
+use log::LevelFilter;
 use mockall::mock;
-use nostr_sdk::{
-    hashes::sha256::Hash as Sha256Hash,
-    nips::nip98::{HttpData, HttpMethod},
-    Event, EventBuilder, Keys, Url,
+use nostr::{
+    event::{Event, FinalizeEvent, IntoEventBuilder},
+    key::Keys,
+    nips::nip98::{HttpData, HttpMethod, Sha256Hash},
+    types::Url,
 };
 use oracle::{
-    app, create_folder, oracle::Oracle, setup_logger, AppState, Database, FileData, WeatherData,
+    AppState, Background, Database, FileData, WeatherData, app, oracle::Oracle, setup_logger,
 };
-use rand::Rng;
+use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    path::PathBuf,
     str::FromStr,
-    sync::{Arc, Mutex, Once},
+    sync::{Arc, Once},
 };
+use tokio_util::sync::CancellationToken;
 
 pub struct TestApp {
     pub app: Router,
     pub oracle: Arc<Oracle>,
+    pub state: Arc<AppState>,
+    _writer: WriterGuard,
+    _directory: tempfile::TempDir,
 }
+
+/// Stops the writer when the test ends so the temporary directory can go.
+struct WriterGuard(CancellationToken);
+
+impl Drop for WriterGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 static INIT_LOGGER: Once = Once::new();
 fn init_logger() {
     INIT_LOGGER.call_once(|| {
-        setup_logger().level(LevelFilter::Debug).apply().unwrap();
+        let _ = setup_logger().level(LevelFilter::Debug).apply();
     });
-}
-
-pub fn random_test_number() -> i32 {
-    let mut rng = rand::thread_rng();
-    rng.gen_range(10000..99999)
 }
 
 pub async fn spawn_app(weather_db: Arc<dyn WeatherData>) -> TestApp {
     init_logger();
-    create_folder("./test_data");
-    let random_test_number = random_test_number();
-    info!("test number: {}", random_test_number);
-    let test_folder = format!("./test_data/{}", random_test_number);
-    create_folder(&test_folder.clone());
-    let event_data = format!("{}/event_data", test_folder);
-    create_folder(&event_data.clone());
-
-    let db = Arc::new(Database::new(&event_data).await.unwrap());
-    let private_key_file_path = String::from("./oracle_private_key.pem");
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let (database, writer) = Database::open(&directory.path().join("event_data"))
+        .await
+        .expect("open database");
+    let shutdown = CancellationToken::new();
+    tokio::spawn(writer.run(shutdown.clone()));
+    let private_key_file_path = directory.path().join("oracle_private_key.pem");
     let oracle = Arc::new(
-        Oracle::new(db, weather_db.clone(), &private_key_file_path)
+        Oracle::new(database.clone(), weather_db.clone(), &private_key_file_path)
             .await
-            .unwrap(),
+            .expect("oracle"),
     );
-
-    let app_state = AppState {
-        static_dir: String::from("./static"),
-        remote_url: String::from("http://127.0.0.1:9100"),
+    let state = Arc::new(AppState::new(
+        String::from("http://127.0.0.1:9100"),
+        PathBuf::from("./static"),
+        Arc::new(MockFileAccess::new()),
         weather_db,
-        file_access: Arc::new(MockFileAccess::new()),
-        oracle: oracle.clone(),
-        forecast_cache: Arc::new(Mutex::new(HashMap::new())),
-    };
-    let app = app(app_state);
+        oracle.clone(),
+        database,
+        Background::new(),
+    ));
+    let app = app(state.clone());
 
-    TestApp { app, oracle }
+    TestApp {
+        app,
+        oracle,
+        state,
+        _writer: WriterGuard(shutdown),
+        _directory: directory,
+    }
 }
 
 mock! {
     pub FileAccess {}
     #[async_trait]
     impl FileData for FileAccess {
-        async fn grab_file_names(&self, params: oracle::FileParams) -> Result<Vec<String>, oracle::Error>;
-        fn current_folder(&self) -> String;
+        async fn grab_file_names(&self, params: oracle::FileParams) -> Result<Vec<String>, oracle::file_access::Error>;
         fn build_file_paths(&self, file_names: Vec<String>) -> Vec<String>;
-        fn build_file_path(&self, filename: &str, file_generated_at: time::OffsetDateTime) -> String;
-        async fn download_file(&self, filename: &str, file_generated_at: time::OffsetDateTime) -> Result<axum::body::Body, oracle::Error>;
+        fn build_file_path(&self, file: &oracle::ParquetFileName) -> String;
+        async fn download_file(&self, file: &oracle::ParquetFileName) -> Result<axum::body::Body, oracle::file_access::Error>;
     }
 }
 
@@ -99,7 +114,13 @@ mock! {
     }
 }
 
-pub async fn create_auth_event(
+/// NIP-98 payload tag: the SHA-256 of the request body.
+pub fn payload_hash(body: &[u8]) -> Sha256Hash {
+    Sha256Hash::from_byte_array(Sha256::digest(body).into())
+}
+
+/// Signs a NIP-98 event the way the coordinator's client does.
+pub fn create_auth_event(
     method: &str,
     url: &str,
     payload_hash: Option<Sha256Hash>,
@@ -113,7 +134,8 @@ pub async fn create_auth_event(
         http_data = http_data.payload(hash);
     }
 
-    EventBuilder::http_auth(http_data)
-        .sign_with_keys(keys)
+    http_data
+        .into_event_builder()
+        .finalize(keys)
         .expect("Failed to sign event")
 }

@@ -13,20 +13,33 @@ A data pipeline system that fetches weather data from NOAA and serves it via a R
 
 **Components:**
 - **daemon** - Background process that pulls data from NOAA, transforms it into parquet files, and pushes to the oracle
-- **oracle** - REST API that stores parquet files, serves them via browser UI, and provides DLC attestation
+- **oracle** - REST API that stores parquet files, serves them via browser UI, tracks DLC events in SQLite, and signs attestations
 - **ui** - Browser interface using DuckDB-WASM for client-side querying of parquet files
 - **core** - Shared library for configuration loading and utilities
+
+**Event storage:** the oracle keeps DLC events in one SQLite database. A
+single writer task owns the only writable connection and runs commands from
+a bounded queue; HTTP handlers read through a read-only pool and receive a
+reply only after a commit. A full queue answers HTTP 503 so the coordinator
+retries later. On shutdown the oracle stops readiness, drains HTTP and
+background work, then drains and closes the writer. Litestream (optional)
+replicates the file asynchronously, so a successful write confirms a local
+commit only. See [docs/quality.md](docs/quality.md).
 
 ## Quick Start
 
 ### Using Nix (Recommended)
+
+`rust-toolchain.toml` pins the Rust toolchain for both rustup and the Nix
+shell, and the flake provides the DuckDB library version the `duckdb` crate
+expects.
 
 ```bash
 # Enter development shell
 nix develop
 
 # Build both binaries
-cargo build --workspace
+cargo build --workspace --locked
 
 # Or use just commands
 just build
@@ -34,7 +47,7 @@ just build
 
 ### Without Nix
 
-The oracle crate links against the DuckDB C library. Download the library from [DuckDB releases](https://github.com/duckdb/duckdb/releases) (e.g., `libduckdb-linux-amd64.zip`) and point to it:
+The oracle crate links against the DuckDB C library. Download the library matching the `duckdb` crate version in `crates/oracle/Cargo.toml` from [DuckDB releases](https://github.com/duckdb/duckdb/releases) (e.g., `libduckdb-linux-amd64.zip`) and point to it:
 
 ```bash
 # Extract and set environment variables
@@ -80,14 +93,22 @@ port = "9800"
 log_level = "info"
 
 # Path to weather data (parquet files)
-weather_dir = "/var/lib/noaa-oracle/weather"
+data_dir = "/var/lib/noaa-oracle/weather"
+
+# Directory holding events.sqlite
+event_db = "/var/lib/noaa-oracle/events"
 
 # Path to UI files
-ui_path = "/var/lib/noaa-oracle/ui"
+ui_dir = "/usr/share/noaa-oracle/ui"
 
 # Oracle private key for DLC attestation
-oracle_private_key = "/etc/noaa-oracle/oracle.pem"
+private_key_path = "/etc/noaa-oracle/keys/oracle.pem"
+
+# Seconds to finish requests and accepted writes after SIGTERM
+shutdown_timeout = 25
 ```
+
+`GET /health` reports readiness (writer available and a database read succeeds) and turns 503 during shutdown; `GET /healthy` reports HTTP liveness only.
 
 ### Daemon Configuration
 
@@ -146,15 +167,19 @@ nix develop
 # Format code
 just fmt
 
-# Run clippy
-just clippy
+# Local gate: fmt-check, clippy -D warnings, tests, cargo-machete
+just check
 
-# Run tests
-just test
+# Only the oracle HTTP API tests
+just test-api
 
-# Build release
-just release
+# Playwright UI tests against fixture data
+just test-ui
 ```
+
+Tests use temporary SQLite databases and generated keys; nothing outside the
+repository is touched. Conventions for changes live in
+[docs/quality.md](docs/quality.md).
 
 ## Data Sources
 

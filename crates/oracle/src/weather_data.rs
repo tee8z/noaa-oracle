@@ -1,17 +1,21 @@
+//! Weather queries over parquet files with an in-process DuckDB connection.
+//!
+//! Every query opens a fresh in-memory connection, so there is no shared
+//! state or locking between requests. Station ids and file names are
+//! validated before they are interpolated into SQL.
+
 use crate::{
-    file_access, FileAccess, FileData, FileParams, ForecastRequest, ObservationRequest,
-    TemperatureUnit,
+    file_access::{self, FileData, FileParams},
+    routes::{ForecastRequest, ObservationRequest, TemperatureUnit},
 };
 use async_trait::async_trait;
 use duckdb::{
+    Connection,
     arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray},
-    params_from_iter, Connection,
 };
-use regex::Regex;
-use scooby::postgres::Select;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime, Time};
+use time::{Duration, OffsetDateTime, Time, format_description::well_known::Rfc3339};
 use utoipa::ToSchema;
 
 pub struct WeatherAccess {
@@ -28,6 +32,49 @@ pub enum Error {
     TimeParse(#[from] time::error::Parse),
     #[error("Failed to access files: {0}")]
     FileAccess(#[from] file_access::Error),
+    #[error("Invalid station id: {0:?}")]
+    InvalidStationId(String),
+}
+
+const MAX_STATION_ID_LENGTH: usize = 16;
+
+/// Station ids come from query strings and event definitions. Only ASCII
+/// letters, digits, `-` and `_` are accepted so they can be quoted into SQL.
+pub fn validate_station_id(station_id: &str) -> Result<(), Error> {
+    let valid = !station_id.is_empty()
+        && station_id.len() <= MAX_STATION_ID_LENGTH
+        && station_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::InvalidStationId(station_id.to_string()))
+    }
+}
+
+/// `WHERE station_id IN (...)` for the requested stations, or an empty
+/// string when no filter applies.
+fn station_filter(station_ids: &[String]) -> Result<String, Error> {
+    if station_ids.is_empty() {
+        return Ok(String::new());
+    }
+    for station_id in station_ids {
+        validate_station_id(station_id)?;
+    }
+    Ok(format!(
+        "WHERE station_id IN ({})",
+        sql_string_list(station_ids)
+    ))
+}
+
+/// Quotes values as a comma separated SQL string list.
+fn sql_string_list(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| format!("'{}'", value.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[async_trait]
@@ -60,29 +107,15 @@ pub fn convert_temperature(value: f64, from_unit: &str, to_unit: &TemperatureUni
 }
 
 impl WeatherAccess {
-    pub fn new(file_access: Arc<FileAccess>) -> Result<Self, duckdb::Error> {
-        Ok(Self { file_access })
+    pub fn new(file_access: Arc<dyn FileData>) -> Self {
+        Self { file_access }
     }
 
     /// Creates new in-memory connection, making it so we always start with a fresh slate and no possible locking issues
-    pub fn open_connection(&self) -> Result<Connection, duckdb::Error> {
+    fn open_connection(&self) -> Result<Connection, duckdb::Error> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("INSTALL parquet; LOAD parquet;")?;
         Ok(conn)
-    }
-
-    pub async fn query(
-        &self,
-        select: Select,
-        params: Vec<String>,
-    ) -> Result<Vec<RecordBatch>, duckdb::Error> {
-        let re = Regex::new(r"\$(\d+)").unwrap();
-        let binding = select.to_string();
-        let fixed_params = re.replace_all(&binding, "?");
-        let conn = self.open_connection()?;
-        let mut stmt = conn.prepare(&fixed_params)?;
-        let sql_params = params_from_iter(params.iter());
-        Ok(stmt.query_arrow(sql_params)?.collect())
     }
 }
 #[async_trait]
@@ -92,6 +125,7 @@ impl WeatherData for WeatherAccess {
         req: &ForecastRequest,
         station_ids: Vec<String>,
     ) -> Result<Vec<Forecast>, Error> {
+        let station_filter = station_filter(&station_ids)?;
         // If start is provided, look back one day to ensure we capture relevant files
         // If start is None, keep it None to find all available data
         let mut file_params: FileParams = req.into();
@@ -103,14 +137,6 @@ impl WeatherData for WeatherAccess {
         if file_paths.is_empty() {
             return Ok(vec![]);
         }
-
-        // Build station filter clause
-        let station_filter = if !station_ids.is_empty() {
-            let quoted: Vec<String> = station_ids.iter().map(|s| format!("'{}'", s)).collect();
-            format!("WHERE station_id IN ({})", quoted.join(", "))
-        } else {
-            String::new()
-        };
 
         // Build time filter clauses for forecast period (begin_time/end_time)
         let mut time_filters = Vec::new();
@@ -207,7 +233,7 @@ impl WeatherData for WeatherAccess {
                            NULL::VARCHAR AS generated_at
                     WHERE false
                     UNION ALL BY NAME
-                    SELECT * FROM read_parquet(['{}'], union_by_name = true)
+                    SELECT * FROM read_parquet([{}], union_by_name = true)
                 )
             ),
             -- Deduplicate: for each station + time window (normalized to UTC), take the most recent forecast
@@ -400,7 +426,7 @@ impl WeatherData for WeatherAccess {
             LEFT JOIN daily_precip dp ON df.station_id = dp.station_id AND df.date = dp.date
             GROUP BY df.station_id, df.date, dp.total_qpf, dp.snow_amt, dp.avg_snow_ratio, dp.ice_amt
             "#,
-            file_paths.join("', '"),
+            sql_string_list(&file_paths),
             station_filter,
             time_filter,
             start_time_expr,
@@ -428,6 +454,7 @@ impl WeatherData for WeatherAccess {
         req: &ObservationRequest,
         station_ids: Vec<String>,
     ) -> Result<Vec<Observation>, Error> {
+        let station_filter = station_filter(&station_ids)?;
         // If start is provided, look back one day to ensure we capture relevant files
         // If start is None, keep it None to find all available data
         let mut file_params: FileParams = req.into();
@@ -440,18 +467,6 @@ impl WeatherData for WeatherAccess {
         if file_paths.is_empty() {
             return Ok(vec![]);
         }
-
-        if file_paths.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Build station filter clause
-        let station_filter = if !station_ids.is_empty() {
-            let quoted: Vec<String> = station_ids.iter().map(|s| format!("'{}'", s)).collect();
-            format!("WHERE station_id IN ({})", quoted.join(", "))
-        } else {
-            String::new()
-        };
 
         // Build time filter clauses
         let mut time_filters = Vec::new();
@@ -507,7 +522,7 @@ impl WeatherData for WeatherAccess {
                            NULL::VARCHAR AS wx_string
                     WHERE false
                     UNION ALL BY NAME
-                    SELECT * FROM read_parquet(['{}'], union_by_name = true)
+                    SELECT * FROM read_parquet([{}], union_by_name = true)
                 )
                 {} {}
             ),
@@ -553,7 +568,7 @@ impl WeatherData for WeatherAccess {
             FROM classified
             GROUP BY station_id
             "#,
-            file_paths.join("', '"),
+            sql_string_list(&file_paths),
             station_filter,
             time_filter,
             start_time_expr,
@@ -578,6 +593,7 @@ impl WeatherData for WeatherAccess {
         req: &ObservationRequest,
         station_ids: Vec<String>,
     ) -> Result<Vec<DailyObservation>, Error> {
+        let station_filter = station_filter(&station_ids)?;
         let mut file_params: FileParams = req.into();
         if let Some(start_date) = req.start {
             file_params.start = Some(start_date.saturating_sub(Duration::days(1)));
@@ -588,14 +604,6 @@ impl WeatherData for WeatherAccess {
         if file_paths.is_empty() {
             return Ok(vec![]);
         }
-
-        // Build station filter clause
-        let station_filter = if !station_ids.is_empty() {
-            let quoted: Vec<String> = station_ids.iter().map(|s| format!("'{}'", s)).collect();
-            format!("WHERE station_id IN ({})", quoted.join(", "))
-        } else {
-            String::new()
-        };
 
         // Build time filter clauses
         let mut time_filters = Vec::new();
@@ -634,7 +642,7 @@ impl WeatherData for WeatherAccess {
                            NULL::VARCHAR AS wx_string
                     WHERE false
                     UNION ALL BY NAME
-                    SELECT * FROM read_parquet(['{}'], union_by_name = true)
+                    SELECT * FROM read_parquet([{}], union_by_name = true)
                 )
                 {} {}
             ),
@@ -672,7 +680,7 @@ impl WeatherData for WeatherAccess {
             FROM classified
             GROUP BY station_id, DATE_TRUNC('day', generated_at::TIMESTAMP)::TEXT
             "#,
-            file_paths.join("', '"),
+            sql_string_list(&file_paths),
             station_filter,
             time_filter,
         );
@@ -726,13 +734,12 @@ impl WeatherData for WeatherAccess {
                        NULL::DOUBLE AS elevation_m, NULL::DOUBLE AS latitude, NULL::DOUBLE AS longitude
                 WHERE false
                 UNION ALL BY NAME
-                SELECT * FROM read_parquet(['{}'], union_by_name = true)
+                SELECT * FROM read_parquet([{}], union_by_name = true)
             )
             "#,
-            file_paths.join("', '")
+            sql_string_list(&file_paths)
         );
 
-        // Execute raw SQL directly since we're not using the scooby builder
         let conn = self.open_connection()?;
         let mut stmt = conn.prepare(&query_sql)?;
         let records: Vec<RecordBatch> = stmt.query_arrow([])?.collect();
@@ -926,11 +933,7 @@ impl Forecasts {
                 None
             } else {
                 let val = rain_amt_arr.value(row_index);
-                if val >= 0.0 {
-                    Some(val)
-                } else {
-                    None
-                }
+                if val >= 0.0 { Some(val) } else { None }
             };
 
             // Snow amount in inches
@@ -938,11 +941,7 @@ impl Forecasts {
                 None
             } else {
                 let val = snow_amt_arr.value(row_index);
-                if val >= 0.0 {
-                    Some(val)
-                } else {
-                    None
-                }
+                if val >= 0.0 { Some(val) } else { None }
             };
 
             // Ice amount in inches
@@ -950,11 +949,7 @@ impl Forecasts {
                 None
             } else {
                 let val = ice_amt_arr.value(row_index);
-                if val >= 0.0 {
-                    Some(val)
-                } else {
-                    None
-                }
+                if val >= 0.0 { Some(val) } else { None }
             };
 
             let mut forecast = Forecast {
@@ -1157,33 +1152,21 @@ impl Observations {
                 None
             } else {
                 let val = rain_amt_arr.value(row_index);
-                if val >= 0.0 {
-                    Some(val)
-                } else {
-                    None
-                }
+                if val >= 0.0 { Some(val) } else { None }
             };
 
             let snow_amt = if snow_amt_arr.is_null(row_index) {
                 None
             } else {
                 let val = snow_amt_arr.value(row_index);
-                if val >= 0.0 {
-                    Some(val)
-                } else {
-                    None
-                }
+                if val >= 0.0 { Some(val) } else { None }
             };
 
             let ice_amt = if ice_amt_arr.is_null(row_index) {
                 None
             } else {
                 let val = ice_amt_arr.value(row_index);
-                if val >= 0.0 {
-                    Some(val)
-                } else {
-                    None
-                }
+                if val >= 0.0 { Some(val) } else { None }
             };
 
             let mut observation = Observation {
@@ -1423,33 +1406,21 @@ impl DailyObservations {
                 None
             } else {
                 let val = rain_amt_arr.value(row_index);
-                if val >= 0.0 {
-                    Some(val)
-                } else {
-                    None
-                }
+                if val >= 0.0 { Some(val) } else { None }
             };
 
             let snow_amt = if snow_amt_arr.is_null(row_index) {
                 None
             } else {
                 let val = snow_amt_arr.value(row_index);
-                if val >= 0.0 {
-                    Some(val)
-                } else {
-                    None
-                }
+                if val >= 0.0 { Some(val) } else { None }
             };
 
             let ice_amt = if ice_amt_arr.is_null(row_index) {
                 None
             } else {
                 let val = ice_amt_arr.value(row_index);
-                if val >= 0.0 {
-                    Some(val)
-                } else {
-                    None
-                }
+                if val >= 0.0 { Some(val) } else { None }
             };
 
             let mut observation = DailyObservation {
@@ -1566,4 +1537,40 @@ pub struct Station {
     pub elevation_m: Option<f64>,
     pub latitude: f64,
     pub longitude: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn station_ids_are_validated_before_reaching_sql() {
+        for valid in ["KORD", "PFNO", "K1G3", "station_1", "abc-def"] {
+            assert!(validate_station_id(valid).is_ok(), "{valid}");
+        }
+        for invalid in [
+            "",
+            "KORD'",
+            "KORD') OR 1=1 --",
+            "K ORD",
+            "K;ORD",
+            "ABCDEFGHIJKLMNOPQ",
+        ] {
+            assert!(validate_station_id(invalid).is_err(), "{invalid}");
+        }
+        assert!(station_filter(&["KORD".into(), "bad'id".into()]).is_err());
+        assert_eq!(
+            station_filter(&["KORD".into(), "KSAW".into()]).unwrap(),
+            "WHERE station_id IN ('KORD', 'KSAW')"
+        );
+        assert_eq!(station_filter(&[]).unwrap(), "");
+    }
+
+    #[test]
+    fn sql_string_lists_escape_quotes() {
+        assert_eq!(
+            sql_string_list(&["a".into(), "it's".into()]),
+            "'a', 'it''s'"
+        );
+    }
 }

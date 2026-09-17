@@ -1,8 +1,8 @@
-use maud::{html, Markup};
+use maud::{Markup, html};
 
 use crate::templates::{
-    fragments::{event_stats, oracle_info, weather_table, EventStats, WeatherDisplay},
-    layouts::{base, CurrentPage, PageConfig},
+    fragments::{EventStats, WeatherDisplay, event_stats, oracle_info, weather_table},
+    layouts::{CurrentPage, PageConfig, base},
 };
 
 /// Dashboard page data

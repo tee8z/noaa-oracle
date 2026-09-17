@@ -7,7 +7,7 @@ use axum::{
 };
 use uuid::Uuid;
 
-use crate::{templates::event_detail_page, AppState};
+use crate::{AppState, templates::event_detail_page};
 
 /// Handler for the event detail page (GET /events/{id})
 pub async fn event_detail_handler(

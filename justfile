@@ -19,62 +19,59 @@ dev:
 build:
     #!/usr/bin/env bash
     if [ -n "$IN_NIX_SHELL" ]; then
-        cargo build --workspace
+        cargo build --workspace --locked
     else
-        nix develop -c cargo build --workspace
+        nix develop -c cargo build --workspace --locked
     fi
 
 # Build in release mode
 build-release:
     #!/usr/bin/env bash
     if [ -n "$IN_NIX_SHELL" ]; then
-        cargo build --workspace --release
+        cargo build --workspace --release --locked
     else
-        nix develop -c cargo build --workspace --release
+        nix develop -c cargo build --workspace --release --locked
     fi
 
 # Build oracle only
 build-oracle:
     #!/usr/bin/env bash
     if [ -n "$IN_NIX_SHELL" ]; then
-        cargo build -p oracle
+        cargo build -p oracle --locked
     else
-        nix develop -c cargo build -p oracle
+        nix develop -c cargo build -p oracle --locked
     fi
 
 # Build daemon only
 build-daemon:
     #!/usr/bin/env bash
     if [ -n "$IN_NIX_SHELL" ]; then
-        cargo build -p daemon
+        cargo build -p daemon --locked
     else
-        nix develop -c cargo build -p daemon
+        nix develop -c cargo build -p daemon --locked
     fi
 
 # =============================================================================
 # Testing & Linting
 # =============================================================================
 
-# Run all tests (unit tests only, use test-e2e for integration tests)
+# Run unit and API tests; each test uses its own temporary SQLite database
 test:
     #!/usr/bin/env bash
     if [ -n "$IN_NIX_SHELL" ]; then
-        cargo test --workspace --lib
+        cargo test --workspace --locked
     else
-        nix develop -c cargo test --workspace --lib
+        nix develop -c cargo test --workspace --locked
     fi
 
-# Run e2e/integration tests (requires test environment setup)
-test-e2e:
+# Run only the oracle HTTP API tests
+test-api:
     #!/usr/bin/env bash
     if [ -n "$IN_NIX_SHELL" ]; then
-        cargo test --package oracle --test api -- --test-threads=1
+        cargo test --package oracle --test api --locked
     else
-        nix develop -c cargo test --package oracle --test api -- --test-threads=1
+        nix develop -c cargo test --package oracle --test api --locked
     fi
-
-# Run all tests including e2e
-test-all: test test-e2e
 
 # Run Playwright UI tests (uses fixtures data)
 test-ui:
@@ -102,9 +99,18 @@ test-ui-headed:
 clippy:
     #!/usr/bin/env bash
     if [ -n "$IN_NIX_SHELL" ]; then
-        cargo clippy --workspace --all-targets -- -D warnings
+        cargo clippy --workspace --all-targets --locked -- -D warnings
     else
-        nix develop -c cargo clippy --workspace --all-targets -- -D warnings
+        nix develop -c cargo clippy --workspace --all-targets --locked -- -D warnings
+    fi
+
+# Fail on dependencies that are declared but unused
+machete:
+    #!/usr/bin/env bash
+    if [ -n "$IN_NIX_SHELL" ]; then
+        cargo machete --with-metadata
+    else
+        nix develop -c cargo machete --with-metadata
     fi
 
 # Check formatting
@@ -125,8 +131,8 @@ fmt:
         nix develop -c cargo fmt --all
     fi
 
-# Run all checks (fmt, clippy, test)
-check: fmt-check clippy test
+# Local gate: formatting, Clippy, tests, and unused dependencies
+check: fmt-check clippy test machete
 
 # =============================================================================
 # Running Services
@@ -247,16 +253,12 @@ stop-daemon:
 clean:
     cargo clean
 
-# Clean test data
-clean-test:
-    rm -rf test_data/
-
 # Clean all data (weather, events, logs)
 clean-data:
     rm -rf weather_data/* event_data/* data/* logs/*
 
 # Clean everything (build, test data, runtime data)
-clean-all: clean clean-test clean-data
+clean-all: clean clean-data
     rm -rf result .direnv
 
 # =============================================================================

@@ -1,4 +1,4 @@
-use minify_js::{minify, Session, TopLevelMode};
+use minify_js::{Session, TopLevelMode, minify};
 use sha2::{Digest, Sha256};
 use std::{env, fs, path::Path};
 use walkdir::WalkDir;
@@ -82,11 +82,11 @@ fn build_css(templates: &Path, output: &Path) {
 
     // Base styles first (from templates directory, not output)
     let base = templates.join("styles.css");
-    if base.exists() {
-        if let Ok(content) = fs::read_to_string(&base) {
-            combined.push_str(&content);
-            combined.push('\n');
-        }
+    if base.exists()
+        && let Ok(content) = fs::read_to_string(&base)
+    {
+        combined.push_str(&content);
+        combined.push('\n');
     }
 
     // Then template CSS
@@ -131,7 +131,7 @@ fn build_css(templates: &Path, output: &Path) {
 }
 
 fn try_minify_js(source: &str) -> Option<String> {
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     let src = source.to_string();
     catch_unwind(AssertUnwindSafe(|| {
         let session = Session::new();
@@ -203,12 +203,12 @@ fn clean_old_hash_files(output: &Path, prefix: &str, suffix: &str, current_hash:
 /// Minifies and copies loader.js (not bundled with app.min.js)
 fn copy_loader(templates: &Path, output: &Path) {
     let loader = templates.join("loader.js");
-    if loader.exists() {
-        if let Ok(content) = fs::read_to_string(&loader) {
-            let minified = try_minify_js(&content).unwrap_or_else(|| content.clone());
-            let _ = fs::write(output.join("loader.js"), &minified);
-            println!("cargo:warning=Built loader.js ({} bytes)", minified.len());
-        }
+    if loader.exists()
+        && let Ok(content) = fs::read_to_string(&loader)
+    {
+        let minified = try_minify_js(&content).unwrap_or_else(|| content.clone());
+        let _ = fs::write(output.join("loader.js"), &minified);
+        println!("cargo:warning=Built loader.js ({} bytes)", minified.len());
     }
 }
 
@@ -230,16 +230,16 @@ fn copy_static_assets(templates: &Path, output: &Path) {
         let path = entry.path();
         println!("cargo:rerun-if-changed={}", path.display());
 
-        if let Some(filename) = path.file_name() {
-            if let Ok(content) = fs::read(path) {
-                let dest = output.join(filename);
-                let _ = fs::write(&dest, &content);
-                println!(
-                    "cargo:warning=Copied {} ({} bytes)",
-                    filename.to_string_lossy(),
-                    content.len()
-                );
-            }
+        if let Some(filename) = path.file_name()
+            && let Ok(content) = fs::read(path)
+        {
+            let dest = output.join(filename);
+            let _ = fs::write(&dest, &content);
+            println!(
+                "cargo:warning=Copied {} ({} bytes)",
+                filename.to_string_lossy(),
+                content.len()
+            );
         }
     }
 }

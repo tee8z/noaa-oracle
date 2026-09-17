@@ -1,19 +1,22 @@
-use ::serde::Deserialize;
 use axum::{
-    extract::{Query, State},
     Json,
+    extract::{Query, State},
 };
 use core::fmt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use time::OffsetDateTime;
 use utoipa::{IntoParams, ToSchema};
 
-use crate::{AppError, AppState, DailyObservation, FileParams, Forecast, Observation, Station};
+use crate::{
+    AppError, AppState,
+    file_access::FileParams,
+    weather_data::{DailyObservation, Forecast, Observation, Station},
+};
 
 #[utoipa::path(
     get,
-    path = "stations/forecasts",
+    path = "/stations/forecasts",
     params(
         ForecastRequest
     ),
@@ -59,11 +62,19 @@ pub struct ForecastRequest {
 
 impl ForecastRequest {
     pub fn station_ids(&self) -> Vec<String> {
-        self.station_ids
-            .split(',')
-            .map(|id| id.to_owned())
-            .collect()
+        split_station_ids(&self.station_ids)
     }
+}
+
+/// Splits a comma separated list, dropping blanks. Validation happens in
+/// the weather layer before any id reaches SQL.
+fn split_station_ids(station_ids: &str) -> Vec<String> {
+    station_ids
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 impl From<&ForecastRequest> for FileParams {
@@ -92,10 +103,7 @@ pub struct ObservationRequest {
 
 impl ObservationRequest {
     pub fn station_ids(&self) -> Vec<String> {
-        self.station_ids
-            .split(',')
-            .map(|id| id.to_owned())
-            .collect()
+        split_station_ids(&self.station_ids)
     }
 }
 
@@ -129,7 +137,7 @@ impl fmt::Display for TemperatureUnit {
 
 #[utoipa::path(
     get,
-    path = "stations/observations",
+    path = "/stations/observations",
     params(
         ObservationRequest
     ),
@@ -152,7 +160,7 @@ pub async fn observations(
 
 #[utoipa::path(
     get,
-    path = "stations/daily-observations",
+    path = "/stations/daily-observations",
     params(
         ObservationRequest
     ),
@@ -175,7 +183,7 @@ pub async fn daily_observations(
 
 #[utoipa::path(
     get,
-    path = "stations",
+    path = "/stations",
     responses(
         (status = OK, description = "Successfully retrieved weather stations", body = Vec<Station>),
         (status = INTERNAL_SERVER_ERROR, description = "Failed to retrieved weather stations from data")

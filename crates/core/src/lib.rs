@@ -9,7 +9,7 @@ mod config;
 pub mod fs;
 
 pub use config::{
-    find_config_file, get_xdg_cache_dir, get_xdg_data_dir, load_config, ConfigSource,
+    ConfigSource, find_config_file, get_xdg_cache_dir, get_xdg_data_dir, load_config,
 };
 pub use fs::{create_dir_all, ensure_dir_exists, is_directory, path_exists};
 

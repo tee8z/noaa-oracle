@@ -32,8 +32,7 @@ pub struct CurrentData {
     #[serde(rename = "METAR")]
     pub metar: Vec<Metar>,
 
-    // num_results is now an attribute on the data element, not a child element
-    #[serde(rename = "num_results", default)]
+    #[serde(rename = "@num_results", default)]
     pub num_results: Option<String>,
 }
 
@@ -85,4 +84,28 @@ pub struct QualityControlFlags {
     pub auto_station: Option<String>,
     #[serde(rename = "no_signal")]
     pub no_signal: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse_xml;
+
+    const METARS: &str = include_str!("testdata/metars.xml");
+
+    #[test]
+    fn parses_aviation_weather_metar_cache() {
+        let observations: ObservationData = parse_xml(METARS).unwrap();
+        assert_eq!(observations.data_source.name, "metar");
+        assert_eq!(observations.request.request_type, "retrieve");
+        assert_eq!(observations.data.num_results.as_deref(), Some("5074"));
+        assert_eq!(observations.data.metar.len(), 2);
+        let with_precip = &observations.data.metar[0];
+        assert_eq!(with_precip.station_id, "KBJJ");
+        assert!(with_precip.temp_c.is_some());
+        assert!(with_precip.precip_in.is_some());
+        assert!(with_precip.wx_string.is_some());
+        assert!(with_precip.observation_time.is_some());
+        assert!(observations.data.metar[1].precip_in.is_none());
+    }
 }
