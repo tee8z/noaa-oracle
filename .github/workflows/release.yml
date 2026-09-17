@@ -131,10 +131,11 @@ jobs:
           mkdir -p "${PKG_NAME}/bin"
           mkdir -p "${PKG_NAME}/config"
 
-          # Copy Nix-built binaries (preferred - fully static)
-          # Note: UI is embedded in the oracle binary, no separate files needed
-          cp result/bin/oracle "${PKG_NAME}/bin/"
+          # Copy the Nix-built binaries and the UI files the oracle serves from ui_dir
+cp result/bin/oracle "${PKG_NAME}/bin/"
           cp result-daemon/bin/daemon "${PKG_NAME}/bin/"
+          mkdir -p "${PKG_NAME}/static"
+          cp -r result/share/noaa-oracle/static/. "${PKG_NAME}/static/"
 
           # Copy and rename config examples to usable defaults
           cp config/oracle.example.toml "${PKG_NAME}/config/oracle.toml"
@@ -242,10 +243,13 @@ jobs:
           mkdir -p release
           mv "${PKG_NAME}.zip" release/
 
-          # Cargo binaries tarball (for users who prefer dynamic linking)
-          mkdir -p cargo-pkg/bin
+          # Cargo binaries tarball (for users who prefer dynamic linking).
+          # The oracle serves its UI from ui_dir (build.rs generates it; the
+          # Nix build installs a copy), so ship those files alongside.
+          mkdir -p cargo-pkg/bin cargo-pkg/static
           cp target/release/oracle cargo-pkg/bin/
           cp target/release/daemon cargo-pkg/bin/
+          cp -r result/share/noaa-oracle/static/. cargo-pkg/static/
           tar czf "release/noaa-oracle-${VERSION}-x86_64-linux-cargo.tar.gz" -C cargo-pkg .
           rm -rf cargo-pkg
 
