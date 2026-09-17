@@ -132,7 +132,7 @@ jobs:
           mkdir -p "${PKG_NAME}/config"
 
           # Copy the Nix-built binaries and the UI files the oracle serves from ui_dir
-cp result/bin/oracle "${PKG_NAME}/bin/"
+          cp result/bin/oracle "${PKG_NAME}/bin/"
           cp result-daemon/bin/daemon "${PKG_NAME}/bin/"
           mkdir -p "${PKG_NAME}/static"
           cp -r result/share/noaa-oracle/static/. "${PKG_NAME}/static/"
