@@ -169,6 +169,8 @@ spec:
         - name: keys
           secret:
             secretName: {{ include "noaa-oracle.fullname" $ }}-keys
+            # The oracle refuses a key readable by group or others.
+            defaultMode: 0400
         {{- end }}
         {{- if $.Values.devMode.enabled }}
         - name: dev-binary
@@ -353,6 +355,8 @@ spec:
         - name: keys
           secret:
             secretName: {{ include "noaa-oracle.fullname" . }}-keys
+            # The oracle refuses a key readable by group or others.
+            defaultMode: 0400
         {{- end }}
         {{- if .Values.devMode.enabled }}
         - name: dev-binary

@@ -38,8 +38,8 @@ pub struct WeatherQuery {
 
 /// Handler for oracle info fragment (GET /fragments/oracle-info)
 pub async fn oracle_info_handler(State(state): State<Arc<AppState>>) -> Html<String> {
-    let pubkey = state.oracle.public_key();
-    let npub = state.oracle.npub().unwrap_or_else(|_| "Error".to_string());
+    let pubkey = state.oracle.public_key_base64();
+    let npub = state.oracle.npub();
     Html(oracle_info(&pubkey, &npub).into_string())
 }
 

@@ -1,28 +1,44 @@
-//! Event domain types shared by the HTTP API, the database, and the ETL.
+//! Events: the coordinator wire contract and the validated domain forms.
 //!
-//! Wire shapes here are part of the coordinator contract: field names,
-//! optionality, and RFC 3339 dates must stay stable across releases.
+//! Wire shapes (`CreateEvent`, `AddEventEntry`, `Event`, `EventSummary`,
+//! `WeatherEntry`) are the coordinator contract: field names, optionality,
+//! and RFC 3339 dates stay stable; the contract test posts the
+//! coordinator's exact JSON. Choices arrive as NOAA-shaped
+//! [`WeatherChoices`] and are converted to source-independent [`Pick`]s at
+//! this boundary, so scoring and storage never see the wire shape.
+//!
+//! Every rule for a new event or its entries lives here, in
+//! [`NewEvent::build`] and [`validate_entries`].
 
-use anyhow::anyhow;
 use dlctix::{
-    EventLockingConditions, attestation_locking_point,
-    secp::{MaybeScalar, Point, Scalar},
+    EventLockingConditions,
+    secp::{MaybeScalar, Point},
 };
-use log::info;
 use nostr::{key::PublicKey as NostrPublicKey, nips::nip19::ToBech32};
 use serde::{Deserialize, Serialize};
-use time::{
-    Date, Duration, OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339,
-    macros::format_description,
-};
+use std::collections::HashSet;
+use time::{Duration, OffsetDateTime, UtcOffset};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
-use crate::weather_data::{self, Forecast, Observation};
+use crate::{
+    scoring::{self, Pick},
+    signing::{EventNonce, SigningKey},
+    sources::{OutcomeSource, Reading, SourceError, noaa},
+};
 
-mod outcomes;
-
-pub use outcomes::{generate_outcome_messages, generate_ranking_permutations};
+/// Entries an event may hold. Outcome enumeration grows as
+/// `entries! / (entries - places)!`, so this and [`MAX_OUTCOMES`] bound the
+/// work and storage one event can cost.
+pub const MAX_ENTRIES: usize = 25;
+pub const MAX_PLACES: usize = 5;
+/// Announced outcomes per event (25 entries with 3 places is 13,801).
+pub const MAX_OUTCOMES: usize = 20_000;
+pub const MAX_LOCATIONS: usize = 50;
+pub const MAX_LIST_LIMIT: usize = 100;
+/// Participants can claim a refund this long after the signing date if the
+/// oracle has not attested.
+const EXPIRY_AFTER_SIGNING: Duration = Duration::DAY;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateEvent {
@@ -32,262 +48,450 @@ pub struct CreateEvent {
     /// Time at which the attestation will be added to the event, needs to be after the end observation date
     pub signing_date: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
-    /// Time when the weather observations start, all entries must be made before this time, must be before the end observation date
+    /// Time when the weather observations start, must be before the end observation date
     pub start_observation_date: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
-    /// Time when the weather observations ends, must be before the signing date
+    /// Time when the weather observations end; entries must be submitted before this time
     pub end_observation_date: OffsetDateTime,
     /// NOAA observation stations used in this event
     pub locations: Vec<String>,
-    /// The number of values that can be selected per entry in the event (default to number_of_locations * 3, (temp_low, temp_high, wind_speed))
+    /// The number of values that can be selected per entry in the event
     pub number_of_values_per_entry: usize,
-    /// Total number of allowed entries into the event
+    /// Total number of allowed entries into the event (at most 25)
     pub total_allowed_entries: usize,
-    /// Total number of ranks can win (max 5 ranks)
-    pub number_of_places_win: i64,
-    /// Which weather fields to use for scoring. Defaults to ["temp_high", "temp_low", "wind_speed"] if not specified.
-    /// Available options: temp_high, temp_low, wind_speed, wind_direction, rain_amt, snow_amt, humidity
+    /// Number of ranks that win (1 to 5, fewer than the number of entries)
+    pub number_of_places_win: usize,
+    /// Which weather fields to use for scoring. Defaults to ["temp_high", "temp_low", "wind_speed"].
     #[serde(default = "ScoringField::defaults")]
     pub scoring_fields: Vec<ScoringField>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateEventData {
-    /// Provide UUIDv7 to use for looking up the event
-    pub id: Uuid,
-    #[serde(with = "time::serde::rfc3339")]
-    /// Time at which the attestation will be added to the event, needs to be after the end observation date
-    pub signing_date: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    /// Time when the weather observations start, all entries must be made before this time, must be before the end observation date
-    pub start_observation_date: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    /// Time when the weather observations ends, must be before the signing date
-    pub end_observation_date: OffsetDateTime,
-    // NOAA observation stations used in this event
-    pub locations: Vec<String>,
-    /// The number of values that can be selected per entry in the event (default to number_of_locations * 3, (temp_low, temp_high, wind_speed))
-    pub number_of_values_per_entry: i64,
-    /// Total number of allowed entries into the event
-    pub total_allowed_entries: i64,
-    /// Total number of ranks can win (max 5 ranks)
-    pub number_of_places_win: i64,
-    /// Used to sign the result of the event being watched
-    pub nonce: Scalar,
-    /// Used in constructing the dlctix transactions
-    pub event_announcement: EventLockingConditions,
-    /// The pubkey of the coordinator
-    pub coordinator_pubkey: String,
-    /// Which weather fields to use for scoring
-    pub scoring_fields: Vec<ScoringField>,
+#[derive(Debug, thiserror::Error)]
+pub enum EventRejection {
+    #[error("event id {0} is not a UUIDv7")]
+    NotUuidV7(Uuid),
+    #[error("observation start must be before its end, and the end no later than the signing date")]
+    DatesOutOfOrder,
+    #[error("signing date is outside the DLC expiry range")]
+    ExpiryOutOfRange,
+    #[error("total_allowed_entries must be between 2 and {MAX_ENTRIES}, requested {0}")]
+    Entries(usize),
+    #[error(
+        "number_of_places_win must be between 1 and {MAX_PLACES} and fewer than the entries, requested {0}"
+    )]
+    Places(usize),
+    #[error(
+        "{entries} entries with {places} places produce too many outcomes (max {MAX_OUTCOMES})"
+    )]
+    TooManyOutcomes { entries: usize, places: usize },
+    #[error("an event needs between 1 and {MAX_LOCATIONS} distinct locations")]
+    Locations,
+    #[error(transparent)]
+    InvalidLocation(SourceError),
+    #[error("at least one scoring field is required and each may appear once")]
+    ScoringFields,
+    #[error("number_of_values_per_entry must be between 1 and {max}, requested {requested}")]
+    ValuesPerEntry { requested: usize, max: usize },
 }
 
-impl CreateEventData {
-    pub fn new(
-        oracle_pubkey: Point,
-        coordinator_pubkey: NostrPublicKey,
+#[derive(Debug, thiserror::Error)]
+pub enum EntryRejection {
+    #[error("entry id {0} is not a UUIDv7")]
+    NotUuidV7(Uuid),
+    #[error("entry {entry} belongs to event {actual}, not {expected}")]
+    WrongEvent {
+        entry: Uuid,
+        expected: Uuid,
+        actual: Uuid,
+    },
+    #[error("entry id {0} appears more than once")]
+    DuplicateEntry(Uuid),
+    #[error("the event needs exactly {expected} entries, received {received}")]
+    Count { expected: usize, received: usize },
+    #[error("entries are only accepted before the observation window ends")]
+    Closed,
+    #[error("entries were already submitted for this event")]
+    AlreadySubmitted,
+    #[error("entry {0} must make between 1 and {1} picks")]
+    PickCount(Uuid, usize),
+    #[error("entry {entry} picks location {location:?}, which is not in the event")]
+    UnknownLocation { entry: Uuid, location: String },
+    #[error("entry {entry} picks {field}, which the event does not score")]
+    UnscoredField { entry: Uuid, field: String },
+    #[error("entry {entry} picks {field} at {location:?} twice")]
+    DuplicatePick {
+        entry: Uuid,
+        location: String,
+        field: String,
+    },
+}
+
+/// A validated event with its announcement, ready to store.
+#[derive(Debug, Clone)]
+pub struct NewEvent {
+    pub id: Uuid,
+    pub source: String,
+    pub signing_date: OffsetDateTime,
+    pub start_observation_date: OffsetDateTime,
+    pub end_observation_date: OffsetDateTime,
+    pub locations: Vec<String>,
+    pub metrics: Vec<String>,
+    pub number_of_values_per_entry: usize,
+    pub total_allowed_entries: usize,
+    pub number_of_places_win: usize,
+    pub nonce: EventNonce,
+    pub event_announcement: EventLockingConditions,
+    /// The coordinator's npub.
+    pub coordinator_pubkey: String,
+}
+
+impl NewEvent {
+    /// Validates `event` for `source` and computes its announcement: one
+    /// locking point per ranking outcome plus the refund-all outcome, in
+    /// the order the coordinator also generates. CPU-bound; call it off the
+    /// async runtime.
+    pub fn build(
         event: CreateEvent,
-    ) -> Result<Self, anyhow::Error> {
+        source: &dyn OutcomeSource,
+        key: &SigningKey,
+        coordinator: NostrPublicKey,
+    ) -> Result<Self, EventRejection> {
         if event.id.get_version_num() != 7 {
-            return Err(anyhow!(
-                "Client needs to provide a valid Uuidv7 for event id {}",
-                event.id
-            ));
+            return Err(EventRejection::NotUuidV7(event.id));
         }
-        if event.start_observation_date > event.end_observation_date {
-            return Err(anyhow!(
-                "Start observation date {} needs to be after end observation date {}",
-                event.signing_date.format(&Rfc3339)?,
-                event.end_observation_date.format(&Rfc3339)?
-            ));
+        if event.start_observation_date >= event.end_observation_date
+            || event.end_observation_date > event.signing_date
+        {
+            return Err(EventRejection::DatesOutOfOrder);
         }
-        if event.end_observation_date > event.signing_date {
-            return Err(anyhow!(
-                "Signing date {} needs to be after end observation date {}",
-                event.signing_date.format(&Rfc3339)?,
-                event.end_observation_date.format(&Rfc3339)?
-            ));
+        let entries = event.total_allowed_entries;
+        let places = event.number_of_places_win;
+        if !(2..=MAX_ENTRIES).contains(&entries) {
+            return Err(EventRejection::Entries(entries));
         }
-        if event.number_of_places_win > 5 {
-            return Err(anyhow!(
-                "Number of ranks can not be larger than 5, requested {}",
-                event.number_of_places_win
-            ));
+        // Places equal to entries would collide with the refund-all outcome.
+        if places == 0 || places > MAX_PLACES || places >= entries {
+            return Err(EventRejection::Places(places));
         }
-        if event.scoring_fields.is_empty() {
-            return Err(anyhow!("At least one scoring field must be selected"));
+        if scoring::outcome_count(entries, places).is_none_or(|count| count > MAX_OUTCOMES) {
+            return Err(EventRejection::TooManyOutcomes { entries, places });
         }
-        let number_of_places_win = usize::try_from(event.number_of_places_win)
-            .map_err(|_| anyhow!("Number of ranks must not be negative"))?;
-        let possible_user_outcomes: Vec<Vec<usize>> =
-            generate_ranking_permutations(event.total_allowed_entries, number_of_places_win);
-        info!("user outcomes: {:?}", possible_user_outcomes);
-
-        let outcome_messages: Vec<Vec<u8>> = generate_outcome_messages(possible_user_outcomes);
-
-        let nonce = Scalar::random(&mut rand::rng());
-        let nonce_point = nonce.base_point_mul();
-
-        // Manually set expiry to 1 day after the signature should have been provided so users can get their funds back
+        let distinct_locations: HashSet<&String> = event.locations.iter().collect();
+        if event.locations.is_empty()
+            || event.locations.len() > MAX_LOCATIONS
+            || distinct_locations.len() != event.locations.len()
+        {
+            return Err(EventRejection::Locations);
+        }
+        for location in &event.locations {
+            source
+                .validate_target(location)
+                .map_err(EventRejection::InvalidLocation)?;
+        }
+        let distinct_fields: HashSet<&ScoringField> = event.scoring_fields.iter().collect();
+        if event.scoring_fields.is_empty() || distinct_fields.len() != event.scoring_fields.len() {
+            return Err(EventRejection::ScoringFields);
+        }
+        let metrics: Vec<String> = event
+            .scoring_fields
+            .iter()
+            .map(|field| field.as_str().to_owned())
+            .collect();
+        if metrics.iter().any(|metric| source.metric(metric).is_none()) {
+            return Err(EventRejection::ScoringFields);
+        }
+        let max_values = event.locations.len() * metrics.len();
+        if !(1..=max_values).contains(&event.number_of_values_per_entry) {
+            return Err(EventRejection::ValuesPerEntry {
+                requested: event.number_of_values_per_entry,
+                max: max_values,
+            });
+        }
+        let signing_date = event.signing_date.to_offset(UtcOffset::UTC);
         let expiry = u32::try_from(
-            event
-                .signing_date
-                .saturating_add(Duration::DAY)
+            signing_date
+                .checked_add(EXPIRY_AFTER_SIGNING)
+                .ok_or(EventRejection::ExpiryOutOfRange)?
                 .unix_timestamp(),
         )
-        .map_err(|_| {
-            anyhow!(
-                "Signing date {} is outside the DLC expiry range",
-                event.signing_date
-            )
-        })?;
+        .map_err(|_| EventRejection::ExpiryOutOfRange)?;
 
-        let locking_points = outcome_messages
+        let nonce = key.new_event_nonce(event.id);
+        let locking_points = scoring::ranking_outcomes(entries, places)
             .iter()
-            .map(|msg| attestation_locking_point(oracle_pubkey, nonce_point, msg))
+            .map(|winners| key.locking_point(nonce.point, &scoring::outcome_message(winners)))
             .collect();
-
-        // The actual announcement the oracle is going to attest the outcome
-        let event_announcement = EventLockingConditions {
-            expiry: Some(expiry),
-            locking_points,
-        };
-
-        let Ok(coordinator_pubkey) = coordinator_pubkey.to_bech32();
-
+        let Ok(coordinator_pubkey) = coordinator.to_bech32();
         Ok(Self {
             id: event.id,
+            source: source.id().as_str().to_owned(),
+            signing_date,
             start_observation_date: event.start_observation_date.to_offset(UtcOffset::UTC),
             end_observation_date: event.end_observation_date.to_offset(UtcOffset::UTC),
-            signing_date: event.signing_date.to_offset(UtcOffset::UTC),
-            nonce,
-            total_allowed_entries: i64::try_from(event.total_allowed_entries)
-                .map_err(|_| anyhow!("Total allowed entries is too large"))?,
-            number_of_places_win: event.number_of_places_win,
-            number_of_values_per_entry: i64::try_from(event.number_of_values_per_entry)
-                .map_err(|_| anyhow!("Number of values per entry is too large"))?,
             locations: event.locations,
-            event_announcement,
+            metrics,
+            number_of_values_per_entry: event.number_of_values_per_entry,
+            total_allowed_entries: entries,
+            number_of_places_win: places,
+            nonce,
+            event_announcement: EventLockingConditions {
+                expiry: Some(expiry),
+                locking_points,
+            },
             coordinator_pubkey,
-            scoring_fields: event.scoring_fields,
         })
     }
 }
 
-impl From<CreateEventData> for Event {
-    fn from(value: CreateEventData) -> Self {
-        Self {
-            id: value.id,
-            signing_date: value.signing_date,
-            start_observation_date: value.start_observation_date,
-            end_observation_date: value.end_observation_date,
-            locations: value.locations,
-            total_allowed_entries: value.total_allowed_entries,
-            number_of_places_win: value.number_of_places_win,
-            number_of_values_per_entry: value.number_of_values_per_entry,
-            event_announcement: value.event_announcement,
-            nonce: value.nonce,
-            status: EventStatus::default(),
-            entry_ids: vec![],
-            entries: vec![],
-            weather: vec![],
-            attestation: None,
-            coordinator_pubkey: value.coordinator_pubkey,
-            scoring_fields: value.scoring_fields,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, IntoParams)]
-pub struct EventFilter {
-    // TODO: add more options, proper pagination and search
-    pub limit: Option<usize>,
-    pub event_ids: Option<Vec<Uuid>>,
-}
-
-impl Default for EventFilter {
-    fn default() -> Self {
-        Self {
-            limit: Some(100_usize),
-            event_ids: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
-pub struct SignEvent {
+/// A stored event without its (large) announcement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventRecord {
     pub id: Uuid,
+    pub source: String,
     pub signing_date: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
     pub start_observation_date: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
     pub end_observation_date: OffsetDateTime,
-    pub status: EventStatus,
-    #[schema(value_type = String)]
-    pub nonce: Scalar,
-    #[schema(value_type = String)]
-    pub event_announcement: EventLockingConditions,
-    pub number_of_places_win: i64,
-    pub number_of_values_per_entry: i64,
-    #[schema(value_type = String)]
-    pub attestation: Option<MaybeScalar>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
-pub struct ActiveEvent {
-    pub id: Uuid,
     pub locations: Vec<String>,
-    pub signing_date: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    pub start_observation_date: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    pub end_observation_date: OffsetDateTime,
-    pub status: EventStatus,
-    pub total_allowed_entries: i64,
-    pub total_entries: i64,
-    pub number_of_values_per_entry: i64,
-    pub number_of_places_win: i64,
-    #[schema(value_type = String)]
+    pub metrics: Vec<String>,
+    pub number_of_values_per_entry: usize,
+    pub total_allowed_entries: usize,
+    pub number_of_places_win: usize,
+    pub nonce: EventNonce,
+    pub coordinator_pubkey: String,
     pub attestation: Option<MaybeScalar>,
-    /// Which weather fields are used for scoring in this event
-    pub scoring_fields: Vec<ScoringField>,
+    pub total_entries: usize,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+impl EventRecord {
+    pub fn status(&self, now: OffsetDateTime) -> EventStatus {
+        if self.attestation.is_some() {
+            EventStatus::Signed
+        } else if now < self.start_observation_date {
+            EventStatus::Live
+        } else if now < self.end_observation_date {
+            EventStatus::Running
+        } else {
+            EventStatus::Completed
+        }
+    }
+
+    /// NOAA-shaped scoring fields for the wire. Metrics this build cannot
+    /// name are left out.
+    fn scoring_fields(&self) -> Vec<ScoringField> {
+        self.metrics
+            .iter()
+            .filter_map(|metric| ScoringField::from_metric(metric))
+            .collect()
+    }
+
+    pub fn into_event(
+        self,
+        now: OffsetDateTime,
+        event_announcement: EventLockingConditions,
+        entries: Vec<Entry>,
+        readings: &[Reading],
+    ) -> Event {
+        Event {
+            id: self.id,
+            status: self.status(now),
+            scoring_fields: self.scoring_fields(),
+            weather: weather_from_readings(&self.locations, readings, self.start_observation_date),
+            signing_date: self.signing_date,
+            start_observation_date: self.start_observation_date,
+            end_observation_date: self.end_observation_date,
+            number_of_values_per_entry: wire_count(self.number_of_values_per_entry),
+            total_allowed_entries: wire_count(self.total_allowed_entries),
+            number_of_places_win: wire_count(self.number_of_places_win),
+            entry_ids: entries.iter().map(|entry| entry.id).collect(),
+            entries: entries.into_iter().map(WeatherEntry::from).collect(),
+            nonce_point: self.nonce.point,
+            event_announcement,
+            attestation: self.attestation,
+            coordinator_pubkey: self.coordinator_pubkey,
+            locations: self.locations,
+        }
+    }
+
+    pub fn into_summary(self, now: OffsetDateTime, readings: &[Reading]) -> EventSummary {
+        EventSummary {
+            id: self.id,
+            status: self.status(now),
+            weather: weather_from_readings(&self.locations, readings, self.start_observation_date),
+            signing_date: self.signing_date,
+            start_observation_date: self.start_observation_date,
+            end_observation_date: self.end_observation_date,
+            number_of_values_per_entry: wire_count(self.number_of_values_per_entry),
+            total_allowed_entries: wire_count(self.total_allowed_entries),
+            total_entries: wire_count(self.total_entries),
+            number_of_places_win: wire_count(self.number_of_places_win),
+            attestation: self.attestation,
+            nonce_point: self.nonce.point,
+            locations: self.locations,
+        }
+    }
+}
+
+/// Counts are bounded far below `i64::MAX` by validation.
+fn wire_count(count: usize) -> i64 {
+    i64::try_from(count).unwrap_or(i64::MAX)
+}
+
+/// A stored entry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entry {
+    pub id: Uuid,
+    pub event_id: Uuid,
+    pub picks: Vec<Pick>,
+    pub score: Option<i64>,
+    pub base_score: Option<i64>,
+}
+
+/// Checks a full set of entries against `event` and converts them to picks.
+/// The coordinator submits every entry at once, before the window ends.
+pub fn validate_entries(
+    event: &EventRecord,
+    entries: Vec<AddEventEntry>,
+    now: OffsetDateTime,
+) -> Result<Vec<Entry>, EntryRejection> {
+    if now >= event.end_observation_date {
+        return Err(EntryRejection::Closed);
+    }
+    if event.total_entries > 0 {
+        return Err(EntryRejection::AlreadySubmitted);
+    }
+    if entries.len() != event.total_allowed_entries {
+        return Err(EntryRejection::Count {
+            expected: event.total_allowed_entries,
+            received: entries.len(),
+        });
+    }
+    let mut ids = HashSet::new();
+    entries
+        .into_iter()
+        .map(|entry| {
+            if entry.id.get_version_num() != 7 {
+                return Err(EntryRejection::NotUuidV7(entry.id));
+            }
+            if entry.event_id != event.id {
+                return Err(EntryRejection::WrongEvent {
+                    entry: entry.id,
+                    expected: event.id,
+                    actual: entry.event_id,
+                });
+            }
+            if !ids.insert(entry.id) {
+                return Err(EntryRejection::DuplicateEntry(entry.id));
+            }
+            let picks = entry_picks(event, &entry)?;
+            Ok(Entry {
+                id: entry.id,
+                event_id: entry.event_id,
+                picks,
+                score: None,
+                base_score: None,
+            })
+        })
+        .collect()
+}
+
+fn entry_picks(event: &EventRecord, entry: &AddEventEntry) -> Result<Vec<Pick>, EntryRejection> {
+    let mut picks: Vec<Pick> = vec![];
+    for choice in &entry.expected_observations {
+        if !event.locations.contains(&choice.stations) {
+            return Err(EntryRejection::UnknownLocation {
+                entry: entry.id,
+                location: choice.stations.clone(),
+            });
+        }
+        for (field, prediction) in choice.predictions() {
+            let metric = field.as_str();
+            if !event.metrics.iter().any(|enabled| enabled == metric) {
+                return Err(EntryRejection::UnscoredField {
+                    entry: entry.id,
+                    field: metric.to_owned(),
+                });
+            }
+            if picks
+                .iter()
+                .any(|pick| pick.target == choice.stations && pick.metric == metric)
+            {
+                return Err(EntryRejection::DuplicatePick {
+                    entry: entry.id,
+                    location: choice.stations.clone(),
+                    field: metric.to_owned(),
+                });
+            }
+            picks.push(Pick {
+                target: choice.stations.clone(),
+                metric: metric.to_owned(),
+                prediction,
+            });
+        }
+    }
+    if picks.is_empty() || picks.len() > event.number_of_values_per_entry {
+        return Err(EntryRejection::PickCount(
+            entry.id,
+            event.number_of_values_per_entry,
+        ));
+    }
+    Ok(picks)
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, IntoParams)]
+pub struct EventFilter {
+    /// At most 100 events; defaults to 100.
+    pub limit: Option<usize>,
+    /// Comma separated event ids (at most 100).
+    pub event_ids: Option<String>,
+}
+
+impl EventFilter {
+    pub fn limit(&self) -> usize {
+        self.limit
+            .unwrap_or(MAX_LIST_LIMIT)
+            .clamp(1, MAX_LIST_LIMIT)
+    }
+
+    /// Parsed ids; unparseable ids are an error rather than ignored.
+    pub fn event_ids(&self) -> Result<Vec<Uuid>, uuid::Error> {
+        self.event_ids
+            .iter()
+            .flat_map(|ids| ids.split(','))
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .take(MAX_LIST_LIMIT)
+            .map(Uuid::parse_str)
+            .collect()
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub enum EventStatus {
-    /// Observation date has not passed yet and entries can be added
+    /// Observation window has not started; entries can be added
     #[default]
     Live,
-    /// Currently in the Observation date, entries cannot be added
+    /// Inside the observation window
     Running,
-    /// Event Observation window has finished, not yet signed
+    /// Observation window has finished, not yet signed
     Completed,
-    /// Event has completed and been signed by the oracle
+    /// Signed by the oracle
     Signed,
+}
+
+impl EventStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Signed => "signed",
+        }
+    }
 }
 
 impl std::fmt::Display for EventStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Live => write!(f, "live"),
-            Self::Running => write!(f, "running"),
-            Self::Completed => write!(f, "completed"),
-            Self::Signed => write!(f, "signed"),
-        }
-    }
-}
-
-impl TryFrom<&str> for EventStatus {
-    type Error = anyhow::Error;
-
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        match s {
-            "live" => Ok(EventStatus::Live),
-            "running" => Ok(EventStatus::Running),
-            "completed" => Ok(EventStatus::Completed),
-            "signed" => Ok(EventStatus::Signed),
-            val => Err(anyhow!("invalid status: {}", val)),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -295,96 +499,60 @@ impl TryFrom<&str> for EventStatus {
 pub struct EventSummary {
     pub id: Uuid,
     #[serde(with = "time::serde::rfc3339")]
-    /// Time at which the attestation will be added to the event, needs to be after the end observation date
     pub signing_date: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
-    /// Time when the weather observations start, all entries must be made before this time, must be before the end observation date
     pub start_observation_date: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
-    /// Time when the weather observations ends, must be before the signing date
     pub end_observation_date: OffsetDateTime,
     /// NOAA observation stations used in this event
     pub locations: Vec<String>,
-    /// The number of values that can be selected per entry in the event (default to number_of_locations * 3, (temp_low, temp_high, wind_speed))
     pub number_of_values_per_entry: i64,
-    /// Current status of the event, where in the lifecyle are we (LIVE, RUNNING, COMPLETED, SIGNED, defaults to LIVE)
     pub status: EventStatus,
-    /// Knowing the total number of entries, how many can place
-    /// The dlctix coordinator can determine how many transactions to create
     pub total_allowed_entries: i64,
-    /// Needs to all be generated at the start
     pub total_entries: i64,
     pub number_of_places_win: i64,
-    /// The forecasted and observed values for each station on the event date
+    /// The forecasted and observed values for each station
     pub weather: Vec<Weather>,
-    /// When added it means the oracle has signed that the current data is the final result
-    #[schema(value_type = String)]
+    /// Present once the oracle has attested the final result
+    #[schema(value_type = Option<String>)]
     pub attestation: Option<MaybeScalar>,
-    /// Used to sign the result of the event being watched
+    /// Public nonce point `R` the attestation is made with
     #[schema(value_type = String)]
-    pub nonce: Scalar,
-}
-
-pub fn get_status(
-    attestation: Option<MaybeScalar>,
-    start_observation_date: OffsetDateTime,
-    end_observation_date: OffsetDateTime,
-) -> EventStatus {
-    if attestation.is_some() {
-        return EventStatus::Signed;
-    }
-
-    let now = OffsetDateTime::now_utc();
-
-    if now < start_observation_date {
-        return EventStatus::Live;
-    }
-
-    if now < end_observation_date {
-        return EventStatus::Running;
-    }
-
-    EventStatus::Completed
+    pub nonce_point: Point,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct Event {
     pub id: Uuid,
     #[serde(with = "time::serde::rfc3339")]
-    /// Time at which the attestation will be added to the event, needs to be after the end observation date
+    /// Time at which the attestation will be added to the event
     pub signing_date: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
-    /// Time when the weather observations start, all entries must be made before this time, must be before the end observation date
     pub start_observation_date: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
-    /// Time when the weather observations ends, must be before the signing date
     pub end_observation_date: OffsetDateTime,
     /// NOAA observation stations used in this event
     pub locations: Vec<String>,
-    /// The number of values that can be selected per entry in the event (default to number_of_locations * 3, (temp_low, temp_high, wind_speed))
     pub number_of_values_per_entry: i64,
-    /// Current status of the event, where in the lifecyle are we (LIVE, RUNNING, COMPLETED, SIGNED)
     pub status: EventStatus,
-    /// Knowing the total number of entries, how many can place
-    /// The dlctix coordinator can determine how many transactions to create
     pub total_allowed_entries: i64,
-    /// Needs to all be generated at the start
     pub entry_ids: Vec<Uuid>,
     pub number_of_places_win: i64,
-    /// All entries into this event, wont be returned until date of observation begins and will be ranked by score
+    /// All entries, in id order; entry `i` is outcome index `i`
     pub entries: Vec<WeatherEntry>,
-    /// The forecasted and observed values for each station on the event date
+    /// The forecasted and observed values for each station
     pub weather: Vec<Weather>,
-    /// Nonce the oracle committed to use as part of signing final results
+    /// Public nonce point `R`. Locking point `i` is
+    /// `R + H(R, P, outcome_i)·P` for the oracle key `P`.
     #[schema(value_type = String)]
-    pub nonce: Scalar,
-    /// Holds the predefined outcomes the oracle will attest to at event complete
-    #[schema(value_type = String)]
+    pub nonce_point: Point,
+    /// The outcomes the oracle will attest to
+    #[schema(value_type = Object)]
     pub event_announcement: EventLockingConditions,
-    /// When added it means the oracle has signed that the current data is the final result
-    #[schema(value_type = String)]
+    /// Present once the oracle has attested the final result
+    #[schema(value_type = Option<String>)]
     pub attestation: Option<MaybeScalar>,
-    /// The pubkey of the coordinator
+    /// The coordinator's npub
     pub coordinator_pubkey: String,
     /// Which weather fields are used for scoring in this event
     pub scoring_fields: Vec<ScoringField>,
@@ -397,50 +565,76 @@ pub struct Weather {
     pub forecasted: Forecasted,
 }
 
+/// Observed values over the event window, dated at the window start.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct Observed {
     #[serde(with = "time::serde::rfc3339")]
     pub date: OffsetDateTime,
     pub temp_low: i64,
     pub temp_high: i64,
-    pub wind_speed: i64,
+    /// Knots
+    pub wind_speed: Option<i64>,
 }
 
-impl TryFrom<&Observation> for Observed {
-    type Error = weather_data::Error;
-
-    fn try_from(value: &Observation) -> Result<Observed, Self::Error> {
-        Ok(Self {
-            date: OffsetDateTime::parse(&value.start_time, &Rfc3339)?,
-            temp_low: value.temp_low.round() as i64,
-            temp_high: value.temp_high.round() as i64,
-            wind_speed: value.wind_speed,
-        })
-    }
-}
-
+/// The forecast baseline for the event window, dated at the window start.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct Forecasted {
     #[serde(with = "time::serde::rfc3339")]
     pub date: OffsetDateTime,
     pub temp_low: i64,
     pub temp_high: i64,
+    /// Knots
     pub wind_speed: Option<i64>,
 }
 
-impl TryFrom<&Forecast> for Forecasted {
-    type Error = weather_data::Error;
-
-    fn try_from(value: &Forecast) -> Result<Forecasted, Self::Error> {
-        let format = format_description!("[year]-[month]-[day]");
-        let date = Date::parse(&value.date, format)?;
-        Ok(Self {
-            date: date.midnight().assume_utc(),
-            temp_low: value.temp_low,
-            temp_high: value.temp_high,
-            wind_speed: value.wind_speed,
+/// NOAA display rows from stored readings. A station appears once it has
+/// both temperature baselines; observations once both temperatures exist.
+fn weather_from_readings(
+    locations: &[String],
+    readings: &[Reading],
+    date: OffsetDateTime,
+) -> Vec<Weather> {
+    let value = |station: &str, metric: &str, observed: bool| {
+        readings
+            .iter()
+            .find(|reading| reading.target == station && reading.metric == metric)
+            .and_then(|reading| {
+                if observed {
+                    reading.observed
+                } else {
+                    reading.baseline
+                }
+            })
+            .map(|value| value.round() as i64)
+    };
+    locations
+        .iter()
+        .filter_map(|station| {
+            let forecasted = Forecasted {
+                date,
+                temp_low: value(station, noaa::TEMP_LOW, false)?,
+                temp_high: value(station, noaa::TEMP_HIGH, false)?,
+                wind_speed: value(station, noaa::WIND_SPEED, false),
+            };
+            let observed = match (
+                value(station, noaa::TEMP_LOW, true),
+                value(station, noaa::TEMP_HIGH, true),
+            ) {
+                (Some(temp_low), Some(temp_high)) => Some(Observed {
+                    date,
+                    temp_low,
+                    temp_high,
+                    wind_speed: value(station, noaa::WIND_SPEED, true),
+                }),
+                _ => None,
+            };
+            Some(Weather {
+                station_id: station.clone(),
+                observed,
+                forecasted,
+            })
         })
-    }
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -449,8 +643,6 @@ pub struct AddEventEntries {
     pub entries: Vec<AddEventEntry>,
 }
 
-// Once submitted for now don't allow changes
-// Decide if we want to add a pubkey for who submitted the entry?
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AddEventEntry {
     /// Client needs to provide a valid Uuidv7
@@ -459,31 +651,32 @@ pub struct AddEventEntry {
     pub expected_observations: Vec<WeatherChoices>,
 }
 
-impl From<AddEventEntry> for WeatherEntry {
-    fn from(value: AddEventEntry) -> Self {
-        WeatherEntry {
-            id: value.id,
-            event_id: value.event_id,
-            expected_observations: value.expected_observations,
-            score: None,
-            base_score: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct WeatherEntry {
     pub id: Uuid,
     pub event_id: Uuid,
     pub expected_observations: Vec<WeatherChoices>,
-    /// A score wont appear until the observation_date has begun
+    /// Present once the observation window has begun and the oracle scored it
     pub score: Option<i64>,
     pub base_score: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+impl From<Entry> for WeatherEntry {
+    fn from(entry: Entry) -> Self {
+        Self {
+            id: entry.id,
+            event_id: entry.event_id,
+            expected_observations: WeatherChoices::from_picks(&entry.picks),
+            score: entry.score,
+            base_score: entry.base_score,
+        }
+    }
+}
+
+/// Predictions for one NOAA station.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct WeatherChoices {
-    // NOAA weather stations we're using
+    /// NOAA station id
     pub stations: String,
     pub temp_high: Option<ValueOptions>,
     pub temp_low: Option<ValueOptions>,
@@ -494,8 +687,55 @@ pub struct WeatherChoices {
     pub humidity: Option<ValueOptions>,
 }
 
-/// Available fields that can be used for scoring in an event
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq, Hash)]
+impl WeatherChoices {
+    fn slot(&mut self, field: ScoringField) -> &mut Option<ValueOptions> {
+        match field {
+            ScoringField::TempHigh => &mut self.temp_high,
+            ScoringField::TempLow => &mut self.temp_low,
+            ScoringField::WindSpeed => &mut self.wind_speed,
+            ScoringField::WindDirection => &mut self.wind_direction,
+            ScoringField::RainAmt => &mut self.rain_amt,
+            ScoringField::SnowAmt => &mut self.snow_amt,
+            ScoringField::Humidity => &mut self.humidity,
+        }
+    }
+
+    /// The predictions made, one per field.
+    pub fn predictions(&self) -> impl Iterator<Item = (ScoringField, ValueOptions)> + '_ {
+        let mut choices = self.clone();
+        ScoringField::ALL
+            .into_iter()
+            .filter_map(move |field| choices.slot(field).take().map(|choice| (field, choice)))
+    }
+
+    /// Groups picks by station, in first-seen order.
+    pub fn from_picks(picks: &[Pick]) -> Vec<Self> {
+        let mut choices: Vec<Self> = vec![];
+        for pick in picks {
+            let Some(field) = ScoringField::from_metric(&pick.metric) else {
+                continue;
+            };
+            let index = match choices
+                .iter()
+                .position(|choice| choice.stations == pick.target)
+            {
+                Some(index) => index,
+                None => {
+                    choices.push(Self {
+                        stations: pick.target.clone(),
+                        ..Self::default()
+                    });
+                    choices.len() - 1
+                }
+            };
+            *choices[index].slot(field) = Some(pick.prediction);
+        }
+        choices
+    }
+}
+
+/// NOAA metrics an event can score. Names match [`noaa`] metric ids.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ScoringField {
     TempHigh,
@@ -507,91 +747,138 @@ pub enum ScoringField {
     Humidity,
 }
 
+impl ScoringField {
+    pub const ALL: [ScoringField; 7] = [
+        Self::TempHigh,
+        Self::TempLow,
+        Self::WindSpeed,
+        Self::WindDirection,
+        Self::RainAmt,
+        Self::SnowAmt,
+        Self::Humidity,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TempHigh => noaa::TEMP_HIGH,
+            Self::TempLow => noaa::TEMP_LOW,
+            Self::WindSpeed => noaa::WIND_SPEED,
+            Self::WindDirection => noaa::WIND_DIRECTION,
+            Self::RainAmt => noaa::RAIN_AMT,
+            Self::SnowAmt => noaa::SNOW_AMT,
+            Self::Humidity => noaa::HUMIDITY,
+        }
+    }
+
+    pub fn from_metric(metric: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|field| field.as_str() == metric)
+    }
+
+    pub fn defaults() -> Vec<ScoringField> {
+        vec![Self::TempHigh, Self::TempLow, Self::WindSpeed]
+    }
+}
+
 impl std::fmt::Display for ScoringField {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::TempHigh => write!(f, "temp_high"),
-            Self::TempLow => write!(f, "temp_low"),
-            Self::WindSpeed => write!(f, "wind_speed"),
-            Self::WindDirection => write!(f, "wind_direction"),
-            Self::RainAmt => write!(f, "rain_amt"),
-            Self::SnowAmt => write!(f, "snow_amt"),
-            Self::Humidity => write!(f, "humidity"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
-impl TryFrom<&str> for ScoringField {
-    type Error = anyhow::Error;
-
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        match s {
-            "temp_high" => Ok(ScoringField::TempHigh),
-            "temp_low" => Ok(ScoringField::TempLow),
-            "wind_speed" => Ok(ScoringField::WindSpeed),
-            "wind_direction" => Ok(ScoringField::WindDirection),
-            "rain_amt" => Ok(ScoringField::RainAmt),
-            "snow_amt" => Ok(ScoringField::SnowAmt),
-            "humidity" => Ok(ScoringField::Humidity),
-            val => Err(anyhow!("invalid scoring field: {}", val)),
-        }
-    }
-}
-
-impl ScoringField {
-    /// Returns the default scoring fields (original behavior)
-    pub fn defaults() -> Vec<ScoringField> {
-        vec![
-            ScoringField::TempHigh,
-            ScoringField::TempLow,
-            ScoringField::WindSpeed,
-        ]
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+/// A prediction relative to the baseline. Serialized as `Over`, `Par`,
+/// `Under` on the wire and `over`, `par`, `under` in storage.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub enum ValueOptions {
     Over,
-    // Par is what was forecasted for this value
+    /// Matches the baseline within the metric's par rule
     Par,
     Under,
 }
 
-impl std::fmt::Display for ValueOptions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl ValueOptions {
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::Over => write!(f, "over"),
-            Self::Par => write!(f, "par"),
-            Self::Under => write!(f, "under"),
+            Self::Over => "over",
+            Self::Par => "par",
+            Self::Under => "under",
         }
+    }
+
+    pub fn from_storage(value: &str) -> Option<Self> {
+        [Self::Over, Self::Par, Self::Under]
+            .into_iter()
+            .find(|option| option.as_str() == value)
     }
 }
 
-impl TryFrom<&str> for ValueOptions {
-    type Error = anyhow::Error;
-
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        match s {
-            "over" => Ok(ValueOptions::Over),
-            "par" => Ok(ValueOptions::Par),
-            "under" => Ok(ValueOptions::Under),
-            val => Err(anyhow!("invalid option: {}", val)),
-        }
+impl std::fmt::Display for ValueOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::{Metric, ObservationWindow, ParRule, SourceId};
+    use async_trait::async_trait;
 
-    fn event(entries: usize, places: i64) -> CreateEvent {
+    struct Stations;
+
+    #[async_trait]
+    impl OutcomeSource for Stations {
+        fn id(&self) -> SourceId {
+            noaa::NOAA_WEATHER
+        }
+        fn metrics(&self) -> &'static [Metric] {
+            &[
+                Metric {
+                    id: noaa::TEMP_HIGH,
+                    par: ParRule::Rounded,
+                },
+                Metric {
+                    id: noaa::TEMP_LOW,
+                    par: ParRule::Rounded,
+                },
+                Metric {
+                    id: noaa::WIND_SPEED,
+                    par: ParRule::Exact,
+                },
+            ]
+        }
+        fn validate_target(&self, target: &str) -> Result<(), SourceError> {
+            if target.starts_with('K') {
+                Ok(())
+            } else {
+                Err(SourceError::InvalidTarget {
+                    target: target.into(),
+                    reason: "not a station".into(),
+                })
+            }
+        }
+        async fn readings(
+            &self,
+            _window: ObservationWindow,
+            _targets: &[String],
+        ) -> Result<Vec<Reading>, SourceError> {
+            Ok(vec![])
+        }
+    }
+
+    fn key() -> (tempfile::TempDir, SigningKey) {
+        let directory = tempfile::tempdir().unwrap();
+        let key = SigningKey::load_or_create(&directory.path().join("oracle.pem")).unwrap();
+        (directory, key)
+    }
+
+    fn event(entries: usize, places: usize) -> CreateEvent {
         let start = OffsetDateTime::now_utc();
         CreateEvent {
             id: Uuid::now_v7(),
             signing_date: start + Duration::hours(3),
             start_observation_date: start,
             end_observation_date: start + Duration::hours(1),
-            locations: vec!["KORD".into()],
+            locations: vec!["KORD".into(), "KSAW".into()],
             number_of_values_per_entry: 3,
             total_allowed_entries: entries,
             number_of_places_win: places,
@@ -599,68 +886,259 @@ mod tests {
         }
     }
 
-    fn oracle_point() -> Point {
-        Scalar::random(&mut rand::rng()).base_point_mul()
+    fn build(event: CreateEvent) -> Result<NewEvent, EventRejection> {
+        let (_directory, key) = key();
+        NewEvent::build(
+            event,
+            &Stations,
+            &key,
+            nostr::key::Keys::generate().public_key(),
+        )
+    }
+
+    fn record(new: NewEvent) -> EventRecord {
+        EventRecord {
+            id: new.id,
+            source: new.source,
+            signing_date: new.signing_date,
+            start_observation_date: new.start_observation_date,
+            end_observation_date: new.end_observation_date,
+            locations: new.locations,
+            metrics: new.metrics,
+            number_of_values_per_entry: new.number_of_values_per_entry,
+            total_allowed_entries: new.total_allowed_entries,
+            number_of_places_win: new.number_of_places_win,
+            nonce: new.nonce,
+            coordinator_pubkey: new.coordinator_pubkey,
+            attestation: None,
+            total_entries: 0,
+        }
     }
 
     #[test]
     fn announcement_commits_to_every_ranking_and_the_refund_outcome() {
-        let created = CreateEventData::new(
-            oracle_point(),
-            nostr::key::Keys::generate().public_key(),
-            event(3, 2),
-        )
-        .unwrap();
+        let created = build(event(3, 2)).unwrap();
         // 3 entries, 2 places: 3 * 2 orderings plus one refund-all outcome.
         assert_eq!(created.event_announcement.locking_points.len(), 7);
-        let expiry = created.event_announcement.expiry.unwrap();
         assert_eq!(
-            i64::from(expiry),
+            i64::from(created.event_announcement.expiry.unwrap()),
             (created.signing_date + Duration::DAY).unix_timestamp()
         );
         assert_eq!(created.signing_date.offset(), UtcOffset::UTC);
     }
 
     #[test]
-    fn invalid_dates_and_ranks_are_rejected() {
-        let pubkey = nostr::key::Keys::generate().public_key();
-        let mut reversed = event(3, 1);
-        reversed.end_observation_date = reversed.start_observation_date - Duration::hours(1);
-        assert!(CreateEventData::new(oracle_point(), pubkey, reversed).is_err());
-        let mut late_signing = event(3, 1);
-        late_signing.signing_date = late_signing.end_observation_date - Duration::hours(1);
-        assert!(CreateEventData::new(oracle_point(), pubkey, late_signing).is_err());
-        assert!(CreateEventData::new(oracle_point(), pubkey, event(3, 6)).is_err());
-        let mut no_fields = event(3, 1);
-        no_fields.scoring_fields.clear();
-        assert!(CreateEventData::new(oracle_point(), pubkey, no_fields).is_err());
-        let mut v4 = event(3, 1);
-        v4.id = Uuid::from_u128(0x1234);
-        assert!(CreateEventData::new(oracle_point(), pubkey, v4).is_err());
+    fn invalid_events_are_rejected() {
+        let rejected = |change: fn(&mut CreateEvent)| {
+            let mut candidate = event(3, 1);
+            change(&mut candidate);
+            build(candidate).unwrap_err()
+        };
+        assert!(matches!(
+            rejected(|e| e.end_observation_date = e.start_observation_date),
+            EventRejection::DatesOutOfOrder
+        ));
+        assert!(matches!(
+            rejected(|e| e.signing_date = e.end_observation_date - Duration::hours(1)),
+            EventRejection::DatesOutOfOrder
+        ));
+        assert!(matches!(
+            rejected(|e| e.number_of_places_win = 3),
+            EventRejection::Places(3)
+        ));
+        assert!(matches!(
+            rejected(|e| e.number_of_places_win = 0),
+            EventRejection::Places(0)
+        ));
+        assert!(matches!(
+            rejected(|e| e.total_allowed_entries = 26),
+            EventRejection::Entries(26)
+        ));
+        assert!(matches!(
+            rejected(|e| {
+                e.total_allowed_entries = 25;
+                e.number_of_places_win = 5;
+            }),
+            EventRejection::TooManyOutcomes { .. }
+        ));
+        assert!(matches!(
+            rejected(|e| e.locations = vec!["KORD".into(), "KORD".into()]),
+            EventRejection::Locations
+        ));
+        assert!(matches!(
+            rejected(|e| e.locations = vec!["bad".into()]),
+            EventRejection::InvalidLocation(_)
+        ));
+        assert!(matches!(
+            rejected(|e| e.scoring_fields.clear()),
+            EventRejection::ScoringFields
+        ));
+        assert!(matches!(
+            rejected(|e| e.scoring_fields = vec![ScoringField::Humidity]),
+            EventRejection::ScoringFields
+        ));
+        assert!(matches!(
+            rejected(|e| e.number_of_values_per_entry = 7),
+            EventRejection::ValuesPerEntry { max: 6, .. }
+        ));
+        assert!(matches!(
+            rejected(|e| e.id = Uuid::from_u128(0x1234)),
+            EventRejection::NotUuidV7(_)
+        ));
+    }
+
+    fn entry(event: &EventRecord, choices: Vec<WeatherChoices>) -> AddEventEntry {
+        AddEventEntry {
+            id: Uuid::now_v7(),
+            event_id: event.id,
+            expected_observations: choices,
+        }
+    }
+
+    fn choice(station: &str) -> WeatherChoices {
+        WeatherChoices {
+            stations: station.into(),
+            temp_high: Some(ValueOptions::Par),
+            ..WeatherChoices::default()
+        }
+    }
+
+    #[test]
+    fn entries_must_fit_the_event() {
+        let mut candidate = event(2, 1);
+        candidate.start_observation_date += Duration::hours(1);
+        candidate.end_observation_date += Duration::hours(1);
+        let event = record(build(candidate).unwrap());
+        let now = OffsetDateTime::now_utc();
+        let valid = || {
+            vec![
+                entry(&event, vec![choice("KORD")]),
+                entry(&event, vec![choice("KSAW")]),
+            ]
+        };
+
+        let accepted = validate_entries(&event, valid(), now).unwrap();
+        assert_eq!(accepted[0].picks[0].metric, noaa::TEMP_HIGH);
+
+        let rejected = |entries| validate_entries(&event, entries, now).unwrap_err();
+        assert!(matches!(
+            rejected(vec![entry(&event, vec![choice("KORD")])]),
+            EntryRejection::Count { .. }
+        ));
+        assert!(matches!(
+            rejected(vec![
+                entry(&event, vec![choice("KORD")]),
+                entry(&event, vec![choice("KMSP")])
+            ]),
+            EntryRejection::UnknownLocation { .. }
+        ));
+        let humidity = WeatherChoices {
+            humidity: Some(ValueOptions::Over),
+            ..choice("KORD")
+        };
+        assert!(matches!(
+            rejected(vec![
+                entry(&event, vec![humidity]),
+                entry(&event, vec![choice("KORD")])
+            ]),
+            EntryRejection::UnscoredField { .. }
+        ));
+        assert!(matches!(
+            rejected(vec![
+                entry(&event, vec![choice("KORD"), choice("KORD")]),
+                entry(&event, vec![choice("KORD")])
+            ]),
+            EntryRejection::DuplicatePick { .. }
+        ));
+        assert!(matches!(
+            rejected(vec![
+                entry(&event, vec![]),
+                entry(&event, vec![choice("KORD")])
+            ]),
+            EntryRejection::PickCount(..)
+        ));
+        let first = entry(&event, vec![choice("KORD")]);
+        assert!(matches!(
+            rejected(vec![first.clone(), first]),
+            EntryRejection::DuplicateEntry(_)
+        ));
+        assert!(matches!(
+            validate_entries(&event, valid(), event.end_observation_date).unwrap_err(),
+            EntryRejection::Closed
+        ));
+        let submitted = EventRecord {
+            total_entries: 2,
+            ..event.clone()
+        };
+        assert!(matches!(
+            validate_entries(&submitted, valid(), now).unwrap_err(),
+            EntryRejection::AlreadySubmitted
+        ));
+    }
+
+    #[test]
+    fn choices_round_trip_through_picks() {
+        let choices = vec![
+            WeatherChoices {
+                wind_speed: Some(ValueOptions::Under),
+                ..choice("KORD")
+            },
+            choice("KSAW"),
+        ];
+        let picks: Vec<Pick> = choices
+            .iter()
+            .flat_map(|choice| {
+                choice.predictions().map(|(field, prediction)| Pick {
+                    target: choice.stations.clone(),
+                    metric: field.as_str().to_owned(),
+                    prediction,
+                })
+            })
+            .collect();
+        assert_eq!(picks.len(), 3);
+        assert_eq!(WeatherChoices::from_picks(&picks), choices);
     }
 
     #[test]
     fn status_follows_attestation_then_observation_window() {
-        let now = OffsetDateTime::now_utc();
+        let event = record(build(event(3, 1)).unwrap());
+        let start = event.start_observation_date;
+        assert_eq!(event.status(start - Duration::SECOND), EventStatus::Live);
+        assert_eq!(event.status(start), EventStatus::Running);
         assert_eq!(
-            get_status(None, now + Duration::hours(1), now + Duration::hours(2)),
-            EventStatus::Live
-        );
-        assert_eq!(
-            get_status(None, now - Duration::hours(1), now + Duration::hours(1)),
-            EventStatus::Running
-        );
-        assert_eq!(
-            get_status(None, now - Duration::hours(2), now - Duration::hours(1)),
+            event.status(event.end_observation_date),
             EventStatus::Completed
         );
+        let signed = EventRecord {
+            attestation: Some(MaybeScalar::Zero),
+            ..event
+        };
+        assert_eq!(signed.status(start), EventStatus::Signed);
+    }
+
+    #[test]
+    fn stable_encodings() {
         assert_eq!(
-            get_status(
-                Some(MaybeScalar::Zero),
-                now + Duration::hours(1),
-                now + Duration::hours(2)
-            ),
-            EventStatus::Signed
+            serde_json::to_string(&ScoringField::WindDirection).unwrap(),
+            "\"wind_direction\""
         );
+        assert_eq!(
+            serde_json::to_string(&ValueOptions::Par).unwrap(),
+            "\"Par\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EventStatus::Live).unwrap(),
+            "\"Live\""
+        );
+        for field in ScoringField::ALL {
+            assert_eq!(ScoringField::from_metric(field.as_str()), Some(field));
+            assert_eq!(
+                serde_json::to_string(&field).unwrap(),
+                format!("\"{}\"", field.as_str())
+            );
+        }
+        for option in [ValueOptions::Over, ValueOptions::Par, ValueOptions::Under] {
+            assert_eq!(ValueOptions::from_storage(option.as_str()), Some(option));
+        }
     }
 }

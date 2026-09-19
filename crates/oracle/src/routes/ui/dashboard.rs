@@ -63,8 +63,8 @@ async fn build_dashboard_data(
     end: Option<OffsetDateTime>,
 ) -> DashboardData {
     // Get oracle identity
-    let pubkey = state.oracle.public_key();
-    let npub = state.oracle.npub().unwrap_or_else(|_| "Error".to_string());
+    let pubkey = state.oracle.public_key_base64();
+    let npub = state.oracle.npub();
 
     // Get event statistics
     let events = state

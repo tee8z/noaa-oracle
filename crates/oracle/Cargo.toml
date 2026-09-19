@@ -53,9 +53,11 @@ base64 = "0.23"
 # Match the rand version enabled by dlctix's secp256k1 so key and nonce
 # generation share one RNG API.
 rand = "0.9"
+sha2 = "0.11"
+zeroize = "1.8"
 
 # Logging
-log.workspace = true
+log = { workspace = true, features = ["serde"] }
 fern.workspace = true
 
 # Time
@@ -85,13 +87,13 @@ hex = "0.4"
 tower = { version = "0.5", features = ["util"] }
 mockall = "0.15"
 tempfile.workspace = true
+toml.workspace = true
 # Tests generate keys and sign NIP-98 events; the server only verifies them.
 nostr = { version = "0.45", features = ["os-rng"] }
-sha2 = "0.11"
 futures = { workspace = true, features = ["async-await"] }
 
 [package.metadata.cargo-machete]
-ignored = ["hex", "minify-js", "sha2", "walkdir"]
+ignored = ["hex", "minify-js", "walkdir"]
 
 [lints]
 workspace = true

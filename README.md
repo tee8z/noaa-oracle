@@ -86,29 +86,50 @@ Example configurations are in the `config/` directory:
 
 ### Oracle Configuration
 
+See [config/oracle.example.toml](config/oracle.example.toml) for every
+setting. The essentials:
+
 ```toml
-[oracle]
-host = "127.0.0.1"
-port = "9800"
-log_level = "info"
-
-# Path to weather data (parquet files)
+host = "0.0.0.0"
+port = 9800
+# Public origin that NIP-98 signatures are made over
+remote_url = "https://oracle.example.com"
 data_dir = "/var/lib/noaa-oracle/weather"
-
-# Directory holding events.sqlite
 event_db = "/var/lib/noaa-oracle/events"
-
-# Path to UI files
-ui_dir = "/usr/share/noaa-oracle/ui"
-
-# Oracle private key for DLC attestation
 private_key_path = "/etc/noaa-oracle/keys/oracle.pem"
-
-# Seconds to finish requests and accepted writes after SIGTERM
-shutdown_timeout = 25
+# Nostr keys (npub or hex) allowed to write
+coordinator_pubkeys = ["npub1..."]
+uploader_pubkeys = ["npub1..."]
 ```
 
 `GET /health` reports readiness (writer available and a database read succeeds) and turns 503 during shutdown; `GET /healthy` reports HTTP liveness only.
+
+### Security model
+
+- **Attestations.** Each event commits to a nonce point `R`; its nonce is
+  derived from the oracle key, the event id, and a random per-event salt at
+  signing time and is never stored or served. The oracle attests at most
+  once per event and only an outcome listed in the event's announcement.
+- **Writes.** Event creation and entry submission need a NIP-98 signature
+  from an allowlisted coordinator; data uploads and `POST /oracle/update`
+  need an allowlisted uploader (the daemon). The signed URL must match
+  `remote_url`, the `payload` tag must match the body, and each signed
+  event is accepted once.
+- **Keys.** The key file must be mode 0600 (or 0400); the oracle refuses
+  wider permissions and erases the key from memory on exit.
+- **Uploads.** Files are raw parquet bodies, written atomically, and never
+  replaced once published.
+
+### Adding a data source
+
+The pipeline is source independent: a daemon publishes parquet files, the
+oracle reads them, scores entries against a baseline, and attests the
+ranking. To attest something other than NOAA weather, implement
+`OutcomeSource` (`crates/oracle/src/sources/`) for the oracle side: valid
+targets, metrics with their "par" rules, and baseline/observed readings for
+an observation window. Scoring, ranking, announcements, and attestation are
+shared. On the daemon side, implement its `Source` trait to fetch and write
+the parquet datasets.
 
 ### Daemon Configuration
 

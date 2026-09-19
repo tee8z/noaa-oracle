@@ -1,9 +1,9 @@
-use oracle::{get_config_info, get_log_level, setup_logger};
+use oracle::{Cli, setup_logger};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = get_config_info();
-    let log_level = get_log_level(&cli);
+    let cli = Cli::load()?;
+    let log_level = cli.log_level();
 
     setup_logger()
         .level(log_level)

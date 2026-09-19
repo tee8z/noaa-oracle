@@ -17,16 +17,35 @@
 #
 # All settings can also be set via environment variables:
 #   NOAA_ORACLE_LEVEL, NOAA_ORACLE_HOST, NOAA_ORACLE_PORT, etc.
+# Unknown keys are rejected, so a typo fails startup instead of being ignored.
 
 # Logging level: trace, debug, info, warn, error
 level = "info"
 
 # Server binding
 host = "127.0.0.1"    # Use "0.0.0.0" to listen on all interfaces
-port = "9800"
+port = 9800
 
-# Public URL (used for generating links in API responses)
+# Public origin clients use to reach the oracle (scheme://host[:port], no
+# path). Coordinators and the daemon sign NIP-98 requests over this URL, so
+# behind a proxy set it to the public address, e.g. "https://4casttruth.win".
 remote_url = "http://127.0.0.1:9800"
+
+# =============================================================================
+# Who may write
+# =============================================================================
+# Every write is a NIP-98 signed request from an allowlisted nostr key
+# (npub or hex). Empty lists mean nobody can do that operation.
+#
+# Coordinators create events and submit entries.
+coordinator_pubkeys = []
+# Uploaders publish parquet files and trigger processing (the daemon logs
+# its npub at startup).
+uploader_pubkeys = []
+
+# Seconds between scheduled scoring and signing passes. Uploads also start
+# a pass.
+etl_interval = 300
 
 # =============================================================================
 # Weather Data Storage
@@ -46,7 +65,7 @@ data_dir = "./weather_data"
 # =============================================================================
 # Event Database (DLC Contract State)
 # =============================================================================
-# DuckDB database storing prediction events, entries, and attestations.
+# SQLite database storing prediction events, entries, and attestations.
 # This is where the oracle tracks:
 #   - Active prediction events
 #   - User entries/predictions
@@ -64,9 +83,10 @@ event_db = "./event_data"
 # For Nix installs: set automatically to the package's share directory
 ui_dir = "./static"
 
-# Oracle signing key (ECDSA secp256k1)
-# Used to sign DLC attestations - keep this secure!
-# Will be generated automatically if it doesn't exist
+# Oracle signing key (secp256k1, PEM). Used for DLC attestations and as the
+# oracle's nostr identity - keep it secret. Generated with mode 0600 if it
+# doesn't exist; the oracle refuses to start if the file is readable by
+# group or others.
 private_key_path = "./oracle_private_key.pem"
 
 # =============================================================================

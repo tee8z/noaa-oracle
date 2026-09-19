@@ -1,28 +1,31 @@
-use crate::{
-    AppState,
-    database::WriteError,
-    events::{AddEventEntries, CreateEvent, Event, EventFilter, EventSummary, WeatherEntry},
-    nostr_extractor::NostrAuth,
-    oracle,
-};
 use axum::{
     Json,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use log::{error, info};
-use serde::{Deserialize, Serialize};
+use log::{error, info, warn};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use std::sync::Arc;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::{
+    AppState, EtlRejected,
+    auth::{Role, Signed},
+    database::WriteError,
+    events::{
+        AddEventEntries, CreateEvent, EntryRejection, Event, EventFilter, EventSummary,
+        WeatherEntry,
+    },
+    oracle::Error,
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Base64Pubkey {
-    /// base64 representation of the compressed DER encoding of the publickey. This consists of a parity
-    /// byte at the beginning, which is either `0x02` (even parity) or `0x03` (odd parity),
-    /// followed by the big-endian encoding of the point's X-coordinate.
+    /// base64 of the compressed SEC1 public key: a parity byte (`0x02` or
+    /// `0x03`) followed by the big-endian X coordinate.
     pub key: String,
 }
 
@@ -32,15 +35,21 @@ pub struct Pubkey {
     pub key: String,
 }
 
+/// Error body for every oracle route.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ErrorBody {
+    pub error: String,
+}
+
 #[utoipa::path(
     get,
     path = "/oracle/pubkey",
     responses(
-        (status = OK, description = "Successfully retrieved oracle's pubkey data", body = Base64Pubkey),
+        (status = OK, description = "The oracle's attestation public key", body = Base64Pubkey),
     ))]
 pub async fn get_pubkey(State(state): State<Arc<AppState>>) -> Json<Base64Pubkey> {
     Json(Base64Pubkey {
-        key: state.oracle.public_key(),
+        key: state.oracle.public_key_base64(),
     })
 }
 
@@ -48,12 +57,12 @@ pub async fn get_pubkey(State(state): State<Arc<AppState>>) -> Json<Base64Pubkey
     get,
     path = "/oracle/npub",
     responses(
-        (status = OK, description = "Successfully retrieved oracle's nostr npub", body = Pubkey),
+        (status = OK, description = "The oracle's nostr npub (the same key)", body = Pubkey),
     ))]
-pub async fn get_npub(State(state): State<Arc<AppState>>) -> Result<Json<Pubkey>, oracle::Error> {
-    Ok(Json(Pubkey {
-        key: state.oracle.npub()?,
-    }))
+pub async fn get_npub(State(state): State<Arc<AppState>>) -> Json<Pubkey> {
+    Json(Pubkey {
+        key: state.oracle.npub(),
+    })
 }
 
 #[utoipa::path(
@@ -61,18 +70,14 @@ pub async fn get_npub(State(state): State<Arc<AppState>>) -> Result<Json<Pubkey>
     path = "/oracle/events",
     params(EventFilter),
     responses(
-        (status = OK, description = "Successfully retrieved oracle events", body = Vec<EventSummary>),
+        (status = OK, description = "Newest events first, at most 100", body = Vec<EventSummary>),
+        (status = BAD_REQUEST, description = "Invalid event id in the filter", body = ErrorBody),
     ))]
 pub async fn list_events(
     State(state): State<Arc<AppState>>,
     Query(filter): Query<EventFilter>,
-) -> Result<Json<Vec<EventSummary>>, oracle::Error> {
-    state
-        .oracle
-        .list_events(filter)
-        .await
-        .map(Json)
-        .inspect_err(|e| error!("error retrieving event data: {}", e))
+) -> Result<Json<Vec<EventSummary>>, Error> {
+    state.oracle.list_events(filter).await.map(Json)
 }
 
 #[utoipa::path(
@@ -80,23 +85,27 @@ pub async fn list_events(
     path = "/oracle/events",
     request_body = CreateEvent,
     responses(
-        (status = OK, description = "Successfully created oracle weather event", body = Event),
-        (status = BAD_REQUEST, description = "Invalid event to be created"),
-        (status = FORBIDDEN, description = "Invalid signature from coordinator in nostr authorization header"),
-        (status = UNAUTHORIZED, description = "Invalid nostr authorization header nip-98 using coordinator keys"),
-        (status = SERVICE_UNAVAILABLE, description = "The oracle is shutting down or its write queue is full; retry later"),
+        (status = OK, description = "Created event with its announcement", body = Event),
+        (status = BAD_REQUEST, description = "Invalid event", body = ErrorBody),
+        (status = UNAUTHORIZED, description = "Missing, stale, replayed, or mismatched NIP-98 authorization"),
+        (status = FORBIDDEN, description = "Signer is not an allowed coordinator"),
+        (status = SERVICE_UNAVAILABLE, description = "The oracle is shutting down or its write queue is full; retry later", body = ErrorBody),
     ))]
 pub async fn create_event(
-    NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
-    Json(body): Json<CreateEvent>,
-) -> Result<Json<Event>, oracle::Error> {
+    signed: Signed,
+) -> Result<Json<Event>, Response> {
+    state
+        .auth
+        .require(Role::Coordinator, &signed.pubkey)
+        .map_err(IntoResponse::into_response)?;
+    let event: CreateEvent = json_body(&signed.body)?;
     state
         .oracle
-        .create_event(pubkey, body)
+        .create_event(signed.pubkey, event)
         .await
         .map(Json)
-        .inspect_err(|e| error!("error saving event data: {}", e))
+        .map_err(IntoResponse::into_response)
 }
 
 #[utoipa::path(
@@ -106,19 +115,14 @@ pub async fn create_event(
         ("event_id" = Uuid, Path, description = "ID of a weather event the oracle is tracking"),
     ),
     responses(
-        (status = OK, description = "Successfully retrieved event data", body = Event),
-        (status = NOT_FOUND, description = "Event not found for the provided ID"),
+        (status = OK, description = "Event with entries, readings, and announcement", body = Event),
+        (status = NOT_FOUND, description = "Event not found", body = ErrorBody),
     ))]
 pub async fn get_event(
     State(state): State<Arc<AppState>>,
     Path(event_id): Path<Uuid>,
-) -> Result<Json<Event>, oracle::Error> {
-    state
-        .oracle
-        .get_event(&event_id)
-        .await
-        .map(Json)
-        .inspect_err(|e| error!("error event data: {}", e))
+) -> Result<Json<Event>, Error> {
+    state.oracle.get_event(event_id).await.map(Json)
 }
 
 #[utoipa::path(
@@ -126,30 +130,35 @@ pub async fn get_event(
     path = "/oracle/events/{event_id}/entries",
     request_body = AddEventEntries,
     responses(
-        (status = OK, description = "Successfully add entries into oracle weather event", body = Vec<WeatherEntry>),
-        (status = BAD_REQUEST, description = "Invalid entries to be created"),
-        (status = FORBIDDEN, description = "Invalid signature from coordinator in nostr authorization header"),
-        (status = UNAUTHORIZED, description = "Invalid nostr authorization header nip-98 using coordinator keys"),
-        (status = SERVICE_UNAVAILABLE, description = "The oracle is shutting down or its write queue is full; retry later"),
+        (status = OK, description = "Stored entries", body = Vec<WeatherEntry>),
+        (status = BAD_REQUEST, description = "Invalid entries", body = ErrorBody),
+        (status = UNAUTHORIZED, description = "Missing, stale, replayed, or mismatched NIP-98 authorization"),
+        (status = FORBIDDEN, description = "Signer is not this event's coordinator"),
+        (status = CONFLICT, description = "Entries were already submitted", body = ErrorBody),
+        (status = SERVICE_UNAVAILABLE, description = "The oracle is shutting down or its write queue is full; retry later", body = ErrorBody),
     ))]
 pub async fn add_event_entries(
-    NostrAuth { pubkey, .. }: NostrAuth,
     State(state): State<Arc<AppState>>,
     Path(event_id): Path<Uuid>,
-    Json(body): Json<AddEventEntries>,
-) -> Result<Json<Vec<WeatherEntry>>, oracle::Error> {
+    signed: Signed,
+) -> Result<Json<Vec<WeatherEntry>>, Response> {
+    state
+        .auth
+        .require(Role::Coordinator, &signed.pubkey)
+        .map_err(IntoResponse::into_response)?;
+    let body: AddEventEntries = json_body(&signed.body)?;
     if body.event_id != event_id {
-        return Err(oracle::Error::BadEntry(format!(
-            "entries are for event {} but were posted to event {}",
-            body.event_id, event_id
+        return Err(bad_request(format!(
+            "entries are for event {} but were posted to event {event_id}",
+            body.event_id
         )));
     }
     state
         .oracle
-        .add_event_entries(pubkey, body.event_id, body.entries)
+        .add_event_entries(signed.pubkey, event_id, body.entries)
         .await
         .map(Json)
-        .inspect_err(|e| error!("error adding entries to event: {}", e))
+        .map_err(IntoResponse::into_response)
 }
 
 #[utoipa::path(
@@ -157,83 +166,94 @@ pub async fn add_event_entries(
     path = "/oracle/events/{event_id}/entries/{entry_id}",
     params(
         ("event_id" = Uuid, Path, description = "ID of a weather event the oracle is tracking"),
-        ("entry_id" = Uuid, Path, description = "ID of a entry into weather event the oracle is tracking"),
+        ("entry_id" = Uuid, Path, description = "ID of an entry in that event"),
     ),
     responses(
-        (status = OK, description = "Successfully retrieved event entry", body = WeatherEntry),
-        (status = NOT_FOUND, description = "Event entry not found for the provided ID"),
+        (status = OK, description = "The entry", body = WeatherEntry),
+        (status = NOT_FOUND, description = "Entry not found", body = ErrorBody),
     ))]
 pub async fn get_event_entry(
     State(state): State<Arc<AppState>>,
     Path((event_id, entry_id)): Path<(Uuid, Uuid)>,
-) -> Result<Json<WeatherEntry>, oracle::Error> {
+) -> Result<Json<WeatherEntry>, Error> {
     state
         .oracle
-        .get_event_entry(&event_id, &entry_id)
+        .get_event_entry(event_id, entry_id)
         .await
         .map(Json)
-        .inspect_err(|e| error!("error weather entry data: {}", e))
 }
 
 #[utoipa::path(
     post,
     path = "/oracle/update",
     responses(
-        (status = ACCEPTED, description = "Oracle data update started in the background"),
-        (status = CONFLICT, description = "An update is already running"),
+        (status = ACCEPTED, description = "Processing started in the background"),
+        (status = UNAUTHORIZED, description = "Missing or invalid NIP-98 authorization"),
+        (status = FORBIDDEN, description = "Signer is not an allowed uploader"),
+        (status = CONFLICT, description = "Processing is already running"),
         (status = SERVICE_UNAVAILABLE, description = "The oracle is shutting down"),
     ))]
-pub async fn update_data(State(state): State<Arc<AppState>>) -> StatusCode {
+pub async fn update_data(State(state): State<Arc<AppState>>, signed: Signed) -> Response {
+    if let Err(error) = state.auth.require(Role::Uploader, &signed.pubkey) {
+        return error.into_response();
+    }
     match state.start_etl() {
         Ok(etl_process_id) => {
-            info!("accepted etl process: {}", etl_process_id);
-            StatusCode::ACCEPTED
+            info!("accepted etl process: {etl_process_id}");
+            StatusCode::ACCEPTED.into_response()
         }
-        Err(crate::EtlRejected::AlreadyRunning) => StatusCode::CONFLICT,
-        Err(crate::EtlRejected::ShuttingDown) => StatusCode::SERVICE_UNAVAILABLE,
+        Err(EtlRejected::AlreadyRunning) => StatusCode::CONFLICT.into_response(),
+        Err(EtlRejected::ShuttingDown) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 
-impl IntoResponse for oracle::Error {
+fn json_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, Response> {
+    serde_json::from_slice(body).map_err(|error| bad_request(format!("invalid JSON body: {error}")))
+}
+
+fn bad_request(message: String) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
+}
+
+impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        let (status, error_message) = match &self {
-            oracle::Error::NotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
-            oracle::Error::BadEntry(_) | oracle::Error::BadEvent(_) => {
-                (StatusCode::BAD_REQUEST, self.to_string())
-            }
-            oracle::Error::WeatherData(error) => match error {
-                crate::weather_data::Error::InvalidStationId(_) => {
-                    (StatusCode::BAD_REQUEST, self.to_string())
-                }
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    String::from("internal server error"),
-                ),
-            },
+        let status = match &self {
+            Error::EventNotFound(_) | Error::EntryNotFound { .. } => StatusCode::NOT_FOUND,
+            Error::InvalidEvent(_) | Error::InvalidFilter(_) => StatusCode::BAD_REQUEST,
+            Error::InvalidEntries(EntryRejection::AlreadySubmitted) => StatusCode::CONFLICT,
+            Error::InvalidEntries(_) => StatusCode::BAD_REQUEST,
+            Error::WrongCoordinator(_) => StatusCode::FORBIDDEN,
             // Rejected before admission: nothing was written, so the caller
             // can retry once the queue drains or a new instance is ready.
-            oracle::Error::Write(WriteError::Unavailable) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                String::from("oracle is not accepting writes right now; retry later"),
-            ),
-            // Admitted but the reply was lost: the write may have committed.
-            oracle::Error::Write(WriteError::OutcomeUnknown) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                String::from("write outcome unknown; check the event before retrying"),
-            ),
-            oracle::Error::Write(WriteError::Database(_))
-            | oracle::Error::DataQuery(_)
-            | oracle::Error::Key(_)
-            | oracle::Error::ConvertKey(_)
-            | oracle::Error::MismatchPubkey(_)
-            | oracle::Error::OutcomeNotFound(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                String::from("internal server error"),
-            ),
+            Error::Write(WriteError::Unavailable) => StatusCode::SERVICE_UNAVAILABLE,
+            Error::Write(WriteError::OutcomeUnknown | WriteError::Database(_))
+            | Error::UnknownSource { .. }
+            | Error::Key(_)
+            | Error::KeyMismatch { .. }
+            | Error::Read(_)
+            | Error::Source(_)
+            | Error::Attest { .. }
+            | Error::Score(_)
+            | Error::Task(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        let body = Json(json!({
-            "error": error_message,
-        }));
-        (status, body).into_response()
+        let message = match &self {
+            Error::Write(WriteError::Unavailable) => {
+                String::from("oracle is not accepting writes right now; retry later")
+            }
+            // Admitted but the reply was lost: the write may have committed.
+            Error::Write(WriteError::OutcomeUnknown) => {
+                String::from("write outcome unknown; check the event before retrying")
+            }
+            _ if status == StatusCode::INTERNAL_SERVER_ERROR => {
+                String::from("internal server error")
+            }
+            _ => self.to_string(),
+        };
+        if status.is_server_error() {
+            error!("oracle request failed: {:#}", anyhow::Error::from(self));
+        } else {
+            warn!("oracle request rejected: {self}");
+        }
+        (status, Json(json!({ "error": message }))).into_response()
     }
 }

@@ -2806,6 +2806,9 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "lru"
@@ -3147,12 +3150,14 @@ dependencies = [
  "time",
  "tokio",
  "tokio-util",
+ "toml",
  "tower",
  "tower-http 0.7.1",
  "utoipa",
  "utoipa-scalar",
  "uuid",
  "walkdir",
+ "zeroize",
 ]
 
 [[package]]

@@ -151,9 +151,9 @@ pub fn event_detail_content(event: &Event) -> Markup {
                     h3 class="title is-6 mb-3" { "DLC Information" }
 
                     div class="mb-3" {
-                        p class="is-size-7 has-text-grey mb-1" { "Nonce" }
+                        p class="is-size-7 has-text-grey mb-1" { "Nonce point" }
                         div class="dlc-info" {
-                            (format!("{:?}", event.nonce))
+                            (event.nonce_point.to_string())
                         }
                     }
 
@@ -247,14 +247,14 @@ fn weather_comparison_table(weather: &[Weather]) -> Markup {
                             // Wind speed
                             td class="forecast-value" {
                                 @if let Some(wind) = w.forecasted.wind_speed {
-                                    (format!("{} mph", wind))
+                                    (format!("{} kt", wind))
                                 } @else {
                                     span class="has-text-grey" { "-" }
                                 }
                             }
                             td class="observed-value" {
-                                @if let Some(ref obs) = w.observed {
-                                    (format!("{} mph", obs.wind_speed))
+                                @if let Some(wind) = w.observed.as_ref().and_then(|obs| obs.wind_speed) {
+                                    (format!("{} kt", wind))
                                 } @else {
                                     span class="has-text-grey" { "-" }
                                 }

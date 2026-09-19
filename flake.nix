@@ -475,6 +475,24 @@
                 default = "${cfg.oracle.dataDir}/events";
                 description = "Directory for event database";
               };
+
+              remoteUrl = mkOption {
+                type = types.str;
+                default = "http://${cfg.oracle.host}:${toString cfg.oracle.port}";
+                description = "Public origin (scheme://host[:port]) that NIP-98 signatures are made over";
+              };
+
+              coordinatorPubkeys = mkOption {
+                type = types.listOf types.str;
+                default = [ ];
+                description = "Nostr pubkeys (npub or hex) allowed to create events and submit entries";
+              };
+
+              uploaderPubkeys = mkOption {
+                type = types.listOf types.str;
+                default = [ ];
+                description = "Nostr pubkeys (npub or hex) allowed to upload data files, e.g. the daemon's npub";
+              };
             };
 
             daemon = {
@@ -528,6 +546,9 @@
                 NOAA_ORACLE_EVENT_DB = cfg.oracle.eventDb;
                 NOAA_ORACLE_UI_DIR = "${cfg.oracle.package}/share/noaa-oracle/static";
                 NOAA_ORACLE_PRIVATE_KEY = "${cfg.oracle.dataDir}/keys/oracle.pem";
+                NOAA_ORACLE_REMOTE_URL = cfg.oracle.remoteUrl;
+                NOAA_ORACLE_COORDINATOR_PUBKEYS = concatStringsSep "," cfg.oracle.coordinatorPubkeys;
+                NOAA_ORACLE_UPLOADER_PUBKEYS = concatStringsSep "," cfg.oracle.uploaderPubkeys;
                 LD_LIBRARY_PATH = "${self.packages.${pkgs.system}.duckdb-lib}/lib";
                 RUST_LOG = "info";
               };
@@ -539,6 +560,8 @@
                 ExecStart = "${cfg.oracle.package}/bin/oracle";
                 Restart = "always";
                 RestartSec = 10;
+                # The signing key is created 0600 and must never be group or world readable.
+                UMask = "0077";
 
                 # Security
                 NoNewPrivileges = true;

@@ -4,11 +4,14 @@ metadata:
   name: {{ include "noaa-oracle.fullname" . }}
   labels:
     {{- include "noaa-oracle.labels" . | nindent 4 }}
+{{- if and (or .Values.config.coordinatorPubkeys .Values.config.uploaderPubkeys) (not .Values.config.remoteUrl) }}
+{{- fail "config.remoteUrl is required when pubkey allowlists are set: NIP-98 signatures are checked against it" }}
+{{- end }}
 data:
   oracle.toml: |
     level = {{ .Values.config.level | quote }}
     host = {{ .Values.config.host | quote }}
-    port = {{ .Values.config.port | quote }}
+    port = {{ .Values.config.port | int }}
     {{- if .Values.config.remoteUrl }}
     remote_url = {{ .Values.config.remoteUrl | quote }}
     {{- end }}
@@ -16,6 +19,9 @@ data:
     event_db = {{ .Values.config.eventDb | quote }}
     ui_dir = {{ .Values.config.uiDir | quote }}
     private_key_path = {{ .Values.config.privateKeyPath | quote }}
+    etl_interval = {{ .Values.config.etlInterval | int }}
+    coordinator_pubkeys = {{ .Values.config.coordinatorPubkeys | toJson }}
+    uploader_pubkeys = {{ .Values.config.uploaderPubkeys | toJson }}
 ---
 {{- if .Values.litestream.enabled }}
 apiVersion: v1
