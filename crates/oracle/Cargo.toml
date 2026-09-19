@@ -46,7 +46,7 @@ duckdb = "1.10505"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 
 # DLC / Crypto
-dlctix = "0.0.9"
+dlctix = "0.1.0"
 nostr = { version = "0.45", default-features = false, features = ["std", "nip98"] }
 pem-rfc7468 = { version = "1.0", features = ["alloc"] }
 base64 = "0.23"
