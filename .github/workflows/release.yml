@@ -32,72 +32,85 @@ jobs:
     steps:
       - name: Get version from tag or input
         id: get_version
+        env:
+          RELEASE_EVENT: ${{ github.event_name }}
+          REQUESTED_VERSION: ${{ github.event.inputs.version }}
+          REQUESTED_DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-            DRY_RUN="${{ github.event.inputs.dry_run }}"
+          if [ "$RELEASE_EVENT" = "workflow_dispatch" ]; then
+            VERSION="$REQUESTED_VERSION"
+            DRY_RUN="$REQUESTED_DRY_RUN"
           else
             VERSION=${GITHUB_REF#refs/tags/v}
             DRY_RUN="false"
           fi
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Release version must have the form MAJOR.MINOR.PATCH" >&2
+            exit 1
+          }
+          [[ "$DRY_RUN" = true || "$DRY_RUN" = false ]] || exit 1
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "version_name=v$VERSION" >> $GITHUB_OUTPUT
           echo "dry_run=$DRY_RUN" >> $GITHUB_OUTPUT
           echo "Release version: $VERSION (dry_run: $DRY_RUN)"
 
-  # Update version in Cargo.toml files and Helm chart appVersion (skipped in dry-run)
-  update-versions:
-    name: Update Versions
+  # Validate the tagged source; release jobs never rewrite commits or tags.
+  validate-versions:
+    name: Validate Versions
     runs-on: ubuntu-latest
     needs: prepare-release
-    if: needs.prepare-release.outputs.dry_run != 'true'
     steps:
       - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
-
-      - name: Setup Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
-        with:
-          use-gha-cache: false
-          use-flakehub: false
-
-      - name: Install cargo-edit and update versions
+      - name: Check package and chart versions
+        env:
+          RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
         run: |
-          VERSION="${{ needs.prepare-release.outputs.version }}"
-          echo "Updating all crates to version $VERSION"
-          nix develop -c cargo install cargo-edit --locked
-          nix develop -c cargo set-version --workspace $VERSION
+          python3 - <<'PYTHON'
+          import os
+          from pathlib import Path
+          import re
+          import tomllib
 
-          echo "Updated versions:"
-          grep "^version" Cargo.toml
-          grep "^version" crates/*/Cargo.toml
-
-          # Charts default the image tag to appVersion, so it must match the release.
-          echo "Updating Helm chart appVersion to $VERSION"
-          for chart in deploy/helm/*/Chart.yaml; do
-            sed -i "s/^appVersion: .*/appVersion: \"$VERSION\"/" "$chart"
-          done
-          grep "^appVersion" deploy/helm/*/Chart.yaml
-
-      - name: Commit version updates
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock crates/*/Cargo.toml deploy/helm/*/Chart.yaml
-          git commit -m "chore: bump version to ${{ needs.prepare-release.outputs.version }}" || echo "No changes to commit"
-          git push origin HEAD:master || echo "No changes to push"
+          version = os.environ["RELEASE_VERSION"]
+          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+              raise SystemExit("Release version must have the form MAJOR.MINOR.PATCH")
+          workspace = tomllib.loads(Path("Cargo.toml").read_text())
+          versions = {"workspace": workspace["workspace"]["package"]["version"]}
+          packages = ("daemon", "noaa-oracle-core", "oracle")
+          locked = tomllib.loads(Path("Cargo.lock").read_text())["package"]
+          for name in packages:
+              matches = [package for package in locked if package["name"] == name]
+              if len(matches) != 1:
+                  raise SystemExit(f"Expected one lockfile entry for {name}")
+              versions[f"Cargo.lock:{name}"] = matches[0]["version"]
+          for member in workspace["workspace"]["members"]:
+              manifest = tomllib.loads(Path(member, "Cargo.toml").read_text())
+              if manifest["package"]["version"] != {"workspace": True}:
+                  raise SystemExit(f"{member} must inherit the workspace version")
+          flake = Path("flake.nix").read_text()
+          for name in ("oracle", "daemon"):
+              match = re.search(r'pname = "' + name + r'";\s+version = "([^"]+)";', flake)
+              if match is None:
+                  raise SystemExit(f"Missing Nix package version for {name}")
+              versions[f"flake.nix:{name}"] = match.group(1)
+          for name in ("noaa-oracle", "noaa-daemon"):
+              chart = Path("deploy/helm", name, "Chart.yaml")
+              match = re.search(r'^appVersion: "([^"]+)"$', chart.read_text(), re.MULTILINE)
+              if match is None:
+                  raise SystemExit(f"Missing appVersion in {chart}")
+              versions[str(chart)] = match.group(1)
+          for source, actual in versions.items():
+              if actual != version:
+                  raise SystemExit(f"{source}: expected {version}, found {actual}")
+          print(f"Validated all package and chart versions: {version}")
+          PYTHON
 
   # Build release binaries for x86_64 using Nix
   build-release-x86_64:
     name: Build Release (x86_64)
     runs-on: ubuntu-latest
-    needs: prepare-release
-    # For real releases, wait for version update; for dry-run, proceed immediately
-    if: always() && needs.prepare-release.result == 'success'
+    needs: [prepare-release, validate-versions]
     steps:
       - uses: actions/checkout@v4
 
@@ -147,6 +160,8 @@ jobs:
           # Copy and rename config examples to usable defaults
           cp config/oracle.example.toml "${PKG_NAME}/config/oracle.toml"
           cp config/daemon.example.toml "${PKG_NAME}/config/daemon.toml"
+          # Signed uploads must use the same origin as the packaged oracle config.
+          sed -i 's|^base_url = "http://localhost:9800"$|base_url = "http://127.0.0.1:9800"|' "${PKG_NAME}/config/daemon.toml"
 
           # Create setup script for first-time deployment
           cat > "${PKG_NAME}/setup.sh" << 'EOF'
@@ -162,19 +177,9 @@ jobs:
           echo "Creating data directories..."
           mkdir -p weather_data event_data logs data
 
-          # Generate signing key
-          if [ -f "oracle_private_key.pem" ]; then
-              echo "WARNING: oracle_private_key.pem already exists!"
-              echo "Skipping key generation. Delete the file manually if you want to regenerate."
-          else
-              echo "Generating oracle signing key..."
-              openssl ecparam -genkey -name secp256k1 -out oracle_private_key.pem
-              chmod 600 oracle_private_key.pem
-              echo "Private key created: oracle_private_key.pem"
-              echo ""
-              echo "IMPORTANT: Back up this key securely! It is used for DLC attestations."
-              echo "If lost, any events signed with this key cannot be attested."
-          fi
+          echo "Each service creates its signing key with mode 0600 on first startup."
+          echo "Existing keys remain in place. Back up both keys after startup."
+          echo "The oracle needs its original key to attest existing events."
 
           echo ""
           echo "Setup complete! You can now run:"
@@ -186,19 +191,15 @@ jobs:
           # Create run script for oracle
           cat > "${PKG_NAME}/run-oracle.sh" << 'EOF'
           #!/bin/bash
+          set -e
           SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
           cd "$SCRIPT_DIR"
-
-          if [ ! -f "oracle_private_key.pem" ]; then
-              echo "ERROR: oracle_private_key.pem not found!"
-              echo "Run ./setup.sh first to generate the signing key."
-              exit 1
-          fi
 
           # Create data directories if missing
           mkdir -p weather_data event_data logs
 
           export RUST_LOG="${RUST_LOG:-info}"
+          export NOAA_ORACLE_CONFIG="${NOAA_ORACLE_CONFIG:-$SCRIPT_DIR/config/oracle.toml}"
           exec ./bin/oracle "$@"
           EOF
           chmod +x "${PKG_NAME}/run-oracle.sh"
@@ -206,12 +207,14 @@ jobs:
           # Create run script for daemon
           cat > "${PKG_NAME}/run-daemon.sh" << 'EOF'
           #!/bin/bash
+          set -e
           SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
           cd "$SCRIPT_DIR"
 
           mkdir -p data logs
 
           export RUST_LOG="${RUST_LOG:-info}"
+          export NOAA_DAEMON_CONFIG="${NOAA_DAEMON_CONFIG:-$SCRIPT_DIR/config/daemon.toml}"
           exec ./bin/daemon "$@"
           EOF
           chmod +x "${PKG_NAME}/run-daemon.sh"
@@ -222,9 +225,9 @@ jobs:
           =======================
 
           Quick Start:
-            1. Run ./setup.sh to initialize (creates directories and signing key)
-            2. Run ./run-oracle.sh to start the oracle server (default port 9800)
-            3. Run ./run-daemon.sh to start fetching NOAA weather data
+            1. Run ./setup.sh to create the data directories
+            2. Run ./run-oracle.sh to start the oracle and create its key (port 9800)
+            3. Run ./run-daemon.sh to create its key and start fetching NOAA weather data
             4. Copy the npub the daemon logs at startup into uploader_pubkeys
                in config/oracle.toml and restart the oracle; until then the
                oracle rejects the daemon's uploads (401)
@@ -232,10 +235,14 @@ jobs:
           Configuration:
             - Edit config/oracle.toml for oracle settings
             - Edit config/daemon.toml for daemon settings
+            - Keep daemon base_url equal to oracle remote_url, including scheme, host, and port
+            - The run scripts load these files; --config or NOAA_ORACLE_CONFIG /
+              NOAA_DAEMON_CONFIG can select another file
 
           Directories:
             - config/       Configuration files
-            - bin/          Binaries (UI is embedded in the oracle binary)
+            - bin/          Service binaries
+            - static/       Browser UI files served by the oracle
             - weather_data/ Downloaded parquet files (created on first run)
             - event_data/   DLC event database (created on first run)
 
@@ -243,7 +250,8 @@ jobs:
             - oracle_private_key.pem is your signing key - BACK IT UP!
             - daemon_private_key.pem signs the daemon's uploads; its npub is
               what uploader_pubkeys lists, so back it up too
-            - This key is used for DLC attestations and must be kept secure
+            - Each service creates its key with mode 0600 if the key is missing
+            - Keep both keys secret and preserve them across upgrades
 
           For more info: https://github.com/tee8z/noaa-oracle
           EOF
@@ -278,9 +286,7 @@ jobs:
   build-release-arm64:
     name: Build Release (ARM64)
     runs-on: ubuntu-24.04-arm
-    needs: prepare-release
-    # For real releases, wait for version update; for dry-run, proceed immediately
-    if: always() && needs.prepare-release.result == 'success'
+    needs: [prepare-release, validate-versions]
     steps:
       - uses: actions/checkout@v4
 
@@ -316,14 +322,17 @@ jobs:
           mkdir -p "${PKG_NAME}/bin"
           mkdir -p "${PKG_NAME}/config"
 
-          # Copy Nix-built binaries
-          # Note: UI is embedded in the oracle binary, no separate files needed
+          # Copy the Nix-built binaries and the UI files the oracle serves from ui_dir
           cp result/bin/oracle "${PKG_NAME}/bin/"
           cp result-daemon/bin/daemon "${PKG_NAME}/bin/"
+          mkdir -p "${PKG_NAME}/static"
+          cp -r result/share/noaa-oracle/static/. "${PKG_NAME}/static/"
 
           # Copy and rename config examples to usable defaults
           cp config/oracle.example.toml "${PKG_NAME}/config/oracle.toml"
           cp config/daemon.example.toml "${PKG_NAME}/config/daemon.toml"
+          # Signed uploads must use the same origin as the packaged oracle config.
+          sed -i 's|^base_url = "http://localhost:9800"$|base_url = "http://127.0.0.1:9800"|' "${PKG_NAME}/config/daemon.toml"
 
           # Create setup script for first-time deployment
           cat > "${PKG_NAME}/setup.sh" << 'EOF'
@@ -339,19 +348,9 @@ jobs:
           echo "Creating data directories..."
           mkdir -p weather_data event_data logs data
 
-          # Generate signing key
-          if [ -f "oracle_private_key.pem" ]; then
-              echo "WARNING: oracle_private_key.pem already exists!"
-              echo "Skipping key generation. Delete the file manually if you want to regenerate."
-          else
-              echo "Generating oracle signing key..."
-              openssl ecparam -genkey -name secp256k1 -out oracle_private_key.pem
-              chmod 600 oracle_private_key.pem
-              echo "Private key created: oracle_private_key.pem"
-              echo ""
-              echo "IMPORTANT: Back up this key securely! It is used for DLC attestations."
-              echo "If lost, any events signed with this key cannot be attested."
-          fi
+          echo "Each service creates its signing key with mode 0600 on first startup."
+          echo "Existing keys remain in place. Back up both keys after startup."
+          echo "The oracle needs its original key to attest existing events."
 
           echo ""
           echo "Setup complete! You can now run:"
@@ -363,19 +362,15 @@ jobs:
           # Create run script for oracle
           cat > "${PKG_NAME}/run-oracle.sh" << 'EOF'
           #!/bin/bash
+          set -e
           SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
           cd "$SCRIPT_DIR"
-
-          if [ ! -f "oracle_private_key.pem" ]; then
-              echo "ERROR: oracle_private_key.pem not found!"
-              echo "Run ./setup.sh first to generate the signing key."
-              exit 1
-          fi
 
           # Create data directories if missing
           mkdir -p weather_data event_data logs
 
           export RUST_LOG="${RUST_LOG:-info}"
+          export NOAA_ORACLE_CONFIG="${NOAA_ORACLE_CONFIG:-$SCRIPT_DIR/config/oracle.toml}"
           exec ./bin/oracle "$@"
           EOF
           chmod +x "${PKG_NAME}/run-oracle.sh"
@@ -383,12 +378,14 @@ jobs:
           # Create run script for daemon
           cat > "${PKG_NAME}/run-daemon.sh" << 'EOF'
           #!/bin/bash
+          set -e
           SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
           cd "$SCRIPT_DIR"
 
           mkdir -p data logs
 
           export RUST_LOG="${RUST_LOG:-info}"
+          export NOAA_DAEMON_CONFIG="${NOAA_DAEMON_CONFIG:-$SCRIPT_DIR/config/daemon.toml}"
           exec ./bin/daemon "$@"
           EOF
           chmod +x "${PKG_NAME}/run-daemon.sh"
@@ -399,9 +396,9 @@ jobs:
           =======================================
 
           Quick Start:
-            1. Run ./setup.sh to initialize (creates directories and signing key)
-            2. Run ./run-oracle.sh to start the oracle server (default port 9800)
-            3. Run ./run-daemon.sh to start fetching NOAA weather data
+            1. Run ./setup.sh to create the data directories
+            2. Run ./run-oracle.sh to start the oracle and create its key (port 9800)
+            3. Run ./run-daemon.sh to create its key and start fetching NOAA weather data
             4. Copy the npub the daemon logs at startup into uploader_pubkeys
                in config/oracle.toml and restart the oracle; until then the
                oracle rejects the daemon's uploads (401)
@@ -409,10 +406,14 @@ jobs:
           Configuration:
             - Edit config/oracle.toml for oracle settings
             - Edit config/daemon.toml for daemon settings
+            - Keep daemon base_url equal to oracle remote_url, including scheme, host, and port
+            - The run scripts load these files; --config or NOAA_ORACLE_CONFIG /
+              NOAA_DAEMON_CONFIG can select another file
 
           Directories:
             - config/       Configuration files
-            - bin/          Binaries (UI is embedded in the oracle binary)
+            - bin/          Service binaries
+            - static/       Browser UI files served by the oracle
             - weather_data/ Downloaded parquet files (created on first run)
             - event_data/   DLC event database (created on first run)
 
@@ -420,7 +421,8 @@ jobs:
             - oracle_private_key.pem is your signing key - BACK IT UP!
             - daemon_private_key.pem signs the daemon's uploads; its npub is
               what uploader_pubkeys lists, so back it up too
-            - This key is used for DLC attestations and must be kept secure
+            - Each service creates its key with mode 0600 if the key is missing
+            - Keep both keys secret and preserve them across upgrades
 
           For more info: https://github.com/tee8z/noaa-oracle
           EOF
@@ -474,8 +476,7 @@ jobs:
   build-docker-amd64:
     name: Build Docker Images (amd64)
     runs-on: ubuntu-latest
-    needs: [prepare-release]
-    if: always() && needs.prepare-release.result == 'success'
+    needs: [prepare-release, validate-versions]
     permissions:
       contents: read
       packages: write
@@ -530,8 +531,7 @@ jobs:
   build-docker-arm64:
     name: Build Docker Images (arm64)
     runs-on: ubuntu-24.04-arm
-    needs: [prepare-release]
-    if: always() && needs.prepare-release.result == 'success'
+    needs: [prepare-release, validate-versions]
     permissions:
       contents: read
       packages: write

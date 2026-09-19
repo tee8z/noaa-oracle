@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/core", "crates/daemon", "crates/oracle"]
 
 [workspace.package]
-version = "1.9.2"
+version = "2.0.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
