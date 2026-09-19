@@ -229,7 +229,7 @@ pub fn forecast_detail(
                                     // Wind
                                     @if let Some(wind) = forecast.wind_speed {
                                         p class="is-size-7" {
-                                            (format!("{} mph", wind))
+                                            (format!("{} kt", wind))
                                             @if let Some(dir) = forecast.wind_direction {
                                                 " "
                                                 span class="has-text-grey" { (wind_direction_label(dir)) }

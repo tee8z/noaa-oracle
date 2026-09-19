@@ -110,7 +110,8 @@ config:
   # Server binding
   host: "0.0.0.0"
   port: 9800
-  # Public URL for API responses
+  # Public origin clients use, e.g. https://4casttruth.win (no path).
+  # NIP-98 signatures from the coordinator and daemon must be made over it.
   remoteUrl: ""
   # Weather data directory (parquet files)
   dataDir: /var/lib/noaa-oracle/weather
@@ -118,8 +119,14 @@ config:
   eventDb: /var/lib/noaa-oracle/events
   # UI static files
   uiDir: /usr/share/noaa-oracle/ui
-  # Private key path for signing
+  # Private key path for signing (mounted with mode 0400)
   privateKeyPath: /etc/noaa-oracle/keys/oracle.pem
+  # Seconds between scheduled scoring and signing passes
+  etlInterval: 300
+  # Nostr pubkeys (npub or hex) allowed to create events and submit entries
+  coordinatorPubkeys: []
+  # Nostr pubkeys (npub or hex) allowed to upload data (the daemon's key)
+  uploaderPubkeys: []
 
 # Environment variables
 env: {}
@@ -164,29 +171,3 @@ cleanup:
   weatherDataDir: /var/lib/noaa-oracle/weather
   # Number of days to retain weather data
   retentionDays: 32
-
-# Oracle update cron job configuration
-# Triggers /oracle/update endpoint on a schedule to refresh data
-updateCron:
-  # Enable the update cronjob
-  enabled: false
-  # Cron schedule (default: every hour at minute 0)
-  schedule: "0 * * * *"
-  # Job history limits
-  successfulJobsHistoryLimit: 3
-  failedJobsHistoryLimit: 3
-  # Retry attempts on failure
-  backoffLimit: 3
-  # Container image for curl
-  image:
-    repository: curlimages/curl
-    tag: "8.5.0"
-    pullPolicy: IfNotPresent
-  # Resource limits
-  resources:
-    requests:
-      memory: 16Mi
-      cpu: 5m
-    limits:
-      memory: 32Mi
-      cpu: 50m

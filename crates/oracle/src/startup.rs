@@ -7,25 +7,28 @@
 //! configured shutdown timeout.
 
 use crate::{
-    Configuration,
+    auth::AuthPolicy,
+    config::{Configuration, Storage},
     database::Database,
     file_access::{FileAccess, FileData, S3FileAccess},
-    oracle::Oracle,
+    oracle::{Oracle, system_clock},
     routes::{
         add_event_entries, create_event, daily_observations, dashboard_handler, download,
         event_detail_handler, event_stats_handler, events_cards_handler, events_handler,
         events_rows_handler, files, forecast_handler, forecasts, get_event, get_event_entry,
-        get_npub, get_pubkey, get_stations, healthy, list_events, observations,
+        get_npub, get_pubkey, get_stations, healthy, list_events, list_sources, observations,
         oracle_info_handler, raw_data_handler, ready, update_data, upload, warm_forecast_cache,
         weather_handler,
     },
-    weather_data::{WeatherAccess, WeatherData},
+    sources::{NoaaWeather, Sources},
+    weather_data::{self, Station, WeatherAccess, WeatherData},
 };
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Router,
     body::Body,
     extract::{DefaultBodyLimit, Path, Request, State},
+    handler::Handler,
     http::{
         Method, StatusCode,
         header::{self, ACCEPT, CONTENT_TYPE},
@@ -52,10 +55,16 @@ use tower_http::cors::{Any, CorsLayer};
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
-const MAX_UPLOAD_BYTES: usize = 30 * 1024 * 1024;
+/// Parquet uploads from the daemon.
+const MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
+/// Every other request body: event and entry JSON is a few KiB.
+const MAX_BODY_BYTES: usize = 256 * 1024;
 /// Source data arrives hourly, so a 30 minute refresh keeps the cache at
 /// most 30 minutes stale.
 const FORECAST_CACHE_REFRESH: Duration = Duration::from_secs(30 * 60);
+/// Forecast fragments kept in memory. Only known stations are cached, so
+/// this bounds memory even if the station list grows unexpectedly.
+const MAX_CACHED_FORECASTS: usize = 4_096;
 
 type TaskResult = Result<Result<()>, JoinError>;
 
@@ -88,11 +97,16 @@ impl Background {
 pub struct AppState {
     pub static_dir: PathBuf,
     pub remote_url: String,
+    /// Local directory uploads land in and DuckDB reads.
+    pub weather_dir: PathBuf,
+    pub auth: AuthPolicy,
     pub file_access: Arc<dyn FileData>,
     pub weather_db: Arc<dyn WeatherData>,
     pub oracle: Arc<Oracle>,
     pub database: Database,
     forecast_cache: Mutex<HashMap<String, String>>,
+    /// Station list and when it was read; it only changes with new uploads.
+    stations: tokio::sync::Mutex<Option<(std::time::Instant, Arc<Vec<Station>>)>>,
     background: Background,
     etl_slot: Arc<Semaphore>,
 }
@@ -103,24 +117,43 @@ pub enum EtlRejected {
     ShuttingDown,
 }
 
+/// Everything [`AppState`] is built from.
+pub struct AppParts {
+    pub remote_url: String,
+    pub static_dir: PathBuf,
+    pub weather_dir: PathBuf,
+    pub auth: AuthPolicy,
+    pub file_access: Arc<dyn FileData>,
+    pub weather_db: Arc<dyn WeatherData>,
+    pub oracle: Arc<Oracle>,
+    pub database: Database,
+    pub background: Background,
+}
+
 impl AppState {
-    pub fn new(
-        remote_url: String,
-        static_dir: PathBuf,
-        file_access: Arc<dyn FileData>,
-        weather_db: Arc<dyn WeatherData>,
-        oracle: Arc<Oracle>,
-        database: Database,
-        background: Background,
-    ) -> Self {
+    pub fn new(parts: AppParts) -> Self {
+        let AppParts {
+            remote_url,
+            static_dir,
+            weather_dir,
+            auth,
+            file_access,
+            weather_db,
+            oracle,
+            database,
+            background,
+        } = parts;
         Self {
             static_dir,
             remote_url,
+            weather_dir,
+            auth,
             file_access,
             weather_db,
             oracle,
             database,
             forecast_cache: Mutex::new(HashMap::new()),
+            stations: tokio::sync::Mutex::new(None),
             background,
             etl_slot: Arc::new(Semaphore::new(1)),
         }
@@ -134,18 +167,49 @@ impl AppState {
             .cloned()
     }
 
+    /// Caches a rendered forecast. Callers pass only known station ids.
     pub fn cache_forecast(&self, station_id: String, html: String) {
-        self.forecast_cache
+        let mut cache = self
+            .forecast_cache
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(station_id, html);
+            .unwrap_or_else(PoisonError::into_inner);
+        if cache.len() < MAX_CACHED_FORECASTS || cache.contains_key(&station_id) {
+            cache.insert(station_id, html);
+        }
     }
 
+    /// Drops cached forecasts and the station list after new data arrives.
     pub fn clear_forecast_cache(&self) {
         self.forecast_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        if let Ok(mut stations) = self.stations.try_lock() {
+            *stations = None;
+        }
+    }
+
+    /// Every station in the observation files, read at most once per
+    /// [`FORECAST_CACHE_REFRESH`] instead of on every page load.
+    pub async fn stations(&self) -> Result<Arc<Vec<Station>>, weather_data::Error> {
+        let mut cached = self.stations.lock().await;
+        if let Some((read_at, stations)) = cached.as_ref()
+            && read_at.elapsed() < FORECAST_CACHE_REFRESH
+        {
+            return Ok(stations.clone());
+        }
+        let stations = Arc::new(self.weather_db.stations().await?);
+        *cached = Some((std::time::Instant::now(), stations.clone()));
+        Ok(stations)
+    }
+
+    /// Whether `station_id` appears in the observation files.
+    pub async fn is_known_station(&self, station_id: &str) -> bool {
+        self.stations().await.is_ok_and(|stations| {
+            stations
+                .iter()
+                .any(|station| station.station_id == station_id)
+        })
     }
 
     /// Runs one ETL pass in the background. Only one pass runs at a time and
@@ -165,8 +229,9 @@ impl AppState {
             let _permit = permit;
             info!("starting etl process: {}", etl_process_id);
             match state.oracle.etl_data(etl_process_id).await {
-                Ok(()) => info!("completed etl process: {}", etl_process_id),
-                Err(e) => error!("failed etl process: {} {}", etl_process_id, e),
+                Ok(0) => info!("completed etl process: {etl_process_id}"),
+                Ok(failed) => warn!("etl process {etl_process_id}: {failed} events failed"),
+                Err(e) => error!("failed etl process: {etl_process_id} {e:#}"),
             }
         });
         Ok(etl_process_id)
@@ -183,6 +248,7 @@ impl AppState {
     paths(
         crate::routes::events::get_npub,
         crate::routes::events::get_pubkey,
+        crate::routes::events::list_sources,
         crate::routes::events::list_events,
         crate::routes::events::create_event,
         crate::routes::events::get_event,
@@ -200,8 +266,12 @@ impl AppState {
     components(
         schemas(
                 crate::routes::files::get_names::Files,
-                crate::oracle::Error,
+                crate::routes::events::ErrorBody,
+                crate::routes::events::SourceInfo,
+                crate::scoring::Pick,
+                crate::sources::Reading,
                 crate::events::Event,
+                crate::events::EventSummary,
                 crate::events::WeatherEntry,
                 crate::events::AddEventEntry,
                 crate::events::CreateEvent,
@@ -222,12 +292,12 @@ async fn build_app_state(
     database: Database,
     background: Background,
 ) -> Result<Arc<AppState>> {
-    let file_access: Arc<dyn FileData> = match &configuration.s3_bucket {
-        Some(bucket) => {
+    let file_access: Arc<dyn FileData> = match &configuration.storage {
+        Storage::S3 { bucket, endpoint } => {
             info!("Using S3 bucket '{}' for file access", bucket);
-            Arc::new(S3FileAccess::new(bucket.clone(), configuration.s3_endpoint.clone()).await)
+            Arc::new(S3FileAccess::new(bucket.clone(), endpoint.clone()).await)
         }
-        None => Arc::new(FileAccess::new(
+        Storage::Local => Arc::new(FileAccess::new(
             configuration.weather_dir.to_string_lossy().into_owned(),
         )),
     };
@@ -235,23 +305,38 @@ async fn build_app_state(
     let local_file_access: Arc<dyn FileData> = Arc::new(FileAccess::new(
         configuration.weather_dir.to_string_lossy().into_owned(),
     ));
-    let weather_db = Arc::new(WeatherAccess::new(local_file_access));
+    let weather_db: Arc<dyn WeatherData> = Arc::new(WeatherAccess::new(local_file_access));
+    let sources = Sources::new(Arc::new(NoaaWeather::new(weather_db.clone())), []);
     let oracle = Oracle::new(
         database.clone(),
-        weather_db.clone(),
+        sources,
         &configuration.private_key,
+        system_clock(),
     )
     .await
-    .map_err(|e| anyhow!("error setting up oracle: {}", e))?;
-    Ok(Arc::new(AppState::new(
-        configuration.remote_url.clone(),
-        configuration.static_dir.clone(),
+    .context("set up oracle")?;
+    info!("oracle npub: {}", oracle.npub());
+    if configuration.coordinators.is_empty() {
+        warn!("no coordinator_pubkeys configured: nobody can create events");
+    }
+    if configuration.uploaders.is_empty() {
+        warn!("no uploader_pubkeys configured: nobody can upload data");
+    }
+    Ok(Arc::new(AppState::new(AppParts {
+        remote_url: configuration.remote_url.clone(),
+        static_dir: configuration.static_dir.clone(),
+        weather_dir: configuration.weather_dir.clone(),
+        auth: AuthPolicy::new(
+            &configuration.remote_url,
+            configuration.coordinators.clone(),
+            configuration.uploaders.clone(),
+        ),
         file_access,
         weather_db,
-        Arc::new(oracle),
+        oracle: Arc::new(oracle),
         database,
         background,
-    )))
+    })))
 }
 
 pub fn app(app_state: Arc<AppState>) -> Router {
@@ -280,14 +365,17 @@ pub fn app(app_state: Arc<AppState>) -> Router {
         .route("/healthy", get(healthy))
         // API routes
         .route("/files", get(files))
-        .route("/file/{file_name}", get(download))
-        .route("/file/{file_name}", post(upload))
+        .route(
+            "/file/{file_name}",
+            get(download).post(upload.layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))),
+        )
         .route("/stations", get(get_stations))
         .route("/stations/forecasts", get(forecasts))
         .route("/stations/observations", get(observations))
         .route("/stations/daily-observations", get(daily_observations))
         .route("/oracle/npub", get(get_npub))
         .route("/oracle/pubkey", get(get_pubkey))
+        .route("/oracle/sources", get(list_sources))
         .route("/oracle/update", post(update_data))
         .route("/oracle/events", get(list_events))
         .route("/oracle/events", post(create_event))
@@ -301,7 +389,7 @@ pub fn app(app_state: Arc<AppState>) -> Router {
         .route("/static/{*path}", get(serve_static_file))
         .with_state(app_state)
         .layer(middleware::from_fn(log_request))
-        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .merge(Scalar::with_url("/docs", api_docs))
         .layer(cors)
 }
@@ -470,6 +558,7 @@ impl ApplicationRuntime {
             }
         };
         spawn_cache_warmer(&state);
+        spawn_etl_schedule(&state, configuration.etl_interval);
         runtime.http = Some(spawn_http(
             listener,
             app(state),
@@ -576,6 +665,28 @@ fn spawn_cache_warmer(state: &Arc<AppState>) {
                 _ = interval.tick() => {
                     state.clear_forecast_cache();
                     warm_forecast_cache(&state).await;
+                }
+            }
+        }
+    });
+}
+
+/// Starts a processing pass every `interval` so events are attested once
+/// their signing date passes, even when no new data arrives.
+fn spawn_etl_schedule(state: &Arc<AppState>, interval: Duration) {
+    let state = state.clone();
+    let stopping = state.background.stopping.clone();
+    state.background.tasks.clone().spawn(async move {
+        let mut interval = tokio::time::interval(interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                () = stopping.cancelled() => break,
+                _ = interval.tick() => {
+                    if let Err(rejected) = state.start_etl() {
+                        info!("scheduled processing skipped: {rejected:?}");
+                    }
                 }
             }
         }

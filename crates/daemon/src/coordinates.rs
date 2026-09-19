@@ -1,10 +1,6 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fmt,
-    sync::Arc,
-};
+use std::{collections::HashMap, fmt, sync::Arc};
 
-use crate::{Point, XmlFetcher, parse_xml};
+use crate::{XmlFetcher, parse_xml};
 use anyhow::Error;
 use serde::{Deserialize, Serialize};
 
@@ -63,11 +59,19 @@ impl Station {
 }
 
 impl WeatherStation {
-    pub fn get_latitude(&self) -> String {
-        format!("{:.2}", self.latitude.parse::<f64>().unwrap())
+    /// Latitude at the 2 decimal places NDFD uses; `None` if unparseable.
+    pub fn get_latitude(&self) -> Option<String> {
+        self.latitude
+            .parse::<f64>()
+            .ok()
+            .map(|value| format!("{value:.2}"))
     }
-    pub fn get_longitude(&self) -> String {
-        format!("{:.2}", self.longitude.parse::<f64>().unwrap())
+    /// Longitude at the 2 decimal places NDFD uses; `None` if unparseable.
+    pub fn get_longitude(&self) -> Option<String> {
+        self.longitude
+            .parse::<f64>()
+            .ok()
+            .map(|value| format!("{value:.2}"))
     }
 }
 
@@ -94,28 +98,19 @@ impl CityWeather {
         self.get_coordinates().join("%20")
     }
 
+    /// `lat,lon` pairs for NDFD; stations with unparseable coordinates are
+    /// left out.
     pub fn get_coordinates(&self) -> Vec<String> {
         self.city_data
             .values()
-            .map(|weather_station| {
-                format!(
+            .filter_map(|station| {
+                Some(format!(
                     "{},{}",
-                    weather_station.get_latitude(),
-                    weather_station.get_longitude()
-                )
+                    station.get_latitude()?,
+                    station.get_longitude()?
+                ))
             })
-            .collect::<Vec<String>>()
-    }
-    pub fn remove_coordinates(mut self, point: Point) {
-        self.city_data
-            .retain(|_, v| !(v.latitude == point.latitude && v.longitude == point.longitude));
-    }
-    pub fn get_station_ids(&self) -> HashSet<String> {
-        let mut station_ids: HashSet<String> = HashSet::new();
-        self.city_data.iter().for_each(|(_city_name, city_data)| {
-            station_ids.insert(city_data.station_id.clone());
-        });
-        station_ids
+            .collect()
     }
 }
 
@@ -210,7 +205,7 @@ mod tests {
         assert_eq!(weather.city_data.len(), 1);
         let station = weather.city_data.get("K00U").unwrap();
         assert_eq!(station.state, "MT");
-        assert_eq!(station.get_latitude(), "45.75");
+        assert_eq!(station.get_latitude().as_deref(), Some("45.75"));
         assert_eq!(station.elevation_m, Some(922.0));
     }
 }

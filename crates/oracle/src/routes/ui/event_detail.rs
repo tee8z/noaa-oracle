@@ -14,15 +14,19 @@ pub async fn event_detail_handler(
     State(state): State<Arc<AppState>>,
     Path(event_id): Path<Uuid>,
 ) -> Response {
-    match state.oracle.get_event(&event_id).await {
+    match state.oracle.get_event(event_id).await {
         Ok(event) => {
             Html(event_detail_page(&state.remote_url, &event).into_string()).into_response()
         }
-        Err(_) => (
+        Err(crate::oracle::Error::EventNotFound(_)) => (
             StatusCode::NOT_FOUND,
             Html(not_found_page(&event_id.to_string())),
         )
             .into_response(),
+        Err(error) => {
+            log::error!("event page {event_id}: {error:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 

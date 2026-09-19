@@ -167,7 +167,7 @@ async function fetchStationForecast(stationId, popup) {
       return null;
     };
     const formatWind = (speed) =>
-      speed != null ? `${Math.round(speed)} mph` : null;
+      speed != null ? `${Math.round(speed)} kt` : null;
     const formatChance = (chance) => (chance != null ? `${chance}%` : null);
     const formatAmount = (amount) =>
       amount != null && amount > 0 ? `${amount.toFixed(2)}"` : null;

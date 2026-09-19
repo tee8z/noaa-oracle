@@ -1,7 +1,7 @@
 use super::*;
-use crate::events::{CreateEvent, CreateEventData, ScoringField};
+use crate::{events::NewEvent, signing::SigningKey};
 use axum::routing::post;
-use dlctix::secp::Scalar;
+use dlctix::EventLockingConditions;
 use std::{
     future::Future,
     io::{Read, Write},
@@ -37,21 +37,29 @@ async fn runtime(directory: &Path) -> (ApplicationRuntime, Database) {
     (runtime, database)
 }
 
-fn event_data() -> CreateEventData {
+fn event_data() -> NewEvent {
+    let directory = tempfile::tempdir().unwrap();
+    let key = SigningKey::load_or_create(&directory.path().join("oracle.pem")).unwrap();
+    let id = Uuid::now_v7();
     let start = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
-    let event = CreateEvent {
-        id: Uuid::now_v7(),
+    NewEvent {
+        id,
+        source: "noaa_weather".into(),
         signing_date: start + time::Duration::hours(3),
         start_observation_date: start,
         end_observation_date: start + time::Duration::hours(1),
         locations: vec!["KORD".into()],
-        number_of_values_per_entry: 3,
+        metrics: vec!["temp_high".into()],
+        number_of_values_per_entry: 1,
         total_allowed_entries: 2,
         number_of_places_win: 1,
-        scoring_fields: ScoringField::defaults(),
-    };
-    let oracle = Scalar::random(&mut rand::rng()).base_point_mul();
-    CreateEventData::new(oracle, nostr::key::Keys::generate().public_key(), event).unwrap()
+        nonce: key.new_event_nonce(id),
+        event_announcement: EventLockingConditions {
+            locking_points: vec![],
+            expiry: Some(1),
+        },
+        coordinator_pubkey: "npub1coordinator".into(),
+    }
 }
 
 async fn serve(runtime: &mut ApplicationRuntime, router: Router) -> SocketAddr {
@@ -78,14 +86,7 @@ fn post_event(address: SocketAddr) -> String {
 
 async fn event_count(directory: &Path) -> i64 {
     let (database, writer) = Database::open(&directory.join("event_data")).await.unwrap();
-    let count = i64::try_from(
-        database
-            .filtered_list_events(crate::events::EventFilter::default())
-            .await
-            .unwrap()
-            .len(),
-    )
-    .unwrap();
+    let count = i64::try_from(database.list_events(&[], 100).await.unwrap().len()).unwrap();
     let shutdown = CancellationToken::new();
     shutdown.cancel();
     writer.run(shutdown).await.unwrap();
@@ -113,12 +114,9 @@ async fn shutdown_finishes_an_accepted_http_request_before_stopping_the_writer()
             async move {
                 admitted.notify_one();
                 finish.notified().await;
-                database
-                    .add_event(event_data())
-                    .await
-                    .unwrap()
-                    .id
-                    .to_string()
+                let event = event_data();
+                database.add_event(&event).await.unwrap();
+                event.id.to_string()
             }
         }),
     );
@@ -161,7 +159,7 @@ async fn background_work_drains_before_the_writer_closes() {
     runtime.background.tasks.spawn(async move {
         task_started.notify_one();
         task_release.notified().await;
-        task_database.add_event(event_data()).await.unwrap();
+        task_database.add_event(&event_data()).await.unwrap();
     });
     let running = tokio::spawn(runtime.run_until_stop());
     bounded(started.notified()).await;
@@ -210,10 +208,7 @@ async fn an_unexpected_http_exit_drains_and_closes_the_writer() {
     assert!(writer_shutdown.is_cancelled());
     assert!(!database.is_writer_available());
     assert!(
-        database
-            .filtered_list_events(crate::events::EventFilter::default())
-            .await
-            .is_err(),
+        database.list_events(&[], 100).await.is_err(),
         "read pool must be closed"
     );
 }
@@ -248,20 +243,23 @@ async fn etl_runs_one_at_a_time_and_not_during_shutdown() {
     let weather: Arc<dyn WeatherData> = Arc::new(WeatherAccess::new(files.clone()));
     let oracle = Oracle::new(
         database.clone(),
-        weather.clone(),
+        Sources::new(Arc::new(NoaaWeather::new(weather.clone())), []),
         &directory.path().join("oracle.pem"),
+        system_clock(),
     )
     .await
     .unwrap();
-    let state = Arc::new(AppState::new(
-        "http://localhost".into(),
-        directory.path().to_path_buf(),
-        files,
-        weather,
-        Arc::new(oracle),
+    let state = Arc::new(AppState::new(AppParts {
+        remote_url: "http://localhost".into(),
+        static_dir: directory.path().to_path_buf(),
+        weather_dir: directory.path().to_path_buf(),
+        auth: AuthPolicy::new("http://localhost", [], []),
+        file_access: files,
+        weather_db: weather,
+        oracle: Arc::new(oracle),
         database,
-        runtime.background.clone(),
-    ));
+        background: runtime.background.clone(),
+    }));
     let first = state.start_etl().unwrap();
     let second = state.start_etl();
     assert!(matches!(second, Ok(_) | Err(EtlRejected::AlreadyRunning)));

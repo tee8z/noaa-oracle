@@ -63,8 +63,8 @@ async fn build_dashboard_data(
     end: Option<OffsetDateTime>,
 ) -> DashboardData {
     // Get oracle identity
-    let pubkey = state.oracle.public_key();
-    let npub = state.oracle.npub().unwrap_or_else(|_| "Error".to_string());
+    let pubkey = state.oracle.public_key_base64();
+    let npub = state.oracle.npub();
 
     // Get event statistics
     let events = state
@@ -244,7 +244,10 @@ async fn get_latest_weather(
         .unwrap_or_default();
 
     // Get station names for lookup
-    let all_stations = state.weather_db.stations().await.unwrap_or_default();
+    let all_stations = state.stations().await.unwrap_or_else(|error| {
+        log::error!("failed to read stations: {error:#}");
+        Default::default()
+    });
 
     // First, try to get data for major airports
     let mut weather_data: Vec<WeatherDisplay> = Vec::new();
@@ -262,7 +265,7 @@ async fn get_latest_weather(
                 elevation_m: station.and_then(|s| s.elevation_m),
                 temp_high: Some(obs.temp_high),
                 temp_low: Some(obs.temp_low),
-                wind_speed: Some(obs.wind_speed),
+                wind_speed: obs.wind_speed,
                 wind_direction: obs.wind_direction,
                 humidity: obs.humidity,
                 rain_amt: obs.rain_amt,
@@ -345,7 +348,7 @@ async fn get_latest_weather(
                 elevation_m: station.and_then(|s| s.elevation_m),
                 temp_high: Some(obs.temp_high),
                 temp_low: Some(obs.temp_low),
-                wind_speed: Some(obs.wind_speed),
+                wind_speed: obs.wind_speed,
                 wind_direction: obs.wind_direction,
                 humidity: obs.humidity,
                 rain_amt: obs.rain_amt,

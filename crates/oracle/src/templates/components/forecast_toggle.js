@@ -1,10 +1,36 @@
+// Fetches the forecast fragment for a station. Station ids come from
+// data attributes, never from inline script, and are encoded for the URL.
+function fetchForecast(stationId) {
+  return fetch("/fragments/forecast/" + encodeURIComponent(stationId)).then(
+    function (response) {
+      if (!response.ok) {
+        throw new Error("forecast request failed: " + response.status);
+      }
+      return response.text();
+    },
+  );
+}
+
+// Rows and cards carry data-station and data-forecast-toggle; one listener
+// handles them, including ones htmx swaps in later.
+document.addEventListener("click", function (event) {
+  var target = event.target.closest("[data-forecast-toggle]");
+  if (!target) return;
+  var stationId = target.dataset.station;
+  if (!stationId) return;
+  if (target.dataset.forecastToggle === "card") {
+    window.toggleCardForecast(stationId);
+  } else {
+    window.loadForecast(stationId);
+  }
+});
+
 // Load forecast data for a station
-// Called from onclick on weather row
 window.loadForecast = function loadForecast(stationId) {
   var forecastRow = document.getElementById("forecast-row-" + stationId);
   var forecastContainer = document.getElementById("forecast-" + stationId);
   var weatherRow = document.querySelector(
-    "tr[data-station='" + stationId + "']",
+    "tr[data-station='" + CSS.escape(stationId) + "']",
   );
 
   if (!forecastRow || !forecastContainer) {
@@ -29,10 +55,7 @@ window.loadForecast = function loadForecast(stationId) {
   }
 
   // First time - fetch the forecast data
-  fetch("/fragments/forecast/" + stationId)
-    .then(function (response) {
-      return response.text();
-    })
+  fetchForecast(stationId)
     .then(function (html) {
       forecastContainer.innerHTML = html;
       forecastRow.dataset.loaded = "true";
@@ -65,10 +88,7 @@ window.toggleCardForecast = function toggleCardForecast(stationId) {
   }
 
   // First time - fetch forecast
-  fetch("/fragments/forecast/" + stationId)
-    .then(function (response) {
-      return response.text();
-    })
+  fetchForecast(stationId)
     .then(function (html) {
       container.innerHTML = html;
       container.dataset.loaded = "true";

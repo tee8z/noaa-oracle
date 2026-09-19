@@ -56,6 +56,11 @@ Only needed if you want live/current weather data.
 daemon --base-url http://your-oracle:9800
 ```
 
+The daemon signs every upload. On first start it creates its key
+(`private_key`, mode 0600) and logs its npub; add that npub to the
+oracle's `uploader_pubkeys`, and make sure `base_url` equals the oracle's
+`remote_url`, because the signature covers the request URL.
+
 ## Quick Start
 
 ```bash
@@ -98,9 +103,14 @@ export NOAA_ORACLE_PRIVATE_KEY_PATH=/etc/noaa-oracle/oracle.pem
 ### Daemon
 ```bash
 export NOAA_DAEMON_LEVEL=info
-export NOAA_DAEMON_BASE_URL=http://localhost:9800
+export NOAA_DAEMON_BASE_URL=http://localhost:9800   # must equal the oracle's remote_url
 export NOAA_DAEMON_DATA_DIR=/var/cache/noaa-oracle
 export NOAA_DAEMON_SLEEP_INTERVAL=3600
+export NOAA_DAEMON_PRIVATE_KEY=/var/cache/noaa-oracle/keys/daemon.pem
+export NOAA_DAEMON_MIN_FORECAST_COVERAGE=0.8
+export NOAA_DAEMON_RETENTION_DAYS=7
+export NOAA_DAEMON_S3_BUCKET=noaa-oracle-archive     # optional archival
+export NOAA_DAEMON_S3_ENDPOINT=http://localhost:5000 # optional, moto/localstack
 ```
 
 ## Deployment Scenarios

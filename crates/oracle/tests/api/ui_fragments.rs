@@ -133,6 +133,9 @@ async fn forecast_fragment_returns_forecast_data() {
         .times(1)
         .returning(|_, _| Ok(vec![]));
 
+    weather_data
+        .expect_stations()
+        .returning(|| Ok(mock_stations()));
     let test_app = spawn_app(Arc::new(weather_data)).await;
 
     let request = Request::builder()
@@ -178,6 +181,9 @@ async fn forecast_fragment_handles_no_data() {
         .times(1)
         .returning(|_, _| Ok(vec![]));
 
+    weather_data
+        .expect_stations()
+        .returning(|| Ok(mock_stations()));
     let test_app = spawn_app(Arc::new(weather_data)).await;
 
     let request = Request::builder()
@@ -250,7 +256,7 @@ fn mock_observation_data() -> Vec<Observation> {
         end_time: String::from("2024-08-12T23:59:59+00:00"),
         temp_low: 55.0,
         temp_high: 75.0,
-        wind_speed: 10,
+        wind_speed: Some(10),
         temp_unit_code: TemperatureUnit::Fahrenheit.to_string(),
         wind_direction: None,
         humidity: None,
@@ -309,4 +315,19 @@ fn mock_stations() -> Vec<Station> {
         latitude: 41.9742,
         longitude: -87.9073,
     }]
+}
+
+#[tokio::test]
+async fn invalid_or_unbounded_weather_requests_are_rejected() {
+    let test_app = spawn_app(Arc::new(MockWeatherAccess::new())).await;
+    for path in [
+        "/fragments/forecast/KORD%27%29%3Balert(1)",
+        "/stations/observations?station_ids=",
+        "/stations/observations?station_ids=KORD&start=2020-01-01T00:00:00Z&end=2021-01-01T00:00:00Z",
+        "/stations/forecasts?station_ids=bad%27id",
+        "/files?start=2020-01-01T00:00:00Z&end=2026-01-01T00:00:00Z",
+    ] {
+        let (status, _) = test_app.get(path).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{path}");
+    }
 }

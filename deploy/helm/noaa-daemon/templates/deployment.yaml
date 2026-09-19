@@ -31,6 +31,8 @@ spec:
           env:
             - name: RUST_LOG
               value: {{ .Values.config.level }}
+            - name: NOAA_DAEMON_LEVEL
+              value: {{ .Values.config.level | quote }}
             - name: NOAA_DAEMON_BASE_URL
               value: {{ .Values.config.baseUrl | quote }}
             - name: NOAA_DAEMON_DATA_DIR
@@ -41,6 +43,16 @@ spec:
               value: {{ .Values.config.refillRate | quote }}
             - name: NOAA_DAEMON_TOKEN_CAPACITY
               value: {{ .Values.config.tokenCapacity | quote }}
+            - name: NOAA_DAEMON_MIN_FORECAST_COVERAGE
+              value: {{ .Values.config.minForecastCoverage | quote }}
+            - name: NOAA_DAEMON_RETENTION_DAYS
+              value: {{ .Values.config.retentionDays | quote }}
+            - name: NOAA_DAEMON_PRIVATE_KEY
+              {{- if include "noaa-daemon.keySecret" . }}
+              value: /etc/noaa-daemon/keys/daemon.pem
+              {{- else }}
+              value: {{ printf "%s/daemon.pem" .Values.config.dataDir | quote }}
+              {{- end }}
             {{- if .Values.sleepInterval }}
             - name: NOAA_DAEMON_SLEEP_INTERVAL
               value: {{ .Values.sleepInterval | quote }}
@@ -80,20 +92,36 @@ spec:
                   key: secret-access-key
             {{- end }}
             {{- end }}
-          {{- if .Values.devMode.enabled }}
+          {{- if or (include "noaa-daemon.keySecret" .) .Values.devMode.enabled }}
           volumeMounts:
+            {{- if include "noaa-daemon.keySecret" . }}
+            - name: keys
+              mountPath: /etc/noaa-daemon/keys
+              readOnly: true
+            {{- end }}
+            {{- if .Values.devMode.enabled }}
             - name: dev-binary
               mountPath: /app
               readOnly: true
+            {{- end }}
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-      {{- if .Values.devMode.enabled }}
+      {{- if or (include "noaa-daemon.keySecret" .) .Values.devMode.enabled }}
       volumes:
+        {{- if include "noaa-daemon.keySecret" . }}
+        - name: keys
+          secret:
+            secretName: {{ .Values.secrets.privateKey.existingSecret | default (printf "%s-keys" (include "noaa-daemon.fullname" .)) }}
+            # The daemon refuses a key readable by group or others.
+            defaultMode: 0400
+        {{- end }}
+        {{- if .Values.devMode.enabled }}
         - name: dev-binary
           hostPath:
             path: {{ .Values.devMode.hostPath | dir }}
             type: Directory
+        {{- end }}
       {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

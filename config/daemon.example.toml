@@ -33,8 +33,9 @@ base_url = "http://localhost:9800"
 # =============================================================================
 # Local Storage
 # =============================================================================
-# Temporary directory for parquet files before upload
-# Files are organized by date: data_dir/YYYY-MM-DD/*.parquet
+# Parquet files are written here and kept until they are published and
+# older than retention_days. Files are organized by date:
+# data_dir/YYYY-MM-DD/*.parquet
 #
 # For user installs: ~/.cache/noaa-oracle/
 # For system installs: /var/cache/noaa-oracle/
@@ -56,3 +57,35 @@ user_agent = "noaa-oracle-daemon/1.0"
 # Default: 3 requests per 15 second window
 refill_rate = 15.0
 token_capacity = 3
+
+# =============================================================================
+# Upload Signing
+# =============================================================================
+# Uploads are signed (NIP-98) with this secp256k1 key. The file is created
+# with mode 0600 if it does not exist and refused if it is readable by group
+# or others. The daemon logs its npub at startup; add that npub to the
+# oracle's `uploader_pubkeys`. Signatures cover the request URL, so
+# base_url must equal the oracle's `remote_url`.
+private_key = "./daemon_private_key.pem"
+
+# =============================================================================
+# Publishing
+# =============================================================================
+# A run is published only when at least this fraction of stations received
+# a forecast (0.0 to 1.0). A sparser run is discarded and retried at the
+# next interval, so partial data is never attested as if it were complete.
+min_forecast_coverage = 0.8
+
+# Days to keep published parquet files under data_dir. Files the oracle has
+# not accepted yet are kept and retried every run regardless of age.
+retention_days = 7
+
+# =============================================================================
+# S3 Archival (optional)
+# =============================================================================
+# Also archive each published file to S3 under weather_data/YYYY-MM-DD/.
+# Credentials come from the AWS credential chain (AWS_ACCESS_KEY_ID and
+# AWS_SECRET_ACCESS_KEY, a profile, or an instance role).
+# s3_bucket = "noaa-oracle-archive"
+# Custom endpoint for moto or localstack; leave unset for AWS.
+# s3_endpoint = "http://localhost:5000"

@@ -34,10 +34,15 @@ securityContext: {}
 config:
   # Logging level
   level: "info"
-  # Oracle server URL to upload data to
+  # Oracle server URL to upload data to. Uploads are signed over this URL,
+  # so it must equal the oracle's config.remoteUrl.
   baseUrl: "http://noaa-oracle.oracle.svc.cluster.local:9800"
-  # Temporary data directory
+  # Parquet files stay here until published and older than retentionDays
   dataDir: /tmp/noaa-daemon
+  # Discard a run when fewer than this fraction of stations got a forecast
+  minForecastCoverage: 0.8
+  # Days to keep published parquet files in dataDir
+  retentionDays: 7
   # HTTP client settings
   # User-Agent header for NOAA API requests (include contact info)
   userAgent: "4casttruth/1.0 (https://www.4casttruth.win/; 5day4cast@protonmail.com)"
@@ -54,6 +59,20 @@ s3:
   # AWS credentials (for local dev with moto)
   accessKeyId: ""
   secretAccessKey: ""
+
+# Upload signing key. The oracle accepts uploads only from npubs listed in
+# its config.uploaderPubkeys, so the key must survive pod restarts: provide
+# it as a secret with a `daemon.pem` entry (raw 32-byte secp256k1 secret in
+# an `EC PRIVATE KEY` PEM). Without a secret the daemon creates a key under
+# dataDir on every start, and its npub changes with each restart.
+secrets:
+  privateKey:
+    # Set to true to create a secret from the value below
+    create: false
+    # The private key PEM content (for local dev only - use external secrets in prod)
+    value: ""
+    # Name of an existing secret holding `daemon.pem`
+    existingSecret: ""
 
 # Environment variables
 env: {}

@@ -45,9 +45,9 @@ jobs:
           echo "dry_run=$DRY_RUN" >> $GITHUB_OUTPUT
           echo "Release version: $VERSION (dry_run: $DRY_RUN)"
 
-  # Update version in Cargo.toml files (skipped in dry-run)
+  # Update version in Cargo.toml files and Helm chart appVersion (skipped in dry-run)
   update-versions:
-    name: Update Crate Versions
+    name: Update Versions
     runs-on: ubuntu-latest
     needs: prepare-release
     if: needs.prepare-release.outputs.dry_run != 'true'
@@ -76,11 +76,18 @@ jobs:
           grep "^version" Cargo.toml
           grep "^version" crates/*/Cargo.toml
 
+          # Charts default the image tag to appVersion, so it must match the release.
+          echo "Updating Helm chart appVersion to $VERSION"
+          for chart in deploy/helm/*/Chart.yaml; do
+            sed -i "s/^appVersion: .*/appVersion: \"$VERSION\"/" "$chart"
+          done
+          grep "^appVersion" deploy/helm/*/Chart.yaml
+
       - name: Commit version updates
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock crates/*/Cargo.toml
+          git add Cargo.toml Cargo.lock crates/*/Cargo.toml deploy/helm/*/Chart.yaml
           git commit -m "chore: bump version to ${{ needs.prepare-release.outputs.version }}" || echo "No changes to commit"
           git push origin HEAD:master || echo "No changes to push"
 
@@ -218,6 +225,9 @@ jobs:
             1. Run ./setup.sh to initialize (creates directories and signing key)
             2. Run ./run-oracle.sh to start the oracle server (default port 9800)
             3. Run ./run-daemon.sh to start fetching NOAA weather data
+            4. Copy the npub the daemon logs at startup into uploader_pubkeys
+               in config/oracle.toml and restart the oracle; until then the
+               oracle rejects the daemon's uploads (401)
 
           Configuration:
             - Edit config/oracle.toml for oracle settings
@@ -231,6 +241,8 @@ jobs:
 
           Security:
             - oracle_private_key.pem is your signing key - BACK IT UP!
+            - daemon_private_key.pem signs the daemon's uploads; its npub is
+              what uploader_pubkeys lists, so back it up too
             - This key is used for DLC attestations and must be kept secure
 
           For more info: https://github.com/tee8z/noaa-oracle
@@ -390,6 +402,9 @@ jobs:
             1. Run ./setup.sh to initialize (creates directories and signing key)
             2. Run ./run-oracle.sh to start the oracle server (default port 9800)
             3. Run ./run-daemon.sh to start fetching NOAA weather data
+            4. Copy the npub the daemon logs at startup into uploader_pubkeys
+               in config/oracle.toml and restart the oracle; until then the
+               oracle rejects the daemon's uploads (401)
 
           Configuration:
             - Edit config/oracle.toml for oracle settings
@@ -403,6 +418,8 @@ jobs:
 
           Security:
             - oracle_private_key.pem is your signing key - BACK IT UP!
+            - daemon_private_key.pem signs the daemon's uploads; its npub is
+              what uploader_pubkeys lists, so back it up too
             - This key is used for DLC attestations and must be kept secure
 
           For more info: https://github.com/tee8z/noaa-oracle

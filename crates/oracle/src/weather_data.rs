@@ -1,8 +1,16 @@
 //! Weather queries over parquet files with an in-process DuckDB connection.
 //!
-//! Every query opens a fresh in-memory connection, so there is no shared
-//! state or locking between requests. Station ids and file names are
-//! validated before they are interpolated into SQL.
+//! Every query opens a fresh in-memory connection on a blocking thread, so
+//! queries never stall the async runtime and share no state. A semaphore
+//! bounds how many run at once, and each connection has memory and thread
+//! limits. Station ids and file names are validated before they are
+//! interpolated into SQL.
+//!
+//! Parquet files are append-only history written by every daemon version.
+//! Each query unions a NULL-typed row declaring every column it reads, so
+//! files that predate a column still load, and casts its output so decoded
+//! Arrow types do not depend on which files matched. Decoding looks columns
+//! up by name, never panics, and keeps missing values missing.
 
 use crate::{
     file_access::{self, FileData, FileParams},
@@ -13,13 +21,41 @@ use duckdb::{
     Connection,
     arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray},
 };
+use log::debug;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use time::{Duration, OffsetDateTime, Time, format_description::well_known::Rfc3339};
+use tokio::sync::Semaphore;
 use utoipa::ToSchema;
+
+/// METAR present weather (`wx_string`) to `rain`, `snow`, or `ice`. Each
+/// token is an optional intensity (`+`/`-`), an optional `VC`, then
+/// two-letter groups: `-SN`, `+SHSN`, `-RASN`, `BLSN`, `-FZRA`, `PL`. Ice
+/// wins over snow and snow over rain. Files without `wx_string` fall back
+/// to temperature: at or below 2 °C counts as snow.
+const PRECIP_TYPE_SQL: &str = r#"CASE
+        WHEN wx_string IS NOT NULL AND wx_string != '' THEN
+            CASE
+                WHEN regexp_matches(wx_string, '(^|\s)[-+]?(VC)?(([A-Z]{2})*(PL|GR|GS|IC)|FZ(RA|DZ))(\s|$|[A-Z])') THEN 'ice'
+                WHEN regexp_matches(wx_string, '(^|\s)[-+]?(VC)?([A-Z]{2})*(SN|SG)(\s|$|[A-Z])') THEN 'snow'
+                ELSE 'rain'
+            END
+        WHEN temperature_value IS NOT NULL AND temperature_value <= 2.0 THEN 'snow'
+        ELSE 'rain'
+    END"#;
+
+/// Observation history, back from the newest file, the station list is read from.
+const STATION_LOOKBACK: Duration = Duration::days(30);
+
+/// Queries running at once; more wait for a slot.
+const MAX_CONCURRENT_QUERIES: usize = 4;
+/// Per-connection DuckDB limits.
+const QUERY_MEMORY_LIMIT: &str = "512MB";
+const QUERY_THREADS: usize = 2;
 
 pub struct WeatherAccess {
     file_access: Arc<dyn FileData>,
+    slots: Arc<Semaphore>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -34,6 +70,13 @@ pub enum Error {
     FileAccess(#[from] file_access::Error),
     #[error("Invalid station id: {0:?}")]
     InvalidStationId(String),
+    #[error("query result column {column} is missing or not {expected}")]
+    Schema {
+        column: &'static str,
+        expected: &'static str,
+    },
+    #[error("query task failed")]
+    Task(#[from] tokio::task::JoinError),
 }
 
 const MAX_STATION_ID_LENGTH: usize = 16;
@@ -98,25 +141,76 @@ pub trait WeatherData: Sync + Send {
     async fn stations(&self) -> Result<Vec<Station>, Error>;
 }
 
-pub fn convert_temperature(value: f64, from_unit: &str, to_unit: &TemperatureUnit) -> f64 {
-    match (from_unit.to_lowercase().as_str(), to_unit) {
-        ("celsius", TemperatureUnit::Fahrenheit) => (value * 9.0 / 5.0) + 32.0,
-        ("fahrenheit", TemperatureUnit::Celsius) => (value - 32.0) * 5.0 / 9.0,
-        _ => value, // No conversion needed
+/// The temperature unit a parquet row was written in. The daemon writes
+/// `"celcius"` (sic); historical files keep that spelling, so both are
+/// accepted.
+fn source_unit(code: &str) -> Option<TemperatureUnit> {
+    match code.to_ascii_lowercase().as_str() {
+        "celsius" | "celcius" => Some(TemperatureUnit::Celsius),
+        "fahrenheit" => Some(TemperatureUnit::Fahrenheit),
+        _ => None,
+    }
+}
+
+/// Converts `value` from `code` to `target`; unknown codes are left as is.
+fn convert(value: f64, code: &str, target: &TemperatureUnit) -> f64 {
+    match (source_unit(code), target) {
+        (Some(TemperatureUnit::Celsius), TemperatureUnit::Fahrenheit) => value * 9.0 / 5.0 + 32.0,
+        (Some(TemperatureUnit::Fahrenheit), TemperatureUnit::Celsius) => (value - 32.0) * 5.0 / 9.0,
+        _ => value,
+    }
+}
+
+/// The unit code values end up in after [`convert`].
+fn converted_code(code: &str, target: &TemperatureUnit) -> String {
+    match source_unit(code) {
+        Some(_) => target.to_string(),
+        None => code.to_owned(),
     }
 }
 
 impl WeatherAccess {
     pub fn new(file_access: Arc<dyn FileData>) -> Self {
-        Self { file_access }
+        Self {
+            file_access,
+            slots: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
+        }
     }
 
-    /// Creates new in-memory connection, making it so we always start with a fresh slate and no possible locking issues
-    fn open_connection(&self) -> Result<Connection, duckdb::Error> {
-        let conn = Connection::open_in_memory()?;
-        conn.execute_batch("INSTALL parquet; LOAD parquet;")?;
-        Ok(conn)
+    /// Runs `sql` on a fresh connection off the async runtime and decodes
+    /// the result there too.
+    async fn query<T: Send + 'static>(
+        &self,
+        sql: String,
+        decode: impl FnOnce(&[RecordBatch]) -> Result<Vec<T>, Error> + Send + 'static,
+    ) -> Result<Vec<T>, Error> {
+        let _slot = self
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Schema {
+                column: "query slot",
+                expected: "an open semaphore",
+            })?;
+        tokio::task::spawn_blocking(move || {
+            let connection = open_connection()?;
+            let mut statement = connection.prepare(&sql)?;
+            let batches: Vec<RecordBatch> = statement.query_arrow([])?.collect();
+            decode(&batches)
+        })
+        .await?
     }
+}
+
+/// A fresh in-memory connection with bounded memory and threads.
+fn open_connection() -> Result<Connection, duckdb::Error> {
+    let connection = Connection::open_in_memory()?;
+    connection.execute_batch(&format!(
+        "SET memory_limit = '{QUERY_MEMORY_LIMIT}'; SET threads = {QUERY_THREADS};
+         INSTALL parquet; LOAD parquet;"
+    ))?;
+    Ok(connection)
 }
 #[async_trait]
 impl WeatherData for WeatherAccess {
@@ -401,27 +495,27 @@ impl WeatherData for WeatherAccess {
                 GROUP BY station_id, DATE_TRUNC('day', begin_time::TIMESTAMPTZ AT TIME ZONE 'UTC')::TEXT
             )
             SELECT
-                df.station_id,
-                df.date,
-                {} AS start_time,
-                {} AS end_time,
-                MIN(df.temp_low) AS temp_low,
-                MAX(df.temp_high) AS temp_high,
-                MAX(df.wind_speed) AS wind_speed,
-                MAX(df.wind_direction) AS wind_direction,
-                MAX(df.humidity_max) AS humidity_max,
-                MIN(df.humidity_min) AS humidity_min,
-                MAX(df.temperature_unit_code) AS temperature_unit_code,
-                MAX(df.precip_chance) AS precip_chance,
+                df.station_id::VARCHAR AS station_id,
+                df.date::VARCHAR AS date,
+                ({})::VARCHAR AS start_time,
+                ({})::VARCHAR AS end_time,
+                MIN(df.temp_low)::BIGINT AS temp_low,
+                MAX(df.temp_high)::BIGINT AS temp_high,
+                MAX(df.wind_speed)::BIGINT AS wind_speed,
+                MAX(df.wind_direction)::BIGINT AS wind_direction,
+                MAX(df.humidity_max)::BIGINT AS humidity_max,
+                MIN(df.humidity_min)::BIGINT AS humidity_min,
+                MAX(df.temperature_unit_code)::VARCHAR AS temperature_unit_code,
+                MAX(df.precip_chance)::DOUBLE AS precip_chance,
                 -- Calculate rain: QPF - (snow / snow_ratio) - ice
                 -- If no snow_ratio, treat all QPF as rain (minus ice)
                 -- Never return negative values
                 GREATEST(0, COALESCE(
                     dp.total_qpf - (dp.snow_amt / NULLIF(dp.avg_snow_ratio, 0)) - COALESCE(dp.ice_amt, 0),
                     dp.total_qpf - COALESCE(dp.ice_amt, 0)
-                )) AS rain_amt,
-                dp.snow_amt AS snow_amt,
-                dp.ice_amt AS ice_amt
+                ))::DOUBLE AS rain_amt,
+                dp.snow_amt::DOUBLE AS snow_amt,
+                dp.ice_amt::DOUBLE AS ice_amt
             FROM daily_forecasts df
             LEFT JOIN daily_precip dp ON df.station_id = dp.station_id AND df.date = dp.date
             GROUP BY df.station_id, df.date, dp.total_qpf, dp.snow_amt, dp.avg_snow_ratio, dp.ice_amt
@@ -433,20 +527,9 @@ impl WeatherData for WeatherAccess {
             end_time_expr,
         );
 
-        // Execute raw SQL directly
-        let conn = self.open_connection()?;
-        let mut stmt = conn.prepare(&query_sql)?;
-        let records: Vec<RecordBatch> = stmt.query_arrow([])?.collect();
-
-        let forecasts: Forecasts = records
-            .iter()
-            .map(|record| Forecasts::from_with_temp_unit(record, &req.temperature_unit))
-            .fold(Forecasts::new(), |mut acc, forecast| {
-                acc.merge(forecast);
-                acc
-            });
-
-        Ok(forecasts.values)
+        let unit = req.temperature_unit;
+        self.query(query_sql, move |batches| decode_forecasts(batches, &unit))
+            .await
     }
 
     async fn observation_data(
@@ -506,10 +589,9 @@ impl WeatherData for WeatherAccess {
         // Use raw SQL with UNION ALL BY NAME to handle schema differences
         // Old parquet files may not have wind_direction, dewpoint_value, precip_in, or wx_string
         // Humidity is derived from temperature and dewpoint using the Magnus formula
-        // Precipitation is split into rain/snow/ice using wx_string (METAR weather codes):
-        //   Snow: SN, BLSN, DRSN  |  Ice: FZRA, FZDZ, PL, GR, GS, IC  |  Rain: everything else
-        // For old files without wx_string, temperature heuristic is used (<=2°C = snow)
+        // Precipitation is split into rain/snow/ice by PRECIP_TYPE_SQL
         // precip_in is liquid equivalent; snow inches = precip_in * snow_ratio (default 10)
+        let precip_type = PRECIP_TYPE_SQL;
         let query_sql = format!(
             r#"
             WITH parquet_data AS (
@@ -528,43 +610,31 @@ impl WeatherData for WeatherAccess {
             ),
             -- Classify each observation's precipitation type
             classified AS (
-                SELECT *,
-                    CASE
-                        -- wx_string available: use METAR weather codes
-                        WHEN wx_string IS NOT NULL AND wx_string != '' THEN
-                            CASE
-                                WHEN regexp_matches(wx_string, '(^|\s)(SN|BLSN|DRSN)(\s|$)') THEN 'snow'
-                                WHEN regexp_matches(wx_string, '(^|\s)(FZRA|FZDZ|PL|GR|GS|IC)(\s|$)') THEN 'ice'
-                                ELSE 'rain'
-                            END
-                        -- No wx_string: fall back to temperature heuristic
-                        WHEN temperature_value IS NOT NULL AND temperature_value <= 2.0 THEN 'snow'
-                        ELSE 'rain'
-                    END AS precip_type
+                SELECT *, {precip_type} AS precip_type
                 FROM parquet_data
             )
             SELECT
-                station_id,
-                {} AS start_time,
-                {} AS end_time,
-                MIN(temperature_value) AS temp_low,
-                MAX(temperature_value) AS temp_high,
-                MAX(wind_speed) FILTER (WHERE wind_speed IS NOT NULL AND wind_speed >= 0 AND wind_speed <= 500) AS wind_speed,
-                MAX(temperature_unit_code) AS temperature_unit_code,
-                MAX(wind_direction) FILTER (WHERE wind_direction IS NOT NULL AND wind_direction >= 0 AND wind_direction <= 360) AS wind_direction,
+                station_id::VARCHAR AS station_id,
+                ({})::VARCHAR AS start_time,
+                ({})::VARCHAR AS end_time,
+                MIN(temperature_value)::DOUBLE AS temp_low,
+                MAX(temperature_value)::DOUBLE AS temp_high,
+                (MAX(wind_speed) FILTER (WHERE wind_speed IS NOT NULL AND wind_speed >= 0 AND wind_speed <= 500))::BIGINT AS wind_speed,
+                MAX(temperature_unit_code)::VARCHAR AS temperature_unit_code,
+                (MAX(wind_direction) FILTER (WHERE wind_direction IS NOT NULL AND wind_direction >= 0 AND wind_direction <= 360))::BIGINT AS wind_direction,
                 -- Derive humidity from temperature and dewpoint using Magnus formula
                 CASE
                     WHEN AVG(dewpoint_value) IS NOT NULL AND AVG(temperature_value) IS NOT NULL
                     THEN ROUND(100.0 * EXP((17.625 * AVG(dewpoint_value)) / (243.04 + AVG(dewpoint_value)))
                          / EXP((17.625 * AVG(temperature_value)) / (243.04 + AVG(temperature_value))))::BIGINT
                     ELSE NULL
-                END AS humidity,
+                END::BIGINT AS humidity,
                 -- Rain: sum precip_in where type is rain (already liquid inches)
-                SUM(precip_in) FILTER (WHERE precip_in IS NOT NULL AND precip_in >= 0 AND precip_type = 'rain') AS rain_amt,
+                SUM(precip_in) FILTER (WHERE precip_in IS NOT NULL AND precip_in >= 0 AND precip_type = 'rain')::DOUBLE AS rain_amt,
                 -- Snow: precip_in * 10 (default snow ratio) to convert liquid equivalent to snow inches
-                SUM(precip_in * 10.0) FILTER (WHERE precip_in IS NOT NULL AND precip_in >= 0 AND precip_type = 'snow') AS snow_amt,
+                SUM(precip_in * 10.0) FILTER (WHERE precip_in IS NOT NULL AND precip_in >= 0 AND precip_type = 'snow')::DOUBLE AS snow_amt,
                 -- Ice: liquid equivalent inches (roughly 1:1)
-                SUM(precip_in) FILTER (WHERE precip_in IS NOT NULL AND precip_in >= 0 AND precip_type = 'ice') AS ice_amt
+                SUM(precip_in) FILTER (WHERE precip_in IS NOT NULL AND precip_in >= 0 AND precip_type = 'ice')::DOUBLE AS ice_amt
             FROM classified
             GROUP BY station_id
             "#,
@@ -575,17 +645,11 @@ impl WeatherData for WeatherAccess {
             end_time_expr,
         );
 
-        let conn = self.open_connection()?;
-        let mut stmt = conn.prepare(&query_sql)?;
-        let records: Vec<RecordBatch> = stmt.query_arrow([])?.collect();
-        let observations: Observations = records
-            .iter()
-            .map(|record| Observations::from_with_temp_unit(record, &req.temperature_unit))
-            .fold(Observations::new(), |mut acc, obs| {
-                acc.merge(obs);
-                acc
-            });
-        Ok(observations.values)
+        let unit = req.temperature_unit;
+        self.query(query_sql, move |batches| {
+            decode_observations(batches, &unit)
+        })
+        .await
     }
 
     async fn daily_observations(
@@ -630,6 +694,7 @@ impl WeatherData for WeatherAccess {
 
         // Use raw SQL with UNION ALL BY NAME to handle schema differences
         // Same precipitation classification as observation_data()
+        let precip_type = PRECIP_TYPE_SQL;
         let query_sql = format!(
             r#"
             WITH parquet_data AS (
@@ -646,37 +711,28 @@ impl WeatherData for WeatherAccess {
                 )
                 {} {}
             ),
+            -- Classify each observation's precipitation type
             classified AS (
-                SELECT *,
-                    CASE
-                        WHEN wx_string IS NOT NULL AND wx_string != '' THEN
-                            CASE
-                                WHEN regexp_matches(wx_string, '(^|\s)(SN|BLSN|DRSN)(\s|$)') THEN 'snow'
-                                WHEN regexp_matches(wx_string, '(^|\s)(FZRA|FZDZ|PL|GR|GS|IC)(\s|$)') THEN 'ice'
-                                ELSE 'rain'
-                            END
-                        WHEN temperature_value IS NOT NULL AND temperature_value <= 2.0 THEN 'snow'
-                        ELSE 'rain'
-                    END AS precip_type
+                SELECT *, {precip_type} AS precip_type
                 FROM parquet_data
             )
             SELECT
-                station_id,
-                DATE_TRUNC('day', generated_at::TIMESTAMP)::TEXT AS date,
-                MIN(temperature_value) FILTER (WHERE temperature_value IS NOT NULL) AS temp_low,
-                MAX(temperature_value) FILTER (WHERE temperature_value IS NOT NULL) AS temp_high,
-                MAX(wind_speed) FILTER (WHERE wind_speed IS NOT NULL AND wind_speed >= 0 AND wind_speed <= 500) AS wind_speed,
-                MAX(temperature_unit_code) AS temperature_unit_code,
-                MAX(wind_direction) FILTER (WHERE wind_direction IS NOT NULL AND wind_direction >= 0 AND wind_direction <= 360) AS wind_direction,
+                station_id::VARCHAR AS station_id,
+                DATE_TRUNC('day', generated_at::TIMESTAMP)::VARCHAR AS date,
+                (MIN(temperature_value) FILTER (WHERE temperature_value IS NOT NULL))::DOUBLE AS temp_low,
+                (MAX(temperature_value) FILTER (WHERE temperature_value IS NOT NULL))::DOUBLE AS temp_high,
+                (MAX(wind_speed) FILTER (WHERE wind_speed IS NOT NULL AND wind_speed >= 0 AND wind_speed <= 500))::BIGINT AS wind_speed,
+                MAX(temperature_unit_code)::VARCHAR AS temperature_unit_code,
+                (MAX(wind_direction) FILTER (WHERE wind_direction IS NOT NULL AND wind_direction >= 0 AND wind_direction <= 360))::BIGINT AS wind_direction,
                 CASE
                     WHEN AVG(dewpoint_value) IS NOT NULL AND AVG(temperature_value) IS NOT NULL
                     THEN ROUND(100.0 * EXP((17.625 * AVG(dewpoint_value)) / (243.04 + AVG(dewpoint_value)))
                          / EXP((17.625 * AVG(temperature_value)) / (243.04 + AVG(temperature_value))))::BIGINT
                     ELSE NULL
-                END AS humidity,
-                SUM(precip_in) FILTER (WHERE precip_in IS NOT NULL AND precip_in >= 0 AND precip_type = 'rain') AS rain_amt,
-                SUM(precip_in * 10.0) FILTER (WHERE precip_in IS NOT NULL AND precip_in >= 0 AND precip_type = 'snow') AS snow_amt,
-                SUM(precip_in) FILTER (WHERE precip_in IS NOT NULL AND precip_in >= 0 AND precip_type = 'ice') AS ice_amt
+                END::BIGINT AS humidity,
+                SUM(precip_in) FILTER (WHERE precip_in IS NOT NULL AND precip_in >= 0 AND precip_type = 'rain')::DOUBLE AS rain_amt,
+                SUM(precip_in * 10.0) FILTER (WHERE precip_in IS NOT NULL AND precip_in >= 0 AND precip_type = 'snow')::DOUBLE AS snow_amt,
+                SUM(precip_in) FILTER (WHERE precip_in IS NOT NULL AND precip_in >= 0 AND precip_type = 'ice')::DOUBLE AS ice_amt
             FROM classified
             GROUP BY station_id, DATE_TRUNC('day', generated_at::TIMESTAMP)::TEXT
             "#,
@@ -685,23 +741,15 @@ impl WeatherData for WeatherAccess {
             time_filter,
         );
 
-        let conn = self.open_connection()?;
-        let mut stmt = conn.prepare(&query_sql)?;
-        let records: Vec<RecordBatch> = stmt.query_arrow([])?.collect();
-        let observations: DailyObservations = records
-            .iter()
-            .map(|record| DailyObservations::from_with_temp_unit(record, &req.temperature_unit))
-            .fold(DailyObservations::new(), |mut acc, obs| {
-                acc.merge(obs);
-                acc
-            });
-        Ok(observations.values)
+        let unit = req.temperature_unit;
+        self.query(query_sql, move |batches| decode_daily(batches, &unit))
+            .await
     }
 
     async fn stations(&self) -> Result<Vec<Station>, Error> {
-        // Query all available observation files to find station data
-        // Using None for start/end finds all available data
-        let parquet_files = self
+        // Stations that reported in the newest month of data; scanning all
+        // history would grow without bound as files accumulate.
+        let mut parquet_files: Vec<(OffsetDateTime, String)> = self
             .file_access
             .grab_file_names(FileParams {
                 start: None,
@@ -709,7 +757,22 @@ impl WeatherData for WeatherAccess {
                 observations: Some(true),
                 forecasts: Some(false),
             })
-            .await?;
+            .await?
+            .into_iter()
+            .filter_map(|name| {
+                file_access::ParquetFileName::parse(&name)
+                    .ok()
+                    .map(|file| (file.generated_at, name))
+            })
+            .collect();
+        let newest = parquet_files
+            .iter()
+            .map(|(generated_at, _)| *generated_at)
+            .max();
+        if let Some(newest) = newest {
+            parquet_files.retain(|(generated_at, _)| *generated_at >= newest - STATION_LOOKBACK);
+        }
+        let parquet_files: Vec<String> = parquet_files.into_iter().map(|(_, name)| name).collect();
         let file_paths = self.file_access.build_file_paths(parquet_files);
         if file_paths.is_empty() {
             return Ok(vec![]);
@@ -721,13 +784,13 @@ impl WeatherData for WeatherAccess {
         let query_sql = format!(
             r#"
             SELECT DISTINCT
-                station_id,
-                COALESCE(station_name, '') AS station_name,
-                COALESCE(state, '') AS state,
-                COALESCE(iata_id, '') AS iata_id,
-                elevation_m,
-                latitude,
-                longitude
+                station_id::VARCHAR AS station_id,
+                COALESCE(station_name, '')::VARCHAR AS station_name,
+                COALESCE(state, '')::VARCHAR AS state,
+                COALESCE(iata_id, '')::VARCHAR AS iata_id,
+                elevation_m::DOUBLE AS elevation_m,
+                latitude::DOUBLE AS latitude,
+                longitude::DOUBLE AS longitude
             FROM (
                 SELECT NULL::VARCHAR AS station_id, NULL::VARCHAR AS station_name,
                        NULL::VARCHAR AS state, NULL::VARCHAR AS iata_id,
@@ -740,241 +803,249 @@ impl WeatherData for WeatherAccess {
             sql_string_list(&file_paths)
         );
 
-        let conn = self.open_connection()?;
-        let mut stmt = conn.prepare(&query_sql)?;
-        let records: Vec<RecordBatch> = stmt.query_arrow([])?.collect();
-
-        let stations: Stations =
-            records
-                .iter()
-                .map(|record| record.into())
-                .fold(Stations::new(), |mut acc, obs| {
-                    acc.merge(obs);
-                    acc
-                });
-
-        Ok(stations.values)
+        self.query(query_sql, decode_stations).await
     }
 }
 
-struct Forecasts {
-    values: Vec<Forecast>,
+/// A result column by name, as the Arrow type the query cast it to.
+fn column<'a, T: Array + 'static>(
+    batch: &'a RecordBatch,
+    name: &'static str,
+    expected: &'static str,
+) -> Result<&'a T, Error> {
+    batch
+        .schema()
+        .index_of(name)
+        .ok()
+        .and_then(|index| batch.column(index).as_any().downcast_ref::<T>())
+        .ok_or(Error::Schema {
+            column: name,
+            expected,
+        })
 }
 
-impl Forecasts {
-    pub fn new() -> Self {
-        Forecasts { values: Vec::new() }
-    }
+fn strings<'a>(batch: &'a RecordBatch, name: &'static str) -> Result<&'a StringArray, Error> {
+    column(batch, name, "VARCHAR")
+}
 
-    pub fn merge(&mut self, forecasts: Forecasts) -> &Forecasts {
-        self.values.extend(forecasts.values);
-        self
-    }
+fn integers<'a>(batch: &'a RecordBatch, name: &'static str) -> Result<&'a Int64Array, Error> {
+    column(batch, name, "BIGINT")
+}
 
-    fn from_with_temp_unit(record_batch: &RecordBatch, target_unit: &TemperatureUnit) -> Self {
-        let mut forecasts = Vec::new();
-        let station_id_arr = record_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Expected StringArray in column 0");
-        let date_arr = record_batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Expected StringArray in column 1");
-        let start_time_arr = record_batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Expected StringArray in column 2");
-        let end_time_arr = record_batch
-            .column(3)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Expected StringArray in column 3");
-        let temp_low_arr = record_batch
-            .column(4)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("Expected Int64Array in column 4");
-        let temp_high_arr = record_batch
-            .column(5)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("Expected Int64Array in column 5");
-        let wind_speed_arr = record_batch
-            .column(6)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("Expected Int64Array in column 6");
+fn doubles<'a>(batch: &'a RecordBatch, name: &'static str) -> Result<&'a Float64Array, Error> {
+    column(batch, name, "DOUBLE")
+}
 
-        let wind_direction_arr = record_batch
-            .column(7)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("Expected Int64Array in column 7");
+fn text(array: &StringArray, row: usize) -> Option<String> {
+    (!array.is_null(row)).then(|| array.value(row).to_owned())
+}
 
-        let humidity_max_arr = record_batch
-            .column(8)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("Expected Int64Array in column 8");
+fn integer(array: &Int64Array, row: usize) -> Option<i64> {
+    (!array.is_null(row)).then(|| array.value(row))
+}
 
-        let humidity_min_arr = record_batch
-            .column(9)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("Expected Int64Array in column 9");
+fn double(array: &Float64Array, row: usize) -> Option<f64> {
+    (!array.is_null(row)).then(|| array.value(row))
+}
 
-        let temperature_unit_code_arr = record_batch
-            .column(10)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Expected StringArray in column 10");
+/// A station id from file contents, if it is one we would accept from a
+/// client. Anything else is dropped so it never reaches HTML or SQL.
+fn station(array: &StringArray, row: usize) -> Option<String> {
+    text(array, row).filter(|id| validate_station_id(id).is_ok())
+}
 
-        let precip_chance_arr = record_batch
-            .column(11)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Expected Float64Array in column 11");
+fn within(value: Option<i64>, range: std::ops::RangeInclusive<i64>) -> Option<i64> {
+    value.filter(|value| range.contains(value))
+}
 
-        let rain_amt_arr = record_batch
-            .column(12)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Expected Float64Array in column 12");
+fn non_negative(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| *value >= 0.0)
+}
 
-        let snow_amt_arr = record_batch
-            .column(13)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Expected Float64Array in column 13");
+fn skipped(kind: &str, row: usize) {
+    debug!("skipping {kind} row {row}: missing station or temperature");
+}
 
-        let ice_amt_arr = record_batch
-            .column(14)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Expected Float64Array in column 14");
-
-        for row_index in 0..record_batch.num_rows() {
-            let station_id = station_id_arr.value(row_index).to_owned();
-            let date = date_arr.value(row_index).to_owned();
-            let start_time = start_time_arr.value(row_index).to_owned();
-            let end_time = end_time_arr.value(row_index).to_owned();
-            let temp_low = temp_low_arr.value(row_index);
-            let temp_high = temp_high_arr.value(row_index);
-
-            // Check for NULL first, then validate the range
-            let wind_speed = if wind_speed_arr.is_null(row_index) {
-                None
-            } else {
-                let wind_speed_val = wind_speed_arr.value(row_index);
-                // Filter out unreasonable values (negative or > 500 mph)
-                if (0..=500).contains(&wind_speed_val) {
-                    Some(wind_speed_val)
-                } else {
-                    None
-                }
+fn decode_forecasts(
+    batches: &[RecordBatch],
+    unit: &TemperatureUnit,
+) -> Result<Vec<Forecast>, Error> {
+    let mut forecasts = vec![];
+    for batch in batches {
+        let station_id = strings(batch, "station_id")?;
+        let date = strings(batch, "date")?;
+        let start_time = strings(batch, "start_time")?;
+        let end_time = strings(batch, "end_time")?;
+        let temp_low = integers(batch, "temp_low")?;
+        let temp_high = integers(batch, "temp_high")?;
+        let wind_speed = integers(batch, "wind_speed")?;
+        let wind_direction = integers(batch, "wind_direction")?;
+        let humidity_max = integers(batch, "humidity_max")?;
+        let humidity_min = integers(batch, "humidity_min")?;
+        let unit_code = strings(batch, "temperature_unit_code")?;
+        let precip_chance = doubles(batch, "precip_chance")?;
+        let rain_amt = doubles(batch, "rain_amt")?;
+        let snow_amt = doubles(batch, "snow_amt")?;
+        let ice_amt = doubles(batch, "ice_amt")?;
+        for row in 0..batch.num_rows() {
+            let (Some(station_id), Some(date), Some(low), Some(high)) = (
+                station(station_id, row),
+                text(date, row),
+                integer(temp_low, row),
+                integer(temp_high, row),
+            ) else {
+                skipped("forecast", row);
+                continue;
             };
-
-            // Wind direction in degrees (0-360)
-            let wind_direction = if wind_direction_arr.is_null(row_index) {
-                None
-            } else {
-                let val = wind_direction_arr.value(row_index);
-                if (0..=360).contains(&val) {
-                    Some(val)
-                } else {
-                    None
-                }
-            };
-
-            // Humidity max (0-100%)
-            let humidity_max = if humidity_max_arr.is_null(row_index) {
-                None
-            } else {
-                let val = humidity_max_arr.value(row_index);
-                if (0..=100).contains(&val) {
-                    Some(val)
-                } else {
-                    None
-                }
-            };
-
-            // Humidity min (0-100%)
-            let humidity_min = if humidity_min_arr.is_null(row_index) {
-                None
-            } else {
-                let val = humidity_min_arr.value(row_index);
-                if (0..=100).contains(&val) {
-                    Some(val)
-                } else {
-                    None
-                }
-            };
-
-            let temp_unit_code = temperature_unit_code_arr.value(row_index).to_owned();
-
-            // Precipitation chance (0-100%)
-            let precip_chance = if precip_chance_arr.is_null(row_index) {
-                None
-            } else {
-                let val = precip_chance_arr.value(row_index);
-                if (0.0..=100.0).contains(&val) {
-                    Some(val.round() as i64)
-                } else {
-                    None
-                }
-            };
-
-            // Rain amount in inches
-            let rain_amt = if rain_amt_arr.is_null(row_index) {
-                None
-            } else {
-                let val = rain_amt_arr.value(row_index);
-                if val >= 0.0 { Some(val) } else { None }
-            };
-
-            // Snow amount in inches
-            let snow_amt = if snow_amt_arr.is_null(row_index) {
-                None
-            } else {
-                let val = snow_amt_arr.value(row_index);
-                if val >= 0.0 { Some(val) } else { None }
-            };
-
-            // Ice amount in inches
-            let ice_amt = if ice_amt_arr.is_null(row_index) {
-                None
-            } else {
-                let val = ice_amt_arr.value(row_index);
-                if val >= 0.0 { Some(val) } else { None }
-            };
-
-            let mut forecast = Forecast {
+            let code = text(unit_code, row).unwrap_or_default();
+            let temperature = |value: i64| convert(value as f64, &code, unit).round() as i64;
+            forecasts.push(Forecast {
                 station_id,
                 date,
-                start_time,
-                end_time,
-                temp_low,
-                temp_high,
-                wind_speed,
-                wind_direction,
-                humidity_max,
-                humidity_min,
-                temp_unit_code,
-                precip_chance,
-                rain_amt,
-                snow_amt,
-                ice_amt,
-            };
-            forecast.convert_temperature(target_unit);
-            forecasts.push(forecast);
+                start_time: text(start_time, row).unwrap_or_default(),
+                end_time: text(end_time, row).unwrap_or_default(),
+                temp_low: temperature(low),
+                temp_high: temperature(high),
+                wind_speed: within(integer(wind_speed, row), 0..=500),
+                wind_direction: within(integer(wind_direction, row), 0..=360),
+                humidity_max: within(integer(humidity_max, row), 0..=100),
+                humidity_min: within(integer(humidity_min, row), 0..=100),
+                temp_unit_code: converted_code(&code, unit),
+                precip_chance: double(precip_chance, row)
+                    .filter(|chance| (0.0..=100.0).contains(chance))
+                    .map(|chance| chance.round() as i64),
+                rain_amt: non_negative(double(rain_amt, row)),
+                snow_amt: non_negative(double(snow_amt, row)),
+                ice_amt: non_negative(double(ice_amt, row)),
+            });
         }
-
-        Self { values: forecasts }
     }
+    Ok(forecasts)
+}
+
+fn decode_observations(
+    batches: &[RecordBatch],
+    unit: &TemperatureUnit,
+) -> Result<Vec<Observation>, Error> {
+    let mut observations = vec![];
+    for batch in batches {
+        let station_id = strings(batch, "station_id")?;
+        let start_time = strings(batch, "start_time")?;
+        let end_time = strings(batch, "end_time")?;
+        let temp_low = doubles(batch, "temp_low")?;
+        let temp_high = doubles(batch, "temp_high")?;
+        let wind_speed = integers(batch, "wind_speed")?;
+        let unit_code = strings(batch, "temperature_unit_code")?;
+        let wind_direction = integers(batch, "wind_direction")?;
+        let humidity = integers(batch, "humidity")?;
+        let rain_amt = doubles(batch, "rain_amt")?;
+        let snow_amt = doubles(batch, "snow_amt")?;
+        let ice_amt = doubles(batch, "ice_amt")?;
+        for row in 0..batch.num_rows() {
+            let (Some(station_id), Some(low), Some(high)) = (
+                station(station_id, row),
+                double(temp_low, row),
+                double(temp_high, row),
+            ) else {
+                skipped("observation", row);
+                continue;
+            };
+            let code = text(unit_code, row).unwrap_or_default();
+            observations.push(Observation {
+                station_id,
+                start_time: text(start_time, row).unwrap_or_default(),
+                end_time: text(end_time, row).unwrap_or_default(),
+                temp_low: convert(low, &code, unit),
+                temp_high: convert(high, &code, unit),
+                wind_speed: within(integer(wind_speed, row), 0..=500),
+                temp_unit_code: converted_code(&code, unit),
+                wind_direction: within(integer(wind_direction, row), 0..=360),
+                humidity: within(integer(humidity, row), 0..=100),
+                rain_amt: non_negative(double(rain_amt, row)),
+                snow_amt: non_negative(double(snow_amt, row)),
+                ice_amt: non_negative(double(ice_amt, row)),
+            });
+        }
+    }
+    Ok(observations)
+}
+
+fn decode_daily(
+    batches: &[RecordBatch],
+    unit: &TemperatureUnit,
+) -> Result<Vec<DailyObservation>, Error> {
+    let mut observations = vec![];
+    for batch in batches {
+        let station_id = strings(batch, "station_id")?;
+        let date = strings(batch, "date")?;
+        let temp_low = doubles(batch, "temp_low")?;
+        let temp_high = doubles(batch, "temp_high")?;
+        let wind_speed = integers(batch, "wind_speed")?;
+        let unit_code = strings(batch, "temperature_unit_code")?;
+        let wind_direction = integers(batch, "wind_direction")?;
+        let humidity = integers(batch, "humidity")?;
+        let rain_amt = doubles(batch, "rain_amt")?;
+        let snow_amt = doubles(batch, "snow_amt")?;
+        let ice_amt = doubles(batch, "ice_amt")?;
+        for row in 0..batch.num_rows() {
+            let (Some(station_id), Some(date), Some(low), Some(high)) = (
+                station(station_id, row),
+                text(date, row),
+                double(temp_low, row),
+                double(temp_high, row),
+            ) else {
+                skipped("daily observation", row);
+                continue;
+            };
+            let code = text(unit_code, row).unwrap_or_default();
+            observations.push(DailyObservation {
+                station_id,
+                date,
+                temp_low: convert(low, &code, unit),
+                temp_high: convert(high, &code, unit),
+                wind_speed: within(integer(wind_speed, row), 0..=500),
+                temp_unit_code: converted_code(&code, unit),
+                wind_direction: within(integer(wind_direction, row), 0..=360),
+                humidity: within(integer(humidity, row), 0..=100),
+                rain_amt: non_negative(double(rain_amt, row)),
+                snow_amt: non_negative(double(snow_amt, row)),
+                ice_amt: non_negative(double(ice_amt, row)),
+            });
+        }
+    }
+    Ok(observations)
+}
+
+fn decode_stations(batches: &[RecordBatch]) -> Result<Vec<Station>, Error> {
+    let mut stations = vec![];
+    for batch in batches {
+        let station_id = strings(batch, "station_id")?;
+        let station_name = strings(batch, "station_name")?;
+        let state = strings(batch, "state")?;
+        let iata_id = strings(batch, "iata_id")?;
+        let elevation_m = doubles(batch, "elevation_m")?;
+        let latitude = doubles(batch, "latitude")?;
+        let longitude = doubles(batch, "longitude")?;
+        for row in 0..batch.num_rows() {
+            let (Some(station_id), Some(latitude), Some(longitude)) = (
+                station(station_id, row),
+                double(latitude, row),
+                double(longitude, row),
+            ) else {
+                continue;
+            };
+            stations.push(Station {
+                station_id,
+                station_name: text(station_name, row).unwrap_or_default(),
+                state: text(state, row).unwrap_or_default(),
+                iata_id: text(iata_id, row).unwrap_or_default(),
+                elevation_m: double(elevation_m, row),
+                latitude,
+                longitude,
+            });
+        }
+    }
+    Ok(stations)
 }
 
 #[derive(Serialize, Deserialize, Debug, ToSchema)]
@@ -985,6 +1056,7 @@ pub struct Forecast {
     pub end_time: String,
     pub temp_low: i64,
     pub temp_high: i64,
+    /// Knots
     pub wind_speed: Option<i64>,
     /// Wind direction in degrees (0-360, where 0/360 = North)
     pub wind_direction: Option<i64>,
@@ -1002,197 +1074,6 @@ pub struct Forecast {
     pub ice_amt: Option<f64>,
 }
 
-impl Forecast {
-    pub fn convert_temperature(&mut self, target_unit: &TemperatureUnit) {
-        // Normalize the current unit code to handle the "celcius" spelling in data
-        // The spelling error comes from NOAA data directly
-        let current_unit = match self.temp_unit_code.to_lowercase().as_str() {
-            "celcius" => "celsius".to_string(),
-            _ => self.temp_unit_code.to_lowercase(),
-        };
-
-        // Skip if already in the target unit
-        if current_unit == target_unit.to_string() {
-            return;
-        }
-
-        match (current_unit.as_str(), target_unit) {
-            ("celsius", TemperatureUnit::Fahrenheit) => {
-                self.temp_low = ((self.temp_low as f64) * 9.0 / 5.0 + 32.0).round() as i64;
-                self.temp_high = ((self.temp_high as f64) * 9.0 / 5.0 + 32.0).round() as i64;
-                self.temp_unit_code = target_unit.to_string();
-            }
-            ("fahrenheit", TemperatureUnit::Celsius) => {
-                self.temp_low = ((self.temp_low as f64 - 32.0) * 5.0 / 9.0).round() as i64;
-                self.temp_high = ((self.temp_high as f64 - 32.0) * 5.0 / 9.0).round() as i64;
-                self.temp_unit_code = target_unit.to_string();
-            }
-            _ => (), // No conversion needed or unknown unit
-        }
-    }
-}
-
-struct Observations {
-    values: Vec<Observation>,
-}
-
-impl Observations {
-    pub fn new() -> Self {
-        Observations { values: Vec::new() }
-    }
-
-    pub fn merge(&mut self, observations: Observations) -> &Observations {
-        self.values.extend(observations.values);
-        self
-    }
-
-    pub fn from_with_temp_unit(record_batch: &RecordBatch, target_unit: &TemperatureUnit) -> Self {
-        let mut observations = Vec::new();
-        // Column order matches the SELECT in observation_data():
-        // 0: station_id, 1: start_time, 2: end_time, 3: temp_low, 4: temp_high,
-        // 5: wind_speed, 6: temperature_unit_code, 7: wind_direction, 8: humidity,
-        // 9: rain_amt, 10: snow_amt, 11: ice_amt
-        let station_id_arr = record_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Expected StringArray in column 0");
-        let start_time_arr = record_batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Expected StringArray in column 1");
-        let end_time_arr = record_batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Expected StringArray in column 2");
-        let temp_low_arr = record_batch
-            .column(3)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Expected Float64Array in column 3");
-        let temp_high_arr = record_batch
-            .column(4)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Expected Float64Array in column 4");
-        let wind_speed_arr = record_batch
-            .column(5)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("Expected Int64Array in column 5");
-        let temperature_unit_code_arr = record_batch
-            .column(6)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Expected StringArray in column 6");
-        let wind_direction_arr = record_batch
-            .column(7)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("Expected Int64Array in column 7");
-        let humidity_arr = record_batch
-            .column(8)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("Expected Int64Array in column 8");
-        let rain_amt_arr = record_batch
-            .column(9)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Expected Float64Array in column 9");
-        let snow_amt_arr = record_batch
-            .column(10)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Expected Float64Array in column 10");
-        let ice_amt_arr = record_batch
-            .column(11)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Expected Float64Array in column 11");
-
-        for row_index in 0..record_batch.num_rows() {
-            let station_id = station_id_arr.value(row_index).to_owned();
-            let start_time = start_time_arr.value(row_index).to_owned();
-            let end_time = end_time_arr.value(row_index).to_owned();
-            let temp_low = temp_low_arr.value(row_index);
-            let temp_high = temp_high_arr.value(row_index);
-            let wind_speed = if wind_speed_arr.is_null(row_index) {
-                0
-            } else {
-                wind_speed_arr.value(row_index)
-            };
-            let temp_unit_code = temperature_unit_code_arr.value(row_index).to_owned();
-
-            let wind_direction = if wind_direction_arr.is_null(row_index) {
-                None
-            } else {
-                let val = wind_direction_arr.value(row_index);
-                if (0..=360).contains(&val) {
-                    Some(val)
-                } else {
-                    None
-                }
-            };
-
-            let humidity = if humidity_arr.is_null(row_index) {
-                None
-            } else {
-                let val = humidity_arr.value(row_index);
-                if (0..=100).contains(&val) {
-                    Some(val)
-                } else {
-                    None
-                }
-            };
-
-            let rain_amt = if rain_amt_arr.is_null(row_index) {
-                None
-            } else {
-                let val = rain_amt_arr.value(row_index);
-                if val >= 0.0 { Some(val) } else { None }
-            };
-
-            let snow_amt = if snow_amt_arr.is_null(row_index) {
-                None
-            } else {
-                let val = snow_amt_arr.value(row_index);
-                if val >= 0.0 { Some(val) } else { None }
-            };
-
-            let ice_amt = if ice_amt_arr.is_null(row_index) {
-                None
-            } else {
-                let val = ice_amt_arr.value(row_index);
-                if val >= 0.0 { Some(val) } else { None }
-            };
-
-            let mut observation = Observation {
-                station_id,
-                start_time,
-                end_time,
-                temp_low,
-                temp_high,
-                wind_speed,
-                temp_unit_code,
-                wind_direction,
-                humidity,
-                rain_amt,
-                snow_amt,
-                ice_amt,
-            };
-            observation.convert_temperature(target_unit);
-            observations.push(observation);
-        }
-
-        Self {
-            values: observations,
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug, ToSchema)]
 pub struct Observation {
     pub station_id: String,
@@ -1200,9 +1081,11 @@ pub struct Observation {
     pub end_time: String,
     pub temp_low: f64,
     pub temp_high: f64,
-    pub wind_speed: i64,
+    /// Knots; missing when no report in the window had a speed
+    pub wind_speed: Option<i64>,
     pub temp_unit_code: String,
-    /// Wind direction in degrees (0-360, where 0/360 = North)
+    /// Wind direction in degrees (0-360, where 0/360 = North); missing for
+    /// variable (`VRB`) or unreported winds
     pub wind_direction: Option<i64>,
     /// Relative humidity (percent)
     pub humidity: Option<i64>,
@@ -1212,36 +1095,6 @@ pub struct Observation {
     pub snow_amt: Option<f64>,
     /// Ice accumulation in inches
     pub ice_amt: Option<f64>,
-}
-
-impl Observation {
-    pub fn convert_temperature(&mut self, target_unit: &TemperatureUnit) {
-        // Normalize the current unit code to handle the "celcius" spelling in data
-        // The spelling error comes from NOAA data directly
-        let current_unit = match self.temp_unit_code.to_lowercase().as_str() {
-            "celcius" => "celsius".to_string(),
-            _ => self.temp_unit_code.to_lowercase(),
-        };
-
-        // Skip if already in the target unit
-        if current_unit == target_unit.to_string() {
-            return;
-        }
-
-        match (current_unit.as_str(), target_unit) {
-            ("celsius", TemperatureUnit::Fahrenheit) => {
-                self.temp_low = self.temp_low * 9.0 / 5.0 + 32.0;
-                self.temp_high = self.temp_high * 9.0 / 5.0 + 32.0;
-                self.temp_unit_code = target_unit.to_string();
-            }
-            ("fahrenheit", TemperatureUnit::Celsius) => {
-                self.temp_low = (self.temp_low - 32.0) * 5.0 / 9.0;
-                self.temp_high = (self.temp_high - 32.0) * 5.0 / 9.0;
-                self.temp_unit_code = target_unit.to_string();
-            }
-            _ => (), // No conversion needed or unknown unit
-        }
-    }
 }
 
 /// Daily aggregated observation (grouped by UTC date)
@@ -1251,7 +1104,8 @@ pub struct DailyObservation {
     pub date: String,
     pub temp_low: f64,
     pub temp_high: f64,
-    pub wind_speed: i64,
+    /// Knots
+    pub wind_speed: Option<i64>,
     pub temp_unit_code: String,
     /// Wind direction in degrees (0-360, where 0/360 = North)
     pub wind_direction: Option<i64>,
@@ -1265,270 +1119,7 @@ pub struct DailyObservation {
     pub ice_amt: Option<f64>,
 }
 
-impl DailyObservation {
-    pub fn convert_temperature(&mut self, target_unit: &TemperatureUnit) {
-        let current_unit = match self.temp_unit_code.to_lowercase().as_str() {
-            "celcius" => "celsius".to_string(),
-            _ => self.temp_unit_code.to_lowercase(),
-        };
-
-        if current_unit == target_unit.to_string() {
-            return;
-        }
-
-        match (current_unit.as_str(), target_unit) {
-            ("celsius", TemperatureUnit::Fahrenheit) => {
-                self.temp_low = self.temp_low * 9.0 / 5.0 + 32.0;
-                self.temp_high = self.temp_high * 9.0 / 5.0 + 32.0;
-                self.temp_unit_code = target_unit.to_string();
-            }
-            ("fahrenheit", TemperatureUnit::Celsius) => {
-                self.temp_low = (self.temp_low - 32.0) * 5.0 / 9.0;
-                self.temp_high = (self.temp_high - 32.0) * 5.0 / 9.0;
-                self.temp_unit_code = target_unit.to_string();
-            }
-            _ => (),
-        }
-    }
-}
-
-struct DailyObservations {
-    values: Vec<DailyObservation>,
-}
-
-impl DailyObservations {
-    pub fn new() -> Self {
-        DailyObservations { values: Vec::new() }
-    }
-
-    pub fn merge(&mut self, observations: DailyObservations) -> &DailyObservations {
-        self.values.extend(observations.values);
-        self
-    }
-
-    pub fn from_with_temp_unit(record_batch: &RecordBatch, target_unit: &TemperatureUnit) -> Self {
-        let mut observations = Vec::new();
-        // Column order matches the SELECT in daily_observations():
-        // 0: station_id, 1: date, 2: temp_low, 3: temp_high, 4: wind_speed,
-        // 5: temperature_unit_code, 6: wind_direction, 7: humidity,
-        // 8: rain_amt, 9: snow_amt, 10: ice_amt
-        let station_id_arr = record_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Expected StringArray in column 0");
-        let date_arr = record_batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Expected StringArray in column 1");
-        let temp_low_arr = record_batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Expected Float64Array in column 2");
-        let temp_high_arr = record_batch
-            .column(3)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Expected Float64Array in column 3");
-        let wind_speed_arr = record_batch
-            .column(4)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("Expected Int64Array in column 4");
-        let temperature_unit_code_arr = record_batch
-            .column(5)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Expected StringArray in column 5");
-        let wind_direction_arr = record_batch
-            .column(6)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("Expected Int64Array in column 6");
-        let humidity_arr = record_batch
-            .column(7)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("Expected Int64Array in column 7");
-        let rain_amt_arr = record_batch
-            .column(8)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Expected Float64Array in column 8");
-        let snow_amt_arr = record_batch
-            .column(9)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Expected Float64Array in column 9");
-        let ice_amt_arr = record_batch
-            .column(10)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Expected Float64Array in column 10");
-
-        for row_index in 0..record_batch.num_rows() {
-            let station_id = station_id_arr.value(row_index).to_owned();
-            let date = date_arr.value(row_index).to_owned();
-            let temp_low = temp_low_arr.value(row_index);
-            let temp_high = temp_high_arr.value(row_index);
-            let wind_speed = if wind_speed_arr.is_null(row_index) {
-                0
-            } else {
-                wind_speed_arr.value(row_index)
-            };
-            let temp_unit_code = temperature_unit_code_arr.value(row_index).to_owned();
-
-            let wind_direction = if wind_direction_arr.is_null(row_index) {
-                None
-            } else {
-                let val = wind_direction_arr.value(row_index);
-                if (0..=360).contains(&val) {
-                    Some(val)
-                } else {
-                    None
-                }
-            };
-
-            let humidity = if humidity_arr.is_null(row_index) {
-                None
-            } else {
-                let val = humidity_arr.value(row_index);
-                if (0..=100).contains(&val) {
-                    Some(val)
-                } else {
-                    None
-                }
-            };
-
-            let rain_amt = if rain_amt_arr.is_null(row_index) {
-                None
-            } else {
-                let val = rain_amt_arr.value(row_index);
-                if val >= 0.0 { Some(val) } else { None }
-            };
-
-            let snow_amt = if snow_amt_arr.is_null(row_index) {
-                None
-            } else {
-                let val = snow_amt_arr.value(row_index);
-                if val >= 0.0 { Some(val) } else { None }
-            };
-
-            let ice_amt = if ice_amt_arr.is_null(row_index) {
-                None
-            } else {
-                let val = ice_amt_arr.value(row_index);
-                if val >= 0.0 { Some(val) } else { None }
-            };
-
-            let mut observation = DailyObservation {
-                station_id,
-                date,
-                temp_low,
-                temp_high,
-                wind_speed,
-                temp_unit_code,
-                wind_direction,
-                humidity,
-                rain_amt,
-                snow_amt,
-                ice_amt,
-            };
-            observation.convert_temperature(target_unit);
-            observations.push(observation);
-        }
-
-        Self {
-            values: observations,
-        }
-    }
-}
-
-struct Stations {
-    values: Vec<Station>,
-}
-
-impl Stations {
-    pub fn new() -> Self {
-        Stations { values: Vec::new() }
-    }
-
-    pub fn merge(&mut self, stations: Stations) -> &Stations {
-        self.values.extend(stations.values);
-        self
-    }
-}
-
-impl From<&RecordBatch> for Stations {
-    fn from(record_batch: &RecordBatch) -> Self {
-        let mut stations = Vec::new();
-        let station_id_arr = record_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Expected StringArray in column 0");
-        let station_name_arr = record_batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Expected StringArray in column 1");
-        let state_arr = record_batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Expected StringArray in column 2");
-        let iata_id_arr = record_batch
-            .column(3)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("Expected StringArray in column 3");
-        let elevation_m_arr = record_batch
-            .column(4)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Expected Float64Array in column 4");
-        let latitude_arr = record_batch
-            .column(5)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Expected Float64Array in column 5");
-        let longitude_arr = record_batch
-            .column(6)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Expected Float64Array in column 6");
-
-        for row_index in 0..record_batch.num_rows() {
-            let station_id = station_id_arr.value(row_index).to_owned();
-            let station_name = station_name_arr.value(row_index).to_owned();
-            let state = state_arr.value(row_index).to_owned();
-            let iata_id = iata_id_arr.value(row_index).to_owned();
-            let elevation_m = if elevation_m_arr.is_null(row_index) {
-                None
-            } else {
-                Some(elevation_m_arr.value(row_index))
-            };
-            let latitude = latitude_arr.value(row_index);
-            let longitude = longitude_arr.value(row_index);
-
-            stations.push(Station {
-                station_id,
-                station_name,
-                state,
-                iata_id,
-                elevation_m,
-                latitude,
-                longitude,
-            });
-        }
-
-        Self { values: stations }
-    }
-}
-
-#[derive(Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 pub struct Station {
     pub station_id: String,
     pub station_name: String,
@@ -1564,6 +1155,197 @@ mod tests {
             "WHERE station_id IN ('KORD', 'KSAW')"
         );
         assert_eq!(station_filter(&[]).unwrap(), "");
+    }
+
+    const FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../e2e/fixtures/weather_data/2026-01-17/observations_2026-01-17T17:16:19.76658783Z.parquet"
+    );
+
+    /// A data directory holding the historical fixture (no `precip_in` or
+    /// `wx_string` columns) and `extra` files written by DuckDB `COPY`.
+    fn data_dir(extra: &[(&str, &str)]) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        let day = directory.path().join("2026-01-17");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::copy(
+            FIXTURE,
+            day.join("observations_2026-01-17T17:16:19.76658783Z.parquet"),
+        )
+        .unwrap();
+        let connection = open_connection().unwrap();
+        for (name, select) in extra {
+            let path = day.join(name);
+            connection
+                .execute_batch(&format!(
+                    "COPY ({select}) TO '{}' (FORMAT PARQUET)",
+                    path.display()
+                ))
+                .unwrap();
+        }
+        directory
+    }
+
+    fn day_request() -> ObservationRequest {
+        ObservationRequest {
+            start: Some(time::macros::datetime!(2026-01-17 00:00 UTC)),
+            end: Some(time::macros::datetime!(2026-01-18 00:00 UTC)),
+            station_ids: "KORD,KSAW".into(),
+            temperature_unit: TemperatureUnit::Fahrenheit,
+        }
+    }
+
+    fn access(directory: &tempfile::TempDir) -> WeatherAccess {
+        WeatherAccess::new(Arc::new(crate::file_access::FileAccess::new(
+            directory.path().to_string_lossy().into_owned(),
+        )))
+    }
+
+    #[tokio::test]
+    async fn historical_and_current_observation_files_query_together() {
+        // A newer file: adds precip_in and wx_string, plus a trailing column
+        // no reader knows yet.
+        let directory = data_dir(&[(
+            "observations_2026-01-17T18:00:00Z.parquet",
+            "SELECT 'KORD' AS station_id, 'Chicago' AS station_name, 41.9::DOUBLE AS latitude,
+                    -87.9::DOUBLE AS longitude, '2026-01-17T17:51:00Z' AS generated_at,
+                    -8.0::DOUBLE AS temperature_value, 'celcius' AS temperature_unit_code,
+                    NULL::BIGINT AS wind_direction, 'degrees' AS wind_direction_unit_code,
+                    NULL::BIGINT AS wind_speed, 'knots' AS wind_speed_unit_code,
+                    -12.0::DOUBLE AS dewpoint_value, 'celcius' AS dewpoint_unit_code,
+                    0.02::DOUBLE AS precip_in, '-SN' AS wx_string, TRUE AS wind_variable",
+        )]);
+        let request = day_request();
+        let observations = access(&directory)
+            .observation_data(&request, request.station_ids())
+            .await
+            .unwrap();
+        let kord = observations
+            .iter()
+            .find(|observation| observation.station_id == "KORD")
+            .unwrap();
+        // -8 °C from the new file beats -10 °C from the old one.
+        assert!((kord.temp_high - 17.6).abs() < 1e-9, "{}", kord.temp_high);
+        assert_eq!(kord.temp_unit_code, "fahrenheit");
+        assert!((kord.snow_amt.unwrap() - 0.2).abs() < 1e-9);
+        let ksaw = observations
+            .iter()
+            .find(|observation| observation.station_id == "KSAW")
+            .unwrap();
+        assert_eq!(ksaw.rain_amt, None, "files without precip_in report none");
+        assert_eq!(ksaw.wind_speed, Some(14));
+    }
+
+    #[tokio::test]
+    async fn unusable_parquet_contents_are_errors_or_dropped_rows_not_panics() {
+        let directory = data_dir(&[
+            (
+                "observations_2026-01-17T19:00:00Z.parquet",
+                "SELECT 'KORD''); DROP' AS station_id, '2026-01-17T18:51:00Z' AS generated_at,
+                        1.0::DOUBLE AS temperature_value, 'celcius' AS temperature_unit_code",
+            ),
+            (
+                "observations_2026-01-17T20:00:00Z.parquet",
+                "SELECT 'KSAW' AS station_id, '2026-01-17T19:51:00Z' AS generated_at,
+                        NULL::DOUBLE AS temperature_value, 'celcius' AS temperature_unit_code",
+            ),
+        ]);
+        let access = access(&directory);
+        let stations = access.stations().await.unwrap();
+        assert!(stations.iter().any(|station| station.station_id == "KORD"));
+        assert!(
+            stations
+                .iter()
+                .all(|station| validate_station_id(&station.station_id).is_ok()),
+            "invalid ids from files never reach callers"
+        );
+        let request = ObservationRequest {
+            station_ids: String::new(),
+            ..day_request()
+        };
+        let observations = access.observation_data(&request, vec![]).await.unwrap();
+        assert!(!observations.is_empty());
+        assert!(
+            observations
+                .iter()
+                .all(|observation| validate_station_id(&observation.station_id).is_ok())
+        );
+
+        let broken = data_dir(&[(
+            "observations_2026-01-17T21:00:00Z.parquet",
+            "SELECT 'KSAW' AS station_id, '2026-01-17T20:51:00Z' AS generated_at,
+                    'warm' AS temperature_value, 'celcius' AS temperature_unit_code",
+        )]);
+        let request = day_request();
+        assert!(
+            super::WeatherAccess::observation_data(
+                &self::access(&broken),
+                &request,
+                request.station_ids()
+            )
+            .await
+            .is_err(),
+            "a column of the wrong type fails the query instead of panicking"
+        );
+    }
+
+    #[test]
+    fn temperature_units_accept_the_daemon_spelling() {
+        assert!((convert(0.0, "celcius", &TemperatureUnit::Fahrenheit) - 32.0).abs() < 1e-9);
+        assert!((convert(0.0, "Celsius", &TemperatureUnit::Fahrenheit) - 32.0).abs() < 1e-9);
+        assert!((convert(212.0, "fahrenheit", &TemperatureUnit::Celsius) - 100.0).abs() < 1e-9);
+        assert_eq!(convert(5.0, "kelvin", &TemperatureUnit::Celsius), 5.0);
+        assert_eq!(
+            converted_code("kelvin", &TemperatureUnit::Celsius),
+            "kelvin"
+        );
+        assert_eq!(
+            converted_code("celcius", &TemperatureUnit::Celsius),
+            "celsius"
+        );
+    }
+
+    #[test]
+    fn metar_weather_codes_classify_precipitation() {
+        let connection = open_connection().unwrap();
+        let classify = |wx: &str, temperature: f64| -> String {
+            connection
+                .query_row(
+                    &format!(
+                        "SELECT {PRECIP_TYPE_SQL} FROM (SELECT ?::VARCHAR AS wx_string, ?::DOUBLE AS temperature_value)"
+                    ),
+                    duckdb::params![wx, temperature],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        for (wx, expected) in [
+            ("SN", "snow"),
+            ("-SN", "snow"),
+            ("+SN", "snow"),
+            ("-SHSN", "snow"),
+            ("-RASN", "snow"),
+            ("BLSN BR", "snow"),
+            ("VCSHSN", "snow"),
+            ("-SG", "snow"),
+            ("-FZRA", "ice"),
+            ("FZDZ", "ice"),
+            ("-FZRA SN", "ice"),
+            ("PL", "ice"),
+            ("-SHGS", "ice"),
+            ("RA", "rain"),
+            ("-TSRA", "rain"),
+            ("BR", "rain"),
+            ("SQ", "rain"),
+        ] {
+            assert_eq!(classify(wx, 10.0), expected, "{wx}");
+        }
+        assert_eq!(
+            classify("", 1.0),
+            "snow",
+            "no weather codes: temperature decides"
+        );
+        assert_eq!(classify("", 5.0), "rain");
     }
 
     #[test]
