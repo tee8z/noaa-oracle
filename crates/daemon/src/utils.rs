@@ -492,6 +492,14 @@ pub fn parse_xml<'de, T: serde::Deserialize<'de>>(xml: &str) -> Result<T, serde_
 
 #[cfg(test)]
 mod tests {
+    /// Clap checks its definition (duplicate short flags and the like) only
+    /// when the binary starts, so check it here.
+    #[test]
+    fn the_command_line_definition_is_consistent() {
+        use clap::CommandFactory;
+        super::Cli::command().debug_assert();
+    }
+
     use super::*;
     use async_compression::tokio::write::GzipEncoder;
     use tokio::io::AsyncWriteExt;

@@ -42,7 +42,7 @@ pub struct Cli {
     pub level: Option<LevelFilter>,
 
     /// Address to listen on (use 0.0.0.0 for all interfaces)
-    #[arg(short, long, env = "NOAA_ORACLE_HOST")]
+    #[arg(long, env = "NOAA_ORACLE_HOST")]
     #[serde(alias = "domain")]
     pub host: Option<IpAddr>,
 
@@ -303,6 +303,14 @@ pub fn setup_logger() -> Dispatch {
 
 #[cfg(test)]
 mod tests {
+    /// Clap checks its definition (duplicate short flags and the like) only
+    /// when the binary starts, so check it here.
+    #[test]
+    fn the_command_line_definition_is_consistent() {
+        use clap::CommandFactory;
+        super::Cli::command().debug_assert();
+    }
+
     use super::*;
 
     #[test]
