@@ -129,7 +129,8 @@ ranking. To attest something other than NOAA weather, implement
 targets, metrics with their "par" rules, and baseline/observed readings for
 an observation window. Scoring, ranking, announcements, and attestation are
 shared. On the daemon side, implement its `Source` trait to fetch and write
-the parquet datasets.
+the parquet datasets. The event, entry, and attestation contract is the same for
+every source; see [docs/attestation.md](docs/attestation.md).
 
 ### Daemon Configuration
 

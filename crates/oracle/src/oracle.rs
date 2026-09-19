@@ -123,6 +123,10 @@ impl Oracle {
         self.key.npub()
     }
 
+    pub fn sources(&self) -> &Sources {
+        &self.sources
+    }
+
     fn now(&self) -> OffsetDateTime {
         (self.clock)()
     }
@@ -179,11 +183,11 @@ impl Oracle {
         coordinator: NostrPublicKey,
         event: CreateEvent,
     ) -> Result<Event, Error> {
-        let source = self.sources.default_source().clone();
+        let sources = self.sources.clone();
         let key = self.key.clone();
         // Building the announcement is bounded (MAX_OUTCOMES) but CPU heavy.
         let new_event = tokio::task::spawn_blocking(move || {
-            NewEvent::build(event, source.as_ref(), &key, coordinator)
+            NewEvent::build(event, &sources, &key, coordinator)
         })
         .await??;
         self.db.add_event(&new_event).await?;

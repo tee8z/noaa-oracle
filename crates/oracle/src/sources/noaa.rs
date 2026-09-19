@@ -76,6 +76,10 @@ impl OutcomeSource for NoaaWeather {
         METRICS
     }
 
+    fn default_metrics(&self) -> Vec<&'static str> {
+        vec![TEMP_HIGH, TEMP_LOW, WIND_SPEED]
+    }
+
     fn validate_target(&self, target: &str) -> Result<(), SourceError> {
         validate_station_id(target).map_err(|error| SourceError::InvalidTarget {
             target: target.to_owned(),

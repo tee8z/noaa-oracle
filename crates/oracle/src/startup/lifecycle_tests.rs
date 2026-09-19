@@ -243,7 +243,7 @@ async fn etl_runs_one_at_a_time_and_not_during_shutdown() {
     let weather: Arc<dyn WeatherData> = Arc::new(WeatherAccess::new(files.clone()));
     let oracle = Oracle::new(
         database.clone(),
-        Sources::new(Arc::new(NoaaWeather::new(weather.clone()))),
+        Sources::new(Arc::new(NoaaWeather::new(weather.clone())), []),
         &directory.path().join("oracle.pem"),
         system_clock(),
     )

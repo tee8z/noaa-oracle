@@ -20,6 +20,7 @@ use crate::{
         WeatherEntry,
     },
     oracle::Error,
+    sources::Metric,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -63,6 +64,41 @@ pub async fn get_npub(State(state): State<Arc<AppState>>) -> Json<Pubkey> {
     Json(Pubkey {
         key: state.oracle.npub(),
     })
+}
+
+/// A data source events can attest to.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SourceInfo {
+    /// Value for `CreateEvent.source`
+    pub id: &'static str,
+    /// Metric ids usable in `scoring_fields` and picks, with their par rules
+    pub metrics: Vec<Metric>,
+    /// Metrics scored when an event names none
+    pub default_metrics: Vec<&'static str>,
+    /// Whether events without a `source` use this one
+    pub default: bool,
+}
+
+#[utoipa::path(
+    get,
+    path = "/oracle/sources",
+    responses(
+        (status = OK, description = "Data sources and the metrics each can score", body = Vec<SourceInfo>),
+    ))]
+pub async fn list_sources(State(state): State<Arc<AppState>>) -> Json<Vec<SourceInfo>> {
+    let sources = state.oracle.sources();
+    let default = sources.default_source().id();
+    Json(
+        sources
+            .all()
+            .map(|source| SourceInfo {
+                id: source.id().as_str(),
+                metrics: source.metrics().to_vec(),
+                default_metrics: source.default_metrics(),
+                default: source.id() == default,
+            })
+            .collect(),
+    )
 }
 
 #[utoipa::path(

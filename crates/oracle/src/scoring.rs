@@ -5,7 +5,9 @@
 //! outcome index. Entry index `i` is the `i`-th entry in id order.
 
 use itertools::Itertools;
+use serde::{Deserialize, Serialize};
 use std::cmp::{Ordering, Reverse};
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{
@@ -17,7 +19,7 @@ pub const OVER_OR_UNDER_POINTS: u64 = 10;
 pub const PAR_POINTS: u64 = 20;
 
 /// One prediction in an entry: `prediction` for `metric` at `target`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct Pick {
     pub target: String,
     pub metric: String,

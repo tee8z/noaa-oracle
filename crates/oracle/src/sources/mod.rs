@@ -14,14 +14,18 @@
 //! `(target, metric)` pairs, and [`crate::scoring`] turns readings into
 //! scores the same way for every source.
 //!
-//! To add a source: implement [`OutcomeSource`] next to [`noaa`], register it
-//! in [`Sources::new`], and expose a way for event creation to select it.
-//! Readings must be deterministic for a given set of published files,
-//! because the attestation is final.
+//! To add a source: implement [`OutcomeSource`] next to [`noaa`] and register
+//! it in `startup.rs` where [`Sources::new`] is called. Events select it with
+//! `"source": "<id>"` and entries use generic picks. Readings must be
+//! deterministic for a given set of published files, because the
+//! attestation is final. The attestation contract itself is in
+//! `docs/attestation.md`.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::{fmt, sync::Arc};
 use time::OffsetDateTime;
+use utoipa::ToSchema;
 
 pub mod noaa;
 
@@ -48,8 +52,10 @@ impl fmt::Display for SourceId {
 }
 
 /// How an observed value compares with the baseline for a `Par` prediction.
-/// `Over` and `Under` always compare the raw values.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// `Over` and `Under` always compare the raw values. Published by
+/// `GET /oracle/sources` as `{"rule": "within", "tolerance": 0.1}`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, ToSchema)]
+#[serde(tag = "rule", content = "tolerance", rename_all = "snake_case")]
 pub enum ParRule {
     /// Par when the values are equal.
     Exact,
@@ -62,7 +68,7 @@ pub enum ParRule {
 }
 
 /// A metric a source can score.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, ToSchema)]
 pub struct Metric {
     /// Stable wire and storage name, e.g. `temp_high`.
     pub id: &'static str,
@@ -78,7 +84,7 @@ pub struct ObservationWindow {
 
 /// Baseline and observation for one metric at one target. `None` means the
 /// source has no value; such readings never earn points.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Reading {
     pub target: String,
     /// A [`Metric::id`] of the source.
@@ -101,6 +107,11 @@ pub trait OutcomeSource: Send + Sync {
 
     /// Every metric this source can score.
     fn metrics(&self) -> &'static [Metric];
+
+    /// Metrics an event scores when it names none. All by default.
+    fn default_metrics(&self) -> Vec<&'static str> {
+        self.metrics().iter().map(|metric| metric.id).collect()
+    }
 
     /// Rejects target ids the source cannot read. Called before a target is
     /// stored or used in a query.
@@ -130,11 +141,18 @@ pub struct Sources {
 }
 
 impl Sources {
-    /// The first source is the default for event creation.
-    pub fn new(default: Arc<dyn OutcomeSource>) -> Self {
+    /// `default` serves events that name no source.
+    pub fn new(
+        default: Arc<dyn OutcomeSource>,
+        others: impl IntoIterator<Item = Arc<dyn OutcomeSource>>,
+    ) -> Self {
         Self {
-            sources: vec![default],
+            sources: std::iter::once(default).chain(others).collect(),
         }
+    }
+
+    pub fn all(&self) -> impl Iterator<Item = &Arc<dyn OutcomeSource>> {
+        self.sources.iter()
     }
 
     pub fn default_source(&self) -> &Arc<dyn OutcomeSource> {
@@ -145,5 +163,25 @@ impl Sources {
         self.sources
             .iter()
             .find(|source| source.id().as_str() == id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn par_rules_have_a_stable_encoding() {
+        let encode = |rule| serde_json::to_string(&rule).unwrap();
+        assert_eq!(encode(ParRule::Exact), r#"{"rule":"exact"}"#);
+        assert_eq!(encode(ParRule::Rounded), r#"{"rule":"rounded"}"#);
+        assert_eq!(
+            encode(ParRule::Within(0.1)),
+            r#"{"rule":"within","tolerance":0.1}"#
+        );
+        assert_eq!(
+            encode(ParRule::Compass(22.0)),
+            r#"{"rule":"compass","tolerance":22.0}"#
+        );
     }
 }

@@ -1,11 +1,18 @@
-//! Events: the coordinator wire contract and the validated domain forms.
+//! Events: the wire contract and the validated domain forms.
 //!
-//! Wire shapes (`CreateEvent`, `AddEventEntry`, `Event`, `EventSummary`,
-//! `WeatherEntry`) are the coordinator contract: field names, optionality,
-//! and RFC 3339 dates stay stable; the contract test posts the
-//! coordinator's exact JSON. Choices arrive as NOAA-shaped
-//! [`WeatherChoices`] and are converted to source-independent [`Pick`]s at
-//! this boundary, so scoring and storage never see the wire shape.
+//! The contract is source independent. An event names a data `source`, the
+//! `locations` (targets) it watches, and the metrics (`scoring_fields`) it
+//! scores. Entries are lists of [`Pick`]s: `Over`, `Par`, or `Under` the
+//! source's baseline for a `(target, metric)`. The oracle attests the
+//! ranking of entries, so the attestation does not depend on the data; see
+//! `docs/attestation.md`.
+//!
+//! NOAA-shaped fields remain for existing clients: entries may send
+//! [`WeatherChoices`] instead of picks, and responses carry `weather` rows
+//! and `expected_observations` for NOAA events. Both are converted at this
+//! boundary, so scoring and storage only see picks and readings. Field
+//! names, optionality, and RFC 3339 dates stay stable; the contract test
+//! posts the coordinator's exact JSON.
 //!
 //! Every rule for a new event or its entries lives here, in
 //! [`NewEvent::build`] and [`validate_entries`].
@@ -24,7 +31,7 @@ use uuid::Uuid;
 use crate::{
     scoring::{self, Pick},
     signing::{EventNonce, SigningKey},
-    sources::{OutcomeSource, Reading, SourceError, noaa},
+    sources::{OutcomeSource, Reading, SourceError, Sources, noaa},
 };
 
 /// Entries an event may hold. Outcome enumeration grows as
@@ -53,23 +60,30 @@ pub struct CreateEvent {
     #[serde(with = "time::serde::rfc3339")]
     /// Time when the weather observations end; entries must be submitted before this time
     pub end_observation_date: OffsetDateTime,
-    /// NOAA observation stations used in this event
+    /// Data source to attest (see `GET /oracle/sources`); defaults to `noaa_weather`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Targets the event watches: NOAA station ids for `noaa_weather`
+    #[serde(alias = "targets")]
     pub locations: Vec<String>,
-    /// The number of values that can be selected per entry in the event
+    /// The number of picks each entry may make
     pub number_of_values_per_entry: usize,
     /// Total number of allowed entries into the event (at most 25)
     pub total_allowed_entries: usize,
     /// Number of ranks that win (1 to 5, fewer than the number of entries)
     pub number_of_places_win: usize,
-    /// Which weather fields to use for scoring. Defaults to ["temp_high", "temp_low", "wind_speed"].
-    #[serde(default = "ScoringField::defaults")]
-    pub scoring_fields: Vec<ScoringField>,
+    /// Metric ids to score, from the source's metric list. Defaults to the
+    /// source's defaults (`temp_high`, `temp_low`, `wind_speed` for NOAA).
+    #[serde(default, alias = "metrics", skip_serializing_if = "Option::is_none")]
+    pub scoring_fields: Option<Vec<String>>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum EventRejection {
     #[error("event id {0} is not a UUIDv7")]
     NotUuidV7(Uuid),
+    #[error("unknown source {0:?}; see GET /oracle/sources")]
+    UnknownSource(String),
     #[error("observation start must be before its end, and the end no later than the signing date")]
     DatesOutOfOrder,
     #[error("signing date is outside the DLC expiry range")]
@@ -88,7 +102,7 @@ pub enum EventRejection {
     Locations,
     #[error(transparent)]
     InvalidLocation(SourceError),
-    #[error("at least one scoring field is required and each may appear once")]
+    #[error("scoring fields must be distinct metrics of the source, at least one")]
     ScoringFields,
     #[error("number_of_values_per_entry must be between 1 and {max}, requested {requested}")]
     ValuesPerEntry { requested: usize, max: usize },
@@ -114,6 +128,13 @@ pub enum EntryRejection {
     AlreadySubmitted,
     #[error("entry {0} must make between 1 and {1} picks")]
     PickCount(Uuid, usize),
+    #[error("entry {0} must use exactly one of `picks` or `expected_observations`")]
+    PickFormat(Uuid),
+    #[error(
+        "entry {entry} uses `expected_observations`, which only {} events accept",
+        noaa::NOAA_WEATHER
+    )]
+    WeatherChoicesUnsupported { entry: Uuid },
     #[error("entry {entry} picks location {location:?}, which is not in the event")]
     UnknownLocation { entry: Uuid, location: String },
     #[error("entry {entry} picks {field}, which the event does not score")]
@@ -146,19 +167,26 @@ pub struct NewEvent {
 }
 
 impl NewEvent {
-    /// Validates `event` for `source` and computes its announcement: one
+    /// Validates `event` for its source and computes its announcement: one
     /// locking point per ranking outcome plus the refund-all outcome, in
     /// the order the coordinator also generates. CPU-bound; call it off the
     /// async runtime.
     pub fn build(
         event: CreateEvent,
-        source: &dyn OutcomeSource,
+        sources: &Sources,
         key: &SigningKey,
         coordinator: NostrPublicKey,
     ) -> Result<Self, EventRejection> {
         if event.id.get_version_num() != 7 {
             return Err(EventRejection::NotUuidV7(event.id));
         }
+        let source: &dyn OutcomeSource = match &event.source {
+            Some(id) => sources
+                .get(id)
+                .ok_or_else(|| EventRejection::UnknownSource(id.clone()))?
+                .as_ref(),
+            None => sources.default_source().as_ref(),
+        };
         if event.start_observation_date >= event.end_observation_date
             || event.end_observation_date > event.signing_date
         {
@@ -188,16 +216,19 @@ impl NewEvent {
                 .validate_target(location)
                 .map_err(EventRejection::InvalidLocation)?;
         }
-        let distinct_fields: HashSet<&ScoringField> = event.scoring_fields.iter().collect();
-        if event.scoring_fields.is_empty() || distinct_fields.len() != event.scoring_fields.len() {
-            return Err(EventRejection::ScoringFields);
-        }
-        let metrics: Vec<String> = event
-            .scoring_fields
-            .iter()
-            .map(|field| field.as_str().to_owned())
-            .collect();
-        if metrics.iter().any(|metric| source.metric(metric).is_none()) {
+        let metrics: Vec<String> = match event.scoring_fields {
+            Some(fields) => fields,
+            None => source
+                .default_metrics()
+                .iter()
+                .map(|metric| (*metric).to_owned())
+                .collect(),
+        };
+        let distinct_metrics: HashSet<&String> = metrics.iter().collect();
+        if metrics.is_empty()
+            || distinct_metrics.len() != metrics.len()
+            || metrics.iter().any(|metric| source.metric(metric).is_none())
+        {
             return Err(EventRejection::ScoringFields);
         }
         let max_values = event.locations.len() * metrics.len();
@@ -275,13 +306,17 @@ impl EventRecord {
         }
     }
 
-    /// NOAA-shaped scoring fields for the wire. Metrics this build cannot
-    /// name are left out.
-    fn scoring_fields(&self) -> Vec<ScoringField> {
-        self.metrics
-            .iter()
-            .filter_map(|metric| ScoringField::from_metric(metric))
-            .collect()
+    fn is_noaa(&self) -> bool {
+        self.source == noaa::NOAA_WEATHER.as_str()
+    }
+
+    /// NOAA display rows; empty for other sources.
+    fn weather(&self, readings: &[Reading]) -> Vec<Weather> {
+        if self.is_noaa() {
+            weather_from_readings(&self.locations, readings, self.start_observation_date)
+        } else {
+            vec![]
+        }
     }
 
     pub fn into_event(
@@ -294,8 +329,8 @@ impl EventRecord {
         Event {
             id: self.id,
             status: self.status(now),
-            scoring_fields: self.scoring_fields(),
-            weather: weather_from_readings(&self.locations, readings, self.start_observation_date),
+            weather: self.weather(readings),
+            readings: readings.to_vec(),
             signing_date: self.signing_date,
             start_observation_date: self.start_observation_date,
             end_observation_date: self.end_observation_date,
@@ -308,6 +343,8 @@ impl EventRecord {
             event_announcement,
             attestation: self.attestation,
             coordinator_pubkey: self.coordinator_pubkey,
+            scoring_fields: self.metrics,
+            source: self.source,
             locations: self.locations,
         }
     }
@@ -316,7 +353,8 @@ impl EventRecord {
         EventSummary {
             id: self.id,
             status: self.status(now),
-            weather: weather_from_readings(&self.locations, readings, self.start_observation_date),
+            weather: self.weather(readings),
+            readings: readings.to_vec(),
             signing_date: self.signing_date,
             start_observation_date: self.start_observation_date,
             end_observation_date: self.end_observation_date,
@@ -326,6 +364,8 @@ impl EventRecord {
             number_of_places_win: wire_count(self.number_of_places_win),
             attestation: self.attestation,
             nonce_point: self.nonce.point,
+            scoring_fields: self.metrics,
+            source: self.source,
             locations: self.locations,
         }
     }
@@ -394,37 +434,50 @@ pub fn validate_entries(
         .collect()
 }
 
+/// The entry's picks, from whichever form it used, checked against the
+/// event: known targets, enabled metrics, no repeats, and a bounded count.
 fn entry_picks(event: &EventRecord, entry: &AddEventEntry) -> Result<Vec<Pick>, EntryRejection> {
-    let mut picks: Vec<Pick> = vec![];
-    for choice in &entry.expected_observations {
-        if !event.locations.contains(&choice.stations) {
+    let picks: Vec<Pick> = match (
+        entry.picks.is_empty(),
+        entry.expected_observations.is_empty(),
+    ) {
+        (false, true) => entry.picks.clone(),
+        (true, false) if event.is_noaa() => entry
+            .expected_observations
+            .iter()
+            .flat_map(|choice| {
+                choice.predictions().map(|(field, prediction)| Pick {
+                    target: choice.stations.clone(),
+                    metric: field.as_str().to_owned(),
+                    prediction,
+                })
+            })
+            .collect(),
+        (true, false) => return Err(EntryRejection::WeatherChoicesUnsupported { entry: entry.id }),
+        (true, true) => vec![],
+        (false, false) => return Err(EntryRejection::PickFormat(entry.id)),
+    };
+    for (index, pick) in picks.iter().enumerate() {
+        if !event.locations.contains(&pick.target) {
             return Err(EntryRejection::UnknownLocation {
                 entry: entry.id,
-                location: choice.stations.clone(),
+                location: pick.target.clone(),
             });
         }
-        for (field, prediction) in choice.predictions() {
-            let metric = field.as_str();
-            if !event.metrics.iter().any(|enabled| enabled == metric) {
-                return Err(EntryRejection::UnscoredField {
-                    entry: entry.id,
-                    field: metric.to_owned(),
-                });
-            }
-            if picks
-                .iter()
-                .any(|pick| pick.target == choice.stations && pick.metric == metric)
-            {
-                return Err(EntryRejection::DuplicatePick {
-                    entry: entry.id,
-                    location: choice.stations.clone(),
-                    field: metric.to_owned(),
-                });
-            }
-            picks.push(Pick {
-                target: choice.stations.clone(),
-                metric: metric.to_owned(),
-                prediction,
+        if !event.metrics.contains(&pick.metric) {
+            return Err(EntryRejection::UnscoredField {
+                entry: entry.id,
+                field: pick.metric.clone(),
+            });
+        }
+        if picks[..index]
+            .iter()
+            .any(|earlier| earlier.target == pick.target && earlier.metric == pick.metric)
+        {
+            return Err(EntryRejection::DuplicatePick {
+                entry: entry.id,
+                location: pick.target.clone(),
+                field: pick.metric.clone(),
             });
         }
     }
@@ -495,7 +548,7 @@ impl std::fmt::Display for EventStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
 pub struct EventSummary {
     pub id: Uuid,
     #[serde(with = "time::serde::rfc3339")]
@@ -511,7 +564,13 @@ pub struct EventSummary {
     pub total_allowed_entries: i64,
     pub total_entries: i64,
     pub number_of_places_win: i64,
-    /// The forecasted and observed values for each station
+    /// Data source the event attests to
+    pub source: String,
+    /// Metric ids the event scores
+    pub scoring_fields: Vec<String>,
+    /// Latest baseline and observed value per target and metric
+    pub readings: Vec<Reading>,
+    /// NOAA display rows (empty for other sources)
     pub weather: Vec<Weather>,
     /// Present once the oracle has attested the final result
     #[schema(value_type = Option<String>)]
@@ -521,7 +580,7 @@ pub struct EventSummary {
     pub nonce_point: Point,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
 pub struct Event {
     pub id: Uuid,
     #[serde(with = "time::serde::rfc3339")]
@@ -540,7 +599,11 @@ pub struct Event {
     pub number_of_places_win: i64,
     /// All entries, in id order; entry `i` is outcome index `i`
     pub entries: Vec<WeatherEntry>,
-    /// The forecasted and observed values for each station
+    /// Data source the event attests to
+    pub source: String,
+    /// Latest baseline and observed value per target and metric
+    pub readings: Vec<Reading>,
+    /// NOAA display rows (empty for other sources)
     pub weather: Vec<Weather>,
     /// Public nonce point `R`. Locking point `i` is
     /// `R + H(R, P, outcome_i)·P` for the oracle key `P`.
@@ -554,8 +617,8 @@ pub struct Event {
     pub attestation: Option<MaybeScalar>,
     /// The coordinator's npub
     pub coordinator_pubkey: String,
-    /// Which weather fields are used for scoring in this event
-    pub scoring_fields: Vec<ScoringField>,
+    /// Metric ids the event scores
+    pub scoring_fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -648,6 +711,11 @@ pub struct AddEventEntry {
     /// Client needs to provide a valid Uuidv7
     pub id: Uuid,
     pub event_id: Uuid,
+    /// Predictions, for any source
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub picks: Vec<Pick>,
+    /// NOAA-shaped predictions; use instead of `picks` for NOAA events
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expected_observations: Vec<WeatherChoices>,
 }
 
@@ -655,6 +723,9 @@ pub struct AddEventEntry {
 pub struct WeatherEntry {
     pub id: Uuid,
     pub event_id: Uuid,
+    /// The entry's predictions
+    pub picks: Vec<Pick>,
+    /// The same predictions grouped by NOAA station (NOAA metrics only)
     pub expected_observations: Vec<WeatherChoices>,
     /// Present once the observation window has begun and the oracle scored it
     pub score: Option<i64>,
@@ -667,6 +738,7 @@ impl From<Entry> for WeatherEntry {
             id: entry.id,
             event_id: entry.event_id,
             expected_observations: WeatherChoices::from_picks(&entry.picks),
+            picks: entry.picks,
             score: entry.score,
             base_score: entry.base_score,
         }
@@ -734,7 +806,7 @@ impl WeatherChoices {
     }
 }
 
-/// NOAA metrics an event can score. Names match [`noaa`] metric ids.
+/// The NOAA metrics [`WeatherChoices`] can name. Ids match [`noaa`]'s.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ScoringField {
@@ -772,10 +844,6 @@ impl ScoringField {
 
     pub fn from_metric(metric: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|field| field.as_str() == metric)
-    }
-
-    pub fn defaults() -> Vec<ScoringField> {
-        vec![Self::TempHigh, Self::TempLow, Self::WindSpeed]
     }
 }
 
@@ -822,8 +890,42 @@ mod tests {
     use super::*;
     use crate::sources::{Metric, ObservationWindow, ParRule, SourceId};
     use async_trait::async_trait;
+    use std::sync::Arc;
 
     struct Stations;
+
+    /// A non-weather source: tide gauges with one metric.
+    struct Tides;
+
+    #[async_trait]
+    impl OutcomeSource for Tides {
+        fn id(&self) -> SourceId {
+            SourceId::new("tides")
+        }
+        fn metrics(&self) -> &'static [Metric] {
+            &[Metric {
+                id: "high_tide_ft",
+                par: ParRule::Within(0.1),
+            }]
+        }
+        fn validate_target(&self, _target: &str) -> Result<(), SourceError> {
+            Ok(())
+        }
+        async fn readings(
+            &self,
+            _window: ObservationWindow,
+            _targets: &[String],
+        ) -> Result<Vec<Reading>, SourceError> {
+            Ok(vec![])
+        }
+    }
+
+    fn sources() -> Sources {
+        Sources::new(
+            Arc::new(Stations),
+            [Arc::new(Tides) as Arc<dyn OutcomeSource>],
+        )
+    }
 
     #[async_trait]
     impl OutcomeSource for Stations {
@@ -882,7 +984,8 @@ mod tests {
             number_of_values_per_entry: 3,
             total_allowed_entries: entries,
             number_of_places_win: places,
-            scoring_fields: ScoringField::defaults(),
+            source: None,
+            scoring_fields: None,
         }
     }
 
@@ -890,7 +993,7 @@ mod tests {
         let (_directory, key) = key();
         NewEvent::build(
             event,
-            &Stations,
+            &sources(),
             &key,
             nostr::key::Keys::generate().public_key(),
         )
@@ -970,11 +1073,11 @@ mod tests {
             EventRejection::InvalidLocation(_)
         ));
         assert!(matches!(
-            rejected(|e| e.scoring_fields.clear()),
+            rejected(|e| e.scoring_fields = Some(vec![])),
             EventRejection::ScoringFields
         ));
         assert!(matches!(
-            rejected(|e| e.scoring_fields = vec![ScoringField::Humidity]),
+            rejected(|e| e.scoring_fields = Some(vec!["humidity".into()])),
             EventRejection::ScoringFields
         ));
         assert!(matches!(
@@ -985,12 +1088,116 @@ mod tests {
             rejected(|e| e.id = Uuid::from_u128(0x1234)),
             EventRejection::NotUuidV7(_)
         ));
+        assert!(matches!(
+            rejected(|e| e.source = Some("space_weather".into())),
+            EventRejection::UnknownSource(_)
+        ));
+    }
+
+    #[test]
+    fn other_sources_use_the_same_contract_with_picks() {
+        let mut tides = event(2, 1);
+        tides.source = Some("tides".into());
+        tides.locations = vec!["9414290".into()];
+        tides.number_of_values_per_entry = 1;
+        tides.start_observation_date += Duration::hours(1);
+        tides.end_observation_date += Duration::hours(1);
+        let created = build(tides).unwrap();
+        assert_eq!(created.source, "tides");
+        assert_eq!(
+            created.metrics,
+            vec!["high_tide_ft".to_string()],
+            "source defaults"
+        );
+        let event = record(created);
+        let pick = |prediction| AddEventEntry {
+            id: Uuid::now_v7(),
+            event_id: event.id,
+            picks: vec![Pick {
+                target: "9414290".into(),
+                metric: "high_tide_ft".into(),
+                prediction,
+            }],
+            expected_observations: vec![],
+        };
+        let now = OffsetDateTime::now_utc();
+        let entries = validate_entries(
+            &event,
+            vec![pick(ValueOptions::Over), pick(ValueOptions::Par)],
+            now,
+        )
+        .unwrap();
+        assert_eq!(entries[1].picks[0].prediction, ValueOptions::Par);
+
+        let weather_shaped = AddEventEntry {
+            picks: vec![],
+            expected_observations: vec![choice("9414290")],
+            ..pick(ValueOptions::Par)
+        };
+        assert!(matches!(
+            validate_entries(&event, vec![weather_shaped, pick(ValueOptions::Par)], now),
+            Err(EntryRejection::WeatherChoicesUnsupported { .. })
+        ));
+        let both = AddEventEntry {
+            expected_observations: vec![choice("9414290")],
+            ..pick(ValueOptions::Par)
+        };
+        assert!(matches!(
+            validate_entries(&event, vec![both, pick(ValueOptions::Par)], now),
+            Err(EntryRejection::PickFormat(_))
+        ));
+
+        let wire = event.into_event(
+            now,
+            EventLockingConditions {
+                locking_points: vec![],
+                expiry: None,
+            },
+            entries,
+            &[Reading {
+                target: "9414290".into(),
+                metric: "high_tide_ft".into(),
+                baseline: Some(5.2),
+                observed: None,
+            }],
+        );
+        assert!(wire.weather.is_empty(), "weather rows are NOAA only");
+        assert_eq!(wire.readings.len(), 1);
+        assert_eq!(wire.entries[0].picks.len(), 1);
+        assert!(wire.entries[0].expected_observations.is_empty());
+    }
+
+    #[test]
+    fn noaa_entries_accept_picks_or_weather_choices() {
+        let mut candidate = event(2, 1);
+        candidate.start_observation_date += Duration::hours(1);
+        candidate.end_observation_date += Duration::hours(1);
+        let event = record(build(candidate).unwrap());
+        let by_picks = AddEventEntry {
+            id: Uuid::now_v7(),
+            event_id: event.id,
+            picks: vec![Pick {
+                target: "KORD".into(),
+                metric: noaa::TEMP_HIGH.into(),
+                prediction: ValueOptions::Par,
+            }],
+            expected_observations: vec![],
+        };
+        let by_choices = entry(&event, vec![choice("KORD")]);
+        let entries = validate_entries(
+            &event,
+            vec![by_picks, by_choices],
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+        assert_eq!(entries[0].picks, entries[1].picks);
     }
 
     fn entry(event: &EventRecord, choices: Vec<WeatherChoices>) -> AddEventEntry {
         AddEventEntry {
             id: Uuid::now_v7(),
             event_id: event.id,
+            picks: vec![],
             expected_observations: choices,
         }
     }

@@ -18,9 +18,9 @@ See the [README](../README.md) for architecture and the
 - Wire types in [events.rs](../crates/oracle/src/events.rs) are part of the
   coordinator contract. Keep field names, optionality, and RFC 3339 dates
   stable; the [contract test](../crates/oracle/tests/api/coordinator_contract.rs)
-  posts the coordinator's exact JSON. The outcome order (permutations of
-  `places` winners, then refund-all) and the outcome message encoding in
-  [scoring.rs](../crates/oracle/src/scoring.rs) are part of it too.
+  posts the coordinator's exact JSON. The outcome order and message
+  encoding in [scoring.rs](../crates/oracle/src/scoring.rs) are part of it;
+  [attestation.md](attestation.md) is the maintained description.
 
 ## Module boundaries
 

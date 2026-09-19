@@ -16,7 +16,7 @@ use crate::{
         add_event_entries, create_event, daily_observations, dashboard_handler, download,
         event_detail_handler, event_stats_handler, events_cards_handler, events_handler,
         events_rows_handler, files, forecast_handler, forecasts, get_event, get_event_entry,
-        get_npub, get_pubkey, get_stations, healthy, list_events, observations,
+        get_npub, get_pubkey, get_stations, healthy, list_events, list_sources, observations,
         oracle_info_handler, raw_data_handler, ready, update_data, upload, warm_forecast_cache,
         weather_handler,
     },
@@ -211,6 +211,7 @@ impl AppState {
     paths(
         crate::routes::events::get_npub,
         crate::routes::events::get_pubkey,
+        crate::routes::events::list_sources,
         crate::routes::events::list_events,
         crate::routes::events::create_event,
         crate::routes::events::get_event,
@@ -229,6 +230,9 @@ impl AppState {
         schemas(
                 crate::routes::files::get_names::Files,
                 crate::routes::events::ErrorBody,
+                crate::routes::events::SourceInfo,
+                crate::scoring::Pick,
+                crate::sources::Reading,
                 crate::events::Event,
                 crate::events::EventSummary,
                 crate::events::WeatherEntry,
@@ -265,7 +269,7 @@ async fn build_app_state(
         configuration.weather_dir.to_string_lossy().into_owned(),
     ));
     let weather_db: Arc<dyn WeatherData> = Arc::new(WeatherAccess::new(local_file_access));
-    let sources = Sources::new(Arc::new(NoaaWeather::new(weather_db.clone())));
+    let sources = Sources::new(Arc::new(NoaaWeather::new(weather_db.clone())), []);
     let oracle = Oracle::new(
         database.clone(),
         sources,
@@ -334,6 +338,7 @@ pub fn app(app_state: Arc<AppState>) -> Router {
         .route("/stations/daily-observations", get(daily_observations))
         .route("/oracle/npub", get(get_npub))
         .route("/oracle/pubkey", get(get_pubkey))
+        .route("/oracle/sources", get(list_sources))
         .route("/oracle/update", post(update_data))
         .route("/oracle/events", get(list_events))
         .route("/oracle/events", post(create_event))
