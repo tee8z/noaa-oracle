@@ -127,21 +127,20 @@ pub async fn list_events(
         (status = FORBIDDEN, description = "Signer is not an allowed coordinator"),
         (status = SERVICE_UNAVAILABLE, description = "The oracle is shutting down or its write queue is full; retry later", body = ErrorBody),
     ))]
-pub async fn create_event(
-    State(state): State<Arc<AppState>>,
-    signed: Signed,
-) -> Result<Json<Event>, Response> {
-    state
-        .auth
-        .require(Role::Coordinator, &signed.pubkey)
-        .map_err(IntoResponse::into_response)?;
-    let event: CreateEvent = json_body(&signed.body)?;
+pub async fn create_event(State(state): State<Arc<AppState>>, signed: Signed) -> Response {
+    if let Err(error) = state.auth.require(Role::Coordinator, &signed.pubkey) {
+        return error.into_response();
+    }
+    let event: CreateEvent = match json_body(&signed.body) {
+        Ok(event) => event,
+        Err(rejection) => return rejection,
+    };
     state
         .oracle
         .create_event(signed.pubkey, event)
         .await
         .map(Json)
-        .map_err(IntoResponse::into_response)
+        .into_response()
 }
 
 #[utoipa::path(
@@ -177,24 +176,26 @@ pub async fn add_event_entries(
     State(state): State<Arc<AppState>>,
     Path(event_id): Path<Uuid>,
     signed: Signed,
-) -> Result<Json<Vec<WeatherEntry>>, Response> {
-    state
-        .auth
-        .require(Role::Coordinator, &signed.pubkey)
-        .map_err(IntoResponse::into_response)?;
-    let body: AddEventEntries = json_body(&signed.body)?;
+) -> Response {
+    if let Err(error) = state.auth.require(Role::Coordinator, &signed.pubkey) {
+        return error.into_response();
+    }
+    let body: AddEventEntries = match json_body(&signed.body) {
+        Ok(body) => body,
+        Err(rejection) => return rejection,
+    };
     if body.event_id != event_id {
-        return Err(bad_request(format!(
+        return bad_request(format!(
             "entries are for event {} but were posted to event {event_id}",
             body.event_id
-        )));
+        ));
     }
     state
         .oracle
         .add_event_entries(signed.pubkey, event_id, body.entries)
         .await
         .map(Json)
-        .map_err(IntoResponse::into_response)
+        .into_response()
 }
 
 #[utoipa::path(
@@ -243,6 +244,10 @@ pub async fn update_data(State(state): State<Arc<AppState>>, signed: Signed) -> 
     }
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "the rejection is returned straight to axum; boxing it only adds an allocation"
+)]
 fn json_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, Response> {
     serde_json::from_slice(body).map_err(|error| bad_request(format!("invalid JSON body: {error}")))
 }

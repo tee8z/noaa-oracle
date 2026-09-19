@@ -1,8 +1,7 @@
-mod attestation;
+mod auth;
 mod coordinator_contract;
-mod create_event;
-mod create_event_entry;
-mod etl_workflow;
-mod get_events;
+mod events;
 mod helpers;
+mod lifecycle;
 mod ui_fragments;
+mod upload;
