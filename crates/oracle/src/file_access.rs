@@ -106,7 +106,12 @@ pub enum Error {
     Io(String),
     #[error("Invalid parquet file name: {0:?}")]
     InvalidFileName(String),
+    #[error("listing files needs a start and end date at most {MAX_LIST_DAYS} days apart")]
+    UnboundedListing,
 }
+
+/// Days one S3 listing may cover; each day is one prefix listing.
+pub const MAX_LIST_DAYS: usize = 366;
 
 /// Where parquet files live. Implementations return only validated file
 /// names, so callers can pass them straight to [`FileData::build_file_paths`].
@@ -240,26 +245,19 @@ impl FileData for S3FileAccess {
     async fn grab_file_names(&self, params: FileParams) -> Result<Vec<String>, Error> {
         let mut file_names = Vec::new();
 
-        // Determine the date range to scan
-        let start_date = params.start.map(|s| s.date());
-        let end_date = params.end.map(|e| e.date());
-
-        // If we have a date range, list objects per date prefix for efficiency.
-        // Otherwise, list everything under weather_data/.
-        let prefixes: Vec<String> = if let (Some(start), Some(end)) = (start_date, end_date) {
-            let mut dates = Vec::new();
-            let mut current = start;
-            while current <= end {
-                dates.push(format!("weather_data/{}/", current));
-                current = current.next_day().unwrap_or(end);
-                if dates.len() > 365 {
-                    break; // safety limit
-                }
-            }
-            dates
-        } else {
-            vec!["weather_data/".to_string()]
+        // One prefix listing per day; the whole bucket is never listed.
+        let (Some(start), Some(end)) = (params.start, params.end) else {
+            return Err(Error::UnboundedListing);
         };
+        let (start, end) = (start.date(), end.date());
+        let prefixes: Vec<String> = std::iter::successors(Some(start), |day| day.next_day())
+            .take_while(|day| *day <= end)
+            .take(MAX_LIST_DAYS + 1)
+            .map(|day| format!("weather_data/{day}/"))
+            .collect();
+        if prefixes.len() > MAX_LIST_DAYS {
+            return Err(Error::UnboundedListing);
+        }
 
         for prefix in &prefixes {
             let mut continuation_token: Option<String> = None;
@@ -276,8 +274,7 @@ impl FileData for S3FileAccess {
 
                 let resp = req.send().await.map_err(|e| {
                     Error::Io(format!(
-                        "S3 list_objects_v2 failed for prefix '{}': {}",
-                        prefix, e
+                        "S3 list_objects_v2 failed for prefix '{prefix}': {e}"
                     ))
                 })?;
 
@@ -327,16 +324,18 @@ impl FileData for S3FileAccess {
             .key(&key)
             .send()
             .await
-            .map_err(|e| Error::NotFound(format!("S3 get_object '{}': {}", key, e)))?;
-
-        let bytes = resp
-            .body
-            .collect()
-            .await
-            .map_err(|e| Error::Io(format!("S3 read body '{}': {}", key, e)))?
-            .into_bytes();
-
-        Ok(Body::from(bytes))
+            .map_err(|error| {
+                let service = error.into_service_error();
+                if service.is_no_such_key() {
+                    Error::NotFound(key.clone())
+                } else {
+                    Error::Io(format!("S3 get_object '{key}': {service}"))
+                }
+            })?;
+        // Stream the object instead of buffering it in memory.
+        Ok(Body::from_stream(ReaderStream::new(
+            resp.body.into_async_read(),
+        )))
     }
 }
 

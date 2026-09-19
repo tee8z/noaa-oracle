@@ -185,7 +185,7 @@ fn station_readings(
         reading(
             WIND_SPEED,
             whole(forecast.wind_speed),
-            observed(|o| Some(o.wind_speed as f64)),
+            observed(|o| o.wind_speed.map(|value| value as f64)),
         ),
         reading(
             WIND_DIRECTION,

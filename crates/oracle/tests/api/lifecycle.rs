@@ -38,7 +38,7 @@ fn observation(station: &str, temp_high: f64, temp_low: f64, wind_speed: i64) ->
         end_time: "2030-01-02T00:00:00Z".into(),
         temp_low,
         temp_high,
-        wind_speed,
+        wind_speed: Some(wind_speed),
         temp_unit_code: "fahrenheit".into(),
         wind_direction: None,
         humidity: None,

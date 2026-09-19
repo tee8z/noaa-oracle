@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Query, State},
-    response::Html,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::{Html, IntoResponse, Response},
 };
+use futures::stream::{self, StreamExt};
+use log::{error, info};
 use serde::Deserialize;
 use time::OffsetDateTime;
 
@@ -16,6 +19,7 @@ use crate::{
         EventStats, ForecastComparison, ForecastDisplay, WeatherDisplay,
         fragments::{event_stats, forecast_detail, oracle_info, weather_table_body},
     },
+    weather_data::validate_station_id,
 };
 
 /// Top 100 major US airport station IDs to show by default
@@ -121,7 +125,10 @@ async fn get_weather_for_stations(
         .unwrap_or_default();
 
     // Get all stations for name lookup
-    let all_stations = state.weather_db.stations().await.unwrap_or_default();
+    let all_stations = state.stations().await.unwrap_or_else(|error| {
+        error!("failed to read stations: {error:#}");
+        Default::default()
+    });
 
     for station_id in station_ids {
         if let Some(obs) = observations.iter().find(|o| o.station_id == *station_id) {
@@ -135,7 +142,7 @@ async fn get_weather_for_stations(
                 elevation_m: station.and_then(|s| s.elevation_m),
                 temp_high: Some(obs.temp_high),
                 temp_low: Some(obs.temp_low),
-                wind_speed: Some(obs.wind_speed),
+                wind_speed: obs.wind_speed,
                 wind_direction: obs.wind_direction,
                 humidity: obs.humidity,
                 rain_amt: obs.rain_amt,
@@ -196,21 +203,24 @@ async fn populate_forecast_accuracy(state: &Arc<AppState>, weather_data: &mut [W
     }
 }
 
-/// Handler for forecast detail fragment (GET /fragments/forecast/:station_id)
+/// Handler for forecast detail fragment (GET /fragments/forecast/:station_id).
+/// Rejects invalid ids and caches only stations present in the data, so
+/// arbitrary paths cannot grow the cache.
 pub async fn forecast_handler(
     State(state): State<Arc<AppState>>,
-    axum::extract::Path(station_id): axum::extract::Path<String>,
-) -> Html<String> {
-    // Check cache first (keyed by station_id, refreshed every 30 min by background task)
-    if let Some(cached) = state.cached_forecast(&station_id) {
-        return Html(cached);
+    Path(station_id): Path<String>,
+) -> Response {
+    if validate_station_id(&station_id).is_err() {
+        return (StatusCode::BAD_REQUEST, "invalid station id").into_response();
     }
-
-    // Cache miss (non-default station or first request before warming completes)
+    if let Some(cached) = state.cached_forecast(&station_id) {
+        return Html(cached).into_response();
+    }
     let html = build_forecast_html(&state, &station_id).await;
-    state.cache_forecast(station_id, html.clone());
-
-    Html(html)
+    if state.is_known_station(&station_id).await {
+        state.cache_forecast(station_id, html.clone());
+    }
+    Html(html).into_response()
 }
 
 /// Build the forecast detail HTML for a station (used by handler and cache warming)
@@ -299,13 +309,7 @@ pub async fn build_forecast_html(state: &Arc<AppState>, station_id: &str) -> Str
                 forecast_snow: f.snow_amt,
                 actual_high: obs.map(|o| o.temp_high),
                 actual_low: obs.map(|o| o.temp_low),
-                actual_wind: obs.and_then(|o| {
-                    if o.wind_speed >= 0 {
-                        Some(o.wind_speed)
-                    } else {
-                        None
-                    }
-                }),
+                actual_wind: obs.and_then(|o| o.wind_speed),
                 actual_humidity: obs.and_then(|o| o.humidity),
                 actual_rain: obs.and_then(|o| o.rain_amt),
                 actual_snow: obs.and_then(|o| o.snow_amt),
@@ -322,9 +326,7 @@ pub async fn build_forecast_html(state: &Arc<AppState>, station_id: &str) -> Str
 /// Pre-warm the forecast cache for all default stations.
 /// Called at startup and every 30 minutes by the background refresh task.
 pub async fn warm_forecast_cache(state: &Arc<AppState>) {
-    use futures::stream::{self, StreamExt};
-
-    log::info!(
+    info!(
         "Warming forecast cache for {} stations...",
         DEFAULT_MAJOR_AIRPORTS.len()
     );
@@ -346,5 +348,5 @@ pub async fn warm_forecast_cache(state: &Arc<AppState>) {
         .collect::<Vec<()>>()
         .await;
 
-    log::info!("Forecast cache warming complete.");
+    info!("Forecast cache warming complete.");
 }

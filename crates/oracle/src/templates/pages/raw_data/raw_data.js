@@ -481,7 +481,12 @@ function escapeCsvValue(value) {
   if (value === null || value === undefined) {
     return "";
   }
-  const str = String(value);
+  let str = String(value);
+  // Text starting with a formula character would run as a formula when the
+  // CSV is opened in a spreadsheet; prefix it so it stays text.
+  if (typeof value === "string" && /^[=+\-@\t\r]/.test(str)) {
+    str = "'" + str;
+  }
   // Escape quotes and wrap in quotes if contains comma, quote, or newline
   if (str.includes(",") || str.includes('"') || str.includes("\n")) {
     return '"' + str.replace(/"/g, '""') + '"';
@@ -552,8 +557,8 @@ WITH classified AS (
         CASE
             WHEN wx_string IS NOT NULL AND wx_string != '' THEN
                 CASE
-                    WHEN regexp_matches(wx_string, '(^|\\s)(SN|BLSN|DRSN)(\\s|$)') THEN 'snow'
-                    WHEN regexp_matches(wx_string, '(^|\\s)(FZRA|FZDZ|PL|GR|GS|IC)(\\s|$)') THEN 'ice'
+                    WHEN regexp_matches(wx_string, '(^|\\s)[-+]?(VC)?(([A-Z]{2})*(PL|GR|GS|IC)|FZ(RA|DZ))(\\s|$|[A-Z])') THEN 'ice'
+                    WHEN regexp_matches(wx_string, '(^|\\s)[-+]?(VC)?([A-Z]{2})*(SN|SG)(\\s|$|[A-Z])') THEN 'snow'
                     ELSE 'rain'
                 END
             WHEN temperature_value IS NOT NULL AND temperature_value <= 2.0 THEN 'snow'

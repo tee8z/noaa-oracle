@@ -21,7 +21,7 @@ use crate::{
         weather_handler,
     },
     sources::{NoaaWeather, Sources},
-    weather_data::{WeatherAccess, WeatherData},
+    weather_data::{self, Station, WeatherAccess, WeatherData},
 };
 use anyhow::{Context, Result, anyhow};
 use axum::{
@@ -62,6 +62,9 @@ const MAX_BODY_BYTES: usize = 256 * 1024;
 /// Source data arrives hourly, so a 30 minute refresh keeps the cache at
 /// most 30 minutes stale.
 const FORECAST_CACHE_REFRESH: Duration = Duration::from_secs(30 * 60);
+/// Forecast fragments kept in memory. Only known stations are cached, so
+/// this bounds memory even if the station list grows unexpectedly.
+const MAX_CACHED_FORECASTS: usize = 4_096;
 
 type TaskResult = Result<Result<()>, JoinError>;
 
@@ -102,6 +105,8 @@ pub struct AppState {
     pub oracle: Arc<Oracle>,
     pub database: Database,
     forecast_cache: Mutex<HashMap<String, String>>,
+    /// Station list and when it was read; it only changes with new uploads.
+    stations: tokio::sync::Mutex<Option<(std::time::Instant, Arc<Vec<Station>>)>>,
     background: Background,
     etl_slot: Arc<Semaphore>,
 }
@@ -148,6 +153,7 @@ impl AppState {
             oracle,
             database,
             forecast_cache: Mutex::new(HashMap::new()),
+            stations: tokio::sync::Mutex::new(None),
             background,
             etl_slot: Arc::new(Semaphore::new(1)),
         }
@@ -161,18 +167,49 @@ impl AppState {
             .cloned()
     }
 
+    /// Caches a rendered forecast. Callers pass only known station ids.
     pub fn cache_forecast(&self, station_id: String, html: String) {
-        self.forecast_cache
+        let mut cache = self
+            .forecast_cache
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(station_id, html);
+            .unwrap_or_else(PoisonError::into_inner);
+        if cache.len() < MAX_CACHED_FORECASTS || cache.contains_key(&station_id) {
+            cache.insert(station_id, html);
+        }
     }
 
+    /// Drops cached forecasts and the station list after new data arrives.
     pub fn clear_forecast_cache(&self) {
         self.forecast_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        if let Ok(mut stations) = self.stations.try_lock() {
+            *stations = None;
+        }
+    }
+
+    /// Every station in the observation files, read at most once per
+    /// [`FORECAST_CACHE_REFRESH`] instead of on every page load.
+    pub async fn stations(&self) -> Result<Arc<Vec<Station>>, weather_data::Error> {
+        let mut cached = self.stations.lock().await;
+        if let Some((read_at, stations)) = cached.as_ref()
+            && read_at.elapsed() < FORECAST_CACHE_REFRESH
+        {
+            return Ok(stations.clone());
+        }
+        let stations = Arc::new(self.weather_db.stations().await?);
+        *cached = Some((std::time::Instant::now(), stations.clone()));
+        Ok(stations)
+    }
+
+    /// Whether `station_id` appears in the observation files.
+    pub async fn is_known_station(&self, station_id: &str) -> bool {
+        self.stations().await.is_ok_and(|stations| {
+            stations
+                .iter()
+                .any(|station| station.station_id == station_id)
+        })
     }
 
     /// Runs one ETL pass in the background. Only one pass runs at a time and

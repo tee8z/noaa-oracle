@@ -108,8 +108,8 @@ for (const script of targets) {
     assert.equal(field("yesterday-temp-fcst"), "fcst: 82° / 60°");
     assert.equal(field("today-temp-obs"), "73° / 64°");
     assert.equal(field("today-temp-fcst"), "fcst: 82° / 60°");
-    assert.equal(field("today-wind-obs"), "13 mph");
-    assert.equal(field("today-wind-fcst"), "fcst: 15 mph");
+    assert.equal(field("today-wind-obs"), "13 kt");
+    assert.equal(field("today-wind-fcst"), "fcst: 15 kt");
     assert.equal(field("today-humidity-obs"), "57-57%");
     assert.equal(field("today-humidity-fcst"), "fcst: 40-65%");
     assert.equal(field("tomorrow-temp-obs"), "-");

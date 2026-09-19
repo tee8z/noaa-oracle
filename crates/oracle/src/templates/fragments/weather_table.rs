@@ -234,7 +234,7 @@ fn render_weather_card(weather: &WeatherDisplay) -> Markup {
     html! {
         div class="weather-card box mb-3 is-clickable"
             data-station=(weather.station_id.clone())
-            onclick=(format!("toggleCardForecast('{}')", weather.station_id)) {
+            data-forecast-toggle="card" {
             // Header: station ID + name
             div class="is-flex is-justify-content-space-between is-align-items-center mb-2" {
                 div {
@@ -401,7 +401,7 @@ fn render_weather_row(weather: &WeatherDisplay) -> Markup {
     html! {
         tr class="is-clickable weather-row"
            data-station=(weather.station_id.clone())
-           onclick=(format!("loadForecast('{}')", weather.station_id)) {
+           data-forecast-toggle="row" {
             td {
                 strong { (weather.station_id.clone()) }
                 @if !weather.iata_id.is_empty() {

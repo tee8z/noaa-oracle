@@ -1,5 +1,6 @@
-//! Error type for weather and file handlers. Internal failures are logged
-//! and reported as a generic message; validation failures echo their cause.
+//! Error type for weather and file handlers. Every variant maps to a fixed
+//! status; internal failures are logged and reported as a generic message,
+//! validation failures echo their cause.
 
 use crate::{file_access, weather_data};
 use axum::{
@@ -7,41 +8,61 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use log::error;
+use log::{error, warn};
 use serde_json::json;
 
 #[derive(thiserror::Error, Debug)]
 pub enum AppError {
-    #[error("Failed to validate request: {0}")]
-    Request(#[from] anyhow::Error),
-    #[error("Failed to get weather data: {0}")]
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+    #[error("failed to get weather data")]
     WeatherData(#[from] weather_data::Error),
-    #[error("Failed to access file data: {0}")]
+    #[error("failed to access file data")]
     FileAccess(#[from] file_access::Error),
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        error!("error handling request: {}", self);
-
-        let (status, error_message) = match &self {
-            AppError::Request(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-            AppError::WeatherData(weather_data::Error::Query(_))
-            | AppError::WeatherData(weather_data::Error::FileAccess(_)) => (
+        let client_error = |message: String| (StatusCode::BAD_REQUEST, message);
+        let internal = || {
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 String::from("internal error"),
-            ),
-            AppError::WeatherData(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-            AppError::FileAccess(file_access::Error::Io(_)) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                String::from("internal error"),
-            ),
-            AppError::FileAccess(file_access::Error::NotFound(_)) => {
-                (StatusCode::NOT_FOUND, self.to_string())
-            }
-            AppError::FileAccess(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            )
         };
-
-        (status, Json(json!({ "error": error_message }))).into_response()
+        let (status, message) = match &self {
+            AppError::InvalidRequest(reason) => client_error(format!("invalid request: {reason}")),
+            AppError::WeatherData(weather_data::Error::InvalidStationId(id)) => {
+                client_error(format!("invalid station id: {id:?}"))
+            }
+            AppError::WeatherData(
+                weather_data::Error::Query(_)
+                | weather_data::Error::TimeFormat(_)
+                | weather_data::Error::TimeParse(_)
+                | weather_data::Error::FileAccess(_)
+                | weather_data::Error::Schema { .. }
+                | weather_data::Error::Task(_),
+            ) => internal(),
+            AppError::FileAccess(file_access::Error::NotFound(_)) => {
+                (StatusCode::NOT_FOUND, String::from("file not found"))
+            }
+            AppError::FileAccess(file_access::Error::InvalidFileName(name)) => {
+                client_error(format!("invalid parquet file name: {name:?}"))
+            }
+            AppError::FileAccess(error @ file_access::Error::UnboundedListing) => {
+                client_error(error.to_string())
+            }
+            AppError::FileAccess(
+                file_access::Error::Io(_)
+                | file_access::Error::TimeFormat(_)
+                | file_access::Error::TimeParse(_),
+            ) => internal(),
+        };
+        if status.is_server_error() {
+            error!("request failed: {:#}", anyhow::Error::from(self));
+        } else {
+            warn!("request rejected: {self:#}");
+        }
+        (status, Json(json!({ "error": message }))).into_response()
     }
 }
