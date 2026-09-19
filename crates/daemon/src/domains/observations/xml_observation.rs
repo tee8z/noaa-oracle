@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{DataSource, Request};
+use crate::coordinates::{DataSource, Request};
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename = "response")]

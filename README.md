@@ -135,18 +135,57 @@ every source; see [docs/attestation.md](docs/attestation.md).
 ### Daemon Configuration
 
 ```toml
-[daemon]
-log_level = "info"
+level = "info"
 
-# Where to store downloaded parquet files
-data_path = "/var/lib/noaa-oracle/data"
+# Oracle to upload to. Must equal the oracle's `remote_url`: uploads are
+# signed over the request URL.
+base_url = "http://localhost:9800"
 
-# Oracle endpoint to push files to
-oracle_url = "http://localhost:9800"
+# Parquet files stay here until published and older than retention_days
+data_dir = "/var/cache/noaa-oracle"
 
-# Fetch interval in seconds (default: 3600 = 1 hour)
-fetch_interval = 3600
+# Fetch interval in seconds (NOAA updates hourly)
+sleep_interval = 3600
+
+# Upload signing key, created with mode 0600 if missing. The daemon logs
+# its npub at startup; list it in the oracle's `uploader_pubkeys`.
+private_key = "/var/cache/noaa-oracle/keys/daemon.pem"
+
+# Discard a run when fewer than this fraction of stations got a forecast
+min_forecast_coverage = 0.8
+retention_days = 7
 ```
+
+Each run writes `forecasts_<rfc3339>.parquet` and
+`observations_<rfc3339>.parquet`, uploads them as signed raw parquet
+bodies, and keeps any file the oracle has not accepted for retry on the
+next run. A run that is too incomplete, fails, or times out is discarded
+rather than published. See `config/daemon.example.toml` for every setting.
+
+### Upgrading from 1.x
+
+Uploads are now signed, so a 1.x daemon cannot publish to a 2.x oracle and
+a 2.x daemon cannot publish to a 1.x oracle. Upgrade both together:
+
+1. Start the new daemon once. It creates its signing key at `private_key`
+   (default `./daemon_private_key.pem`, mode 0600) and logs
+   `add this npub to the oracle's uploader_pubkeys: npub1...`. Back the
+   key up like the oracle's; a new key means a new npub.
+2. Put that npub in the oracle's `uploader_pubkeys` (config file,
+   `NOAA_ORACLE_UPLOADER_PUBKEYS`, the Helm chart's
+   `config.uploaderPubkeys`, or the NixOS module's `uploaderPubkeys`) and
+   restart the oracle.
+3. Set the daemon's `base_url` to exactly the oracle's `remote_url`.
+   Signatures cover the request URL, so a different scheme, host, or port
+   is rejected with 401.
+4. Drop any key from `daemon.toml` that `config/daemon.example.toml` does
+   not list; unknown keys are now a startup error.
+
+Kubernetes: give the daemon chart its key through
+`secrets.privateKey.existingSecret` (a secret holding `daemon.pem`);
+without it the key, and so the npub, changes on every pod restart. NixOS:
+the module creates the key under the daemon's data directory; only the
+npub step is manual.
 
 ## NixOS Deployment
 
@@ -167,10 +206,12 @@ Add to your NixOS configuration:
               enable = true;
               host = "0.0.0.0";
               port = 9800;
+              # The daemon's npub, logged when it starts
+              uploaderPubkeys = [ "npub1..." ];
             };
             daemon = {
               enable = true;
-              fetchInterval = 3600;
+              interval = 3600;
             };
           };
         }

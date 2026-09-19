@@ -513,13 +513,13 @@
               oracleUrl = mkOption {
                 type = types.str;
                 default = "http://localhost:${toString cfg.oracle.port}";
-                description = "Oracle server URL";
+                description = "Oracle URL to upload to; must equal the oracle's remoteUrl because uploads are signed over it";
               };
 
               dataDir = mkOption {
                 type = types.path;
                 default = "/var/cache/noaa-oracle";
-                description = "Cache directory for temporary parquet files";
+                description = "Directory for parquet files until published, and the upload signing key under keys/";
               };
             };
           };
@@ -582,6 +582,7 @@
                 NOAA_DAEMON_BASE_URL = cfg.daemon.oracleUrl;
                 NOAA_DAEMON_DATA_DIR = cfg.daemon.dataDir;
                 NOAA_DAEMON_SLEEP_INTERVAL = toString cfg.daemon.interval;
+                NOAA_DAEMON_PRIVATE_KEY = "${cfg.daemon.dataDir}/keys/daemon.pem";
                 RUST_LOG = "info";
               };
 
@@ -592,6 +593,8 @@
                 ExecStart = "${cfg.daemon.package}/bin/daemon";
                 Restart = "always";
                 RestartSec = 60;
+                # The upload signing key is created 0600 and must never be group or world readable.
+                UMask = "0077";
 
                 # Security
                 NoNewPrivileges = true;
@@ -609,6 +612,7 @@
               "d ${cfg.oracle.dataDir}/events 0750 noaa-oracle noaa-oracle -"
               "d ${cfg.oracle.dataDir}/keys 0700 noaa-oracle noaa-oracle -"
               "d ${cfg.daemon.dataDir} 0750 noaa-oracle noaa-oracle -"
+              "d ${cfg.daemon.dataDir}/keys 0700 noaa-oracle noaa-oracle -"
             ];
           };
         };

@@ -1,13 +1,18 @@
+//! NOAA data daemon: collects source data as parquet, publishes it to the
+//! oracle and S3, and keeps the local copy until it is published.
+
 mod coordinates;
 mod domains;
-mod parquet_handler;
-
+pub mod keys;
+pub mod publish;
 mod s3_storage;
+pub mod source;
 mod utils;
 
-pub use coordinates::*;
+pub use coordinates::{CityWeather, WeatherStation, get_coordinates, split_cityweather};
 pub use domains::*;
-pub use parquet_handler::*;
-
-pub use s3_storage::*;
-pub use utils::*;
+pub use s3_storage::S3Storage;
+pub use utils::{
+    Cli, ConfigError, Configuration, FetchError, RateLimiter, S3Settings, XmlFetcher, parse_xml,
+    redact, setup_logger,
+};

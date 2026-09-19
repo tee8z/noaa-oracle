@@ -7,12 +7,12 @@ use parquet::{
     schema::types::Type,
 };
 use parquet_derive::ParquetRecordWriter;
-use slog::{Logger, info};
+use slog::{Logger, info, warn};
 use std::fs::File;
 use std::sync::Arc;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339, macros::format_description};
 
-use crate::{CityWeather, Metar, ObservationData, Units, XmlFetcher};
+use crate::{CityWeather, Metar, ObservationData, Units, XmlFetcher, parse_xml};
 
 #[derive(Clone)]
 pub struct CurrentWeather {
@@ -41,9 +41,9 @@ impl TryFrom<Metar> for CurrentWeather {
             latitude: val.latitude.unwrap_or(String::from("")).parse::<f64>()?,
             longitude: val.longitude.unwrap_or(String::from("")).parse::<f64>()?,
             generated_at: OffsetDateTime::parse(
-                &val.observation_time
-                    .clone()
-                    .unwrap_or(OffsetDateTime::now_utc().to_string()),
+                val.observation_time
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("report has no observation_time"))?,
                 &Rfc3339,
             )
             .map_err(|e| {
@@ -81,16 +81,39 @@ impl TryFrom<Metar> for CurrentWeather {
                 .map(Some)
                 .unwrap_or(None),
             dewpoint_unit_code: Units::Celcius.to_string(),
-            precip_in: val
-                .precip_in
-                .unwrap_or(String::from(""))
-                .parse::<f64>()
-                .map(Some)
-                .unwrap_or(None),
+            precip_in: precipitation(val.precip_in.as_deref(), &val.raw_text),
             precip_unit_code: Units::Inches.to_string(),
             wx_string: val.wx_string.unwrap_or_default(),
         })
     }
+}
+
+/// Hourly precipitation in inches. At AO2 automated stations the METAR
+/// precipitation group is omitted when none fell, so absence means 0.
+/// Elsewhere (AO1 and manual stations have no precipitation sensor)
+/// absence means unknown. `VRB` and absent wind directions likewise stay
+/// null rather than becoming 0 (north).
+fn precipitation(precip_in: Option<&str>, raw_text: &str) -> Option<f64> {
+    match precip_in.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => value.parse::<f64>().ok(),
+        None => is_ao2(raw_text).then_some(0.0),
+    }
+}
+
+/// Whether the report's remarks declare an AO2 station (precipitation
+/// discriminator), e.g. `KORD 032151Z 23006KT ... RMK AO2 SLP162`.
+fn is_ao2(raw_text: &str) -> bool {
+    raw_text
+        .split_once(" RMK ")
+        .is_some_and(|(_, remarks)| remarks.split_whitespace().any(|token| token == "AO2"))
+}
+
+/// What one observation run wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservationReport {
+    pub written: usize,
+    /// Reports dropped because a required field did not parse.
+    pub skipped: usize,
 }
 
 #[derive(Debug, ParquetRecordWriter)]
@@ -306,11 +329,11 @@ impl ObservationService {
         &self,
         city_weather: &CityWeather,
         output_path: &str,
-    ) -> Result<String, Error> {
+    ) -> Result<ObservationReport, Error> {
         let url = "https://aviationweather.gov/data/cache/metars.cache.xml.gz";
         info!(self.logger, "fetching observations from {}", url);
         let raw_observation = self.fetcher.fetch_xml_gzip(url).await?;
-        let converted_xml: ObservationData = crate::parse_xml(&raw_observation)?;
+        let converted_xml: ObservationData = parse_xml(&raw_observation)?;
 
         // Create parquet writer
         let file = File::create(output_path)
@@ -321,6 +344,7 @@ impl ObservationService {
                 .map_err(|e| anyhow!("failed to create parquet writer: {}", e))?;
 
         let mut observations = vec![];
+        let mut skipped = 0;
         for value in converted_xml.data.metar.iter() {
             if value.temp_c.is_none()
                 || value.longitude.is_none()
@@ -330,9 +354,19 @@ impl ObservationService {
                 // skip reading if missing key values
                 continue;
             }
-            let current: CurrentWeather = value.clone().try_into()?;
-
-            let mut observation: Observation = current.try_into()?;
+            // One malformed report must not lose every station's hour.
+            let converted = CurrentWeather::try_from(value.clone()).and_then(Observation::try_from);
+            let mut observation = match converted {
+                Ok(observation) => observation,
+                Err(error) => {
+                    skipped += 1;
+                    warn!(
+                        self.logger,
+                        "skipping METAR for {}: {}", value.station_id, error
+                    );
+                    continue;
+                }
+            };
             if let Some(city) = city_weather.city_data.get(&observation.station_id) {
                 // only add observation if we have a station_name with it
                 observation.station_name = city.station_name.clone();
@@ -365,6 +399,28 @@ impl ObservationService {
             .map_err(|e| anyhow!("failed to close parquet writer: {}", e))?;
 
         info!(self.logger, "done writing observations to {}", output_path);
-        Ok(output_path.to_string())
+        Ok(ObservationReport {
+            written: observations.len(),
+            skipped,
+        })
+    }
+}
+
+#[cfg(test)]
+mod precipitation_tests {
+    use super::*;
+
+    const AO2: &str = "KORD 032151Z 23006KT 10SM BKN110 14/03 A3000 RMK AO2 SLP162 T01440028";
+    const AO1: &str = "KXYZ 032151Z 23006KT 10SM BKN110 14/03 A3000 RMK AO1";
+
+    #[test]
+    fn absent_precipitation_is_zero_only_at_ao2_stations() {
+        assert_eq!(precipitation(None, AO2), Some(0.0));
+        assert_eq!(precipitation(Some(""), AO2), Some(0.0));
+        assert_eq!(precipitation(None, AO1), None);
+        assert_eq!(precipitation(None, "KXYZ 032151Z AUTO 23006KT"), None);
+        assert_eq!(precipitation(Some("0.02"), AO1), Some(0.02));
+        assert_eq!(precipitation(Some("0.005"), AO2), Some(0.005), "trace");
+        assert!(!is_ao2("KXYZ 032151Z AO2 RMK AO1"), "only remarks count");
     }
 }

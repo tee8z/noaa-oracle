@@ -66,3 +66,10 @@ Return the image name
 {{- $tag := default .Chart.AppVersion .Values.image.tag -}}
 {{- printf "%s:%s" .Values.image.repository $tag -}}
 {{- end }}
+
+{{/*
+Non-empty when an upload signing key secret is mounted
+*/}}
+{{- define "noaa-daemon.keySecret" -}}
+{{- if or .Values.secrets.privateKey.create .Values.secrets.privateKey.existingSecret }}true{{- end }}
+{{- end }}

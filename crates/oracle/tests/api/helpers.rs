@@ -84,6 +84,12 @@ fn init_logger() {
 }
 
 pub async fn spawn_app(weather_db: Arc<dyn WeatherData>) -> TestApp {
+    spawn_app_at(weather_db, ORIGIN).await
+}
+
+/// Like [`spawn_app`], but signatures are checked against `origin`; for
+/// tests that serve the router on a real port.
+pub async fn spawn_app_at(weather_db: Arc<dyn WeatherData>, origin: &str) -> TestApp {
     init_logger();
     let directory = tempfile::tempdir().expect("temporary directory");
     let (database, writer) = Database::open(&directory.path().join("event_data"))
@@ -111,11 +117,11 @@ pub async fn spawn_app(weather_db: Arc<dyn WeatherData>) -> TestApp {
     let uploader = Keys::generate();
     let weather_dir = directory.path().join("weather_data");
     let state = Arc::new(AppState::new(AppParts {
-        remote_url: ORIGIN.into(),
+        remote_url: origin.into(),
         static_dir: PathBuf::from("./static"),
         weather_dir: weather_dir.clone(),
         auth: AuthPolicy::new(
-            ORIGIN,
+            origin,
             [coordinator.public_key(), other_coordinator.public_key()],
             [uploader.public_key()],
         ),
