@@ -146,15 +146,16 @@ async function fetchStationForecast(stationId, popup) {
     const forecasts = forecastRes.ok ? await forecastRes.json() : [];
     const observations = obsRes.ok ? await obsRes.json() : [];
 
-    // Index forecasts and observations by date
+    // API dates can include a midnight timestamp. Match calendar dates without
+    // timezone conversion, accepting both date-only and timestamp responses.
     const forecastByDate = {};
     forecasts.forEach((f) => {
-      forecastByDate[f.date] = f;
+      forecastByDate[f.date.slice(0, 10)] = f;
     });
 
     const obsByDate = {};
     observations.forEach((o) => {
-      if (o.date) obsByDate[o.date] = o;
+      if (o.date) obsByDate[o.date.slice(0, 10)] = o;
     });
 
     // Formatting helpers

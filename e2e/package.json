@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "test": "playwright test",
+    "test:unit": "node --test unit/*.test.js",
     "test:headed": "playwright test --headed",
     "test:debug": "playwright test --debug"
   },
