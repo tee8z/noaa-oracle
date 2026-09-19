@@ -896,6 +896,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c7f02d4ea65f2c1853089ffd8d2787bdbc63de2f0d29dedbcf8ccdfa0ccd4cf"
 
 [[package]]
+name = "base16ct"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd307490d624467aa6f74b0eabb77633d1f758a7b25f12bceb0b22e08d9726f6"
+
+[[package]]
 name = "base58ck"
 version = "0.1.101"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1604,9 +1610,9 @@ dependencies = [
 
 [[package]]
 name = "dlctix"
-version = "0.0.9"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53f366909c600f52e6b371af052f2d52d2630fe00fa54ad2251fbadb7b346bc0"
+checksum = "623c50081195a8a1ca7e214bb9f7517820d37e4e7e54312fc77eda19572184e8"
 dependencies = [
  "bitcoin",
  "hex",
@@ -1614,7 +1620,7 @@ dependencies = [
  "rand 0.9.5",
  "secp",
  "serde",
- "serdect",
+ "serdect 0.4.3",
  "sha2 0.10.9",
 ]
 
@@ -1682,7 +1688,7 @@ version = "0.13.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5e6043086bf7973472e0c7dff2142ea0b680d30e18d9cc40f267efbf222bd47"
 dependencies = [
- "base16ct",
+ "base16ct 0.2.0",
  "crypto-bigint",
  "digest 0.10.7",
  "ff",
@@ -2991,18 +2997,17 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "musig2"
-version = "0.3.1"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c5ffeab912897e7577287c8f2b4efbc4be24912f77531b45ba4b18c93f8be21"
+checksum = "183312a1f782d0e27c2e9aa4d68c151301caa39b38f48ea125c1d55ab1ff29f0"
 dependencies = [
- "base16ct",
+ "base16ct 0.2.0",
  "hmac 0.12.1",
- "once_cell",
  "rand 0.9.5",
  "secp",
  "secp256k1 0.31.1",
  "serde",
- "serdect",
+ "serdect 0.3.0",
  "sha2 0.10.9",
  "subtle",
 ]
@@ -3917,7 +3922,7 @@ version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3e97a565f76233a6003f9f5c54be1d9c5bdfa3eccfb189469f11ec4901c47dc"
 dependencies = [
- "base16ct",
+ "base16ct 0.2.0",
  "der",
  "generic-array",
  "pkcs8",
@@ -3927,16 +3932,15 @@ dependencies = [
 
 [[package]]
 name = "secp"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d3b203895e8f18854c828d1cf7e5710683c3abc28d79330fe5ab723ce5b76e1"
+checksum = "e3ef0ffc3b1b2720b00b919f6c697b1e64aca7bba54b93e0ef4b8560fac6f946"
 dependencies = [
- "base16ct",
- "once_cell",
+ "base16ct 0.2.0",
  "rand 0.9.5",
  "secp256k1 0.31.1",
  "serde",
- "serdect",
+ "serdect 0.3.0",
  "subtle",
 ]
 
@@ -4120,7 +4124,17 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f42f67da2385b51a5f9652db9c93d78aeaf7610bf5ec366080b6de810604af53"
 dependencies = [
- "base16ct",
+ "base16ct 0.2.0",
+ "serde",
+]
+
+[[package]]
+name = "serdect"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66cf8fedced2fcf12406bcb34223dffb92eaf34908ede12fed414c82b7f00b3e"
+dependencies = [
+ "base16ct 1.0.0",
  "serde",
 ]
 
