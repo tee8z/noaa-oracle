@@ -8,10 +8,8 @@ use axum::{
 use serde::Deserialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use std::collections::HashMap;
-
 use crate::{
-    AppState, ForecastRequest, ObservationRequest, TemperatureUnit,
+    AppState,
     events::EventStatus,
     templates::{
         EventStats, WeatherDisplay, dashboard_page,
@@ -21,6 +19,8 @@ use crate::{
 
 #[derive(Debug, Deserialize, Default)]
 pub struct DashboardQuery {
+    /// Comma-separated station ids; defaults to available major airports.
+    pub stations: Option<String>,
     /// Start time for observation data (RFC3339 format)
     pub start: Option<String>,
     /// End time for observation data (RFC3339 format)
@@ -29,7 +29,7 @@ pub struct DashboardQuery {
 
 /// Handler for the dashboard page (GET /)
 /// Returns full page for normal requests, content only for HTMX requests
-/// Accepts optional `start` and `end` query params (RFC3339) to override the default 24-hour window
+/// Optional `start` and `end` query params override the default UTC day so far.
 pub async fn dashboard_handler(
     headers: HeaderMap,
     Query(query): Query<DashboardQuery>,
@@ -45,7 +45,15 @@ pub async fn dashboard_handler(
         .as_ref()
         .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok());
 
-    let data = build_dashboard_data(&state, start, end).await;
+    let station_ids = query.stations.as_deref().map(|stations| {
+        stations
+            .split(',')
+            .map(str::trim)
+            .filter(|station| !station.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    });
+    let data = build_dashboard_data(&state, station_ids.as_deref(), start, end).await;
 
     // Check if this is an HTMX request
     if headers.contains_key("hx-request") {
@@ -59,6 +67,7 @@ pub async fn dashboard_handler(
 
 async fn build_dashboard_data(
     state: &Arc<AppState>,
+    station_ids: Option<&[String]>,
     start: Option<OffsetDateTime>,
     end: Option<OffsetDateTime>,
 ) -> DashboardData {
@@ -84,13 +93,19 @@ async fn build_dashboard_data(
         }
     }
 
-    // Always show weather for major airports on the dashboard
-    let weather = get_latest_weather(state, start, end).await;
-
-    // Get all available stations for the dropdown (from the weather data we already have)
-    let all_stations: Vec<(String, String)> = weather
+    let weather = get_latest_weather(state, station_ids, start, end).await;
+    let displayed_ids: Vec<String> = weather
         .iter()
-        .map(|w| (w.station_id.clone(), w.station_name.clone()))
+        .map(|weather| weather.station_id.clone())
+        .collect();
+    let weather_refresh_path =
+        super::weather::refresh_path(station_ids.unwrap_or(&displayed_ids), start, end);
+
+    // The selector remains useful when the current selection has no reports.
+    let available_stations = state.stations().await.unwrap_or_default();
+    let all_stations: Vec<(String, String)> = available_stations
+        .iter()
+        .map(|station| (station.station_id.clone(), station.station_name.clone()))
         .collect();
 
     DashboardData {
@@ -99,6 +114,7 @@ async fn build_dashboard_data(
         stats,
         weather,
         all_stations,
+        weather_refresh_path,
     }
 }
 
@@ -218,152 +234,30 @@ fn get_region(longitude: f64) -> u8 {
 /// Get weather from the latest available observation files
 async fn get_latest_weather(
     state: &Arc<AppState>,
+    station_ids: Option<&[String]>,
     start: Option<OffsetDateTime>,
     end: Option<OffsetDateTime>,
 ) -> Vec<WeatherDisplay> {
-    // Use provided time range or default to last 24 hours
-    let (query_start, query_end) = match (start, end) {
-        (Some(s), Some(e)) => (Some(s), Some(e)),
-        _ => {
-            let now = OffsetDateTime::now_utc();
-            (Some(now - time::Duration::hours(24)), Some(now))
-        }
-    };
-
-    let req = ObservationRequest {
-        start: query_start,
-        end: query_end,
-        station_ids: String::new(), // Empty = no filter, get all stations
-        temperature_unit: TemperatureUnit::Fahrenheit,
-    };
-
-    let observations = state
-        .weather_db
-        .observation_data(&req, vec![]) // Empty vec = no station filter
-        .await
-        .unwrap_or_default();
-
-    // Get station names for lookup
-    let all_stations = state.stations().await.unwrap_or_else(|error| {
-        log::error!("failed to read stations: {error:#}");
-        Default::default()
-    });
-
-    // First, try to get data for major airports
-    let mut weather_data: Vec<WeatherDisplay> = Vec::new();
-
-    for &airport_id in DEFAULT_MAJOR_AIRPORTS {
-        if let Some(obs) = observations.iter().find(|o| o.station_id == airport_id) {
-            let station = all_stations.iter().find(|s| s.station_id == airport_id);
-            let station_name = station.map(|s| s.station_name.clone()).unwrap_or_default();
-
-            weather_data.push(WeatherDisplay {
-                station_id: obs.station_id.clone(),
-                station_name,
-                state: station.map(|s| s.state.clone()).unwrap_or_default(),
-                iata_id: station.map(|s| s.iata_id.clone()).unwrap_or_default(),
-                elevation_m: station.and_then(|s| s.elevation_m),
-                temp_high: Some(obs.temp_high),
-                temp_low: Some(obs.temp_low),
-                wind_speed: obs.wind_speed,
-                wind_direction: obs.wind_direction,
-                humidity: obs.humidity,
-                rain_amt: obs.rain_amt,
-                snow_amt: obs.snow_amt,
-                observed_start: obs.start_time.clone(),
-                observed_end: obs.end_time.clone(),
-                latitude: station.map(|s| s.latitude).unwrap_or(0.0),
-                longitude: station.map(|s| s.longitude).unwrap_or(0.0),
-                forecast_high: None,
-                forecast_low: None,
-            });
-        }
-    }
-
-    // Sort by geographic region (East to West), then by latitude (North to South) within each region
-    weather_data.sort_by(|a, b| {
-        let region_a = get_region(a.longitude);
-        let region_b = get_region(b.longitude);
-
-        match region_b.cmp(&region_a) {
-            std::cmp::Ordering::Equal => {
-                // Within same region, sort north to south (descending latitude)
-                b.latitude
-                    .partial_cmp(&a.latitude)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }
-            other => other,
-        }
-    });
-
-    // Batch-fetch yesterday's forecast for today to show accuracy
-    if !weather_data.is_empty() {
-        let station_ids: Vec<String> = weather_data.iter().map(|w| w.station_id.clone()).collect();
-        let now = OffsetDateTime::now_utc();
-        let today_start = now.replace_time(time::Time::MIDNIGHT);
-        let today_end = today_start + time::Duration::days(1);
-        let yesterday_start = today_start - time::Duration::days(1);
-
-        let forecast_req = ForecastRequest {
-            start: Some(today_start),
-            end: Some(today_end),
-            generated_start: Some(yesterday_start),
-            generated_end: Some(today_start),
-            station_ids: station_ids.join(","),
-            temperature_unit: TemperatureUnit::Fahrenheit,
-        };
-
-        if let Ok(forecasts) = state
-            .weather_db
-            .forecasts_data(&forecast_req, station_ids)
-            .await
-        {
-            let forecast_map: HashMap<String, _> = forecasts
-                .into_iter()
-                .map(|f| (f.station_id.clone(), f))
-                .collect();
-
-            for weather in &mut weather_data {
-                if let Some(forecast) = forecast_map.get(&weather.station_id) {
-                    weather.forecast_high = Some(forecast.temp_high);
-                    weather.forecast_low = Some(forecast.temp_low);
-                }
-            }
-        }
-
+    let mut weather_data =
+        super::weather::load_weather(state, station_ids.unwrap_or_default(), start, end).await;
+    if station_ids.is_some() {
+        weather_data.sort_by(|a, b| a.station_id.cmp(&b.station_id));
         return weather_data;
     }
-
-    // Fallback: if no major airports found, return first 20 stations alphabetically
-    let mut weather_data: Vec<WeatherDisplay> = observations
-        .into_iter()
-        .map(|obs| {
-            let station = all_stations.iter().find(|s| s.station_id == obs.station_id);
-
-            WeatherDisplay {
-                station_id: obs.station_id.clone(),
-                station_name: station.map(|s| s.station_name.clone()).unwrap_or_default(),
-                state: station.map(|s| s.state.clone()).unwrap_or_default(),
-                iata_id: station.map(|s| s.iata_id.clone()).unwrap_or_default(),
-                elevation_m: station.and_then(|s| s.elevation_m),
-                temp_high: Some(obs.temp_high),
-                temp_low: Some(obs.temp_low),
-                wind_speed: obs.wind_speed,
-                wind_direction: obs.wind_direction,
-                humidity: obs.humidity,
-                rain_amt: obs.rain_amt,
-                snow_amt: obs.snow_amt,
-                observed_start: obs.start_time,
-                observed_end: obs.end_time,
-                latitude: station.map(|s| s.latitude).unwrap_or(0.0),
-                longitude: station.map(|s| s.longitude).unwrap_or(0.0),
-                forecast_high: None,
-                forecast_low: None,
-            }
-        })
-        .collect();
-
-    weather_data.sort_by(|a, b| a.station_id.cmp(&b.station_id));
-    weather_data.truncate(20);
+    if weather_data
+        .iter()
+        .any(|weather| DEFAULT_MAJOR_AIRPORTS.contains(&weather.station_id.as_str()))
+    {
+        weather_data
+            .retain(|weather| DEFAULT_MAJOR_AIRPORTS.contains(&weather.station_id.as_str()));
+        weather_data.sort_by(|a, b| {
+            get_region(b.longitude)
+                .cmp(&get_region(a.longitude))
+                .then_with(|| b.latitude.total_cmp(&a.latitude))
+        });
+    } else {
+        weather_data.sort_by(|a, b| a.station_id.cmp(&b.station_id));
+        weather_data.truncate(20);
+    }
     weather_data
 }

@@ -1,4 +1,5 @@
 use maud::{Markup, html};
+use std::cmp::Reverse;
 
 use crate::events::{Event, EventStatus, Weather, WeatherEntry};
 use crate::templates::layouts::{CurrentPage, PageConfig, base};
@@ -191,7 +192,7 @@ pub fn event_detail_content(event: &Event) -> Markup {
         @if !event.entries.is_empty() && event.status != EventStatus::Live {
             div class="box mt-4" {
                 h3 class="title is-6 mb-3" { "Entries" }
-                (entries_table(&event.entries, event.number_of_places_win as usize))
+                (entries_table(&event.entries, event.number_of_places_win as usize, event.status == EventStatus::Signed))
             }
         }
     }
@@ -267,9 +268,24 @@ fn weather_comparison_table(weather: &[Weather]) -> Markup {
     }
 }
 
-fn entries_table(entries: &[WeatherEntry], num_winners: usize) -> Markup {
+fn entries_table(entries: &[WeatherEntry], num_winners: usize, signed: bool) -> Markup {
+    // API entries stay in id order because outcome indices depend on it.
+    // Sort references for display only. Stored scores also preserve the
+    // ranking of historical events signed with the older score formula.
+    let mut ranked: Vec<_> = entries.iter().collect();
+    ranked.sort_unstable_by_key(|entry| (Reverse(entry.score), entry.id));
+    let scores_ready = !ranked.is_empty() && ranked.iter().all(|entry| entry.score.is_some());
+    let no_points = !ranked.is_empty() && ranked.iter().all(|entry| entry.base_score == Some(0));
+    let show_ranks = scores_ready && !no_points;
     html! {
         div class="table-container" {
+            @if !scores_ready {
+                p class="is-size-7 has-text-grey mb-2" { "Scores pending." }
+            } @else if no_points {
+                p class="is-size-7 has-text-grey mb-2" {
+                    @if signed { "All entries refunded." } @else { "No entry has scored yet." }
+                }
+            }
             table class="table is-fullwidth is-striped" {
                 thead {
                     tr {
@@ -279,10 +295,13 @@ fn entries_table(entries: &[WeatherEntry], num_winners: usize) -> Markup {
                     }
                 }
                 tbody {
-                    @for (idx, entry) in entries.iter().enumerate() {
-                        tr class=(if idx < num_winners { "has-background-success-light" } else { "" }) {
+                    @for (idx, entry) in ranked.iter().enumerate() {
+                        @let winner = show_ranks && idx < num_winners;
+                        tr class=(if winner { "has-background-success-light" } else { "" }) {
                             td {
-                                @if idx < num_winners {
+                                @if !show_ranks {
+                                    span class="has-text-grey" { "—" }
+                                } @else if winner {
                                     span class="tag is-success" { (format!("#{}", idx + 1)) }
                                 } @else {
                                     span class="has-text-grey" { (format!("#{}", idx + 1)) }
@@ -293,7 +312,7 @@ fn entries_table(entries: &[WeatherEntry], num_winners: usize) -> Markup {
                             }
                             td class="has-text-right" {
                                 @if let Some(score) = entry.score {
-                                    span class=(if idx < num_winners { "entry-score winner" } else { "entry-score" }) {
+                                    span class=(if winner { "entry-score winner" } else { "entry-score" }) {
                                         (score)
                                     }
                                 } @else {
@@ -345,6 +364,91 @@ fn back_icon() -> Markup {
             fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" {
             line x1="19" y1="12" x2="5" y2="12" {}
             polyline points="12 19 5 12 12 5" {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn entry(id: u128, score: Option<i64>, base_score: Option<i64>) -> WeatherEntry {
+        WeatherEntry {
+            id: Uuid::from_u128(id),
+            event_id: Uuid::nil(),
+            picks: vec![],
+            expected_observations: vec![],
+            score,
+            base_score,
+        }
+    }
+
+    fn displayed_ids(html: &str) -> Vec<Uuid> {
+        html.split("<code class=\"is-size-7\">")
+            .skip(1)
+            .map(|cell| Uuid::parse_str(cell.split_once("</code>").unwrap().0).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn entry_ranks_follow_stored_scores_then_ids_without_reordering_api_entries() {
+        let entries = vec![
+            entry(1, Some(100_000), Some(10)),
+            entry(3, Some(200_000), Some(20)),
+            entry(2, Some(200_000), Some(20)),
+        ];
+        let original = entries.clone();
+        let html = entries_table(&entries, 1, true).into_string();
+        assert_eq!(
+            displayed_ids(&html),
+            vec![entries[2].id, entries[1].id, entries[0].id]
+        );
+        assert_eq!(entries, original);
+        assert_eq!(html.matches("entry-score winner").count(), 1);
+        assert!(html.contains("#1"));
+    }
+
+    #[test]
+    fn historical_signed_scores_keep_their_original_ranking() {
+        let entries = [
+            entry(1, Some(190_001), Some(20)),
+            entry(2, Some(200_000), Some(20)),
+        ];
+        let html = entries_table(&entries, 1, true).into_string();
+        assert_eq!(displayed_ids(&html), vec![entries[1].id, entries[0].id]);
+    }
+
+    #[test]
+    fn unscored_and_refunded_entries_do_not_get_arbitrary_winner_badges() {
+        for (entries, signed, message) in [
+            (
+                vec![entry(1, None, None), entry(2, None, None)],
+                false,
+                "Scores pending.",
+            ),
+            (
+                vec![
+                    entry(1, Some(10_000), Some(0)),
+                    entry(2, Some(10_000), Some(0)),
+                ],
+                false,
+                "No entry has scored yet.",
+            ),
+            (
+                vec![
+                    entry(1, Some(10_000), Some(0)),
+                    entry(2, Some(10_000), Some(0)),
+                ],
+                true,
+                "All entries refunded.",
+            ),
+        ] {
+            let html = entries_table(&entries, 1, signed).into_string();
+            assert!(html.contains(message));
+            assert!(!html.contains("entry-score winner"));
+            assert!(!html.contains("has-background-success-light"));
+            assert!(!html.contains("#1"));
         }
     }
 }

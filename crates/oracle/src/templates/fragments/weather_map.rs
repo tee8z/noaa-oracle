@@ -127,7 +127,7 @@ pub fn weather_map(weather_data: &[WeatherDisplay]) -> Markup {
                     div class="popup-header" {
                         strong class="popup-station-id" {}
                         span class="popup-iata tag is-iata is-small" {}
-                        button class="delete is-small popup-close" onclick="hideStationPopup()" {}
+                        button class="delete is-small popup-close" aria-label="Close station details" onclick="hideStationPopup()" {}
                     }
                     div class="popup-name" {}
 
@@ -136,27 +136,42 @@ pub fn weather_map(weather_data: &[WeatherDisplay]) -> Markup {
                         // Header row
                         div class="forecast-header-row" {
                             div class="forecast-col-label" {}
-                            div class="forecast-col" { "Yesterday" }
-                            div class="forecast-col" { "Today" }
-                            div class="forecast-col" { "Tomorrow" }
+                            div class="forecast-col" {
+                                "Yesterday"
+                                span class="forecast-day-context" { "Observed" }
+                            }
+                            div class="forecast-col" {
+                                "Today"
+                                span class="forecast-day-context" { "Observed so far" }
+                            }
+                            div class="forecast-col" {
+                                "Tomorrow"
+                                span class="forecast-day-context" { "Forecast" }
+                            }
                         }
                         // Temp row
                         div class="forecast-data-row" {
                             div class="forecast-col-label" {
                                 span class="icon is-small" { i class="fas fa-temperature-high" {} }
                                 " Temp"
+                                span class="forecast-metric-context" { "High / low" }
                             }
                             div class="forecast-col" {
-                                div class="obs-value" data-field="yesterday-temp-obs" { "-" }
-                                div class="fcst-value" data-field="yesterday-temp-fcst" { }
+                                div class="obs-value" data-field="yesterday-temp-obs" { "—" }
+                                div class="fcst-value" {
+                                    span class="forecast-value-label" { "Forecast" }
+                                    span data-field="yesterday-temp-fcst" { "—" }
+                                }
                             }
                             div class="forecast-col" {
-                                div class="obs-value" data-field="today-temp-obs" { "-" }
-                                div class="fcst-value" data-field="today-temp-fcst" { }
+                                div class="obs-value" data-field="today-temp-obs" { "—" }
+                                div class="fcst-value" {
+                                    span class="forecast-value-label" { "Forecast" }
+                                    span data-field="today-temp-fcst" { "—" }
+                                }
                             }
                             div class="forecast-col" {
-                                div class="obs-value" data-field="tomorrow-temp-obs" { "-" }
-                                div class="fcst-value" data-field="tomorrow-temp-fcst" { }
+                                div class="fcst-value forecast-primary" data-field="tomorrow-temp-fcst" { "—" }
                             }
                         }
                         // Wind row
@@ -164,37 +179,42 @@ pub fn weather_map(weather_data: &[WeatherDisplay]) -> Markup {
                             div class="forecast-col-label" {
                                 span class="icon is-small" { i class="fas fa-wind" {} }
                                 " Wind"
+                                span class="forecast-metric-context" { "Max" }
                             }
                             div class="forecast-col" {
-                                div class="obs-value" data-field="yesterday-wind-obs" { "-" }
-                                div class="fcst-value" data-field="yesterday-wind-fcst" { }
+                                div class="obs-value" data-field="yesterday-wind-obs" { "—" }
+                                div class="fcst-value" {
+                                    span class="forecast-value-label" { "Forecast" }
+                                    span data-field="yesterday-wind-fcst" { "—" }
+                                }
                             }
                             div class="forecast-col" {
-                                div class="obs-value" data-field="today-wind-obs" { "-" }
-                                div class="fcst-value" data-field="today-wind-fcst" { }
+                                div class="obs-value" data-field="today-wind-obs" { "—" }
+                                div class="fcst-value" {
+                                    span class="forecast-value-label" { "Forecast" }
+                                    span data-field="today-wind-fcst" { "—" }
+                                }
                             }
                             div class="forecast-col" {
-                                div class="obs-value" data-field="tomorrow-wind-obs" { "-" }
-                                div class="fcst-value" data-field="tomorrow-wind-fcst" { }
+                                div class="fcst-value forecast-primary" data-field="tomorrow-wind-fcst" { "—" }
                             }
                         }
                         // Precipitation chance row (forecast-only)
                         div class="forecast-data-row" {
-                            div class="forecast-col-label" {
+                            div class="forecast-col-label" title="Maximum forecast precipitation probability in a 12-hour period" {
                                 span class="icon is-small" { i class="fas fa-percent" {} }
-                                " Chance"
+                                " Precip"
+                                span class="forecast-metric-context" { "chance" }
+                                span class="forecast-metric-context" { "Forecast" }
                             }
                             div class="forecast-col" {
-                                div class="obs-value" data-field="yesterday-chance-obs" { "-" }
-                                div class="fcst-value" data-field="yesterday-chance-fcst" { }
+                                div class="fcst-value forecast-primary" data-field="yesterday-chance-fcst" { "—" }
                             }
                             div class="forecast-col" {
-                                div class="obs-value" data-field="today-chance-obs" { "-" }
-                                div class="fcst-value" data-field="today-chance-fcst" { }
+                                div class="fcst-value forecast-primary" data-field="today-chance-fcst" { "—" }
                             }
                             div class="forecast-col" {
-                                div class="obs-value" data-field="tomorrow-chance-obs" { "-" }
-                                div class="fcst-value" data-field="tomorrow-chance-fcst" { }
+                                div class="fcst-value forecast-primary" data-field="tomorrow-chance-fcst" { "—" }
                             }
                         }
                         // Precipitation row (rain)
@@ -204,16 +224,21 @@ pub fn weather_map(weather_data: &[WeatherDisplay]) -> Markup {
                                 " Precip"
                             }
                             div class="forecast-col" {
-                                div class="obs-value" data-field="yesterday-rain-obs" { "-" }
-                                div class="fcst-value" data-field="yesterday-rain-fcst" { }
+                                div class="obs-value" data-field="yesterday-rain-obs" { "—" }
+                                div class="fcst-value" {
+                                    span class="forecast-value-label" { "Forecast" }
+                                    span data-field="yesterday-rain-fcst" { "—" }
+                                }
                             }
                             div class="forecast-col" {
-                                div class="obs-value" data-field="today-rain-obs" { "-" }
-                                div class="fcst-value" data-field="today-rain-fcst" { }
+                                div class="obs-value" data-field="today-rain-obs" { "—" }
+                                div class="fcst-value" {
+                                    span class="forecast-value-label" { "Forecast" }
+                                    span data-field="today-rain-fcst" { "—" }
+                                }
                             }
                             div class="forecast-col" {
-                                div class="obs-value" data-field="tomorrow-rain-obs" { "-" }
-                                div class="fcst-value" data-field="tomorrow-rain-fcst" { }
+                                div class="fcst-value forecast-primary" data-field="tomorrow-rain-fcst" { "—" }
                             }
                         }
                         // Snow row
@@ -223,16 +248,21 @@ pub fn weather_map(weather_data: &[WeatherDisplay]) -> Markup {
                                 " Snow"
                             }
                             div class="forecast-col" {
-                                div class="obs-value" data-field="yesterday-snow-obs" { "-" }
-                                div class="fcst-value" data-field="yesterday-snow-fcst" { }
+                                div class="obs-value" data-field="yesterday-snow-obs" { "—" }
+                                div class="fcst-value" {
+                                    span class="forecast-value-label" { "Forecast" }
+                                    span data-field="yesterday-snow-fcst" { "—" }
+                                }
                             }
                             div class="forecast-col" {
-                                div class="obs-value" data-field="today-snow-obs" { "-" }
-                                div class="fcst-value" data-field="today-snow-fcst" { }
+                                div class="obs-value" data-field="today-snow-obs" { "—" }
+                                div class="fcst-value" {
+                                    span class="forecast-value-label" { "Forecast" }
+                                    span data-field="today-snow-fcst" { "—" }
+                                }
                             }
                             div class="forecast-col" {
-                                div class="obs-value" data-field="tomorrow-snow-obs" { "-" }
-                                div class="fcst-value" data-field="tomorrow-snow-fcst" { }
+                                div class="fcst-value forecast-primary" data-field="tomorrow-snow-fcst" { "—" }
                             }
                         }
                         // Humidity row
@@ -242,19 +272,26 @@ pub fn weather_map(weather_data: &[WeatherDisplay]) -> Markup {
                                 " Humidity"
                             }
                             div class="forecast-col" {
-                                div class="obs-value" data-field="yesterday-humidity-obs" { "-" }
-                                div class="fcst-value" data-field="yesterday-humidity-fcst" { }
+                                div class="obs-value" data-field="yesterday-humidity-obs" { "—" }
+                                div class="fcst-value" {
+                                    span class="forecast-value-label" { "Forecast" }
+                                    span data-field="yesterday-humidity-fcst" { "—" }
+                                }
                             }
                             div class="forecast-col" {
-                                div class="obs-value" data-field="today-humidity-obs" { "-" }
-                                div class="fcst-value" data-field="today-humidity-fcst" { }
+                                div class="obs-value" data-field="today-humidity-obs" { "—" }
+                                div class="fcst-value" {
+                                    span class="forecast-value-label" { "Forecast" }
+                                    span data-field="today-humidity-fcst" { "—" }
+                                }
                             }
                             div class="forecast-col" {
-                                div class="obs-value" data-field="tomorrow-humidity-obs" { "-" }
-                                div class="fcst-value" data-field="tomorrow-humidity-fcst" { }
+                                div class="fcst-value forecast-primary" data-field="tomorrow-humidity-fcst" { "—" }
                             }
                         }
                     }
+
+                    p class="popup-data-note" { "Days use UTC · — = unavailable" }
 
                     // Loading indicator
                     div class="popup-loading" style="display: none;" {

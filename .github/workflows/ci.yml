@@ -27,7 +27,7 @@ jobs:
           node-version: '20'
 
       - name: Test station popup rendering
-        run: node --test e2e/unit/weather_view.test.js
+        run: node --test e2e/unit/*.test.js
 
   # Format check (no Nix needed, fast)
   fmt:
@@ -131,7 +131,7 @@ jobs:
           node-version: '20'
 
       - name: Test generated station popup bundle
-        run: node --test e2e/unit/weather_view.test.js
+        run: node --test e2e/unit/*.test.js
         env:
           ORACLE_UI_BUNDLE: crates/oracle/static/app.min.js
 

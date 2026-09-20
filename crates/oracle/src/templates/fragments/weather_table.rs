@@ -2,6 +2,21 @@ use maud::{Markup, html};
 
 use super::weather_map::{region_name, weather_map};
 
+#[derive(Clone)]
+pub enum ObservationPeriod {
+    Today,
+    Selected { start: String, end: String },
+}
+
+impl ObservationPeriod {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Today => "Today so far (UTC)",
+            Self::Selected { .. } => "Selected period (UTC)",
+        }
+    }
+}
+
 /// Weather data for display
 pub struct WeatherDisplay {
     pub station_id: String,
@@ -9,6 +24,10 @@ pub struct WeatherDisplay {
     pub state: String,
     pub iata_id: String,
     pub elevation_m: Option<f64>,
+    /// Most recent temperature report, independent of the aggregate window.
+    pub latest_temp: Option<f64>,
+    pub latest_temp_time: Option<String>,
+    pub observation_period: ObservationPeriod,
     pub temp_high: Option<f64>,
     pub temp_low: Option<f64>,
     pub wind_speed: Option<i64>,
@@ -54,7 +73,11 @@ fn region_class(region: u8) -> &'static str {
 
 /// Weather table fragment
 /// Shows current weather data for selected stations with map/table toggle
-pub fn weather_table(weather_data: &[WeatherDisplay], all_stations: &[(String, String)]) -> Markup {
+pub fn weather_table(
+    weather_data: &[WeatherDisplay],
+    all_stations: &[(String, String)],
+    refresh_path: &str,
+) -> Markup {
     html! {
         div class="box" {
             div class="is-flex is-justify-content-space-between is-align-items-center mb-4 is-flex-wrap-wrap" {
@@ -77,7 +100,7 @@ pub fn weather_table(weather_data: &[WeatherDisplay], all_stations: &[(String, S
                                   href="#"
                                   hx-get=(format!("/fragments/weather?add_station={}", station_id))
                                   hx-target="#weather-table-container"
-                                  hx-swap="innerHTML" {
+                                  hx-swap="outerHTML" {
                                     strong { (station_id) }
                                     " - "
                                     (station_name)
@@ -106,57 +129,85 @@ pub fn weather_table(weather_data: &[WeatherDisplay], all_stations: &[(String, S
                 }
             }
 
-            div id="weather-table-container" {
-                (weather_table_body(weather_data))
-            }
+            (weather_table_body_with_refresh(weather_data, refresh_path))
         }
     }
 }
 
-/// Just the table body - used for HTMX partial updates
-pub fn weather_table_body(weather_data: &[WeatherDisplay]) -> Markup {
+/// Keep request context even when requested stations have no returned readings.
+pub fn weather_table_body_with_refresh(
+    weather_data: &[WeatherDisplay],
+    refresh_url: &str,
+) -> Markup {
     html! {
-        @if weather_data.is_empty() {
-            div class="has-text-centered has-text-grey py-4" {
-                p { "No weather data available." }
-                p class="is-size-7" { "Weather observations may not be available yet. Try again later." }
-            }
-        } @else {
-            // Map view (default)
-            div id="weather-map-view" {
-                (weather_map(weather_data))
-            }
-
-            // Table view - desktop only (hidden by default)
-            div id="weather-table-view" style="display: none;" {
-                div class="table-container is-hidden-mobile" {
-                    table class="table is-fullwidth is-hoverable" {
-                        thead {
-                            tr {
-                                th { "Station" }
-                                th class="has-text-right" { "Temp High" }
-                                th class="has-text-right" { "Temp Low" }
-                                th class="has-text-right" { "Forecast" }
-                                th class="has-text-right" { "Wind" }
-                                th class="has-text-right" { "Humidity" }
-                                th class="has-text-right" { "Precip" }
-                                th class="has-text-right" { "Snow" }
-                                th { "Observed" }
-                            }
-                        }
-                        tbody hx-get="/fragments/weather"
-                              hx-trigger="every 300s"
-                              hx-swap="innerHTML"
-                              hx-select="tbody > tr" {
-                            // Group by region and render with separators
-                            (render_weather_rows_with_regions(weather_data))
-                        }
-                    }
+        div id="weather-table-container"
+            hx-get=(refresh_url)
+            hx-trigger="every 300s"
+            hx-swap="outerHTML" {
+            @if weather_data.is_empty() {
+                div class="has-text-centered has-text-grey py-4" {
+                    p { "No weather data available." }
+                    p class="is-size-7" { "Weather observations may not be available yet. Try again later." }
+                }
+            } @else {
+                // Map view (default)
+                div id="weather-map-view" {
+                    (weather_map(weather_data))
                 }
 
-                // Card view - mobile only
-                div class="weather-cards is-hidden-tablet" {
-                    (render_weather_cards_with_regions(weather_data))
+                // Table view - desktop only (hidden by default)
+                div id="weather-table-view" style="display: none;" {
+                    p class="weather-period-note" {
+                        strong { (weather_data[0].observation_period.label()) }
+                        ". Δ = forecast − observed. "
+                        @if matches!(weather_data[0].observation_period, ObservationPeriod::Today) {
+                            "Comparisons are preliminary. "
+                        }
+                        "— = unavailable."
+                        @if let ObservationPeriod::Selected { start, end } = &weather_data[0].observation_period {
+                            span class="weather-column-context" {
+                                time datetime=(start) { (start.replace('T', " ").trim_end_matches('Z')) }
+                                " – "
+                                time datetime=(end) { (end.replace('T', " ").trim_end_matches('Z')) }
+                                " UTC"
+                            }
+                        }
+                    }
+                    div class="table-container is-hidden-mobile" {
+                        table class="table is-fullwidth is-hoverable weather-observations-table" {
+                            thead {
+                                tr {
+                                    th { "Station" }
+                                    th class="has-text-right" { "Latest observed" }
+                                    th class="has-text-right" { "Observed high" }
+                                    th class="has-text-right" { "Observed low" }
+                                    th class="has-text-right" {
+                                        @match weather_data[0].observation_period {
+                                            ObservationPeriod::Today => { "Yesterday's forecast" },
+                                            ObservationPeriod::Selected { .. } => {
+                                                "Previous-day forecast"
+                                                span class="weather-column-context" { "Issued before selected UTC day" }
+                                            },
+                                        }
+                                        span class="weather-column-context" { "High / low · Δ" }
+                                    }
+                                    th class="has-text-right" { "Max wind" }
+                                    th class="has-text-right" { "Humidity" }
+                                    th class="has-text-right" { "Precip" }
+                                    th class="has-text-right" { "Snow" }
+                                    th { "Observation window" }
+                                }
+                            }
+                            tbody {
+                                (render_weather_rows_with_regions(weather_data))
+                            }
+                        }
+                    }
+
+                    // Card view - mobile only
+                    div class="weather-cards is-hidden-tablet" {
+                        (render_weather_cards_with_regions(weather_data))
+                    }
                 }
             }
         }
@@ -184,7 +235,7 @@ fn render_weather_rows_with_regions(weather_data: &[WeatherDisplay]) -> Markup {
         @for (region, stations) in &by_region {
             // Region header row
             tr class={"region-header " (region_class(*region))} {
-                td colspan="9" {
+                td colspan="10" {
                     (region_name(*region))
                 }
             }
@@ -193,7 +244,7 @@ fn render_weather_rows_with_regions(weather_data: &[WeatherDisplay]) -> Markup {
                 (render_weather_row(weather))
                 // Hidden forecast row
                 tr class="forecast-row" id=(format!("forecast-row-{}", weather.station_id)) style="display: none;" {
-                    td colspan="9" {
+                    td colspan="10" {
                         div id=(format!("forecast-{}", weather.station_id)) {}
                     }
                 }
@@ -229,297 +280,248 @@ fn render_weather_cards_with_regions(weather_data: &[WeatherDisplay]) -> Markup 
     }
 }
 
-/// Render a single weather card (mobile)
+/// Render a single weather card (mobile).
 fn render_weather_card(weather: &WeatherDisplay) -> Markup {
     html! {
         div class="weather-card box mb-3 is-clickable"
-            data-station=(weather.station_id.clone())
+            data-station=(weather.station_id)
             data-forecast-toggle="card" {
-            // Header: station ID + name
-            div class="is-flex is-justify-content-space-between is-align-items-center mb-2" {
+            div class="weather-card-header" {
                 div {
-                    strong { (weather.station_id.clone()) }
+                    strong { (weather.station_id) }
                     @if !weather.iata_id.is_empty() {
                         " "
-                        span class="tag is-iata is-small" { (weather.iata_id.clone()) }
+                        span class="tag is-iata is-small" { (weather.iata_id) }
                     }
+                    (station_description(weather))
                 }
             }
-            @if !weather.station_name.is_empty() || !weather.state.is_empty() {
-                p class="is-size-7 has-text-grey mb-2" {
-                    @if !weather.station_name.is_empty() {
-                        (weather.station_name.clone())
+
+            div class="weather-card-latest" {
+                span class="weather-card-label" { "Latest observed" }
+                (latest_temperature(weather))
+            }
+
+            p class="weather-card-period" { (weather.observation_period.label()) }
+            table class="weather-temperature-comparison" {
+                thead {
+                    tr {
+                        th {}
+                        th scope="col" { "High" }
+                        th scope="col" { "Low" }
                     }
-                    @if !weather.station_name.is_empty() && !weather.state.is_empty() {
-                        ", "
+                }
+                tbody {
+                    tr {
+                        th scope="row" { "Observed" }
+                        td { (temperature_value(weather.temp_high, "temp-high")) }
+                        td { (temperature_value(weather.temp_low, "temp-low")) }
                     }
-                    @if !weather.state.is_empty() {
-                        (weather.state.clone())
+                    tr {
+                        th scope="row" {
+                            @match weather.observation_period {
+                                ObservationPeriod::Today => {
+                                    "Forecast"
+                                    span class="weather-column-context" { "Issued yesterday" }
+                                },
+                                ObservationPeriod::Selected { .. } => {
+                                    "Previous-day forecast"
+                                    span class="weather-column-context" { "Issued before selected UTC day" }
+                                },
+                            }
+                        }
+                        td { (temperature_value(weather.forecast_high.map(|t| t as f64), "temp-high")) }
+                        td { (temperature_value(weather.forecast_low.map(|t| t as f64), "temp-low")) }
                     }
-                    @if let Some(elev) = weather.elevation_m {
-                        " "
-                        span class="has-text-grey-light" { (format!("({:.0}m)", elev)) }
+                    tr {
+                        th scope="row" { "Difference (Δ)" }
+                        td { (temperature_difference(weather.forecast_high, weather.temp_high)) }
+                        td { (temperature_difference(weather.forecast_low, weather.temp_low)) }
                     }
                 }
             }
 
-            // Weather values in a grid
             div class="weather-card-grid" {
                 div class="weather-card-item" {
-                    span class="weather-card-label" { "High" }
-                    @if let Some(temp) = weather.temp_high {
-                        span class="weather-value temp-high" { (format!("{:.0}°F", temp)) }
-                    } @else {
-                        span class="has-text-grey" { "-" }
-                    }
-                }
-                div class="weather-card-item" {
-                    span class="weather-card-label" { "Low" }
-                    @if let Some(temp) = weather.temp_low {
-                        span class="weather-value temp-low" { (format!("{:.0}°F", temp)) }
-                    } @else {
-                        span class="has-text-grey" { "-" }
-                    }
-                }
-                div class="weather-card-item" {
-                    span class="weather-card-label" { "Wind" }
-                    @if let Some(wind) = weather.wind_speed {
-                        span class="weather-value wind" {
-                            (format!("{}", wind))
-                            @if let Some(dir) = weather.wind_direction {
-                                span class="has-text-grey is-size-7" { (format!(" {}", wind_direction_label(dir))) }
-                            }
-                        }
-                    } @else {
-                        span class="has-text-grey" { "-" }
-                    }
+                    span class="weather-card-label" { "Max wind" }
+                    (wind_value(weather))
                 }
                 div class="weather-card-item" {
                     span class="weather-card-label" { "Humidity" }
-                    @if let Some(humidity) = weather.humidity {
-                        span class="weather-value" { (format!("{}%", humidity)) }
-                    } @else {
-                        span class="has-text-grey" { "-" }
-                    }
+                    (humidity_value(weather))
                 }
                 div class="weather-card-item" {
                     span class="weather-card-label" { "Precip" }
-                    @if let Some(rain) = weather.rain_amt {
-                        @if rain > 0.0 {
-                            span class="weather-value has-text-info" { (format!("{:.2}\"", rain)) }
-                        } @else {
-                            span class="has-text-grey" { "-" }
-                        }
-                    } @else {
-                        span class="has-text-grey" { "-" }
-                    }
+                    (precipitation_value(weather.rain_amt, "has-text-info"))
                 }
                 div class="weather-card-item" {
                     span class="weather-card-label" { "Snow" }
-                    @if let Some(snow) = weather.snow_amt {
-                        @if snow > 0.0 {
-                            span class="weather-value has-text-link" { (format!("{:.1}\"", snow)) }
-                        } @else {
-                            span class="has-text-grey" { "-" }
-                        }
-                    } @else {
-                        span class="has-text-grey" { "-" }
-                    }
+                    (precipitation_value(weather.snow_amt, "has-text-link"))
                 }
             }
 
-            // Forecast accuracy
-            @if weather.forecast_high.is_some() || weather.forecast_low.is_some() {
-                div class="weather-card-forecast mt-2 pt-2" {
-                    span class="is-size-7 has-text-grey" { "Yesterday's Forecast:" }
-                    div class="is-flex is-justify-content-space-around mt-1" {
-                        @if let Some(fh) = weather.forecast_high {
-                            div class="has-text-centered" {
-                                span class="weather-card-label" { "Fcst High" }
-                                div {
-                                    span class="weather-value temp-high" { (format!("{}°F", fh)) }
-                                    @if let Some(actual) = weather.temp_high {
-                                        {
-                                            @let diff = fh as f64 - actual;
-                                            @if diff.abs() > 0.5 {
-                                                " "
-                                                span class=(format!("is-size-7 {}", accuracy_class(diff))) {
-                                                    (format!("{:+.0}°", diff))
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        @if let Some(fl) = weather.forecast_low {
-                            div class="has-text-centered" {
-                                span class="weather-card-label" { "Fcst Low" }
-                                div {
-                                    span class="weather-value temp-low" { (format!("{}°F", fl)) }
-                                    @if let Some(actual) = weather.temp_low {
-                                        {
-                                            @let diff = fl as f64 - actual;
-                                            @if diff.abs() > 0.5 {
-                                                " "
-                                                span class=(format!("is-size-7 {}", accuracy_class(diff))) {
-                                                    (format!("{:+.0}°", diff))
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            div class="weather-observation-window" {
+                span class="weather-card-label" { "Observation window" }
+                (observation_window(weather))
             }
 
-            // Observed time
-            div class="mt-2 pt-2" style="border-top: 1px solid var(--bulma-border);" {
-                span class="is-size-7 has-text-grey" {
-                    "Observed: "
-                    span class="local-time-range"
-                         data-utc-start=(weather.observed_start.clone())
-                         data-utc-end=(weather.observed_end.clone()) {
-                        (weather.observed_start.clone()) " - " (weather.observed_end.clone())
-                    }
-                }
+            button type="button" class="button is-small is-fullwidth weather-forecast-action" {
+                "Forecast & history"
+                span class="icon is-small" { (chevron_down_icon()) }
             }
 
-            // Forecast container (hidden until clicked)
             div class="card-forecast"
                 id=(format!("card-forecast-{}", weather.station_id))
-                style="display: none;" {
+                style="display: none;" {}
+        }
+    }
+}
+
+/// Render a single weather row.
+fn render_weather_row(weather: &WeatherDisplay) -> Markup {
+    html! {
+        tr class="is-clickable weather-row"
+           data-station=(weather.station_id)
+           data-forecast-toggle="row" {
+            td {
+                strong { (weather.station_id) }
+                @if !weather.iata_id.is_empty() {
+                    " "
+                    span class="tag is-iata is-small" { (weather.iata_id) }
+                }
+                (station_description(weather))
+                button type="button" class="weather-forecast-link" { "Forecast & history" }
+            }
+            td class="has-text-right weather-latest-cell" { (latest_temperature(weather)) }
+            td class="has-text-right" { (temperature_value(weather.temp_high, "temp-high")) }
+            td class="has-text-right" { (temperature_value(weather.temp_low, "temp-low")) }
+            td class="has-text-right weather-forecast-cell" {
+                (forecast_comparison("High", weather.forecast_high, weather.temp_high, "temp-high"))
+                (forecast_comparison("Low", weather.forecast_low, weather.temp_low, "temp-low"))
+            }
+            td class="has-text-right" { (wind_value(weather)) }
+            td class="has-text-right" { (humidity_value(weather)) }
+            td class="has-text-right" { (precipitation_value(weather.rain_amt, "has-text-info")) }
+            td class="has-text-right" { (precipitation_value(weather.snow_amt, "has-text-link")) }
+            td { (observation_window(weather)) }
+        }
+    }
+}
+
+fn station_description(weather: &WeatherDisplay) -> Markup {
+    html! {
+        p class="weather-station-description" {
+            (weather.station_name)
+            @if !weather.station_name.is_empty() && !weather.state.is_empty() {
+                ", "
+            }
+            (weather.state)
+            @if let Some(elevation) = weather.elevation_m {
+                " "
+                span title="Elevation" { (format!("({:.0}m)", elevation)) }
             }
         }
     }
 }
 
-/// Render a single weather row
-fn render_weather_row(weather: &WeatherDisplay) -> Markup {
+fn latest_temperature(weather: &WeatherDisplay) -> Markup {
     html! {
-        tr class="is-clickable weather-row"
-           data-station=(weather.station_id.clone())
-           data-forecast-toggle="row" {
-            td {
-                strong { (weather.station_id.clone()) }
-                @if !weather.iata_id.is_empty() {
-                    " "
-                    span class="tag is-iata is-small" { (weather.iata_id.clone()) }
-                }
-                br;
-                span class="is-size-7 has-text-grey" {
-                    @if !weather.station_name.is_empty() {
-                        (weather.station_name.clone())
-                    }
-                    @if !weather.station_name.is_empty() && !weather.state.is_empty() {
-                        ", "
-                    }
-                    @if !weather.state.is_empty() {
-                        (weather.state.clone())
-                    }
-                    @if let Some(elev) = weather.elevation_m {
-                        " "
-                        span class="has-text-grey-light" title="Elevation" {
-                            (format!("({:.0}m)", elev))
-                        }
-                    }
+        div class="weather-latest-value" { (temperature_value(weather.latest_temp, "")) }
+        @if let Some(timestamp) = &weather.latest_temp_time {
+            time class="weather-latest-time local-time" datetime=(timestamp) data-utc=(timestamp) {
+                (timestamp)
+            }
+        }
+    }
+}
+
+fn temperature_value(value: Option<f64>, class: &str) -> Markup {
+    html! {
+        @if let Some(temperature) = value {
+            @let rounded = temperature.round();
+            @let rounded = if rounded == 0.0 { 0.0 } else { rounded };
+            span class={ "weather-value " (class) } { (format!("{:.0}°F", rounded)) }
+        } @else {
+            span class="has-text-grey" { "—" }
+        }
+    }
+}
+
+fn forecast_comparison(
+    label: &str,
+    forecast: Option<i64>,
+    observed: Option<f64>,
+    class: &str,
+) -> Markup {
+    html! {
+        div class="weather-forecast-comparison" {
+            span class="weather-comparison-label" { (label) }
+            (temperature_value(forecast.map(|temperature| temperature as f64), class))
+            span class="weather-comparison-difference" {
+                "Δ "
+                (temperature_difference(forecast, observed))
+            }
+        }
+    }
+}
+
+fn temperature_difference(forecast: Option<i64>, observed: Option<f64>) -> Markup {
+    html! {
+        @if let (Some(forecast), Some(observed)) = (forecast, observed) {
+            @let difference = forecast as f64 - observed.round();
+            span class={ "weather-value " (accuracy_class(difference)) } {
+                (format!("{:+.0}°F", difference))
+            }
+        } @else {
+            span class="has-text-grey" { "—" }
+        }
+    }
+}
+
+fn wind_value(weather: &WeatherDisplay) -> Markup {
+    html! {
+        @if let Some(wind) = weather.wind_speed {
+            span class="weather-value wind" {
+                (format!("{} kt", wind))
+                @if let Some(direction) = weather.wind_direction {
+                    span class="weather-column-context" { (wind_direction_label(direction)) }
                 }
             }
-            td class="has-text-right" {
-                @if let Some(temp) = weather.temp_high {
-                    span class="weather-value temp-high" {
-                        (format!("{:.0}°F", temp))
-                    }
-                } @else {
-                    span class="has-text-grey" { "-" }
-                }
-            }
-            td class="has-text-right" {
-                @if let Some(temp) = weather.temp_low {
-                    span class="weather-value temp-low" {
-                        (format!("{:.0}°F", temp))
-                    }
-                } @else {
-                    span class="has-text-grey" { "-" }
-                }
-            }
-            td class="has-text-right" {
-                @if let (Some(fh), Some(fl)) = (weather.forecast_high, weather.forecast_low) {
-                    span class="is-size-7" {
-                        span class="weather-value temp-high" { (format!("{}°", fh)) }
-                        " / "
-                        span class="weather-value temp-low" { (format!("{}°", fl)) }
-                    }
-                    @if let Some(actual_high) = weather.temp_high {
-                        {
-                            @let diff = fh as f64 - actual_high;
-                            @if diff.abs() > 0.5 {
-                                br;
-                                span class=(format!("is-size-7 {}", accuracy_class(diff))) {
-                                    (format!("{:+.0}°", diff))
-                                }
-                            }
-                        }
-                    }
-                } @else {
-                    span class="has-text-grey" { "-" }
-                }
-            }
-            td class="has-text-right" {
-                @if let Some(wind) = weather.wind_speed {
-                    span class="weather-value wind" {
-                        (format!("{}", wind))
-                        @if let Some(dir) = weather.wind_direction {
-                            span class="has-text-grey is-size-7" { (format!(" {}", wind_direction_label(dir))) }
-                        }
-                    }
-                } @else {
-                    span class="has-text-grey" { "-" }
-                }
-            }
-            td class="has-text-right" {
-                @if let Some(humidity) = weather.humidity {
-                    span class="weather-value" {
-                        (format!("{}%", humidity))
-                    }
-                } @else {
-                    span class="has-text-grey" { "-" }
-                }
-            }
-            td class="has-text-right" {
-                @if let Some(rain) = weather.rain_amt {
-                    @if rain > 0.0 {
-                        span class="weather-value has-text-info" {
-                            (format!("{:.2}\"", rain))
-                        }
-                    } @else {
-                        span class="has-text-grey" { "-" }
-                    }
-                } @else {
-                    span class="has-text-grey" { "-" }
-                }
-            }
-            td class="has-text-right" {
-                @if let Some(snow) = weather.snow_amt {
-                    @if snow > 0.0 {
-                        span class="weather-value has-text-link" {
-                            (format!("{:.1}\"", snow))
-                        }
-                    } @else {
-                        span class="has-text-grey" { "-" }
-                    }
-                } @else {
-                    span class="has-text-grey" { "-" }
-                }
-            }
-            td {
-                span class="is-size-7 local-time-range"
-                     data-utc-start=(weather.observed_start.clone())
-                     data-utc-end=(weather.observed_end.clone()) {
-                    (weather.observed_start.clone()) " - " (weather.observed_end.clone())
-                }
+        } @else {
+            span class="has-text-grey" { "—" }
+        }
+    }
+}
+
+fn humidity_value(weather: &WeatherDisplay) -> Markup {
+    html! {
+        @if let Some(humidity) = weather.humidity {
+            span class="weather-value" { (format!("{}%", humidity)) }
+        } @else {
+            span class="has-text-grey" { "—" }
+        }
+    }
+}
+
+fn precipitation_value(value: Option<f64>, class: &str) -> Markup {
+    html! {
+        @if let Some(amount) = value {
+            span class={ "weather-value " (class) } { (format!("{:.2}\"", amount)) }
+        } @else {
+            span class="has-text-grey" { "—" }
+        }
+    }
+}
+
+fn observation_window(weather: &WeatherDisplay) -> Markup {
+    html! {
+        @if weather.observed_start.is_empty() || weather.observed_end.is_empty() {
+            span class="has-text-grey" { "—" }
+        } @else {
+            span class="is-size-7 local-time-range"
+                 data-utc-start=(weather.observed_start)
+                 data-utc-end=(weather.observed_end) {
+                (weather.observed_start) " – " (weather.observed_end)
             }
         }
     }
@@ -538,7 +540,6 @@ fn accuracy_class(diff: f64) -> &'static str {
     }
 }
 
-/// Convert wind direction degrees to compass label
 fn wind_direction_label(degrees: i64) -> &'static str {
     match degrees {
         0..=22 | 338..=360 => "N",
@@ -549,7 +550,7 @@ fn wind_direction_label(degrees: i64) -> &'static str {
         203..=247 => "SW",
         248..=292 => "W",
         293..=337 => "NW",
-        _ => "",
+        _ => "—",
     }
 }
 
@@ -584,5 +585,31 @@ fn list_icon() -> Markup {
             line x1="3" y1="12" x2="3.01" y2="12" {}
             line x1="3" y1="18" x2="3.01" y2="18" {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temperature_comparisons_round_half_degrees_like_scoring() {
+        for (observed, forecast) in [(-2.5, -3), (54.5, 55)] {
+            assert!(
+                temperature_value(Some(observed), "")
+                    .into_string()
+                    .contains(&format!("{forecast}°F"))
+            );
+            assert!(
+                temperature_difference(Some(forecast), Some(observed))
+                    .into_string()
+                    .contains("+0°F")
+            );
+        }
+        assert!(
+            !temperature_value(Some(-0.1), "")
+                .into_string()
+                .contains("-0°F")
+        );
     }
 }

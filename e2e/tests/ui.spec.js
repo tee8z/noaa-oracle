@@ -1,11 +1,9 @@
 const { test, expect } = require("@playwright/test");
 
-// Helper to build dashboard URL with date range that includes fixture data
-// Fixtures are dated with the current date, so we use a wide range to ensure they're included
+// The checked-in observations cover January 17, 2026 (UTC).
 function getDashboardUrl() {
-  // Use a wide date range that will include any fixture data
-  const start = "2020-01-01T00:00:00Z";
-  const end = "2030-12-31T23:59:59Z";
+  const start = "2026-01-17T00:00:00Z";
+  const end = "2026-01-18T00:00:00Z";
   return `/?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`;
 }
 
@@ -62,9 +60,12 @@ test.describe("Dashboard", () => {
     await expect(weatherTable).toBeVisible();
 
     // Verify there are actual rows in the table (station data)
-    const tableRows = page.locator("#weather-table-view table tbody tr");
+    const tableRows = page.locator("#weather-table-view .weather-row");
     const rowCount = await tableRows.count();
     expect(rowCount).toBeGreaterThan(0);
+    await expect(weatherTable.getByRole("columnheader", { name: "Latest observed", exact: true })).toBeVisible();
+    await expect(tableRows.first().locator(".weather-latest-value")).toContainText("°F");
+    await expect(tableRows.first().locator(".weather-latest-time")).toBeVisible();
   });
 
   test("navigation links work", async ({ page }) => {
@@ -74,6 +75,40 @@ test.describe("Dashboard", () => {
     await expect(page.locator('a[href="/"]').first()).toBeVisible();
     await expect(page.locator('a[href="/raw"]')).toBeVisible();
     await expect(page.locator('a[href="/events"]')).toBeVisible();
+  });
+
+  test("refresh preserves the selected UTC day and List view without duplicate parameters", async ({ page }) => {
+    await page.goto(getDashboardUrl());
+    await page.waitForFunction(() => typeof window.switchWeatherView === "function");
+    await page.locator('.tabs li[data-view="table"]').click();
+    await expect(page.locator("#weather-table-view")).toBeVisible();
+    const container = page.locator("#weather-table-container");
+    const refresh = await container.getAttribute("hx-get");
+    const firstStation = await page.locator(".weather-row").first().getAttribute("data-station");
+    const [response] = await Promise.all([
+      page.waitForResponse(response => new URL(response.url()).pathname === "/fragments/weather"),
+      page.evaluate(() => {
+        const container = document.getElementById("weather-table-container");
+        const settled = new Promise(resolve => {
+          const onSettle = event => {
+            if (event.target.id !== "weather-table-container" && event.detail?.target?.id !== "weather-table-container") return;
+            document.removeEventListener("htmx:afterSettle", onSettle);
+            resolve();
+          };
+          document.addEventListener("htmx:afterSettle", onSettle);
+        });
+        const request = window.htmx.ajax("GET", container.getAttribute("hx-get"), { source: container, target: container, swap: "outerHTML" });
+        return Promise.all([request, settled]);
+      }),
+    ]);
+    expect(response.ok()).toBeTruthy();
+    const parameters = new URL(response.url()).searchParams;
+    expect(parameters.getAll("stations")).toHaveLength(1);
+    expect(parameters.getAll("start")).toEqual(["2026-01-17T00:00:00Z"]);
+    expect(parameters.getAll("end")).toEqual(["2026-01-18T00:00:00Z"]);
+    await expect(container).toHaveAttribute("hx-get", refresh);
+    await expect(page.locator("#weather-table-view")).toBeVisible();
+    await expect(page.locator(`.weather-row[data-station="${firstStation}"]`)).toBeVisible();
   });
 
   test("clicking weather row expands forecast data", async ({ page }) => {
@@ -106,22 +141,9 @@ test.describe("Dashboard", () => {
     const forecastRow = page.locator(`#forecast-row-${stationId}`);
     await expect(forecastRow).toBeHidden();
 
-    // Check if loadForecast function exists
-    const hasLoadFn = await page.evaluate(
-      () => typeof window.loadForecast === "function",
-    );
-    expect(hasLoadFn).toBeTruthy();
-
-    // Check if toggleForecastIfLoaded function exists (used for subsequent clicks)
-    const hasToggleFn = await page.evaluate(
-      () => typeof window.toggleForecastIfLoaded === "function",
-    );
-    expect(hasToggleFn).toBeTruthy();
-
-    // Call loadForecast and wait for the fetch to complete
-    await page.evaluate((id) => {
-      window.loadForecast(id);
-    }, stationId);
+    // Exercise the visible control and delegated row click handler.
+    const action = firstRow.getByRole("button", { name: "Forecast & history", exact: true });
+    await action.click();
 
     // Wait for the forecast row to become visible (fetch completes and shows row)
     await expect(forecastRow).toBeVisible({ timeout: 10000 });
@@ -130,21 +152,36 @@ test.describe("Dashboard", () => {
     const forecastContent = page.locator(`#forecast-${stationId}`);
     await expect(forecastContent).toBeVisible();
 
-    // Toggle to hide using toggleForecastIfLoaded (simulates subsequent click)
-    await page.evaluate((id) => {
-      window.toggleForecastIfLoaded(id);
-    }, stationId);
+    await action.click();
 
     // The forecast row should be hidden again
     await expect(forecastRow).toBeHidden();
 
-    // Toggle again to show
-    await page.evaluate((id) => {
-      window.toggleForecastIfLoaded(id);
-    }, stationId);
+    await action.click();
 
     // Should be visible again
     await expect(forecastRow).toBeVisible();
+  });
+
+  test("mobile cards distinguish the latest report and period comparison", async ({ page }) => {
+    await page.setViewportSize({ width: 358, height: 900 });
+    await page.goto(getDashboardUrl());
+    await page.locator('.tabs li[data-view="table"]').click();
+    const card = page.locator(".weather-card").first();
+    await expect(card.getByText("Latest observed", { exact: true })).toBeVisible();
+    await expect(card.locator(".weather-latest-value")).toContainText("°F");
+    await expect(card.locator(".weather-latest-time")).toBeVisible();
+    const comparison = card.locator(".weather-temperature-comparison");
+    await expect(comparison.getByRole("rowheader", { name: "Observed", exact: true })).toBeVisible();
+    await expect(comparison.getByRole("rowheader", { name: /Previous-day forecast/ })).toBeVisible();
+    await expect(comparison.getByRole("rowheader", { name: "Difference (Δ)", exact: true })).toBeVisible();
+    const action = card.getByRole("button", { name: "Forecast & history", exact: true });
+    const forecast = card.locator(".card-forecast");
+    await action.click();
+    await expect(forecast).toBeVisible();
+    await action.click();
+    await expect(forecast).toBeHidden();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(358);
   });
 });
 

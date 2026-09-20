@@ -5,11 +5,16 @@
 use crate::helpers::{MockWeatherAccess, TestApp, event_at, spawn_app};
 use axum::http::StatusCode;
 use dlctix::{attestation_locking_point, secp::MaybePoint};
-use oracle::{Event, EventStatus, Forecast, Observation, scoring::outcome_message};
+use oracle::{
+    Event, EventStatus, Forecast, ForecastRequest, Observation, scoring::outcome_message,
+};
 use serde_json::{Value, json};
-use std::sync::Arc;
-use time::Duration;
-use uuid::Uuid;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use time::{Duration, Time, UtcOffset, format_description::well_known::Rfc3339};
+use uuid::{NoContext, Timestamp, Uuid};
 
 fn forecast(station: &str, temp_high: i64, temp_low: i64, wind_speed: i64) -> Forecast {
     Forecast {
@@ -36,6 +41,8 @@ fn observation(station: &str, temp_high: f64, temp_low: f64, wind_speed: i64) ->
         station_id: station.into(),
         start_time: "2030-01-01T00:00:00Z".into(),
         end_time: "2030-01-02T00:00:00Z".into(),
+        latest_temp: None,
+        latest_temp_time: None,
         temp_low,
         temp_high,
         wind_speed: Some(wind_speed),
@@ -48,15 +55,45 @@ fn observation(station: &str, temp_high: f64, temp_low: f64, wind_speed: i64) ->
     }
 }
 
+fn forecasts_in_window(
+    request: &ForecastRequest,
+    stations: &[(&str, i64, i64, i64)],
+) -> Vec<Forecast> {
+    let start = request.start.unwrap().to_offset(UtcOffset::UTC);
+    let end = request.end.unwrap().to_offset(UtcOffset::UTC);
+    let last_day = (end - Duration::nanoseconds(1)).date();
+    std::iter::successors(Some(start.date()), |date| date.next_day())
+        .take_while(|date| *date <= last_day)
+        .flat_map(|date| {
+            stations.iter().map(move |&(station, high, low, wind)| {
+                let mut forecast = forecast(station, high, low, wind);
+                forecast.date = date.to_string();
+                forecast.start_time = date
+                    .with_time(Time::MIDNIGHT)
+                    .assume_utc()
+                    .max(start)
+                    .format(&Rfc3339)
+                    .unwrap();
+                forecast.end_time = (date.with_time(Time::MIDNIGHT).assume_utc()
+                    + Duration::days(1))
+                .min(end)
+                .format(&Rfc3339)
+                .unwrap();
+                forecast
+            })
+        })
+        .collect()
+}
+
 /// KORD: forecast 70/50/10, observed 75/50/10. KSAW: forecast 40/30/5,
 /// observed 40/29/8.
 async fn app_with_weather() -> TestApp {
     let mut weather = MockWeatherAccess::new();
-    weather.expect_forecasts_data().returning(|_, _| {
-        Ok(vec![
-            forecast("KORD", 70, 50, 10),
-            forecast("KSAW", 40, 30, 5),
-        ])
+    weather.expect_forecasts_data().returning(|request, _| {
+        Ok(forecasts_in_window(
+            request,
+            &[("KORD", 70, 50, 10), ("KSAW", 40, 30, 5)],
+        ))
     });
     weather.expect_observation_data().returning(|_, _| {
         Ok(vec![
@@ -73,10 +110,18 @@ fn pick(target: &str, metric: &str, prediction: &str) -> Value {
 
 /// Creates an event and submits entries with the given picks, in id order.
 async fn event_with_entries(test_app: &TestApp, picks: Vec<Vec<Value>>) -> (Event, Vec<Uuid>) {
+    let ids = picks.iter().map(|_| Uuid::now_v7()).collect();
+    event_with_entry_ids(test_app, picks, ids).await
+}
+
+async fn event_with_entry_ids(
+    test_app: &TestApp,
+    picks: Vec<Vec<Value>>,
+    ids: Vec<Uuid>,
+) -> (Event, Vec<Uuid>) {
     let (status, body) = test_app.create_event(&event_at(test_app.clock.now())).await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     let event: Event = serde_json::from_slice(&body).unwrap();
-    let ids: Vec<Uuid> = picks.iter().map(|_| Uuid::now_v7()).collect();
     let entries: Vec<Value> = ids
         .iter()
         .zip(picks)
@@ -215,10 +260,10 @@ async fn one_failing_event_does_not_block_the_others() {
         if request.station_ids.contains("KMSP") {
             Err(oracle::weather_data::Error::InvalidStationId("KMSP".into()))
         } else {
-            Ok(vec![
-                forecast("KORD", 70, 50, 10),
-                forecast("KSAW", 40, 30, 5),
-            ])
+            Ok(forecasts_in_window(
+                request,
+                &[("KORD", 70, 50, 10), ("KSAW", 40, 30, 5)],
+            ))
         }
     });
     weather
@@ -242,4 +287,111 @@ async fn one_failing_event_does_not_block_the_others() {
     let failures = test_app.oracle.etl_data(1).await.unwrap();
     assert_eq!(failures, 1);
     assert_attests(&test_app, &fetch(&test_app, event.id).await, &[0]);
+}
+
+#[tokio::test]
+async fn forecast_revisions_during_the_event_do_not_change_the_baseline_or_scores() {
+    let revised = Arc::new(AtomicBool::new(false));
+    let mut weather = MockWeatherAccess::new();
+    let forecast_revised = revised.clone();
+    weather
+        .expect_forecasts_data()
+        .returning(move |request, _| {
+            let start = request.start.unwrap();
+            assert_eq!(request.generated_start, Some(start - Duration::days(7)));
+            assert_eq!(
+                request.generated_end,
+                Some(start - Duration::nanoseconds(1))
+            );
+            // A query without the pre-event cutoff would now see the revised
+            // 75°F forecast and change the winner from Over to Par.
+            let high = if forecast_revised.load(Ordering::SeqCst)
+                && request.generated_end.is_none_or(|end| end >= start)
+            {
+                75
+            } else {
+                70
+            };
+            Ok(forecasts_in_window(request, &[("KORD", high, 50, 10)]))
+        });
+    weather.expect_observation_data().returning(|request, _| {
+        let start = request.start.unwrap();
+        assert_eq!(
+            request.end,
+            Some(start + Duration::hours(24) - Duration::nanoseconds(1))
+        );
+        Ok(vec![observation("KORD", 75.0, 50.0, 10)])
+    });
+    let app = spawn_app(Arc::new(weather)).await;
+    let (event, _) = event_with_entries(
+        &app,
+        vec![
+            vec![pick("KORD", "temp_high", "Over")],
+            vec![pick("KORD", "temp_high", "Par")],
+            vec![pick("KORD", "temp_high", "Under")],
+        ],
+    )
+    .await;
+    app.clock
+        .set(event.start_observation_date + Duration::hours(1));
+    app.run_etl().await;
+    let before = fetch(&app, event.id).await;
+    let scores: Vec<_> = before
+        .entries
+        .iter()
+        .map(|entry| entry.base_score)
+        .collect();
+    assert_eq!(scores, vec![Some(10), Some(0), Some(0)]);
+    assert_eq!(before.weather[0].forecasted.temp_high, 70);
+
+    revised.store(true, Ordering::SeqCst);
+    app.clock.set(event.signing_date);
+    app.run_etl().await;
+    let after = fetch(&app, event.id).await;
+    assert_eq!(
+        after
+            .entries
+            .iter()
+            .map(|entry| entry.base_score)
+            .collect::<Vec<_>>(),
+        scores
+    );
+    assert_eq!(after.weather[0].forecasted.temp_high, 70);
+    assert_attests(&app, &after, &[0]);
+}
+
+#[tokio::test]
+async fn equal_scores_across_a_ten_second_boundary_attest_the_earlier_entry() {
+    let app = app_with_weather().await;
+    let boundary = app.clock.now().unix_timestamp() as u64 / 10 * 10_000;
+    let entry_id = |millis: u64| {
+        Uuid::new_v7(Timestamp::from_unix(
+            NoContext,
+            millis / 1000,
+            (millis % 1000) as u32 * 1_000_000,
+        ))
+    };
+    let ids = vec![
+        entry_id(boundary - 1),
+        entry_id(boundary),
+        entry_id(boundary + 1),
+    ];
+    let (event, ids) = event_with_entry_ids(
+        &app,
+        vec![
+            vec![pick("KORD", "temp_high", "Over")],
+            vec![pick("KORD", "temp_high", "Over")],
+            vec![pick("KORD", "temp_high", "Under")],
+        ],
+        ids,
+    )
+    .await;
+    app.clock.set(event.signing_date);
+    app.run_etl().await;
+    let signed = fetch(&app, event.id).await;
+    assert_eq!(signed.entry_ids, ids);
+    assert_eq!(signed.entries[0].base_score, Some(10));
+    assert_eq!(signed.entries[1].base_score, Some(10));
+    assert_eq!(signed.entries[0].score, signed.entries[1].score);
+    assert_attests(&app, &signed, &[0]);
 }

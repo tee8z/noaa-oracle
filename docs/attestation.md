@@ -38,6 +38,41 @@ zero, and earns no points.
 
 `Over` and `Under` compare the raw values (rounded ones for `rounded`).
 
+### NOAA weather baseline
+
+NOAA scoring uses the latest forecast issued strictly before the observation
+window starts. The archive search covers the preceding seven days. Forecasts
+issued during the event cannot replace this baseline.
+
+Observation windows include the start instant and exclude the end instant.
+Queries compare timestamps as instants and group daily values by UTC date.
+File discovery also checks publications up to 24 hours after the requested
+period, capped at the current time. Report timestamps must still fall inside
+the observation window.
+
+Repeated snapshots of the same station report count once. The latest
+publication wins when a report changes. Missing precipitation remains missing;
+a measured zero remains zero.
+
+Multi-day baselines combine the matching UTC forecast days. Temperature highs
+and wind speeds use maxima; temperature lows use minima; precipitation uses
+sums. A missing day or metric leaves that baseline unavailable.
+The current weather API requires temperature extrema for each returned row.
+Rows without those extrema are unavailable even when other measurements exist.
+
+Wind direction is the bearing reported with the maximum wind speed. Equal
+speeds select the latest interval, then the latest UTC day for multi-day
+forecasts. Missing direction at that maximum remains unavailable.
+
+Forecast values retain their native intervals. An interval that overlaps an
+event boundary can include weather outside the event. The oracle does not
+prorate precipitation or infer hourly extrema from daily forecasts. UTC daily
+windows provide the closest comparison with the daily baseline.
+
+Observed humidity is derived from period temperature and dewpoint averages.
+Its baseline remains the maximum forecast humidity. Observed snowfall uses
+the existing 10:1 liquid-to-snow estimate rather than a direct snowfall measurement.
+
 ## Events
 
 `POST /oracle/events`, signed by an allowlisted coordinator (NIP-98):
@@ -85,9 +120,13 @@ an entry uses one form or the other.
 
 Per pick: `Par` earns 20 points, a correct `Over`/`Under` 10, otherwise 0.
 An entry's base score is the sum over its picks. Its total score is
-`max(1, base) × 10,000 − (entry creation milliseconds mod 10,000)`, taken
-from the UUIDv7, so earlier entries win ties; remaining ties rank by entry
-id.
+`max(1, base) × 10,000`. Entries rank by descending base score, then ascending
+full UUIDv7 entry id. Earlier UUIDv7 timestamps win ties, including across
+ten-second boundaries. Equal timestamps rank by the remaining UUID bits.
+
+The total score retains its integer type and scale. Clients must use the entry
+id to break equal scores. Previously signed events retain their stored scores
+and attestations.
 
 ## Outcomes and announcement
 
@@ -106,7 +145,7 @@ signing date.
 
 ## Attestation
 
-After the signing date the oracle ranks entries by total score, takes the
+After the signing date the oracle ranks entries by the scoring rules, takes the
 top `places` indices (or the refund-all outcome when every base score is 0),
 and publishes `attestation` `s` with `s·G` equal to that outcome's locking
 point. The oracle attests each event at most once and only an announced

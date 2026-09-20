@@ -58,6 +58,7 @@ window.loadForecast = function loadForecast(stationId) {
   fetchForecast(stationId)
     .then(function (html) {
       forecastContainer.innerHTML = html;
+      if (typeof convertToLocalTime === "function") convertToLocalTime();
       forecastRow.dataset.loaded = "true";
       forecastRow.style.display = "table-row";
       if (weatherRow) {

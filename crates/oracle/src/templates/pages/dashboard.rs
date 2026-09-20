@@ -12,6 +12,7 @@ pub struct DashboardData {
     pub stats: EventStats,
     pub weather: Vec<WeatherDisplay>,
     pub all_stations: Vec<(String, String)>,
+    pub weather_refresh_path: String,
 }
 
 /// Dashboard page - shows oracle info, event stats, and weather data
@@ -38,7 +39,7 @@ pub fn dashboard_content(data: &DashboardData) -> Markup {
 
         // Weather Data
         div class="mt-4" {
-            (weather_table(&data.weather, &data.all_stations))
+            (weather_table(&data.weather, &data.all_stations, &data.weather_refresh_path))
         }
     }
 }

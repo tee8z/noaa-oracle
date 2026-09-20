@@ -3,6 +3,7 @@ mod event_detail;
 mod events;
 mod fragments;
 mod raw_data;
+mod weather;
 
 pub use dashboard::dashboard_handler;
 pub use event_detail::event_detail_handler;
