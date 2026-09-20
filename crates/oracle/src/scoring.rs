@@ -31,6 +31,9 @@ pub fn points(prediction: &ValueOptions, rule: ParRule, reading: &Reading) -> u6
     let (Some(mut baseline), Some(mut observed)) = (reading.baseline, reading.observed) else {
         return 0;
     };
+    if !baseline.is_finite() || !observed.is_finite() {
+        return 0;
+    }
     if rule == ParRule::Rounded {
         baseline = baseline.round();
         observed = observed.round();
@@ -76,20 +79,17 @@ pub fn base_score(
 #[error("entry {0} is not a UUIDv7")]
 pub struct NotUuidV7(pub Uuid);
 
-/// Total score: `max(1, base) * 10_000 - (entry creation millis % 10_000)`.
+/// Stored score: `max(1, base) * 10_000`.
 ///
-/// Higher base scores dominate; for equal scores the earlier UUIDv7 entry
-/// ranks higher. Four timestamp digits keep the outcome space small while
-/// making collisions negligible for up to 10,000 entries a day. Remaining
-/// ties rank by entry id.
+/// Equal point totals have equal displayed scores. Ranking separately uses
+/// the complete UUIDv7 in ascending order, so timestamp boundaries cannot
+/// let a later entry win a tie. The positive-zero convention is retained.
 pub fn total_score(entry_id: Uuid, base_score: u64) -> Result<i64, NotUuidV7> {
-    let (seconds, nanos) = entry_id
-        .get_timestamp()
-        .ok_or(NotUuidV7(entry_id))?
-        .to_unix();
-    let millis = seconds * 1000 + u64::from(nanos) / 1_000_000;
-    let total = base_score.clamp(1, u64::MAX / 10_000) * 10_000 - millis % 10_000;
-    Ok(i64::try_from(total).unwrap_or(i64::MAX))
+    if entry_id.get_version_num() != 7 {
+        return Err(NotUuidV7(entry_id));
+    }
+    let total = base_score.clamp(1, i64::MAX as u64 / 10_000) * 10_000;
+    Ok(total as i64)
 }
 
 /// A scored entry, identified by its id.
@@ -112,7 +112,7 @@ pub fn winning_indices(entries: &[Scored], places: usize) -> Vec<usize> {
         return (0..ordered.len()).collect();
     }
     (0..ordered.len())
-        .sorted_by_key(|&index| Reverse(ordered[index].total_score))
+        .sorted_by_key(|&index| (Reverse(ordered[index].base_score), ordered[index].id))
         .take(places)
         .collect()
 }
@@ -206,6 +206,18 @@ mod tests {
             ..reading(1.0, 1.0)
         };
         assert_eq!(points(&Par, ParRule::Exact, &missing), 0);
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for prediction in [Over, Par, Under] {
+                assert_eq!(
+                    points(&prediction, ParRule::Exact, &reading(70.0, invalid)),
+                    0
+                );
+                assert_eq!(
+                    points(&prediction, ParRule::Exact, &reading(invalid, 70.0)),
+                    0
+                );
+            }
+        }
     }
 
     #[test]
@@ -237,13 +249,66 @@ mod tests {
     }
 
     #[test]
-    fn earlier_entries_win_ties_and_scores_stay_positive() {
+    fn equal_points_have_equal_stored_scores_and_zero_stays_positive() {
         let earlier = entry_id(1_000_001);
         let later = entry_id(1_000_002);
-        assert!(total_score(earlier, 20).unwrap() > total_score(later, 20).unwrap());
+        assert_eq!(
+            total_score(earlier, 20).unwrap(),
+            total_score(later, 20).unwrap()
+        );
+        assert_eq!(total_score(earlier, 20).unwrap(), 200_000);
         assert!(total_score(earlier, 0).unwrap() > 0);
         assert!(total_score(later, 20).unwrap() > total_score(earlier, 10).unwrap());
         assert!(total_score(Uuid::from_u128(0x1234), 20).is_err());
+    }
+
+    #[test]
+    fn earlier_entries_win_ties_across_timestamp_boundaries() {
+        let scored = |millis| {
+            let id = entry_id(millis);
+            Scored {
+                id,
+                base_score: 20,
+                total_score: total_score(id, 20).unwrap(),
+            }
+        };
+        for (earlier, later) in [(9_999, 10_000), (86_399_999, 86_400_000)] {
+            let first = scored(earlier);
+            let second = scored(later);
+            assert_eq!(first.total_score, second.total_score);
+            assert_eq!(winning_indices(&[second, first], 1), vec![0]);
+        }
+    }
+
+    #[test]
+    fn ranking_uses_full_id_for_same_millisecond_ties_and_ignores_legacy_penalties() {
+        let earlier_id = entry_id(9_999);
+        let later_id = entry_id(10_000);
+        let earlier = Scored {
+            id: earlier_id,
+            base_score: 20,
+            total_score: 190_001,
+        };
+        let later = Scored {
+            id: later_id,
+            base_score: 20,
+            total_score: 200_000,
+        };
+        assert_eq!(winning_indices(&[later, earlier], 1), vec![0]);
+
+        let low_id = Uuid::from_u128(earlier_id.as_u128() & !0xffff);
+        let high_id = Uuid::from_u128(low_id.as_u128() + 1);
+        let same_time = [
+            Scored {
+                id: high_id,
+                ..earlier
+            },
+            Scored {
+                id: low_id,
+                ..earlier
+            },
+        ];
+        assert_eq!(winning_indices(&same_time, 1), vec![0]);
     }
 
     #[test]

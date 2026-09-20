@@ -48,7 +48,7 @@ pub fn forecast_detail(
     html! {
         div class="forecast-detail p-3" {
             h3 class="title is-5 mb-4" {
-                "Forecast for " (station_id)
+                "Forecasts and observations for " (station_id)
             }
 
             // Past performance section — table showing forecast vs actual
@@ -56,9 +56,12 @@ pub fn forecast_detail(
                 div class="past-performance mb-5" {
                     h4 class="title is-6 mb-3" {
                         span class="icon-text" {
-                            span { "Past Performance" }
-                            span class="tag is-light is-small ml-2" { (format!("{} days", comparisons.len())) }
+                            span { "Past forecast comparison" }
+                            span class="tag is-light is-small ml-2" { (format!("{} days", comparisons.len().min(7))) }
                         }
+                    }
+                    p class="is-size-7 has-text-grey mb-2" {
+                        "Latest available forecasts and observations by UTC day. Differences = forecast − observed; + means the forecast was higher. — means unavailable."
                     }
                     div class="table-container" {
                         table class="table is-fullwidth is-narrow is-size-7" {
@@ -67,53 +70,55 @@ pub fn forecast_detail(
                                     th { "Date" }
                                     th class="has-text-centered" colspan="2" { "Temp High" }
                                     th class="has-text-centered" colspan="2" { "Temp Low" }
-                                    th class="has-text-centered" colspan="2" { "Wind" }
+                                    th class="has-text-centered" colspan="2" { "Max wind" }
                                     th class="has-text-centered" colspan="2" { "Humidity" }
                                     th class="has-text-centered" colspan="2" { "Rain" }
                                     th class="has-text-centered" colspan="2" { "Snow" }
                                 }
                                 tr class="past-subheader" {
                                     th {}
-                                    th class="has-text-centered" { "Fcst" }
-                                    th class="has-text-centered" { "Actual" }
-                                    th class="has-text-centered" { "Fcst" }
-                                    th class="has-text-centered" { "Actual" }
-                                    th class="has-text-centered" { "Fcst" }
-                                    th class="has-text-centered" { "Actual" }
-                                    th class="has-text-centered" { "Fcst" }
-                                    th class="has-text-centered" { "Actual" }
-                                    th class="has-text-centered" { "Fcst" }
-                                    th class="has-text-centered" { "Actual" }
-                                    th class="has-text-centered" { "Fcst" }
-                                    th class="has-text-centered" { "Actual" }
+                                    th class="has-text-centered" { "Forecast" }
+                                    th class="has-text-centered" { "Observed" }
+                                    th class="has-text-centered" { "Forecast" }
+                                    th class="has-text-centered" { "Observed" }
+                                    th class="has-text-centered" { "Forecast" }
+                                    th class="has-text-centered" { "Observed" }
+                                    th class="has-text-centered" title="Forecast daily humidity range" { "Forecast range" }
+                                    th class="has-text-centered" title="Relative humidity estimated from average temperature and dew point" { "Observed" }
+                                    th class="has-text-centered" { "Forecast" }
+                                    th class="has-text-centered" { "Observed" }
+                                    th class="has-text-centered" { "Forecast" }
+                                    th class="has-text-centered" title="Snow estimated from liquid precipitation using a 10:1 snow-to-liquid ratio" { "Observed est." }
                                 }
                             }
                             tbody {
                                 @for comp in comparisons.iter().take(7) {
                                     tr {
-                                        td class="has-text-weight-semibold local-date" data-utc=(comp.date.clone()) {
-                                            (comp.date.clone())
+                                        td class="has-text-weight-semibold calendar-date" data-date=(calendar_date(&comp.date)) {
+                                            (calendar_date(&comp.date))
                                         }
                                         // Temp High: forecast vs actual
                                         td class="has-text-centered" {
-                                            span class="weather-value temp-high" { (format!("{}°", comp.forecast_high)) }
+                                            span class="weather-value temp-high" { (format!("{}°F", comp.forecast_high)) }
                                         }
                                         td class="has-text-centered" {
                                             @if let Some(actual) = comp.actual_high {
-                                                span class="weather-value temp-high" { (format!("{:.0}°", actual)) }
-                                                (diff_badge(comp.forecast_high as f64 - actual))
+                                                @let actual = rounded_temperature(actual);
+                                                span class="weather-value temp-high" { (format!("{:.0}°F", actual)) }
+                                                (diff_badge(comp.forecast_high as f64 - actual, "°F"))
                                             } @else {
                                                 span class="has-text-grey" { "—" }
                                             }
                                         }
                                         // Temp Low: forecast vs actual
                                         td class="has-text-centered" {
-                                            span class="weather-value temp-low" { (format!("{}°", comp.forecast_low)) }
+                                            span class="weather-value temp-low" { (format!("{}°F", comp.forecast_low)) }
                                         }
                                         td class="has-text-centered" {
                                             @if let Some(actual) = comp.actual_low {
-                                                span class="weather-value temp-low" { (format!("{:.0}°", actual)) }
-                                                (diff_badge(comp.forecast_low as f64 - actual))
+                                                @let actual = rounded_temperature(actual);
+                                                span class="weather-value temp-low" { (format!("{:.0}°F", actual)) }
+                                                (diff_badge(comp.forecast_low as f64 - actual, "°F"))
                                             } @else {
                                                 span class="has-text-grey" { "—" }
                                             }
@@ -121,16 +126,16 @@ pub fn forecast_detail(
                                         // Wind: forecast vs actual
                                         td class="has-text-centered" {
                                             @if let Some(w) = comp.forecast_wind {
-                                                (format!("{}", w))
+                                                (format!("{} kt", w))
                                             } @else {
                                                 span class="has-text-grey" { "—" }
                                             }
                                         }
                                         td class="has-text-centered" {
                                             @if let Some(w) = comp.actual_wind {
-                                                (format!("{}", w))
+                                                (format!("{} kt", w))
                                                 @if let Some(fw) = comp.forecast_wind {
-                                                    (diff_badge(fw as f64 - w as f64))
+                                                    (diff_badge(fw as f64 - w as f64, "kt"))
                                                 }
                                             } @else {
                                                 span class="has-text-grey" { "—" }
@@ -157,7 +162,7 @@ pub fn forecast_detail(
                                                 @if r > 0.0 {
                                                     span class="has-text-info" { (format!("{:.2}\"", r)) }
                                                 } @else {
-                                                    span class="has-text-grey" { "—" }
+                                                    span class="has-text-grey" { (format!("{:.2}\"", r)) }
                                                 }
                                             } @else {
                                                 span class="has-text-grey" { "—" }
@@ -168,7 +173,7 @@ pub fn forecast_detail(
                                                 @if r > 0.0 {
                                                     span class="has-text-info" { (format!("{:.2}\"", r)) }
                                                 } @else {
-                                                    span class="has-text-grey" { "—" }
+                                                    span class="has-text-grey" { (format!("{:.2}\"", r)) }
                                                 }
                                             } @else {
                                                 span class="has-text-grey" { "—" }
@@ -180,7 +185,7 @@ pub fn forecast_detail(
                                                 @if s > 0.0 {
                                                     span class="has-text-link" { (format!("{:.1}\"", s)) }
                                                 } @else {
-                                                    span class="has-text-grey" { "—" }
+                                                    span class="has-text-grey" { (format!("{:.1}\"", s)) }
                                                 }
                                             } @else {
                                                 span class="has-text-grey" { "—" }
@@ -191,7 +196,7 @@ pub fn forecast_detail(
                                                 @if s > 0.0 {
                                                     span class="has-text-link" { (format!("{:.1}\"", s)) }
                                                 } @else {
-                                                    span class="has-text-grey" { "—" }
+                                                    span class="has-text-grey" { (format!("{:.1}\"", s)) }
                                                 }
                                             } @else {
                                                 span class="has-text-grey" { "—" }
@@ -208,8 +213,9 @@ pub fn forecast_detail(
             // Upcoming forecast section
             div class="upcoming-forecast" {
                 h4 class="title is-6 mb-3" {
-                    "Upcoming Forecast"
+                    "Upcoming forecast"
                 }
+                p class="is-size-7 has-text-grey mb-2" { "Forecast values by UTC date." }
                 @if forecasts.is_empty() {
                     p class="has-text-grey" { "No forecast data available." }
                 } @else {
@@ -217,14 +223,14 @@ pub fn forecast_detail(
                         @for forecast in forecasts.iter().take(7) {
                             div class="column is-one-fifth-desktop is-half-mobile" {
                                 div class="box forecast-day has-text-centered p-2" {
-                                    p class="is-size-7 has-text-weight-semibold mb-1 local-date" data-utc=(forecast.date.clone()) {
-                                        (forecast.date.clone())
+                                    p class="is-size-7 has-text-weight-semibold mb-1 calendar-date" data-date=(calendar_date(&forecast.date)) {
+                                        (calendar_date(&forecast.date))
                                     }
                                     // Temperature
                                     p class="mb-1" {
-                                        span class="weather-value temp-high" { (format!("{}°", forecast.temp_high)) }
+                                        span class="weather-value temp-high" { (format!("{}°F", forecast.temp_high)) }
                                         " / "
-                                        span class="weather-value temp-low" { (format!("{}°", forecast.temp_low)) }
+                                        span class="weather-value temp-low" { (format!("{}°F", forecast.temp_low)) }
                                     }
                                     // Wind
                                     @if let Some(wind) = forecast.wind_speed {
@@ -244,26 +250,20 @@ pub fn forecast_detail(
                                     }
                                     // Precipitation chance
                                     @if let Some(precip) = forecast.precip_chance {
-                                        @if precip > 0 {
-                                            p class="is-size-7 has-text-info" {
-                                                (format!("{}% chance", precip))
-                                            }
+                                        p class="is-size-7 has-text-info" {
+                                            (format!("{}% precip chance", precip))
                                         }
                                     }
                                     // Precipitation amount
                                     @if let Some(precip_amt) = forecast.rain_amt {
-                                        @if precip_amt > 0.0 {
-                                            p class="is-size-7 has-text-info" {
-                                                (format!("{:.2}\" precip", precip_amt))
-                                            }
+                                        p class="is-size-7 has-text-info" {
+                                            (format!("{:.2}\" rain", precip_amt))
                                         }
                                     }
                                     // Snow amount
                                     @if let Some(snow) = forecast.snow_amt {
-                                        @if snow > 0.0 {
-                                            p class="is-size-7 has-text-link" {
-                                                (format!("{:.1}\" snow", snow))
-                                            }
+                                        p class="is-size-7 has-text-link" {
+                                            (format!("{:.1}\" snow", snow))
                                         }
                                     }
                                 }
@@ -276,8 +276,18 @@ pub fn forecast_detail(
     }
 }
 
-/// Render a small colored diff badge (e.g. "+3°" in green, "-5°" in red)
-fn diff_badge(diff: f64) -> Markup {
+/// Preserve the UTC calendar date when the data includes a midnight timestamp.
+fn calendar_date(date: &str) -> &str {
+    date.split([' ', 'T']).next().unwrap_or(date)
+}
+
+/// Render the signed forecast error with its unit and sign convention.
+fn rounded_temperature(value: f64) -> f64 {
+    let rounded = value.round();
+    if rounded == 0.0 { 0.0 } else { rounded }
+}
+
+fn diff_badge(diff: f64, unit: &str) -> Markup {
     if diff.abs() <= 0.5 {
         return html! {};
     }
@@ -290,8 +300,9 @@ fn diff_badge(diff: f64) -> Markup {
     };
     html! {
         " "
-        span class=(format!("is-size-7 {}", class)) {
-            (format!("{:+.0}", diff))
+        span class=(format!("is-size-7 {}", class))
+            title=(format!("Forecast − observed: {:+.1} {}. Positive means the forecast was higher.", diff, unit)) {
+            (format!("{:+.0} {}", diff, unit))
         }
     }
 }
@@ -308,5 +319,36 @@ fn wind_direction_label(degrees: i64) -> &'static str {
         248..=292 => "W",
         293..=337 => "NW",
         _ => "",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn past_comparisons_round_temperature_halves_like_scoring() {
+        let comparison = ForecastComparison {
+            date: "2026-09-19".into(),
+            forecast_high: 55,
+            forecast_low: -3,
+            forecast_wind: None,
+            forecast_humidity_max: None,
+            forecast_humidity_min: None,
+            forecast_rain: None,
+            forecast_snow: None,
+            actual_high: Some(54.5),
+            actual_low: Some(-2.5),
+            actual_wind: None,
+            actual_humidity: None,
+            actual_rain: None,
+            actual_snow: None,
+        };
+        let html = forecast_detail("KPWM", &[comparison], &[]).into_string();
+        assert_eq!(html.matches("55°F").count(), 2);
+        assert_eq!(html.matches("-3°F").count(), 2);
+        assert!(!html.contains("54°F"));
+        assert!(!html.contains("-2°F"));
+        assert!(!html.contains("Forecast − observed:"));
     }
 }

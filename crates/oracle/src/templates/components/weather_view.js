@@ -60,51 +60,51 @@ window.showStationPopup = function (marker) {
   const nameText = [stationName, state].filter(Boolean).join(", ");
   popup.querySelector(".popup-name").textContent = nameText;
 
-  // Reset forecast values to loading state
+  // Clear the previous station while the comparison loads.
   const forecastGrid = popup.querySelector(".popup-forecast-grid");
   const loadingEl = popup.querySelector(".popup-loading");
   if (forecastGrid) {
-    forecastGrid.querySelectorAll(".forecast-value").forEach((el) => {
-      el.textContent = "-";
+    forecastGrid.querySelectorAll("[data-field]").forEach((el) => {
+      el.textContent = "—";
     });
   }
-
-  // Position popup near marker
-  const mapWrapper = document.querySelector(".map-wrapper");
-  const mapRect = mapWrapper.getBoundingClientRect();
-  const markerRect = marker.getBoundingClientRect();
-
-  // Calculate position relative to map wrapper
-  let left = markerRect.left - mapRect.left + markerRect.width / 2;
-  let top = markerRect.top - mapRect.top - 10;
-
-  // Adjust if popup would go off screen
-  const popupWidth = 360;
-  const popupHeight = 280;
-
-  if (left + popupWidth / 2 > mapRect.width) {
-    left = mapRect.width - popupWidth / 2 - 10;
-  }
-  if (left - popupWidth / 2 < 0) {
-    left = popupWidth / 2 + 10;
-  }
-
-  // Position above marker, but below if too close to top
-  if (top < popupHeight) {
-    top = markerRect.top - mapRect.top + markerRect.height + 10;
-    popup.style.transform = "translateX(-50%)";
-  } else {
-    top = top - popupHeight;
-    popup.style.transform = "translateX(-50%)";
-  }
-
-  popup.style.left = `${left}px`;
-  popup.style.top = `${top}px`;
+  if (loadingEl) loadingEl.style.display = "block";
   popup.style.display = "block";
 
-  // Fetch forecast data for this station
-  fetchStationForecast(stationId, popup);
+  positionStationPopup(marker, popup);
+
+  // Reposition after rendering because comparison labels can wrap on phones.
+  fetchStationForecast(stationId, popup).then(() => {
+    if (currentPopupStation === stationId) positionStationPopup(marker, popup);
+  });
 };
+
+function positionStationPopup(marker, popup) {
+  const mapRect = document.querySelector(".map-wrapper").getBoundingClientRect();
+  const markerRect = marker.getBoundingClientRect();
+  const { width, height } = popup.getBoundingClientRect();
+  const viewport = document.documentElement;
+  const margin = 10;
+
+  // The popup can extend beyond a narrow map, but stays within the viewport.
+  const center = markerRect.left + markerRect.width / 2;
+  const left = Math.max(
+    margin + width / 2,
+    Math.min(center, viewport.clientWidth - width / 2 - margin),
+  );
+  const above = markerRect.top - height - margin;
+  const preferredTop = above >= margin
+    ? above
+    : markerRect.top + markerRect.height + margin;
+  const top = Math.max(
+    margin,
+    Math.min(preferredTop, viewport.clientHeight - height - margin),
+  );
+
+  popup.style.transform = "translateX(-50%)";
+  popup.style.left = `${left - mapRect.left}px`;
+  popup.style.top = `${top - mapRect.top}px`;
+}
 
 // Fetch forecast data for popup
 async function fetchStationForecast(stationId, popup) {
@@ -113,14 +113,16 @@ async function fetchStationForecast(stationId, popup) {
   if (loadingEl) loadingEl.style.display = "block";
 
   try {
-    // Get dates for yesterday, today, tomorrow in UTC
+    // The APIs aggregate UTC calendar days. Include all of yesterday, even
+    // when the popup is opened late in the day or across a local DST change.
     const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
     const yesterday = new Date(today);
-    yesterday.setDate(yesterday.getDate() - 1);
+    yesterday.setUTCDate(yesterday.getUTCDate() - 1);
     const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
+    tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
     const dayAfterTomorrow = new Date(today);
-    dayAfterTomorrow.setDate(dayAfterTomorrow.getDate() + 2);
+    dayAfterTomorrow.setUTCDate(dayAfterTomorrow.getUTCDate() + 2);
 
     // Format dates as ISO strings for API
     const formatDateParam = (d) => d.toISOString();
@@ -145,6 +147,7 @@ async function fetchStationForecast(stationId, popup) {
 
     const forecasts = forecastRes.ok ? await forecastRes.json() : [];
     const observations = obsRes.ok ? await obsRes.json() : [];
+    if (currentPopupStation !== stationId) return;
 
     // API dates can include a midnight timestamp. Match calendar dates without
     // timezone conversion, accepting both date-only and timestamp responses.
@@ -159,19 +162,20 @@ async function fetchStationForecast(stationId, popup) {
     });
 
     // Formatting helpers
+    // Match Rust/scoring: exact halves round away from zero.
+    const wholeDegrees = (value) => Math.sign(value) * Math.round(Math.abs(value));
     const formatTemp = (high, low) => {
-      if (high != null && low != null)
-        return `${Math.round(high)}° / ${Math.round(low)}°`;
-      if (high != null) return `${Math.round(high)}°`;
-      if (low != null) return `${Math.round(low)}°`;
-      return null;
+      if (high == null && low == null) return null;
+      const bound = (value) => value == null ? "—" : `${wholeDegrees(value)}°`;
+      return `${bound(high)} / ${bound(low)}`;
     };
     const formatWind = (speed) =>
       speed != null ? `${Math.round(speed)} kt` : null;
     const formatChance = (chance) => (chance != null ? `${chance}%` : null);
     const formatAmount = (amount) =>
-      amount != null && amount > 0 ? `${amount.toFixed(2)}"` : null;
+      amount != null ? `${amount.toFixed(2)}"` : null;
     const formatHumidity = (max, min) => {
+      if (max != null && max === min) return `${max}%`;
       if (max != null && min != null) return `${min}-${max}%`;
       if (max != null) return `${max}%`;
       if (min != null) return `${min}%`;
@@ -181,13 +185,14 @@ async function fetchStationForecast(stationId, popup) {
     // Set a single data-field element's text
     const setValue = (field, value) => {
       const el = popup.querySelector(`[data-field="${field}"]`);
-      if (el) el.textContent = value ?? "-";
+      if (el) el.textContent = value ?? "—";
     };
 
-    // Set both obs and fcst values for a cell
+    // Source labels live in the markup. Tomorrow and precipitation chance
+    // have forecast fields only; past and current days retain both readings.
     const setCell = (day, metric, obsVal, fcstVal) => {
-      setValue(`${day}-${metric}-obs`, obsVal ?? "-");
-      setValue(`${day}-${metric}-fcst`, fcstVal ? `fcst: ${fcstVal}` : "");
+      setValue(`${day}-${metric}-obs`, obsVal);
+      setValue(`${day}-${metric}-fcst`, fcstVal);
     };
 
     // Populate a full day column for all metrics
@@ -236,13 +241,16 @@ async function fetchStationForecast(stationId, popup) {
     populateDay("today", todayObs, todayForecast);
     populateDay("tomorrow", null, tomorrowForecast);
   } catch (err) {
+    if (currentPopupStation !== stationId) return;
     console.error("Error fetching forecast:", err);
     // Show error state
     popup.querySelectorAll("[data-field]").forEach((el) => {
       el.textContent = "?";
     });
   } finally {
-    if (loadingEl) loadingEl.style.display = "none";
+    if (loadingEl && currentPopupStation === stationId) {
+      loadingEl.style.display = "none";
+    }
   }
 }
 
@@ -307,12 +315,16 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 });
 
-// Re-initialize after HTMX swaps
-document.addEventListener("htmx:afterSwap", function (e) {
-  // Check if the weather container was updated
+// Restore the selected view after replacement and after HTMX settles attributes.
+function restoreWeatherView(e) {
+  // OuterHTML can detach the original target before this event bubbles.
+  const target = e.detail?.target || e.target;
   if (
     e.target.id === "weather-table-container" ||
-    e.target.closest("#weather-table-container")
+    e.target.closest?.("#weather-table-container") ||
+    target.id === "weather-table-container" ||
+    target.closest?.("#weather-table-container") ||
+    e.detail?.elt?.id === "weather-table-container"
   ) {
     const savedView = localStorage.getItem("weatherView") || "map";
     const mapView = document.getElementById("weather-map-view");
@@ -322,7 +334,9 @@ document.addEventListener("htmx:afterSwap", function (e) {
       switchWeatherView(savedView);
     }
   }
-});
+}
+document.addEventListener("htmx:afterSwap", restoreWeatherView);
+document.addEventListener("htmx:afterSettle", restoreWeatherView);
 
 // Persist stations to localStorage when adding via dropdown
 document.addEventListener("htmx:afterRequest", function (e) {
@@ -331,11 +345,34 @@ document.addEventListener("htmx:afterRequest", function (e) {
     e.detail.pathInfo &&
     e.detail.pathInfo.requestPath.includes("add_station=")
   ) {
-    // Extract current stations from URL or data attributes
-    const url = new URL(window.location.href);
+    const refreshPath = document.getElementById("weather-table-container")?.getAttribute("hx-get");
+    if (!refreshPath) return;
+    const url = new URL(refreshPath, window.location.origin);
     const stations = url.searchParams.get("stations");
     if (stations) {
       localStorage.setItem("weatherStations", stations);
+    }
+  }
+});
+
+// Refreshes and station additions retain the selection independently of rows.
+document.addEventListener("htmx:configRequest", function (event) {
+  if (!event.detail.path) return;
+  const request = new URL(event.detail.path, window.location.origin);
+  if (request.pathname !== "/fragments/weather") return;
+  const container = document.getElementById("weather-table-container");
+  const refreshPath = container?.getAttribute("hx-get");
+  if (!refreshPath) return;
+  const current = new URL(refreshPath, window.location.origin);
+  // Older or empty fragments can lack context; the initial dashboard URL
+  // remains a useful fallback until the first complete fragment is returned.
+  const parameters = !current.search && window.location.pathname === "/"
+    ? new URLSearchParams(window.location.search)
+    : current.searchParams;
+  for (const key of ["stations", "start", "end"]) {
+    // HTMX appends parameters to the path's existing query string.
+    if (!request.searchParams.has(key) && parameters.has(key)) {
+      event.detail.parameters[key] = parameters.get(key);
     }
   }
 });

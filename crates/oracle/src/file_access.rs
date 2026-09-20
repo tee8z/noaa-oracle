@@ -10,7 +10,8 @@ use axum::body::Body;
 use log::trace;
 use serde::{Deserialize, Serialize};
 use time::{
-    Date, OffsetDateTime, format_description::well_known::Rfc3339, macros::format_description,
+    Date, OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339,
+    macros::format_description,
 };
 use tokio::fs;
 use tokio_util::io::ReaderStream;
@@ -110,7 +111,7 @@ pub enum Error {
     UnboundedListing,
 }
 
-/// Days one S3 listing may cover; each day is one prefix listing.
+/// Requested UTC days one S3 listing may cover, plus two offset boundary prefixes.
 pub const MAX_LIST_DAYS: usize = 366;
 
 /// Where parquet files live. Implementations return only validated file
@@ -194,15 +195,46 @@ impl FileData for FileAccess {
 }
 
 fn is_date_in_range(compare_to: Date, params: &FileParams) -> bool {
+    // Existing keys use the timestamp's own calendar date. An offset timestamp
+    // can live in either adjacent UTC date directory; matches() filters instants.
     let after_start = params
         .start
-        .map(|start| compare_to >= start.date())
+        .map(|start| compare_to >= first_directory_date(start))
         .unwrap_or(true);
     let before_end = params
         .end
-        .map(|end| compare_to <= end.date())
+        .map(|end| compare_to <= last_directory_date(end))
         .unwrap_or(true);
     after_start && before_end
+}
+
+fn first_directory_date(time: OffsetDateTime) -> Date {
+    let day = time.to_offset(UtcOffset::UTC).date();
+    day.previous_day().unwrap_or(day)
+}
+
+fn last_directory_date(time: OffsetDateTime) -> Date {
+    let day = time.to_offset(UtcOffset::UTC).date();
+    day.next_day().unwrap_or(day)
+}
+
+fn listing_prefixes(params: &FileParams) -> Result<Vec<String>, Error> {
+    let (Some(start), Some(end)) = (params.start, params.end) else {
+        return Err(Error::UnboundedListing);
+    };
+    let requested_days = (end.to_offset(UtcOffset::UTC).date()
+        - start.to_offset(UtcOffset::UTC).date())
+    .whole_days()
+        + 1;
+    if start > end || requested_days > MAX_LIST_DAYS as i64 {
+        return Err(Error::UnboundedListing);
+    }
+    Ok(
+        std::iter::successors(Some(first_directory_date(start)), |day| day.next_day())
+            .take_while(|day| *day <= last_directory_date(end))
+            .map(|day| format!("weather_data/{day}/"))
+            .collect(),
+    )
 }
 
 fn is_time_in_range(compare_to: OffsetDateTime, params: &FileParams) -> bool {
@@ -246,18 +278,7 @@ impl FileData for S3FileAccess {
         let mut file_names = Vec::new();
 
         // One prefix listing per day; the whole bucket is never listed.
-        let (Some(start), Some(end)) = (params.start, params.end) else {
-            return Err(Error::UnboundedListing);
-        };
-        let (start, end) = (start.date(), end.date());
-        let prefixes: Vec<String> = std::iter::successors(Some(start), |day| day.next_day())
-            .take_while(|day| *day <= end)
-            .take(MAX_LIST_DAYS + 1)
-            .map(|day| format!("weather_data/{day}/"))
-            .collect();
-        if prefixes.len() > MAX_LIST_DAYS {
-            return Err(Error::UnboundedListing);
-        }
+        let prefixes = listing_prefixes(&params)?;
 
         for prefix in &prefixes {
             let mut continuation_token: Option<String> = None;
@@ -342,6 +363,64 @@ impl FileData for S3FileAccess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bounds(start: &str, end: &str) -> FileParams {
+        FileParams {
+            start: Some(OffsetDateTime::parse(start, &Rfc3339).unwrap()),
+            end: Some(OffsetDateTime::parse(end, &Rfc3339).unwrap()),
+            observations: Some(true),
+            forecasts: Some(false),
+        }
+    }
+
+    #[test]
+    fn s3_prefixes_cover_offset_dates_without_unbounded_listing() {
+        let params = bounds("2026-01-22T00:00:00+02:00", "2026-01-22T00:30:00+02:00");
+        assert_eq!(
+            listing_prefixes(&params).unwrap(),
+            vec![
+                "weather_data/2026-01-20/",
+                "weather_data/2026-01-21/",
+                "weather_data/2026-01-22/",
+            ]
+        );
+        let mut full_year = bounds("2024-01-01T00:00:00Z", "2024-12-31T23:59:59Z");
+        assert_eq!(
+            listing_prefixes(&full_year).unwrap().len(),
+            MAX_LIST_DAYS + 2
+        );
+        full_year.end = full_year.end.map(|end| end + time::Duration::days(1));
+        assert!(listing_prefixes(&full_year).is_err());
+        assert!(listing_prefixes(&bounds("2026-01-22T00:00:00Z", "2026-01-21T00:00:00Z")).is_err());
+        full_year.start = None;
+        assert!(listing_prefixes(&full_year).is_err());
+    }
+
+    #[tokio::test]
+    async fn lists_offset_files_by_instant_across_directory_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let access = FileAccess::new(directory.path().to_string_lossy().into_owned());
+        let names = [
+            "observations_2026-01-21T22:00:00Z.parquet",
+            "observations_2026-01-22T00:15:00+02:00.parquet",
+            "observations_2026-01-21T21:59:59Z.parquet",
+            "observations_2026-01-22T00:31:00+02:00.parquet",
+        ];
+        for name in names {
+            let file = ParquetFileName::parse(name).unwrap();
+            std::fs::create_dir_all(directory.path().join(file.generated_at.date().to_string()))
+                .unwrap();
+            std::fs::write(access.build_file_path(&file), b"").unwrap();
+        }
+        for params in [
+            bounds("2026-01-22T00:00:00+02:00", "2026-01-22T00:30:00+02:00"),
+            bounds("2026-01-21T22:00:00Z", "2026-01-21T22:30:00Z"),
+        ] {
+            let mut files = access.grab_file_names(params).await.unwrap();
+            files.sort();
+            assert_eq!(files, names[..2]);
+        }
+    }
 
     #[test]
     fn parses_daemon_file_names_and_rejects_everything_else() {

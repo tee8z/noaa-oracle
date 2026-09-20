@@ -30,6 +30,20 @@ function convertToLocalTime() {
     }
   });
 
+  // Forecast days are UTC calendar dates, not instants to shift by timezone.
+  document.querySelectorAll(".calendar-date[data-date]").forEach((el) => {
+    const day = el.getAttribute("data-date");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day || "")) return;
+    const date = new Date(`${day}T00:00:00Z`);
+    if (isNaN(date.getTime())) return;
+    el.textContent = date.toLocaleDateString(undefined, {
+      weekday: "short",
+      month: "short",
+      day: "numeric",
+      timeZone: "UTC",
+    });
+  });
+
   // Convert date-only elements (for forecasts)
   const dateElements = document.querySelectorAll(".local-date[data-utc]");
 

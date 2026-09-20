@@ -6,18 +6,16 @@ use axum::{
     response::{Html, IntoResponse, Response},
 };
 use futures::stream::{self, StreamExt};
-use log::{error, info};
+use log::info;
 use serde::Deserialize;
-use time::OffsetDateTime;
-
-use std::collections::HashMap;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
     AppState, ForecastRequest, ObservationRequest, TemperatureUnit,
     events::EventStatus,
     templates::{
-        EventStats, ForecastComparison, ForecastDisplay, WeatherDisplay,
-        fragments::{event_stats, forecast_detail, oracle_info, weather_table_body},
+        EventStats, ForecastComparison, ForecastDisplay,
+        fragments::{event_stats, forecast_detail, oracle_info, weather_table_body_with_refresh},
     },
     weather_data::validate_station_id,
 };
@@ -38,6 +36,8 @@ const DEFAULT_MAJOR_AIRPORTS: &[&str] = &[
 pub struct WeatherQuery {
     pub stations: Option<String>,
     pub add_station: Option<String>,
+    pub start: Option<String>,
+    pub end: Option<String>,
 }
 
 /// Handler for oracle info fragment (GET /fragments/oracle-info)
@@ -91,116 +91,17 @@ pub async fn weather_handler(
         station_ids.push(add_station.clone());
     }
 
-    let weather = get_weather_for_stations(&state, &station_ids).await;
-    Html(weather_table_body(&weather).into_string())
-}
-
-async fn get_weather_for_stations(
-    state: &Arc<AppState>,
-    station_ids: &[String],
-) -> Vec<WeatherDisplay> {
-    if station_ids.is_empty() {
-        return Vec::new();
-    }
-
-    let mut weather_data = Vec::new();
-
-    let now = OffsetDateTime::now_utc();
-
-    // Return last 3 days of data - frontend will filter by user's local calendar day
-    // This ensures we have enough data for any timezone
-    let start = now - time::Duration::days(3);
-
-    let req = ObservationRequest {
-        start: Some(start),
-        end: Some(now),
-        station_ids: station_ids.join(","),
-        temperature_unit: TemperatureUnit::Fahrenheit,
-    };
-
-    let observations = state
-        .weather_db
-        .observation_data(&req, station_ids.to_vec())
-        .await
-        .unwrap_or_default();
-
-    // Get all stations for name lookup
-    let all_stations = state.stations().await.unwrap_or_else(|error| {
-        error!("failed to read stations: {error:#}");
-        Default::default()
-    });
-
-    for station_id in station_ids {
-        if let Some(obs) = observations.iter().find(|o| o.station_id == *station_id) {
-            let station = all_stations.iter().find(|s| s.station_id == *station_id);
-
-            weather_data.push(WeatherDisplay {
-                station_id: station_id.clone(),
-                station_name: station.map(|s| s.station_name.clone()).unwrap_or_default(),
-                state: station.map(|s| s.state.clone()).unwrap_or_default(),
-                iata_id: station.map(|s| s.iata_id.clone()).unwrap_or_default(),
-                elevation_m: station.and_then(|s| s.elevation_m),
-                temp_high: Some(obs.temp_high),
-                temp_low: Some(obs.temp_low),
-                wind_speed: obs.wind_speed,
-                wind_direction: obs.wind_direction,
-                humidity: obs.humidity,
-                rain_amt: obs.rain_amt,
-                snow_amt: obs.snow_amt,
-                observed_start: obs.start_time.clone(),
-                observed_end: obs.end_time.clone(),
-                latitude: station.map(|s| s.latitude).unwrap_or(0.0),
-                longitude: station.map(|s| s.longitude).unwrap_or(0.0),
-                forecast_high: None,
-                forecast_low: None,
-            });
-        }
-    }
-
-    // Batch-fetch yesterday's forecast for today to show accuracy
-    populate_forecast_accuracy(state, &mut weather_data).await;
-
-    weather_data
-}
-
-/// Batch-fetch yesterday's forecast for today and populate forecast_high/forecast_low
-async fn populate_forecast_accuracy(state: &Arc<AppState>, weather_data: &mut [WeatherDisplay]) {
-    if weather_data.is_empty() {
-        return;
-    }
-
-    let station_ids: Vec<String> = weather_data.iter().map(|w| w.station_id.clone()).collect();
-    let now = OffsetDateTime::now_utc();
-    let today_start = now.replace_time(time::Time::MIDNIGHT);
-    let today_end = today_start + time::Duration::days(1);
-    let yesterday_start = today_start - time::Duration::days(1);
-
-    let forecast_req = ForecastRequest {
-        start: Some(today_start),
-        end: Some(today_end),
-        generated_start: Some(yesterday_start),
-        generated_end: Some(today_start),
-        station_ids: station_ids.join(","),
-        temperature_unit: TemperatureUnit::Fahrenheit,
-    };
-
-    if let Ok(forecasts) = state
-        .weather_db
-        .forecasts_data(&forecast_req, station_ids)
-        .await
-    {
-        let forecast_map: HashMap<String, _> = forecasts
-            .into_iter()
-            .map(|f| (f.station_id.clone(), f))
-            .collect();
-
-        for weather in weather_data.iter_mut() {
-            if let Some(forecast) = forecast_map.get(&weather.station_id) {
-                weather.forecast_high = Some(forecast.temp_high);
-                weather.forecast_low = Some(forecast.temp_low);
-            }
-        }
-    }
+    let start = query
+        .start
+        .as_deref()
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok());
+    let end = query
+        .end
+        .as_deref()
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok());
+    let weather = super::weather::load_weather(&state, &station_ids, start, end).await;
+    let refresh_path = super::weather::refresh_path(&station_ids, start, end);
+    Html(weather_table_body_with_refresh(&weather, &refresh_path).into_string())
 }
 
 /// Handler for forecast detail fragment (GET /fragments/forecast/:station_id).
@@ -227,10 +128,11 @@ pub async fn forecast_handler(
 pub async fn build_forecast_html(state: &Arc<AppState>, station_id: &str) -> String {
     let now = OffsetDateTime::now_utc();
 
-    // Fetch upcoming forecasts (today + 7 days)
-    let future_end = now + time::Duration::days(7);
+    // Forecasts and comparison observations use complete UTC calendar days.
+    let today = now.replace_time(time::Time::MIDNIGHT);
+    let future_end = today + time::Duration::days(7);
     let future_req = ForecastRequest {
-        start: Some(now),
+        start: Some(today),
         end: Some(future_end),
         generated_start: None,
         generated_end: None,
@@ -244,8 +146,15 @@ pub async fn build_forecast_html(state: &Arc<AppState>, station_id: &str) -> Str
         .await
         .unwrap_or_default();
 
+    let today_key = today.date().to_string();
     let mut forecast_displays: Vec<ForecastDisplay> = forecasts
         .into_iter()
+        .filter(|forecast| {
+            forecast
+                .date
+                .get(..10)
+                .is_some_and(|date| date >= today_key.as_str())
+        })
         .map(|f| ForecastDisplay {
             date: f.date,
             temp_high: f.temp_high,
@@ -264,10 +173,10 @@ pub async fn build_forecast_html(state: &Arc<AppState>, station_id: &str) -> Str
     forecast_displays.sort_by(|a, b| a.date.cmp(&b.date));
 
     // Fetch past forecasts and daily observations in parallel (last 7 days)
-    let past_start = now - time::Duration::days(7);
+    let past_start = today - time::Duration::days(7);
     let past_req = ForecastRequest {
         start: Some(past_start),
-        end: Some(now),
+        end: Some(today),
         generated_start: Some(past_start - time::Duration::days(1)),
         generated_end: Some(now),
         station_ids: station_id.to_string(),
@@ -276,7 +185,7 @@ pub async fn build_forecast_html(state: &Arc<AppState>, station_id: &str) -> Str
 
     let obs_req = ObservationRequest {
         start: Some(past_start),
-        end: Some(now),
+        end: Some(today - time::Duration::nanoseconds(1)),
         station_ids: station_id.to_string(),
         temperature_unit: TemperatureUnit::Fahrenheit,
     };
@@ -294,10 +203,19 @@ pub async fn build_forecast_html(state: &Arc<AppState>, station_id: &str) -> Str
     let daily_obs = daily_obs.unwrap_or_default();
 
     // Build comparison data by matching forecast dates to observation dates
+    let past_key = past_start.date().to_string();
     let mut comparisons: Vec<ForecastComparison> = past_forecasts
         .into_iter()
+        .filter(|forecast| {
+            forecast
+                .date
+                .get(..10)
+                .is_some_and(|date| date >= past_key.as_str() && date < today_key.as_str())
+        })
         .map(|f| {
-            let obs = daily_obs.iter().find(|o| o.date == f.date);
+            let obs = daily_obs
+                .iter()
+                .find(|o| o.date.get(..10) == f.date.get(..10));
             ForecastComparison {
                 date: f.date,
                 forecast_high: f.temp_high,
