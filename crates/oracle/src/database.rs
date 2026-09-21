@@ -453,6 +453,52 @@ impl Database {
             .collect()
     }
 
+    /// Takes or renews the lease on `name` for `ttl`. False while another
+    /// process holds it; an expired or released lease passes to `holder`.
+    pub async fn take_lease(
+        &self,
+        name: &str,
+        holder: &str,
+        ttl: std::time::Duration,
+    ) -> Result<bool, WriteError> {
+        let (name, holder) = (name.to_owned(), holder.to_owned());
+        let now = unix_millis();
+        let expires_at = now.saturating_add(ttl.as_millis() as i64);
+        self.write_waiting(move |connection| {
+            Box::pin(async move {
+                let result = sqlx::query(
+                    "INSERT INTO leases (name, holder, expires_at) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (name) DO UPDATE SET holder = excluded.holder, expires_at = excluded.expires_at
+                     WHERE leases.holder = excluded.holder OR leases.expires_at <= ?4",
+                )
+                .bind(name)
+                .bind(holder)
+                .bind(expires_at)
+                .bind(now)
+                .execute(connection)
+                .await?;
+                Ok(result.rows_affected() == 1)
+            })
+        })
+        .await
+    }
+
+    /// Hands the lease on `name` over at once, if `holder` holds it.
+    pub async fn release_lease(&self, name: &str, holder: &str) -> Result<(), WriteError> {
+        let (name, holder) = (name.to_owned(), holder.to_owned());
+        self.write_waiting(move |connection| {
+            Box::pin(async move {
+                sqlx::query("UPDATE leases SET expires_at = 0 WHERE name = ? AND holder = ?")
+                    .bind(name)
+                    .bind(holder)
+                    .execute(connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
     /// Stores the attestation unless the event already has one. Returns
     /// whether it was stored. Never overwriting is what guarantees one
     /// signature per nonce.
@@ -751,3 +797,10 @@ fn json_column<T: DeserializeOwned>(row: &SqliteRow, column: &str) -> Result<T, 
 
 #[cfg(test)]
 mod tests;
+
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}

@@ -421,3 +421,53 @@ async fn oracle_metadata_is_stored_once() {
     shutdown.cancel();
     bounded(task).await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn one_oracle_process_runs_processing_until_it_hands_over() {
+    let directory = tempfile::tempdir().unwrap();
+    let (blue, blue_writer) = bounded(Database::open(directory.path())).await.unwrap();
+    let (green, green_writer) = bounded(Database::open(directory.path())).await.unwrap();
+    let (blue_shutdown, blue_task) = start(blue_writer);
+    let (green_shutdown, green_task) = start(green_writer);
+    let ttl = Duration::from_secs(900);
+
+    assert!(bounded(blue.take_lease("etl", "blue", ttl)).await.unwrap());
+    assert!(
+        !bounded(green.take_lease("etl", "green", ttl))
+            .await
+            .unwrap()
+    );
+    assert!(
+        bounded(blue.take_lease("etl", "blue", ttl)).await.unwrap(),
+        "the holder renews"
+    );
+
+    // A stopping process hands over at once.
+    bounded(blue.release_lease("etl", "blue")).await.unwrap();
+    assert!(
+        bounded(green.take_lease("etl", "green", ttl))
+            .await
+            .unwrap()
+    );
+    assert!(!bounded(blue.take_lease("etl", "blue", ttl)).await.unwrap());
+
+    // A holder that stops renewing loses the lease when it expires.
+    bounded(green.release_lease("etl", "green")).await.unwrap();
+    let short = Duration::from_millis(50);
+    assert!(
+        bounded(blue.take_lease("etl", "blue", short))
+            .await
+            .unwrap()
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        bounded(green.take_lease("etl", "green", ttl))
+            .await
+            .unwrap()
+    );
+
+    blue_shutdown.cancel();
+    green_shutdown.cancel();
+    bounded(blue_task).await.unwrap().unwrap();
+    bounded(green_task).await.unwrap().unwrap();
+}
