@@ -127,6 +127,14 @@
     line-height: 1.2;
 }
 
+.stat-card .stat-value.stat-running {
+    color: #8a5a00; /* Dark amber: readable on the light card */
+}
+
+[data-theme="dark"] .stat-card .stat-value.stat-running {
+    color: #fbbf24; /* Bright amber: readable on the dark card */
+}
+
 .stat-card .stat-label {
     font-size: 0.875rem;
     color: var(--bulma-text-weak);
