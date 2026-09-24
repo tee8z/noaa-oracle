@@ -137,10 +137,12 @@
           nativeBuildInputs = buildDeps;
           cargoExtraArgs = "--bin oracle";
 
-          # The binary embeds its UI; only the example configuration is installed.
+          # Keep the static directory expected by existing rollout preflight
+          # checks. Assets themselves are embedded in the binary.
           postInstall = ''
-            mkdir -p $out/share/noaa-oracle
+            mkdir -p $out/share/noaa-oracle/static
             cp -r config $out/share/noaa-oracle/
+            echo 'UI assets are embedded in bin/oracle.' > $out/share/noaa-oracle/static/.embedded
           '';
 
           # The binary loads DuckDB and the C++ runtime dynamically. Record
