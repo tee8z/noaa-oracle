@@ -111,6 +111,20 @@ body {
     color: var(--muted);
 }
 
+/* A value's label in a list row: read by screen readers everywhere, shown
+   on phones (each list's stylesheet), where the column headers are gone. */
+.cell-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}
+
 code.key {
     color: var(--key);
     word-break: break-all;

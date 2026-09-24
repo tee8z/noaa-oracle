@@ -117,11 +117,18 @@ a.ev-row:focus-visible {
     .ev-row > .ev-num:nth-last-child(2) { grid-area: entries; text-align: left; }
     .ev-row > .ev-num:last-child { grid-area: places; }
 
-    .ev-row > [data-label]::before {
-        content: attr(data-label) ": ";
+    .ev-row .cell-label {
+        position: static;
+        width: auto;
+        height: auto;
+        margin: 0;
+        overflow: visible;
+        clip: auto;
+        white-space: normal;
         color: var(--muted);
         font-size: 0.75rem;
     }
+
 }
 
 .ev-pages {

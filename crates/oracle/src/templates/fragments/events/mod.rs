@@ -178,6 +178,7 @@ pub fn events_list(page: &EventsPage) -> Markup {
                     }
                 }
             } @else {
+                // Visual only: every value carries its own label.
                 div class="ev-row ev-header" aria-hidden="true" {
                     span { "Event" }
                     span { "Locations" }
@@ -217,20 +218,35 @@ fn event_row(event: &EventView, now: OffsetDateTime) -> Markup {
     let href = format!("/events/{}", event.id);
     html! {
         a class="ev-row" href=(href) hx-get=(href) hx-target="#main-content" hx-push-url="true" {
-            span class="ev-id" { code title=(event.id) { (event.id.get(..8).unwrap_or(&event.id)) } }
+            span class="ev-id" {
+                span class="is-sr-only" { "Event " }
+                code title=(event.id) { (event.id.get(..8).unwrap_or(&event.id)) }
+            }
             span class="ev-locations" {
+                span class="is-sr-only" { "Locations " }
                 @for location in &event.locations { span class="tag" { (location) } " " }
             }
             span class="ev-status" {
+                span class="is-sr-only" { "Status " }
                 (status_tag(event.status))
                 @if event.is_test() { " " span class="tag is-light" { "Test" } }
             }
-            span class="ev-window" data-label="Window" {
+            span class="ev-window" {
+                span class="cell-label" { "Window: " }
                 (when::window(event.start_observation, event.end_observation))
             }
-            span class="ev-signing" data-label="Signing" { (when::relative(event.signing_date, now)) }
-            span class="ev-num" data-label="Entries" { (event.total_entries) " / " (event.total_allowed_entries) }
-            span class="ev-num" data-label="Paid places" { (event.number_of_places_win) }
+            span class="ev-signing" {
+                span class="cell-label" { "Signing: " }
+                (when::relative(event.signing_date, now))
+            }
+            span class="ev-num" {
+                span class="cell-label" { "Entries: " }
+                (event.total_entries) " / " (event.total_allowed_entries)
+            }
+            span class="ev-num" {
+                span class="cell-label" { "Paid places: " }
+                (event.number_of_places_win)
+            }
         }
     }
 }

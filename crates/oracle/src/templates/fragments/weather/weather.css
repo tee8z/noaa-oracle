@@ -194,8 +194,14 @@
         display: none;
     }
 
-    .wx-row > span[data-label]:not(.wx-latest)::before {
-        content: attr(data-label);
+    .wx-row .cell-label {
+        position: static;
+        width: auto;
+        height: auto;
+        margin: 0;
+        overflow: visible;
+        clip: auto;
+        white-space: normal;
         display: block;
         font-size: 0.65rem;
         text-transform: uppercase;

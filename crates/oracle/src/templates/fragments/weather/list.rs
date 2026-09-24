@@ -86,6 +86,8 @@ pub fn weather_list(weather: &[WeatherDisplay], context: &WeatherContext) -> Mar
             } @else if shown.is_empty() {
                 p class="wx-empty" { "No station in this list matches “" (context.query.trim()) "”." }
             } @else {
+                // Visual only: every value carries its own label, which
+                // screen readers read and phones show.
                 div class="wx-row wx-header" aria-hidden="true" {
                     span class="wx-name" { "Station" }
                     span class="wx-latest" { "Latest" }
@@ -161,27 +163,32 @@ fn station_row(weather: &WeatherDisplay, context: &WeatherContext) -> Markup {
             hx-target="find .wx-forecast" {
             summary class="wx-row" title=(observed) {
                 span class="wx-name" {
+                    span class="is-sr-only" { "Station " }
                     strong { (weather.station_id) }
                     @if !weather.iata_id.is_empty() {
                         " " span class="tag is-iata" { (weather.iata_id) }
                     }
                     span class="wx-place" { (place(weather)) }
                 }
-                span class="wx-latest" data-label="Latest" {
+                span class="wx-latest" {
+                    span class="is-sr-only" { "Latest " }
                     (values::temperature(weather.latest_temp, ""))
                     @if let Some(time) = weather.latest_temp_time.as_deref().and_then(when::parse) {
                         " " span class="wx-when" { (when::relative(time, context.now)) }
                     }
                 }
-                span class="wx-high" data-label="High" {
+                span class="wx-high" {
+                    span class="cell-label" { "High " }
                     (values::temperature(weather.temp_high, "temp-high"))
                     " " (values::difference(weather.temp_high, forecast_high, "°F", settled))
                 }
-                span class="wx-low" data-label="Low" {
+                span class="wx-low" {
+                    span class="cell-label" { "Low " }
                     (values::temperature(weather.temp_low, "temp-low"))
                     " " (values::difference(weather.temp_low, forecast_low, "°F", settled))
                 }
-                span class="wx-fcst" data-label="Forecast" {
+                span class="wx-fcst" {
+                    span class="cell-label" { "Forecast " }
                     @if forecast_high.is_none() && forecast_low.is_none() {
                         (values::missing())
                     } @else {
@@ -190,10 +197,22 @@ fn station_row(weather: &WeatherDisplay, context: &WeatherContext) -> Markup {
                         (values::temperature(forecast_low, "temp-low"))
                     }
                 }
-                span class="wx-wind" data-label="Wind" { (values::wind(weather.wind_speed, weather.wind_direction)) }
-                span class="wx-humidity" data-label="Humidity" { (values::percent(weather.humidity)) }
-                span class="wx-rain" data-label="Precip" { (values::precipitation(weather.rain_amt, "rain", 2)) }
-                span class="wx-snow" data-label="Snow" { (values::precipitation(weather.snow_amt, "snow", 2)) }
+                span class="wx-wind" {
+                    span class="cell-label" { "Wind " }
+                    (values::wind(weather.wind_speed, weather.wind_direction))
+                }
+                span class="wx-humidity" {
+                    span class="cell-label" { "Humidity " }
+                    (values::percent(weather.humidity))
+                }
+                span class="wx-rain" {
+                    span class="cell-label" { "Precip " }
+                    (values::precipitation(weather.rain_amt, "rain", 2))
+                }
+                span class="wx-snow" {
+                    span class="cell-label" { "Snow " }
+                    (values::precipitation(weather.snow_amt, "snow", 2))
+                }
             }
             div class="wx-forecast"
                 data-load-error="Couldn't load the forecast and history." {

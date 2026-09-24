@@ -263,7 +263,7 @@ async fn multi_day_selection_does_not_compare_against_a_single_day_forecast() {
     assert!(html.contains("55°F"));
     assert!(!html.contains("+0°F"));
     let forecast_cell = html
-        .split_once("wx-fcst\" data-label=\"Forecast\">")
+        .split_once("class=\"wx-fcst\"><span class=\"cell-label\">Forecast </span>")
         .unwrap()
         .1
         .split_once("</span></span>")
