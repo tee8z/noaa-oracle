@@ -117,8 +117,6 @@ config:
   dataDir: /var/lib/noaa-oracle/weather
   # Event database directory (SQLite)
   eventDb: /var/lib/noaa-oracle/events
-  # UI static files
-  uiDir: /usr/share/noaa-oracle/ui
   # Private key path for signing (mounted with mode 0400)
   privateKeyPath: /etc/noaa-oracle/keys/oracle.pem
   # Seconds between scheduled scoring and signing passes

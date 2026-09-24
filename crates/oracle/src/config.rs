@@ -64,8 +64,8 @@ pub struct Cli {
     #[arg(short, long, env = "NOAA_ORACLE_EVENT_DB")]
     pub event_db: Option<PathBuf>,
 
-    /// Directory containing UI static files
-    #[arg(short, long, env = "NOAA_ORACLE_UI_DIR")]
+    /// Ignored: the binary embeds its UI. Accepted so older settings still load.
+    #[arg(short, long, env = "NOAA_ORACLE_UI_DIR", hide = true)]
     pub ui_dir: Option<PathBuf>,
 
     /// Path to the oracle signing key (secp256k1, PEM, mode 0600)
@@ -108,7 +108,6 @@ pub struct Configuration {
     pub remote_url: String,
     pub weather_dir: PathBuf,
     pub event_dir: PathBuf,
-    pub static_dir: PathBuf,
     pub private_key: PathBuf,
     pub coordinators: Vec<PublicKey>,
     pub uploaders: Vec<PublicKey>,
@@ -211,11 +210,6 @@ impl Cli {
                 .event_db
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("./event_data")),
-            // Fall back to the compile-time path where build.rs writes assets.
-            static_dir: self
-                .ui_dir
-                .clone()
-                .unwrap_or_else(|| PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/static"))),
             private_key: self
                 .oracle_private_key
                 .clone()

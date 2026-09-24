@@ -17,7 +17,6 @@ data:
     {{- end }}
     data_dir = {{ .Values.config.dataDir | quote }}
     event_db = {{ .Values.config.eventDb | quote }}
-    ui_dir = {{ .Values.config.uiDir | quote }}
     private_key_path = {{ .Values.config.privateKeyPath | quote }}
     etl_interval = {{ .Values.config.etlInterval | int }}
     coordinator_pubkeys = {{ .Values.config.coordinatorPubkeys | toJson }}

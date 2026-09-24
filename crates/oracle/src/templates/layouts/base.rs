@@ -1,6 +1,9 @@
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
-use crate::templates::components::{tabs, theme_toggle};
+use crate::templates::{
+    assets,
+    components::{tabs, theme_toggle},
+};
 
 pub struct PageConfig<'a> {
     pub title: &'a str,
@@ -23,9 +26,9 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
                 meta name="viewport" content="width=device-width, initial-scale=1.0";
                 title { (config.title) }
                 link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@1.0.4/css/bulma.min.css";
-                link rel="stylesheet" href="/static/styles.min.css";
+                link rel="stylesheet" href=(assets::CSS_URL);
                 script defer src="https://cdn.jsdelivr.net/npm/htmx.org@1.9.10/dist/htmx.min.js" {}
-                script defer src="/static/app.min.js" {}
+                script defer src=(assets::JS_URL) {}
                 // Apply the saved theme before the page paints.
                 script { (PreEscaped(THEME_INIT_SCRIPT)) }
             }

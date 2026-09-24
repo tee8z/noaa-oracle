@@ -118,7 +118,6 @@ pub async fn spawn_app_at(weather_db: Arc<dyn WeatherData>, origin: &str) -> Tes
     let weather_dir = directory.path().join("weather_data");
     let state = Arc::new(AppState::new(AppParts {
         remote_url: origin.into(),
-        static_dir: PathBuf::from("./static"),
         weather_dir: weather_dir.clone(),
         auth: AuthPolicy::new(
             origin,
