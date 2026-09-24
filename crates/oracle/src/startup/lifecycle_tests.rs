@@ -11,6 +11,134 @@ use std::{
 use tokio::sync::Notify;
 use uuid::Uuid;
 
+#[derive(Default)]
+struct ControlledPreparation {
+    started: Notify,
+    release: Notify,
+    passes: std::sync::atomic::AtomicUsize,
+    fail: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl WeatherData for ControlledPreparation {
+    async fn forecasts_data(
+        &self,
+        _: &crate::ForecastRequest,
+        _: Vec<String>,
+    ) -> Result<Vec<crate::Forecast>, weather_data::Error> {
+        Ok(vec![])
+    }
+
+    async fn observation_data(
+        &self,
+        _: &crate::ObservationRequest,
+        _: Vec<String>,
+    ) -> Result<Vec<crate::Observation>, weather_data::Error> {
+        Ok(vec![])
+    }
+
+    async fn daily_observations(
+        &self,
+        _: &crate::ObservationRequest,
+        _: Vec<String>,
+    ) -> Result<Vec<crate::DailyObservation>, weather_data::Error> {
+        Ok(vec![])
+    }
+
+    async fn stations(&self) -> Result<Vec<Station>, weather_data::Error> {
+        Ok(vec![])
+    }
+
+    async fn prepare_files(
+        &self,
+        stopping: &CancellationToken,
+    ) -> Result<usize, weather_data::Error> {
+        self.passes.fetch_add(1, Ordering::AcqRel);
+        self.started.notify_one();
+        tokio::select! {
+            () = self.release.notified() => {},
+            () = stopping.cancelled() => {},
+        }
+        if self.fail.load(Ordering::Acquire) {
+            Err(weather_data::Error::Schema {
+                column: "fixture",
+                expected: "readable weather files",
+            })
+        } else {
+            Ok(0)
+        }
+    }
+}
+
+async fn preparation_state(
+    directory: &Path,
+    runtime: &ApplicationRuntime,
+    weather: Arc<ControlledPreparation>,
+) -> Arc<AppState> {
+    let oracle = Oracle::new(
+        runtime.database.clone(),
+        Sources::new(Arc::new(NoaaWeather::new(weather.clone())), []),
+        &directory.join("oracle.pem"),
+        system_clock(),
+    )
+    .await
+    .unwrap();
+    Arc::new(AppState::new(AppParts {
+        remote_url: "http://localhost".into(),
+        weather_dir: directory.into(),
+        auth: AuthPolicy::new("http://localhost", [], []),
+        file_access: Arc::new(FileAccess::new(directory.to_string_lossy().into_owned())),
+        weather_db: weather,
+        oracle: Arc::new(oracle),
+        database: runtime.database.clone(),
+        background: runtime.background.clone(),
+    }))
+}
+
+#[tokio::test]
+async fn startup_waits_for_preparation_and_recovers_from_a_preparation_error() {
+    for fails in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut runtime, _) = runtime(directory.path()).await;
+        let weather = Arc::new(ControlledPreparation::default());
+        weather.fail.store(fails, Ordering::Release);
+        let state = preparation_state(directory.path(), &runtime, weather.clone()).await;
+        let preparing = tokio::spawn(async move {
+            prepare_weather_before_serving(&state, TEST_TIMEOUT).await;
+        });
+        bounded(weather.started.notified()).await;
+        assert!(
+            !preparing.is_finished(),
+            "readiness waits for the first pass"
+        );
+        weather.release.notify_one();
+        bounded(preparing).await.unwrap();
+        assert_eq!(weather.passes.load(Ordering::Acquire), 1);
+        bounded(runtime.shutdown()).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn startup_deadline_keeps_one_preparation_worker_and_does_not_lose_uploads() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut runtime, _) = runtime(directory.path()).await;
+    let weather = Arc::new(ControlledPreparation::default());
+    let state = preparation_state(directory.path(), &runtime, weather.clone()).await;
+    bounded(prepare_weather_before_serving(
+        &state,
+        Duration::from_millis(10),
+    ))
+    .await;
+    bounded(weather.started.notified()).await;
+    assert_eq!(weather.passes.load(Ordering::Acquire), 1);
+    state.file_added();
+    weather.release.notify_one();
+    bounded(weather.started.notified()).await;
+    assert_eq!(weather.passes.load(Ordering::Acquire), 2);
+    // Shutdown cancels the same tracked worker, including its pending pass.
+    bounded(runtime.shutdown()).await.unwrap();
+}
+
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn bounded<T>(future: impl Future<Output = T>) -> T {

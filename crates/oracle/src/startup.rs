@@ -72,6 +72,10 @@ const MAX_CACHED_FORECASTS: usize = 4_096;
 /// How often derived forecast files are checked for, besides after each
 /// upload: catches files added by another oracle process.
 const PREPARE_FILES_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// Leave room in the deployment's ten minute readiness window for opening
+/// dependencies. A larger or slower archive continues preparing in the
+/// background, with exact queries falling back to published files.
+const STARTUP_WEATHER_BUDGET: Duration = Duration::from_secs(9 * 60);
 
 type TaskResult = Result<Result<()>, JoinError>;
 
@@ -575,6 +579,7 @@ impl ApplicationRuntime {
                     )
                 })?;
             let state = build_app_state(configuration, database, background).await?;
+            prepare_weather_before_serving(&state, STARTUP_WEATHER_BUDGET).await;
             let listener = TcpListener::bind(configuration.listen)
                 .await
                 .with_context(|| format!("bind HTTP listener {}", configuration.listen))?;
@@ -600,7 +605,6 @@ impl ApplicationRuntime {
                 return first_failure(result.map(|_| ()), cleanup).map(|()| None);
             }
         };
-        spawn_file_preparation(&state);
         spawn_cache_warmer(&state);
         spawn_etl_schedule(&state, configuration.etl_interval);
         spawn_lease_release(&state);
@@ -699,10 +703,8 @@ fn spawn_cache_warmer(state: &Arc<AppState>) {
     let state = state.clone();
     let stopping = state.background.stopping.clone();
     state.background.tasks.clone().spawn(async move {
-        if let Err(error) = state.stations().await {
-            warn!("cannot read the station list: {error}");
-        }
-        warm_forecast_cache(&state).await;
+        // Prepared files make uncached station details fast. Let the first
+        // visitors use the query slots before periodic fragment warming starts.
         let mut interval = tokio::time::interval(FORECAST_CACHE_REFRESH);
         interval.tick().await; // the first tick completes immediately
         loop {
@@ -721,13 +723,18 @@ fn spawn_cache_warmer(state: &Arc<AppState>) {
 /// Makes derived copies of new forecast files: at start, after each
 /// upload, and every [`PREPARE_FILES_INTERVAL`]. Stops between files on
 /// shutdown.
-fn spawn_file_preparation(state: &Arc<AppState>) {
+fn spawn_file_preparation(state: &Arc<AppState>) -> tokio::sync::oneshot::Receiver<()> {
     let state = state.clone();
     let stopping = state.background.stopping.clone();
+    let (prepared, ready) = tokio::sync::oneshot::channel();
     state.background.tasks.clone().spawn(async move {
+        let mut prepared = Some(prepared);
         loop {
             if let Err(error) = state.weather_db.prepare_files(&stopping).await {
                 warn!("cannot prepare weather files for queries: {error}");
+            }
+            if let Some(prepared) = prepared.take() {
+                let _ = prepared.send(());
             }
             tokio::select! {
                 biased;
@@ -737,6 +744,33 @@ fn spawn_file_preparation(state: &Arc<AppState>) {
             }
         }
     });
+    ready
+}
+
+/// Prepare only the active forecast window and preload station metadata before
+/// accepting visitors. The tracked worker survives the deadline, so timing out
+/// does not start a second compaction or abandon an in-flight file write.
+async fn prepare_weather_before_serving(state: &Arc<AppState>, budget: Duration) {
+    let started = std::time::Instant::now();
+    let prepared = spawn_file_preparation(state);
+    let preparation = async {
+        if let Err(error) = state.stations().await {
+            warn!("cannot preload the station list: {error}");
+        }
+        if prepared.await.is_err() {
+            warn!("weather preparation stopped before its first pass completed");
+        }
+    };
+    if tokio::time::timeout(budget, preparation).await.is_err() {
+        warn!(
+            "weather startup preparation exceeded {}s; continuing in the background with published-file fallback",
+            budget.as_secs_f64()
+        );
+    }
+    info!(
+        "weather startup preparation took {:.3}s",
+        started.elapsed().as_secs_f64()
+    );
 }
 
 /// On shutdown, hands processing over to another oracle process at once. The

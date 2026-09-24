@@ -1,8 +1,9 @@
 //! Weather queries over parquet files with an in-process DuckDB connection.
 //!
-//! Every query opens a fresh in-memory connection on a blocking thread, so
-//! queries never stall the async runtime and share no state. A semaphore
-//! bounds how many run at once, and each connection has memory and thread
+//! Queries use a bounded pool of in-memory connections on blocking threads.
+//! Reusing a connection preserves immutable Parquet metadata between requests.
+//! A semaphore bounds concurrent work, including cancelled requests whose
+//! blocking work has not finished, and each connection has memory and thread
 //! limits. Station ids and file names are validated before they are
 //! interpolated into SQL.
 //!
@@ -23,7 +24,11 @@ use duckdb::{
 };
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 use time::{Duration, OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -109,6 +114,7 @@ const QUERY_THREADS: usize = 2;
 pub struct WeatherAccess {
     file_access: Arc<dyn FileData>,
     slots: Arc<Semaphore>,
+    connections: Arc<Mutex<Vec<Connection>>>,
     derived: Option<DerivedForecasts>,
 }
 
@@ -351,11 +357,12 @@ fn source_forecast_rows_sql(files: &[String], filter: &str) -> String {
 struct ForecastFiles {
     derived: Vec<String>,
     source: Vec<String>,
+    compacted: Vec<derived::CompactSelection>,
 }
 
 impl ForecastFiles {
     fn is_empty(&self) -> bool {
-        self.derived.is_empty() && self.source.is_empty()
+        self.derived.is_empty() && self.source.is_empty() && self.compacted.is_empty()
     }
 }
 
@@ -428,6 +435,15 @@ fn forecasts_sql(
     let times = conditions.join(" AND ");
 
     let mut branches = Vec::new();
+    for selected in &files.compacted {
+        let stations = stations
+            .map(|condition| format!("{condition} AND "))
+            .unwrap_or_default();
+        branches.push(format!(
+            "SELECT {FORECAST_ROW_COLUMNS} FROM read_parquet([{}], hive_partitioning = false) WHERE {stations}{times} AND source IN ({})",
+            sql_string_list(&selected.paths), sql_string_list(&selected.sources)
+        ));
+    }
     if !files.derived.is_empty() {
         let stations = stations
             .map(|condition| format!("{condition} AND "))
@@ -595,6 +611,7 @@ impl WeatherAccess {
         Self {
             file_access,
             slots: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
+            connections: Arc::new(Mutex::new(Vec::new())),
             derived: None,
         }
     }
@@ -610,9 +627,19 @@ impl WeatherAccess {
 
     /// The derived copy of each forecast file where one exists, and the
     /// published file where not.
-    fn forecast_files(&self, file_names: Vec<String>) -> ForecastFiles {
+    fn forecast_files(&self, file_names: Vec<String>, stations: &[String]) -> ForecastFiles {
         let mut files = ForecastFiles::default();
+        let covered = if let Some(derived) = &self.derived {
+            let (compacted, covered) = derived.compact_files(&file_names, stations);
+            files.compacted = compacted;
+            covered
+        } else {
+            Default::default()
+        };
         for name in file_names {
+            if covered.contains(&name) {
+                continue;
+            }
             let Ok(file) = ParquetFileName::parse(&name) else {
                 continue;
             };
@@ -639,19 +666,45 @@ impl WeatherAccess {
             })
     }
 
-    /// Runs `sql` on a fresh connection off the async runtime and decodes
-    /// the result there too.
+    /// Runs and decodes `sql` off the async runtime. The connection and
+    /// concurrency permit remain owned by the blocking task if its caller
+    /// is cancelled.
     async fn query<T: Send + 'static>(
         &self,
         sql: String,
         decode: impl FnOnce(&[RecordBatch]) -> Result<Vec<T>, Error> + Send + 'static,
     ) -> Result<Vec<T>, Error> {
-        let _slot = self.slot().await?;
+        let slot = self.slot().await?;
+        let connections = self.connections.clone();
         tokio::task::spawn_blocking(move || {
-            let connection = open_connection()?;
-            let mut statement = connection.prepare(&sql)?;
-            let batches: Vec<RecordBatch> = statement.query_arrow([])?.collect();
-            decode(&batches)
+            let _slot = slot;
+            let started = Instant::now();
+            let connection = connections.lock().unwrap_or_else(|p| p.into_inner()).pop();
+            let connection = match connection {
+                Some(connection) => connection,
+                None => open_connection()?,
+            };
+            let acquired = started.elapsed();
+            let result = (|| {
+                let mut statement = connection.prepare(&sql)?;
+                let prepared = started.elapsed();
+                let batches: Vec<RecordBatch> = statement.query_arrow([])?.collect();
+                let executed = started.elapsed();
+                let rows = decode(&batches)?;
+                debug!(
+                    "weather query: reader={:.1}ms prepare={:.1}ms execute={:.1}ms total={:.1}ms",
+                    acquired.as_secs_f64() * 1000.0,
+                    (prepared - acquired).as_secs_f64() * 1000.0,
+                    (executed - prepared).as_secs_f64() * 1000.0,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+                Ok(rows)
+            })();
+            connections
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(connection);
+            result
         })
         .await?
     }
@@ -662,7 +715,7 @@ fn open_connection() -> Result<Connection, duckdb::Error> {
     let connection = Connection::open_in_memory()?;
     connection.execute_batch(&format!(
         "SET memory_limit = '{QUERY_MEMORY_LIMIT}'; SET threads = {QUERY_THREADS};
-         INSTALL parquet; LOAD parquet;"
+         INSTALL parquet; LOAD parquet; SET parquet_metadata_cache = true;"
     ))?;
     Ok(connection)
 }
@@ -703,7 +756,7 @@ impl WeatherData for WeatherAccess {
             return Ok(vec![]);
         }
         let parquet_files = self.file_access.grab_file_names(file_params).await?;
-        let files = self.forecast_files(parquet_files);
+        let files = self.forecast_files(parquet_files, &station_ids);
         if files.is_empty() {
             return Ok(vec![]);
         }
@@ -1038,7 +1091,7 @@ impl WeatherData for WeatherAccess {
         };
         let now = OffsetDateTime::now_utc();
         let oldest = now - DERIVED_WINDOW;
-        let mut files: Vec<ParquetFileName> = self
+        let all_files: Vec<ParquetFileName> = self
             .file_access
             .grab_file_names(FileParams {
                 start: Some(oldest),
@@ -1049,7 +1102,11 @@ impl WeatherData for WeatherAccess {
             .await?
             .iter()
             .filter_map(|name| ParquetFileName::parse(name).ok())
+            .collect();
+        let mut files: Vec<_> = all_files
+            .iter()
             .filter(|file| derived.missing(file))
+            .cloned()
             .collect();
         // Newest first: current pages read the newest files.
         files.sort_by_key(|file| std::cmp::Reverse(file.generated_at));
@@ -1058,14 +1115,33 @@ impl WeatherData for WeatherAccess {
             if stopping.is_cancelled() {
                 break;
             }
-            let _slot = self.slot().await?;
+            let slot = self.slot().await?;
             let source = self.file_access.build_file_path(&file);
             let derived = derived.clone();
-            let copied =
-                tokio::task::spawn_blocking(move || derived.copy(&file, &source)).await??;
+            let copied = tokio::task::spawn_blocking(move || {
+                let _slot = slot;
+                derived.copy(&file, &source)
+            })
+            .await??;
             if copied == derived::Copied::Made {
                 made += 1;
             }
+        }
+        let mut days = std::collections::BTreeMap::<_, Vec<_>>::new();
+        for file in all_files {
+            days.entry(file.generated_at.date()).or_default().push(file);
+        }
+        for (_, files) in days.into_iter().rev() {
+            if stopping.is_cancelled() {
+                break;
+            }
+            let derived = derived.clone();
+            let slot = self.slot().await?;
+            tokio::task::spawn_blocking(move || {
+                let _slot = slot;
+                derived.compact_day(&files)
+            })
+            .await??;
         }
         let derived = derived.clone();
         let oldest = oldest.to_offset(UtcOffset::UTC).date().previous_day();
@@ -2529,7 +2605,7 @@ mod tests {
         );
         assert_eq!(
             derived
-                .forecast_files(copied.iter().map(|(name, _)| name.clone()).collect())
+                .forecast_files(copied.iter().map(|(name, _)| name.clone()).collect(), &[])
                 .source,
             Vec::<String>::new(),
             "every file is read from its copy"
@@ -2568,6 +2644,134 @@ mod tests {
                 &from_copies,
                 &format!("derived files: {context}"),
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn compacted_forecasts_preserve_partial_publications_and_uncovered_files() {
+        let row = |high| {
+            format!(
+                "SELECT 'KTEST' AS station_id, '2026-01-17T00:00:00Z' AS begin_time,
+                    '2026-01-18T00:00:00Z' AS end_time, '2026-01-16T10:00:00Z' AS generated_at,
+                    30::BIGINT AS min_temp, {high}::BIGINT AS max_temp,
+                    'fahrenheit' AS temperature_unit_code"
+            )
+        };
+        let directory = data_dir(&[
+            ("forecasts_2026-01-17T10:05:00Z.parquet", &row(60)),
+            ("forecasts_2026-01-17T11:05:00Z.parquet", &row(90)),
+            ("forecasts_2026-01-17T12:05:00Z.parquet", &row(100)),
+        ]);
+        let published = access(&directory);
+        let compacted = derived_access(&directory);
+        let mut copied = derive_all(&compacted).await;
+        copied.sort_by(|a, b| a.0.cmp(&b.0));
+        let ready: Vec<_> = copied[..2]
+            .iter()
+            .map(|(name, _)| ParquetFileName::parse(name).unwrap())
+            .collect();
+        let copies = compacted.derived.as_ref().unwrap();
+        assert!(copies.compact_day(&ready).unwrap());
+        assert!(
+            !copies.compact_day(&ready).unwrap(),
+            "unchanged days are not rewritten"
+        );
+        let selected =
+            compacted.forecast_files(copied.iter().map(|(name, _)| name.clone()).collect(), &[]);
+        assert_eq!(selected.compacted.len(), 1);
+        assert_eq!(
+            selected.derived.len(),
+            1,
+            "a new publication outside the manifest still loads"
+        );
+        for (cutoff, expected) in [("10:30", 60), ("11:30", 90), ("12:30", 100)] {
+            let request = ForecastRequest {
+                start: Some(time::macros::datetime!(2026-01-17 00:00 UTC)),
+                end: Some(time::macros::datetime!(2026-01-18 00:00 UTC)),
+                generated_start: Some(time::macros::datetime!(2026-01-16 00:00 UTC)),
+                generated_end: Some(
+                    OffsetDateTime::parse(&format!("2026-01-16T{cutoff}:00Z"), &Rfc3339).unwrap(),
+                ),
+                station_ids: "KTEST".into(),
+                temperature_unit: TemperatureUnit::Fahrenheit,
+            };
+            let original = published
+                .forecasts_data(&request, request.station_ids())
+                .await
+                .unwrap();
+            let actual = compacted
+                .forecasts_data(&request, request.station_ids())
+                .await
+                .unwrap();
+            assert_eq!(
+                actual[0].temp_high, expected,
+                "publication grace cutoff {cutoff}"
+            );
+            assert_same_forecasts(&original, &actual, cutoff);
+        }
+        // Retired files stay readable for requests that selected the previous
+        // manifest, even when that file was created long before its retirement.
+        let old_path = selected.compacted[0].paths[0]
+            .split("/bucket=")
+            .next()
+            .unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::File::open(old_path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let all: Vec<_> = copied
+            .iter()
+            .map(|(name, _)| ParquetFileName::parse(name).unwrap())
+            .collect();
+        assert!(copies.compact_day(&all).unwrap());
+        copies.prune(time::macros::date!(2026 - 01 - 16)).unwrap();
+        assert!(
+            Path::new(old_path).is_dir(),
+            "retirement grace starts at manifest replacement"
+        );
+        std::fs::File::open(old_path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        copies.prune(time::macros::date!(2026 - 01 - 16)).unwrap();
+        assert!(
+            !Path::new(old_path).exists(),
+            "retired files are eventually reclaimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn compacted_forecasts_match_originals_across_issue_windows_and_units() {
+        let directory = forecast_data_dir();
+        let published = access(&directory);
+        let compacted = derived_access(&directory);
+        let copied = derive_all(&compacted).await;
+        let mut days = std::collections::BTreeMap::<_, Vec<_>>::new();
+        for (name, _) in copied {
+            let file = ParquetFileName::parse(&name).unwrap();
+            days.entry(file.generated_at.date()).or_default().push(file);
+        }
+        for files in days.values() {
+            compacted
+                .derived
+                .as_ref()
+                .unwrap()
+                .compact_day(files)
+                .unwrap();
+        }
+        for (request, station_ids) in fixture_forecast_requests() {
+            for days in [UtcOffset::UTC, UtcOffset::from_hms(-5, 0, 0).unwrap()] {
+                let expected = published
+                    .local_forecasts(&request, station_ids.clone(), days)
+                    .await
+                    .unwrap();
+                let actual = compacted
+                    .local_forecasts(&request, station_ids.clone(), days)
+                    .await
+                    .unwrap();
+                assert_same_forecasts(&expected, &actual, "daily compaction");
+            }
         }
     }
 
@@ -2789,6 +2993,23 @@ mod tests {
             started.elapsed().as_secs_f64()
         );
 
+        let started = Instant::now();
+        let mut days = std::collections::BTreeMap::<_, Vec<_>>::new();
+        for name in &names {
+            let file = ParquetFileName::parse(name).unwrap();
+            days.entry(file.generated_at.date()).or_default().push(file);
+        }
+        for files in days.into_values() {
+            let copies = copies.clone();
+            tokio::task::spawn_blocking(move || copies.compact_day(&files))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        println!(
+            "daily compaction ready in {:.1}s",
+            started.elapsed().as_secs_f64()
+        );
         let now = newest;
         let today = now.replace_time(time::Time::MIDNIGHT);
         let airports: Vec<String> = "KATL,KLAX,KORD,KDFW,KDEN,KJFK,KSFO,KSEA,KLAS,KMCO,KEWR,KMIA,KPHX,KIAH,KBOS,KMSP,KFLL,KDTW,KPHL,KLGA,KBWI,KSLC,KDCA,KSAN,KTPA,KPDX,KSTL,KHNL,KBNA,KAUS,KMCI,KRDU,KMKE,KSMF,KCLT,KPIT,KSAT,KOAK,KCLE,KSJC,KIND,KCVG,KCMH,KJAN,KRSW,KABQ,KANC,KOMA,KBUF,KPBI,KBDL,KPVD,KBTV,KPWM,KMHT,KBOI,KBIL,KFSD,KFAR,KGEG,KICT,KLIT,KLEX,KBHM,KMEM,KJAX,KCHS,KRIC,KORF,KCRW,KPNS,KMOB,KSHV,KMSY,KTUL,KELP,KTUS,KCOS,KGRR,KDSM,KMSN,KDLH,KBZN,KGJT,KRAP,KFCA,KCYS,KJAR,KSGF,KFSM"

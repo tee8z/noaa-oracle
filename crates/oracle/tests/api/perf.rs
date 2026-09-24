@@ -37,10 +37,15 @@ async fn page_timings_on_real_data() {
         Arc::new(FileAccess::new(directory.clone())),
         &std::path::Path::new(&directory).join("derived"),
     ));
+    let preparing = Instant::now();
     weather
         .prepare_files(&tokio_util::sync::CancellationToken::new())
         .await
         .unwrap();
+    println!(
+        "weather preparation: {:.3}s",
+        preparing.elapsed().as_secs_f64()
+    );
     let test_app = spawn_app(weather).await;
 
     let now = OffsetDateTime::now_utc();
