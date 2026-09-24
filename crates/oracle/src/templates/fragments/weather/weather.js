@@ -17,3 +17,21 @@ document.addEventListener("keydown", function (event) {
   event.preventDefault();
   htmx.trigger(pin, "click");
 });
+
+// An interactive request takes precedence over an automatic section refresh.
+// Requests for individual station details still run independently.
+document.addEventListener("htmx:beforeRequest", function (event) {
+  var source = event.target;
+  var section = source.closest && source.closest("#weather-table-container");
+  if (section && source !== section) htmx.trigger(section, "htmx:abort");
+});
+
+// The reader may start typing or open a station after a refresh was sent.
+document.addEventListener("htmx:beforeSwap", function (event) {
+  var source = event.detail.requestConfig.elt;
+  if (source.id !== "weather-table-container") return;
+  var section = document.getElementById("weather-table-container");
+  if (section && section.querySelector("details.wx-station[open], #weather-search:focus, #map-station > *")) {
+    event.detail.shouldSwap = false;
+  }
+});

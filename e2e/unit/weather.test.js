@@ -70,3 +70,17 @@ test("Enter or Space on a map pin opens it like a click", () => {
   listeners.keydown({ key: "Enter", target: { closest: () => null }, preventDefault() {} });
   assert.equal(triggered.length, 2);
 });
+
+test("interaction wins over an automatic refresh already in flight", () => {
+  const { listeners, document, triggered } = load();
+  const section = { id: "weather-table-container", querySelector: () => ({}) };
+  document.getElementById = () => section;
+  listeners["htmx:beforeRequest"]({ target: { closest: () => section } });
+  assert.deepEqual(triggered, [[section, "htmx:abort"]]);
+  const detail = { requestConfig: { elt: section }, shouldSwap: true };
+  listeners["htmx:beforeSwap"]({ detail });
+  assert.equal(detail.shouldSwap, false);
+  const search = { requestConfig: { elt: { id: "weather-search" } }, shouldSwap: true };
+  listeners["htmx:beforeSwap"]({ detail: search });
+  assert.equal(search.shouldSwap, true);
+});

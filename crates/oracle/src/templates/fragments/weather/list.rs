@@ -17,6 +17,7 @@ pub(super) fn search_form(context: &WeatherContext) -> Markup {
         form class="weather-search" role="search"
             hx-get=(action)
             hx-target="#weather-list"
+            hx-sync="this:replace"
             hx-swap="outerHTML"
             hx-trigger="input changed delay:200ms from:#weather-search, search from:#weather-search, submit"
             hx-indicator="#weather-search-loading" {
@@ -152,6 +153,7 @@ fn station_row(weather: &WeatherDisplay, context: &WeatherContext) -> Markup {
         details class="wx-station"
             hx-get=(format!("/fragments/forecast/{}", weather.station_id))
             hx-trigger="toggle once"
+            hx-swap="innerHTML"
             hx-target="find .wx-forecast" {
             summary class="wx-row" title=(observed) {
                 span class="wx-name" {

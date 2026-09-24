@@ -109,12 +109,9 @@ pub struct WeatherContext<'a> {
 impl WeatherContext<'_> {
     /// The fragment for `view` with the current search.
     pub fn fragment_url(&self, view: WeatherView) -> String {
-        let mut parameters = vec![];
-        if view == WeatherView::List {
-            parameters.push(("view", "list"));
-            if !self.query.is_empty() {
-                parameters.push(("q", self.query));
-            }
+        let mut parameters = vec![("view", view.as_str())];
+        if view == WeatherView::List && !self.query.is_empty() {
+            parameters.push(("q", self.query));
         }
         with_parameters(self.selection_path, &parameters)
     }
@@ -160,10 +157,13 @@ fn encode(value: &str) -> String {
 /// The weather section. It refreshes itself every five minutes, but not
 /// while the reader has a station open or is typing a search (`weather.js`).
 pub fn weather_section(weather: &[WeatherDisplay], context: &WeatherContext) -> Markup {
-    let refresh = context.fragment_url(context.view);
+    // Searches replace the list only. Read the current input when refreshing
+    // the whole section, rather than restoring the query from its initial HTML.
+    let refresh = with_parameters(context.selection_path, &[("view", context.view.as_str())]);
     html! {
         section id="weather-table-container"
             hx-get=(refresh)
+            hx-include=[(context.view == WeatherView::List).then_some("#weather-search")]
             hx-trigger="every 300s"
             hx-swap="outerHTML"
             class="box weather" {
@@ -306,7 +306,10 @@ mod tests {
             context.fragment_url(WeatherView::List),
             "/fragments/weather?stations=KSTL%2CKORD&view=list&q=St.%20Louis%20%26%20co"
         );
-        assert_eq!(context.page_url(WeatherView::Map), "/?stations=KSTL%2CKORD");
+        assert_eq!(
+            context.page_url(WeatherView::Map),
+            "/?stations=KSTL%2CKORD&view=map"
+        );
         assert_eq!(page_url("/fragments/weather"), "/");
         assert_eq!(
             with_parameters("/fragments/weather", &[("view", "list")]),

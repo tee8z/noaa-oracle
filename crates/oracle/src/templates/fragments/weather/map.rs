@@ -108,6 +108,8 @@ pub(super) fn weather_map(weather: &[WeatherDisplay], context: &WeatherContext) 
                               aria-label=(summary(station, context).replace('\n', ", "))
                               hx-get=(station_url(&station.station_id))
                               hx-target="#map-station"
+                          hx-swap="innerHTML"
+                          hx-sync="#map-station:replace"
                               hx-indicator="#map-station-loading" {
                                 title { (summary(station, context)) }
                                 // A wider invisible circle is easier to hit.
@@ -132,6 +134,8 @@ pub(super) fn weather_map(weather: &[WeatherDisplay], context: &WeatherContext) 
                         a href=(format!("/?view=list&q={}", station.station_id))
                           hx-get=(station_url(&station.station_id))
                           hx-target="#map-station"
+                          hx-swap="innerHTML"
+                          hx-sync="#map-station:replace"
                           hx-indicator="#map-station-loading"
                           title=(summary(station, context)) {
                             (station.station_id)
