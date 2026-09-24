@@ -161,7 +161,7 @@ async fn selected_utc_day_uses_its_previous_day_forecast_and_preserves_refresh_c
         .await;
     assert!(status.is_success());
     let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(html.contains("Selected period (UTC)"));
+    assert!(html.contains("Selected period"));
     assert!(html.contains("81°F"));
     assert!(html.contains("62°F"));
     // Observed − forecast: 75 − 81 and 55 − 62.
@@ -180,7 +180,7 @@ async fn selected_utc_day_uses_its_previous_day_forecast_and_preserves_refresh_c
     let refreshed = String::from_utf8(body.to_vec()).unwrap();
     assert!(refreshed.contains("81°F"));
     assert!(refreshed.contains("-6°F"));
-    assert!(refreshed.contains("Selected period (UTC)"));
+    assert!(refreshed.contains("Selected period"));
     assert_eq!(weather_refresh_url(&refreshed), refresh);
 }
 
@@ -212,7 +212,7 @@ async fn start_only_weather_selection_keeps_its_bound_and_refresh_context() {
         .await;
     assert!(status.is_success());
     let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(html.contains("Selected period (UTC)"));
+    assert!(html.contains("Selected period"));
     assert!(!html.contains("Today so far (UTC)"));
     let refresh = weather_refresh_url(&html);
     assert_eq!(
@@ -222,7 +222,7 @@ async fn start_only_weather_selection_keeps_its_bound_and_refresh_context() {
     let (status, body) = app.get(&refresh).await;
     assert!(status.is_success());
     let refreshed = String::from_utf8(body.to_vec()).unwrap();
-    assert!(refreshed.contains("Selected period (UTC)"));
+    assert!(refreshed.contains("Selected period"));
     assert_eq!(weather_refresh_url(&refreshed), refresh);
     let after = OffsetDateTime::now_utc();
     let ends = requested_ends.lock().unwrap();
@@ -258,7 +258,7 @@ async fn multi_day_selection_does_not_compare_against_a_single_day_forecast() {
         .await;
     assert!(status.is_success());
     let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(html.contains("Selected period (UTC)"));
+    assert!(html.contains("Selected period"));
     assert!(html.contains("75°F"));
     assert!(html.contains("55°F"));
     assert!(!html.contains("+0°F"));

@@ -7,7 +7,7 @@ mod list;
 mod map;
 
 use maud::{Markup, html};
-use time::OffsetDateTime;
+use time::{OffsetDateTime, Time};
 
 use crate::{
     templates::components::{time as when, values::Settled},
@@ -23,22 +23,33 @@ pub enum ObservationPeriod {
 }
 
 impl ObservationPeriod {
+    /// Today is a UTC day. A selection's times are shown in the reader's
+    /// time zone (`local_time.js`), with UTC on hover, so its label names
+    /// no zone.
     pub fn label(&self) -> &'static str {
         match self {
             Self::Today => "Today so far (UTC)",
-            Self::Selected { .. } => "Selected period (UTC)",
+            Self::Selected { .. } => "Selected period",
         }
     }
 
-    /// Whether the observed high and low can still change: the period is
-    /// today so far, or a selection that ends in the future.
+    /// Whether the differences are final: only for a selection of whole UTC
+    /// days that has ended. Today, a selection still running and part of a
+    /// day all compare some hours of reports with a whole day's forecast.
     pub fn settled(&self, now: OffsetDateTime) -> Settled {
-        match self {
-            Self::Today => Settled::SoFar,
-            Self::Selected { end, .. } => match when::parse(end) {
-                Some(end) if end < now => Settled::Final,
-                _ => Settled::SoFar,
-            },
+        let Self::Selected { start, end } = self else {
+            return Settled::SoFar;
+        };
+        match (when::parse(start), when::parse(end)) {
+            (Some(start), Some(end))
+                if start.time() == Time::MIDNIGHT
+                    && end.time() == Time::MIDNIGHT
+                    && start < end
+                    && end <= now =>
+            {
+                Settled::Final
+            }
+            _ => Settled::SoFar,
         }
     }
 }
@@ -227,7 +238,12 @@ fn period_note(period: &ObservationPeriod, now: OffsetDateTime) -> Markup {
             " · Δ = observed − forecast"
             @if period.settled(now) == Settled::SoFar {
                 span class="weather-provisional" {
-                    " · The day isn't over, so differences stay grey: a few hours of reports can't be judged against a whole day's forecast."
+                    @if matches!(period, ObservationPeriod::Today) {
+                        " · The day isn't over, "
+                    } @else {
+                        " · This isn't a whole, finished UTC day, "
+                    }
+                    "so differences stay grey: some hours of reports can't be judged against a whole day's forecast."
                 }
             }
         }
@@ -347,5 +363,16 @@ mod tests {
             end: "2026-09-25T00:00:00Z".into(),
         };
         assert_eq!(open.settled(now), Settled::SoFar);
+        // Part of a day, even one that has ended, is not a whole day.
+        let partial = ObservationPeriod::Selected {
+            start: "2026-09-23T06:00:00Z".into(),
+            end: "2026-09-23T18:00:00Z".into(),
+        };
+        assert_eq!(partial.settled(now), Settled::SoFar);
+        let from_midnight = ObservationPeriod::Selected {
+            start: "2026-09-23T00:00:00Z".into(),
+            end: "2026-09-23T18:00:00Z".into(),
+        };
+        assert_eq!(from_midnight.settled(now), Settled::SoFar);
     }
 }
