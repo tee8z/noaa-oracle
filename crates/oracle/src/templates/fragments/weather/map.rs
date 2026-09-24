@@ -5,7 +5,10 @@
 use maud::{Markup, html};
 
 use super::{WeatherContext, WeatherDisplay, list::no_data, place};
-use crate::templates::components::{time as when, values::whole_degrees};
+use crate::templates::{
+    assets,
+    components::{time as when, values::whole_degrees},
+};
 
 /// Diverging bands, cold blue through a neutral middle to hot red.
 const BANDS: [(&str, &str); 5] = [
@@ -95,7 +98,7 @@ pub(super) fn weather_map(weather: &[WeatherDisplay], context: &WeatherContext) 
     html! {
         div class="wx-map" {
             div class="map-wrapper" {
-                img src="/static/usa-map.svg" alt="" class="usa-map";
+                img src=(assets::USA_MAP_URL) alt="" class="usa-map";
                 svg class="station-markers" viewBox="0 0 599.96 327.28" preserveAspectRatio="none"
                     role="group" aria-label="Stations by latest temperature" {
                     @for station in weather {

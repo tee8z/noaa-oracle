@@ -137,44 +137,12 @@
           nativeBuildInputs = buildDeps;
           cargoExtraArgs = "--bin oracle";
 
-          # Copy static files right after cargo build, before they get cleaned up
-          postBuild = ''
-            mkdir -p $TMPDIR/static-files
-            # build.rs outputs static files to $CARGO_MANIFEST_DIR/static (source tree)
-            # which in Nix build is /build/source/crates/oracle/static/
-            STATIC_DIR="/build/source/crates/oracle/static"
-            if [ -d "$STATIC_DIR" ] && [ -f "$STATIC_DIR/app.min.js" ]; then
-              echo "Found static files at: $STATIC_DIR"
-              cp -r "$STATIC_DIR"/* $TMPDIR/static-files/
-            else
-              echo "Warning: Static files not found at $STATIC_DIR"
-              echo "Searching for app.min.js in source tree..."
-              for f in $(find /build/source -name "app.min.js" -type f 2>/dev/null); do
-                echo "Found static files at: $(dirname "$f")"
-                cp "$(dirname "$f")"/* $TMPDIR/static-files/ || true
-                break
-              done
-            fi
-            echo "Static files collected:"
-            ls -la $TMPDIR/static-files/ || true
-          '';
-
+          # Keep the static directory expected by existing rollout preflight
+          # checks. Assets themselves are embedded in the binary.
           postInstall = ''
             mkdir -p $out/share/noaa-oracle/static
-            # Copy the static files we saved during postBuild
-            if [ -d "$TMPDIR/static-files" ] && [ -f "$TMPDIR/static-files/app.min.js" ]; then
-              cp -r $TMPDIR/static-files/* $out/share/noaa-oracle/static/
-              echo "Installed static files:"
-              ls -la $out/share/noaa-oracle/static/
-            else
-              echo "Error: No static files found in $TMPDIR/static-files"
-              echo "Contents of TMPDIR:"
-              ls -la $TMPDIR/ || true
-              echo "Contents of static-files (if exists):"
-              ls -la $TMPDIR/static-files/ || true
-              exit 1
-            fi
             cp -r config $out/share/noaa-oracle/
+            echo 'UI assets are embedded in bin/oracle.' > $out/share/noaa-oracle/static/.embedded
           '';
 
           # The binary loads DuckDB and the C++ runtime dynamically. Record
@@ -211,7 +179,6 @@
             Cmd = [ "${oracle}/bin/oracle" ];
             Env = [
               "LD_LIBRARY_PATH=${duckdb-lib}/lib:${pkgs.stdenv.cc.cc.lib}/lib"
-              "NOAA_ORACLE_UI_DIR=${oracle}/share/noaa-oracle/static"
               "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
             ];
             ExposedPorts = {
@@ -336,9 +303,6 @@
             export LD_LIBRARY_PATH="${duckdb-lib}/lib:${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH"
             export RUSTFLAGS="-C link-arg=-fuse-ld=lld"
 
-            # UI static files for development
-            export NOAA_ORACLE_UI_DIR="''${NOAA_ORACLE_UI_DIR:-./crates/oracle/static}"
-
             # Default AWS credentials for moto
             export AWS_ACCESS_KEY_ID=''${AWS_ACCESS_KEY_ID:-test}
             export AWS_SECRET_ACCESS_KEY=''${AWS_SECRET_ACCESS_KEY:-test}
@@ -368,7 +332,6 @@
         # Runner scripts
         run-oracle = pkgs.writeShellScriptBin "noaa-oracle" ''
           export LD_LIBRARY_PATH="${duckdb-lib}/lib:${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH"
-          export NOAA_ORACLE_UI_DIR="''${NOAA_ORACLE_UI_DIR:-${oracle}/share/noaa-oracle/static}"
           exec ${oracle}/bin/oracle "$@"
         '';
 
@@ -544,7 +507,6 @@
                 NOAA_ORACLE_PORT = toString cfg.oracle.port;
                 NOAA_ORACLE_DATA_DIR = cfg.oracle.weatherDir;
                 NOAA_ORACLE_EVENT_DB = cfg.oracle.eventDb;
-                NOAA_ORACLE_UI_DIR = "${cfg.oracle.package}/share/noaa-oracle/static";
                 NOAA_ORACLE_PRIVATE_KEY = "${cfg.oracle.dataDir}/keys/oracle.pem";
                 NOAA_ORACLE_REMOTE_URL = cfg.oracle.remoteUrl;
                 NOAA_ORACLE_COORDINATOR_PUBKEYS = concatStringsSep "," cfg.oracle.coordinatorPubkeys;

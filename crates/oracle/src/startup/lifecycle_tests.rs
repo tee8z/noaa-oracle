@@ -251,7 +251,6 @@ async fn etl_runs_one_at_a_time_and_not_during_shutdown() {
     .unwrap();
     let state = Arc::new(AppState::new(AppParts {
         remote_url: "http://localhost".into(),
-        static_dir: directory.path().to_path_buf(),
         weather_dir: directory.path().to_path_buf(),
         auth: AuthPolicy::new("http://localhost", [], []),
         file_access: files,

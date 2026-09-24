@@ -137,6 +137,19 @@ test.describe("HTMX Navigation", () => {
   });
 });
 
+test.describe("Assets", () => {
+  test("the stylesheet and script are served at hashed URLs with long caching", async ({ page, request }) => {
+    await page.goto("/events");
+    const css = await page.locator('link[href^="/assets/site."]').getAttribute("href");
+    const js = await page.locator('script[src^="/assets/site."]').getAttribute("src");
+    for (const url of [css, js]) {
+      const response = await request.get(url);
+      expect(response.ok()).toBeTruthy();
+      expect(response.headers()["cache-control"]).toBe("public, max-age=31536000, immutable");
+    }
+  });
+});
+
 test.describe("API Endpoints", () => {
   test("oracle pubkey endpoint returns data", async ({ request }) => {
     const response = await request.get("/oracle/pubkey");
