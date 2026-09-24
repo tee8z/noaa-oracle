@@ -15,22 +15,10 @@ use crate::{
     AppState, ForecastRequest, ObservationRequest, TemperatureUnit,
     templates::fragments::{
         ForecastComparison, ForecastDisplay, WeatherContext, forecast_detail, station_detail,
-        weather_list, weather_section,
+        weather::place_name, weather_list, weather_section,
     },
     weather_data::validate_station_id,
 };
-
-/// Top 100 major US airport station IDs to show by default
-const DEFAULT_MAJOR_AIRPORTS: &[&str] = &[
-    "KATL", "KLAX", "KORD", "KDFW", "KDEN", "KJFK", "KSFO", "KSEA", "KLAS", "KMCO", "KEWR", "KMIA",
-    "KPHX", "KIAH", "KBOS", "KMSP", "KFLL", "KDTW", "KPHL", "KLGA", "KBWI", "KSLC", "KDCA", "KSAN",
-    "KTPA", "KPDX", "KSTL", "KHNL", "KBNA", "KAUS", "KMCI", "KRDU", "KMKE", "KSMF", "KCLT", "KPIT",
-    "KSAT", "KOAK", "KCLE", "KSJC", "KIND", "KCVG", "KCMH", "KJAN", "KRSW", "KABQ", "KANC", "KOMA",
-    "KBUF", "KPBI", "KBDL", "KPVD", "KBTV", "KPWM", "KMHT", "KBOI", "KBIL", "KFSD", "KFAR", "KGEG",
-    "KICT", "KLIT", "KLEX", "KBHM", "KMEM", "KJAX", "KCHS", "KRIC", "KORF", "KCRW", "KPNS", "KMOB",
-    "KSHV", "KMSY", "KTUL", "KELP", "KTUS", "KCOS", "KGRR", "KDSM", "KMSN", "KDLH", "KBZN", "KGJT",
-    "KRAP", "KFCA", "KCYS", "KJAR", "KSGF", "KFSM",
-];
 
 #[derive(Debug, Deserialize)]
 pub struct WeatherQuery {
@@ -52,23 +40,17 @@ pub async fn weather_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<WeatherQuery>,
 ) -> Response {
-    // Get stations from query or use default major airports
-    let requested = query.stations.is_some() || query.add_station.is_some();
-    let mut station_ids: Vec<String> = if let Some(stations) = &query.stations {
-        stations.split(',').map(|s| s.trim().to_string()).collect()
-    } else {
-        // Default to major airports
-        DEFAULT_MAJOR_AIRPORTS
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
-    };
-
-    // Add station if requested
-    if let Some(add_station) = &query.add_station
-        && !station_ids.contains(add_station)
+    let add_station = query
+        .add_station
+        .as_deref()
+        .filter(|station| validate_station_id(station).is_ok());
+    let named = super::weather::requested_stations(query.stations.as_deref());
+    let requested = named.is_some() || add_station.is_some();
+    let mut station_ids = named.unwrap_or_else(super::weather::default_airports);
+    if let Some(add_station) = add_station
+        && !station_ids.iter().any(|station| station == add_station)
     {
-        station_ids.push(add_station.clone());
+        station_ids.push(add_station.to_string());
     }
 
     let start = query
@@ -106,7 +88,7 @@ pub async fn weather_handler(
     }
     if !headers.contains_key("hx-request") {
         response
-    } else if query.add_station.is_some() {
+    } else if add_station.is_some() {
         with_url(response, "hx-push-url", &context.page_url(view))
     } else if only_list {
         with_url(response, "hx-replace-url", &context.page_url(view))
@@ -133,13 +115,7 @@ pub async fn station_handler(
     let place = stations
         .iter()
         .find(|station| station.station_id == station_id)
-        .map(|station| {
-            if station.state.is_empty() {
-                station.station_name.clone()
-            } else {
-                format!("{}, {}", station.station_name, station.state)
-            }
-        });
+        .map(|station| place_name(&station.station_name, &station.state));
     Html(station_detail(&station_id, place.as_deref(), &forecast).into_string()).into_response()
 }
 
@@ -283,16 +259,13 @@ pub async fn build_forecast_html(state: &Arc<AppState>, station_id: &str) -> Str
 /// Pre-warm the forecast cache for all default stations.
 /// Called at startup and every 30 minutes by the background refresh task.
 pub async fn warm_forecast_cache(state: &Arc<AppState>) {
-    info!(
-        "Warming forecast cache for {} stations...",
-        DEFAULT_MAJOR_AIRPORTS.len()
-    );
+    let airports = super::weather::default_airports();
+    info!("Warming forecast cache for {} stations...", airports.len());
 
-    let futs: Vec<_> = DEFAULT_MAJOR_AIRPORTS
-        .iter()
+    let futs: Vec<_> = airports
+        .into_iter()
         .map(|station_id| {
             let state = state.clone();
-            let station_id = station_id.to_string();
             async move {
                 let html = build_forecast_html(&state, &station_id).await;
                 state.cache_forecast(station_id, html);

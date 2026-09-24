@@ -538,21 +538,24 @@ async fn forecast_fragment_handles_no_data() {
 async fn dashboard_handles_no_weather_data() {
     let mut weather_data = MockWeatherAccess::new();
 
-    // The default airports first, then every station as a fallback.
+    // The default airports first, then the first stations in the data;
+    // never an empty list, which would query every station.
     weather_data
         .expect_observation_data()
+        .withf(|_, stations| !stations.is_empty())
         .times(4)
         .returning(|_, _| Ok(vec![]));
 
     weather_data
         .expect_forecasts_data()
+        .withf(|_, stations| !stations.is_empty())
         .times(2)
         .returning(|_, _| Ok(vec![]));
 
     weather_data
         .expect_stations()
         .times(1)
-        .returning(|| Ok(vec![]));
+        .returning(|| Ok(mock_stations()));
 
     let test_app = spawn_app(Arc::new(weather_data)).await;
 
@@ -623,6 +626,36 @@ async fn dashboard_queries_forecasts_for_default_airports() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let html = String::from_utf8(body.to_vec()).unwrap();
     assert!(html.contains("KORD"));
+}
+
+/// `?stations=` with nothing usable shows the default airports; it must
+/// not query every station, which is what an empty list means to the data
+/// layer. Every weather call here names the airports.
+#[tokio::test]
+async fn an_empty_station_list_shows_the_default_airports() {
+    let mut weather = MockWeatherAccess::new();
+    weather
+        .expect_observation_data()
+        .withf(|_, stations| stations.len() > 1 && stations.iter().any(|id| id == "KORD"))
+        .returning(|_, _| Ok(mock_observation_data()));
+    weather
+        .expect_forecasts_data()
+        .withf(|_, stations| stations.len() > 1)
+        .returning(|_, _| Ok(vec![]));
+    weather.expect_stations().returning(|| Ok(vec![]));
+    let app = spawn_app(Arc::new(weather)).await;
+    for path in [
+        "/?stations=",
+        "/?stations=,%20,bad%27id",
+        "/fragments/weather?stations=",
+    ] {
+        let (status, body) = app.get(path).await;
+        assert!(status.is_success(), "{path}");
+        assert!(
+            String::from_utf8(body.to_vec()).unwrap().contains("KORD"),
+            "{path}"
+        );
+    }
 }
 
 fn mock_observation_data() -> Vec<Observation> {

@@ -79,14 +79,7 @@ pub async fn dashboard_handler(
         .as_ref()
         .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok());
 
-    let station_ids = query.stations.as_deref().map(|stations| {
-        stations
-            .split(',')
-            .map(str::trim)
-            .filter(|station| !station.is_empty())
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-    });
+    let station_ids = super::weather::requested_stations(query.stations.as_deref());
     let (data, selection_path) =
         build_dashboard_data(&state, station_ids.as_deref(), start, end).await;
     let stations = state.stations().await.unwrap_or_default();
@@ -154,104 +147,6 @@ async fn build_dashboard_data(
     )
 }
 
-/// Top 100 major US airport station IDs to show by default
-/// Covers all 50 states and major population centers
-const DEFAULT_MAJOR_AIRPORTS: &[&str] = &[
-    // Top 30 busiest US airports
-    "KATL", // Atlanta
-    "KLAX", // Los Angeles
-    "KORD", // Chicago O'Hare
-    "KDFW", // Dallas/Fort Worth
-    "KDEN", // Denver
-    "KJFK", // New York JFK
-    "KSFO", // San Francisco
-    "KSEA", // Seattle
-    "KLAS", // Las Vegas
-    "KMCO", // Orlando
-    "KEWR", // Newark
-    "KMIA", // Miami
-    "KPHX", // Phoenix
-    "KIAH", // Houston Intercontinental
-    "KBOS", // Boston
-    "KMSP", // Minneapolis
-    "KFLL", // Fort Lauderdale
-    "KDTW", // Detroit
-    "KPHL", // Philadelphia
-    "KLGA", // New York LaGuardia
-    "KBWI", // Baltimore
-    "KSLC", // Salt Lake City
-    "KDCA", // Washington Reagan
-    "KSAN", // San Diego
-    "KTPA", // Tampa
-    "KPDX", // Portland OR
-    "KSTL", // St. Louis
-    "KHNL", // Honolulu
-    "KBNA", // Nashville
-    "KAUS", // Austin
-    // Additional major airports (31-60)
-    "KMCI", // Kansas City
-    "KRDU", // Raleigh-Durham
-    "KMKE", // Milwaukee
-    "KSMF", // Sacramento
-    "KCLT", // Charlotte
-    "KPIT", // Pittsburgh
-    "KSAT", // San Antonio
-    "KOAK", // Oakland
-    "KCLE", // Cleveland
-    "KSJC", // San Jose
-    "KIND", // Indianapolis
-    "KCVG", // Cincinnati
-    "KCMH", // Columbus OH
-    "KJAN", // Jackson MS
-    "KRSW", // Fort Myers
-    "KABQ", // Albuquerque
-    "KANC", // Anchorage
-    "KOMA", // Omaha
-    "KBUF", // Buffalo
-    "KPBI", // West Palm Beach
-    // Additional airports for state coverage (61-100)
-    "KBDL", // Hartford CT
-    "KPVD", // Providence RI
-    "KBTV", // Burlington VT
-    "KPWM", // Portland ME
-    "KMHT", // Manchester NH
-    "KBOI", // Boise ID
-    "KBIL", // Billings MT
-    "KFSD", // Sioux Falls SD
-    "KFAR", // Fargo ND
-    "KGEG", // Spokane WA
-    "KICT", // Wichita KS
-    "KLIT", // Little Rock AR
-    "KLEX", // Lexington KY
-    "KBHM", // Birmingham AL
-    "KMEM", // Memphis TN
-    "KJAX", // Jacksonville FL
-    "KCHS", // Charleston SC
-    "KRIC", // Richmond VA
-    "KORF", // Norfolk VA
-    "KCRW", // Charleston WV
-    "KPNS", // Pensacola FL
-    "KMOB", // Mobile AL
-    "KSHV", // Shreveport LA
-    "KMSY", // New Orleans
-    "KTUL", // Tulsa OK
-    "KELP", // El Paso TX
-    "KTUS", // Tucson AZ
-    "KCOS", // Colorado Springs
-    "KGRR", // Grand Rapids MI
-    "KDSM", // Des Moines IA
-    "KMSN", // Madison WI
-    "KDLH", // Duluth MN
-    "KBZN", // Bozeman MT
-    "KGJT", // Grand Junction CO
-    "KRAP", // Rapid City SD
-    "KFCA", // Kalispell MT
-    "KCYS", // Cheyenne WY
-    "KJAR", // Casper WY (KCPR)
-    "KSGF", // Springfield MO
-    "KFSM", // Fort Smith AR
-];
-
 /// Get weather from the latest available observation files. Also says
 /// whether these are the default airports, which need not be named.
 async fn get_latest_weather(
@@ -266,17 +161,23 @@ async fn get_latest_weather(
     }
     // Query only the default airports: a forecast query over every station
     // exceeds the per-query memory limit, which left the forecast column empty.
-    let airports: Vec<String> = DEFAULT_MAJOR_AIRPORTS
-        .iter()
-        .map(|station| station.to_string())
-        .collect();
-    let weather_data = super::weather::load_weather(state, &airports, start, end).await;
+    let weather_data =
+        super::weather::load_weather(state, &super::weather::default_airports(), start, end).await;
     if !weather_data.is_empty() {
         return (weather_data, true);
     }
-    // Data without any default airport: show the first stations reporting.
-    let mut weather_data = super::weather::load_weather(state, &[], start, end).await;
+    // Data without any default airport: show the first 20 stations in it.
+    let stations = state.stations().await.unwrap_or_default();
+    let mut first: Vec<String> = stations
+        .iter()
+        .map(|station| station.station_id.clone())
+        .collect();
+    first.sort();
+    first.truncate(20);
+    if first.is_empty() {
+        return (vec![], false);
+    }
+    let mut weather_data = super::weather::load_weather(state, &first, start, end).await;
     weather_data.sort_by(|a, b| a.station_id.cmp(&b.station_id));
-    weather_data.truncate(20);
     (weather_data, false)
 }

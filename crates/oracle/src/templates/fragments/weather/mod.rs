@@ -280,12 +280,16 @@ pub(super) fn by_region<'a>(
     regions
 }
 
-/// "Chicago O'Hare, IL"
 pub(super) fn place(weather: &WeatherDisplay) -> String {
-    match (weather.station_name.is_empty(), weather.state.is_empty()) {
-        (false, false) => format!("{}, {}", weather.station_name, weather.state),
-        (false, true) => weather.station_name.clone(),
-        (true, _) => weather.state.clone(),
+    place_name(&weather.station_name, &weather.state)
+}
+
+/// "Chicago O'Hare, IL", or whichever part is known.
+pub fn place_name(name: &str, state: &str) -> String {
+    match (name.is_empty(), state.is_empty()) {
+        (false, false) => format!("{name}, {state}"),
+        (false, true) => name.to_string(),
+        (true, _) => state.to_string(),
     }
 }
 
