@@ -1,11 +1,12 @@
-use oracle::{Cli, setup_logger};
+use oracle::{Cli, setup_buffered_logger};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::load()?;
     let log_level = cli.log_level();
 
-    setup_logger()
+    let (logger, _log_guard) = setup_buffered_logger()?;
+    logger
         .level(log_level)
         .level_for("duckdb", log_level)
         .level_for("oracle", log_level)

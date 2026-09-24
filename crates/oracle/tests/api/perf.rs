@@ -20,6 +20,13 @@ use oracle::{
 use std::{sync::Arc, time::Instant};
 use time::{Duration, OffsetDateTime, Time, UtcOffset, format_description::well_known::Rfc3339};
 
+pub(super) const AIRPORTS: &str = "KATL,KLAX,KORD,KDFW,KDEN,KJFK,KSFO,KSEA,KLAS,KMCO,KEWR,KMIA,KPHX,KIAH,\
+        KBOS,KMSP,KFLL,KDTW,KPHL,KLGA,KBWI,KSLC,KDCA,KSAN,KTPA,KPDX,KSTL,KHNL,KBNA,KAUS,KMCI,\
+        KRDU,KMKE,KSMF,KCLT,KPIT,KSAT,KOAK,KCLE,KSJC,KIND,KCVG,KCMH,KJAN,KRSW,KABQ,KANC,KOMA,\
+        KBUF,KPBI,KBDL,KPVD,KBTV,KPWM,KMHT,KBOI,KBIL,KFSD,KFAR,KGEG,KICT,KLIT,KLEX,KBHM,KMEM,\
+        KJAX,KCHS,KRIC,KORF,KCRW,KPNS,KMOB,KSHV,KMSY,KTUL,KELP,KTUS,KCOS,KGRR,KDSM,KMSN,KDLH,\
+        KBZN,KGJT,KRAP,KFCA,KCYS,KJAR,KSGF,KFSM";
+
 const STATIONS: &str = "KPWM,KBTV,KBED";
 
 fn at(time: OffsetDateTime) -> String {
@@ -56,12 +63,7 @@ async fn page_timings_on_real_data() {
     // today and is still running.
     let finished = today - Duration::hours(21);
     let running = today + Duration::hours(2);
-    let airports = "KATL,KLAX,KORD,KDFW,KDEN,KJFK,KSFO,KSEA,KLAS,KMCO,KEWR,KMIA,KPHX,KIAH,\
-        KBOS,KMSP,KFLL,KDTW,KPHL,KLGA,KBWI,KSLC,KDCA,KSAN,KTPA,KPDX,KSTL,KHNL,KBNA,KAUS,KMCI,\
-        KRDU,KMKE,KSMF,KCLT,KPIT,KSAT,KOAK,KCLE,KSJC,KIND,KCVG,KCMH,KJAN,KRSW,KABQ,KANC,KOMA,\
-        KBUF,KPBI,KBDL,KPVD,KBTV,KPWM,KMHT,KBOI,KBIL,KFSD,KFAR,KGEG,KICT,KLIT,KLEX,KBHM,KMEM,\
-        KJAX,KCHS,KRIC,KORF,KCRW,KPNS,KMOB,KSHV,KMSY,KTUL,KELP,KTUS,KCOS,KGRR,KDSM,KMSN,KDLH,\
-        KBZN,KGJT,KRAP,KFCA,KCYS,KJAR,KSGF,KFSM";
+
     let requests: Vec<(&str, String, bool)> = vec![
         ("station list", "/stations".into(), false),
         ("events page", "/events".into(), false),
@@ -104,7 +106,7 @@ async fn page_timings_on_real_data() {
         (
             "API forecasts, 90 airports today",
             format!(
-                "/stations/forecasts?station_ids={airports}&start={}&end={}",
+                "/stations/forecasts?station_ids={AIRPORTS}&start={}&end={}",
                 at(today),
                 at(today + Duration::days(1))
             ),
@@ -131,7 +133,7 @@ async fn page_timings_on_real_data() {
         (
             "API observations, 90 airports today",
             format!(
-                "/stations/observations?station_ids={airports}&start={}&end={}",
+                "/stations/observations?station_ids={AIRPORTS}&start={}&end={}",
                 at(today),
                 at(now)
             ),

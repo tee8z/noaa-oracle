@@ -11,6 +11,7 @@ pub mod config;
 pub mod database;
 pub mod events;
 pub mod file_access;
+mod logging;
 pub mod oracle;
 pub mod routes;
 pub mod scoring;
@@ -28,6 +29,7 @@ pub use events::{
     ValueOptions, Weather, WeatherChoices, WeatherEntry,
 };
 pub use file_access::{FileData, FileParams, ParquetFileName};
+pub use logging::{LogGuard, setup_buffered_logger};
 pub use routes::{ForecastRequest, ObservationRequest, TemperatureUnit};
 pub use startup::{AppParts, AppState, Background, EtlRejected, app, run_until_stop};
 pub use weather_data::{DailyObservation, Forecast, Observation, Station, WeatherData};

@@ -22,7 +22,7 @@ use duckdb::{
     Connection,
     arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray},
 };
-use log::{debug, info};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::{
     path::Path,
@@ -37,6 +37,7 @@ use utoipa::ToSchema;
 mod derived;
 #[cfg(test)]
 mod legacy;
+mod prepared;
 
 pub use derived::DerivedForecasts;
 
@@ -114,8 +115,24 @@ const QUERY_THREADS: usize = 2;
 pub struct WeatherAccess {
     file_access: Arc<dyn FileData>,
     slots: Arc<Semaphore>,
-    connections: Arc<Mutex<Vec<Connection>>>,
+    connections: Arc<Mutex<Vec<ReaderConnection>>>,
     derived: Option<DerivedForecasts>,
+    prepared: Option<prepared::PreparedForecasts>,
+}
+
+struct ReaderConnection {
+    connection: Connection,
+    generation: Option<Arc<prepared::Generation>>,
+}
+
+impl ReaderConnection {
+    fn detach(&mut self) -> Result<(), duckdb::Error> {
+        if self.generation.is_some() {
+            self.connection.execute_batch("DETACH prepared")?;
+            self.generation = None;
+        }
+        Ok(())
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -355,6 +372,7 @@ fn source_forecast_rows_sql(files: &[String], filter: &str) -> String {
 /// the published files otherwise.
 #[derive(Debug, Default)]
 struct ForecastFiles {
+    native: Option<prepared::Selection>,
     derived: Vec<String>,
     source: Vec<String>,
     compacted: Vec<derived::CompactSelection>,
@@ -362,7 +380,10 @@ struct ForecastFiles {
 
 impl ForecastFiles {
     fn is_empty(&self) -> bool {
-        self.derived.is_empty() && self.source.is_empty() && self.compacted.is_empty()
+        self.native.is_none()
+            && self.derived.is_empty()
+            && self.source.is_empty()
+            && self.compacted.is_empty()
     }
 }
 
@@ -435,6 +456,15 @@ fn forecasts_sql(
     let times = conditions.join(" AND ");
 
     let mut branches = Vec::new();
+    if let Some(selected) = &files.native {
+        let stations = stations
+            .map(|condition| format!("{condition} AND "))
+            .unwrap_or_default();
+        branches.push(format!(
+            "SELECT {FORECAST_ROW_COLUMNS} FROM prepared.forecasts WHERE {stations}{times} AND source IN ({})",
+            sql_string_list(&selected.sources)
+        ));
+    }
     for selected in &files.compacted {
         let stations = stations
             .map(|condition| format!("{condition} AND "))
@@ -507,20 +537,29 @@ fn forecasts_sql(
     -- Per station and period, the newest issue, then the newest
     -- publication of that issue. Value ties are deterministic.
     deduped AS (
-        SELECT station_id, begin_ts, end_ts, min_temp, max_temp, wind_speed, wind_direction,
-            relative_humidity_max, relative_humidity_min, precip_chance,
-            liquid_precipitation_amt, snow_amt, snow_ratio, ice_amt,
+        SELECT station_id, begin_ts, end_ts, picked.*,
             {date} AS date,
             EXTRACT(EPOCH FROM (end_ts - begin_ts)) AS duration_secs
-        FROM forecast_rows
-        QUALIFY ROW_NUMBER() OVER (
-            PARTITION BY station_id, begin_ts, end_ts
-            ORDER BY generated_ts DESC, published_ts DESC, source DESC,
-                     max_temp DESC, min_temp DESC, wind_speed DESC, wind_direction DESC,
-                     relative_humidity_max DESC, relative_humidity_min DESC,
-                     precip_chance DESC, liquid_precipitation_amt DESC,
-                     snow_amt DESC, snow_ratio DESC, ice_amt DESC
-        ) = 1
+        FROM (
+            SELECT station_id, begin_ts, end_ts,
+                FIRST(STRUCT_PACK(
+                    min_temp := min_temp, max_temp := max_temp,
+                    wind_speed := wind_speed, wind_direction := wind_direction,
+                    relative_humidity_max := relative_humidity_max,
+                    relative_humidity_min := relative_humidity_min,
+                    precip_chance := precip_chance,
+                    liquid_precipitation_amt := liquid_precipitation_amt,
+                    snow_amt := snow_amt, snow_ratio := snow_ratio, ice_amt := ice_amt
+                ) ORDER BY generated_ts DESC NULLS LAST, published_ts DESC NULLS LAST,
+                    source DESC NULLS LAST, max_temp DESC NULLS LAST, min_temp DESC NULLS LAST,
+                    wind_speed DESC NULLS LAST, wind_direction DESC NULLS LAST,
+                    relative_humidity_max DESC NULLS LAST, relative_humidity_min DESC NULLS LAST,
+                    precip_chance DESC NULLS LAST, liquid_precipitation_amt DESC NULLS LAST,
+                    snow_amt DESC NULLS LAST, snow_ratio DESC NULLS LAST, ice_amt DESC NULLS LAST
+                ) AS picked
+            FROM forecast_rows
+            GROUP BY station_id, begin_ts, end_ts
+        )
     ),{qpf}{snow}{ice}
     daily AS (
         SELECT
@@ -613,6 +652,7 @@ impl WeatherAccess {
             slots: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
             connections: Arc::new(Mutex::new(Vec::new())),
             derived: None,
+            prepared: None,
         }
     }
 
@@ -621,6 +661,7 @@ impl WeatherAccess {
     pub fn with_derived_forecasts(file_access: Arc<dyn FileData>, directory: &Path) -> Self {
         Self {
             derived: Some(DerivedForecasts::new(directory)),
+            prepared: Some(prepared::PreparedForecasts::new(directory)),
             ..Self::new(file_access)
         }
     }
@@ -628,8 +669,32 @@ impl WeatherAccess {
     /// The derived copy of each forecast file where one exists, and the
     /// published file where not.
     fn forecast_files(&self, file_names: Vec<String>, stations: &[String]) -> ForecastFiles {
+        self.forecast_files_for(file_names, stations, None)
+    }
+
+    fn forecast_files_for(
+        &self,
+        mut file_names: Vec<String>,
+        stations: &[String],
+        request: Option<&ForecastRequest>,
+    ) -> ForecastFiles {
         let mut files = ForecastFiles::default();
-        let covered = if let Some(derived) = &self.derived {
+        if let Some((selection, covered)) = self
+            .prepared
+            .as_ref()
+            .and_then(|prepared| request.and_then(|req| prepared.select(req, &file_names)))
+        {
+            files.native = Some(selection);
+            file_names.retain(|name| !covered.contains(name));
+        }
+        // A few uploads should read their own copies while the native
+        // generation catches up. Even one source in a daily compacted file
+        // otherwise binds every selected station bucket for that whole day.
+        // Larger historical source sets still benefit from daily compaction.
+        const MAX_NATIVE_DELTA_FILES: usize = 4;
+        let covered = if let Some(derived) = &self.derived
+            && (files.native.is_none() || file_names.len() > MAX_NATIVE_DELTA_FILES)
+        {
             let (compacted, covered) = derived.compact_files(&file_names, stations);
             files.compacted = compacted;
             covered
@@ -674,19 +739,45 @@ impl WeatherAccess {
         sql: String,
         decode: impl FnOnce(&[RecordBatch]) -> Result<Vec<T>, Error> + Send + 'static,
     ) -> Result<Vec<T>, Error> {
+        self.query_prepared(sql, None, decode).await
+    }
+
+    async fn query_prepared<T: Send + 'static>(
+        &self,
+        sql: String,
+        generation: Option<Arc<prepared::Generation>>,
+        decode: impl FnOnce(&[RecordBatch]) -> Result<Vec<T>, Error> + Send + 'static,
+    ) -> Result<Vec<T>, Error> {
+        let started = Instant::now();
         let slot = self.slot().await?;
         let connections = self.connections.clone();
         tokio::task::spawn_blocking(move || {
             let _slot = slot;
-            let started = Instant::now();
+            let queued = started.elapsed();
             let connection = connections.lock().unwrap_or_else(|p| p.into_inner()).pop();
-            let connection = match connection {
+            let mut reader = match connection {
                 Some(connection) => connection,
-                None => open_connection()?,
+                None => ReaderConnection {
+                    connection: open_connection()?,
+                    generation: None,
+                },
             };
             let acquired = started.elapsed();
             let result = (|| {
-                let mut statement = connection.prepare(&sql)?;
+                if let Some(generation) = generation
+                    && reader
+                        .generation
+                        .as_ref()
+                        .is_none_or(|current| current.path != generation.path)
+                {
+                    reader.detach()?;
+                    reader.connection.execute_batch(&format!(
+                        "ATTACH '{}' AS prepared (READ_ONLY)",
+                        generation.path.to_string_lossy().replace('\'', "''")
+                    ))?;
+                    reader.generation = Some(generation);
+                }
+                let mut statement = reader.connection.prepare(&sql)?;
                 let prepared = started.elapsed();
                 let batches: Vec<RecordBatch> = statement.query_arrow([])?.collect();
                 let executed = started.elapsed();
@@ -698,12 +789,23 @@ impl WeatherAccess {
                     (executed - prepared).as_secs_f64() * 1000.0,
                     started.elapsed().as_secs_f64() * 1000.0,
                 );
+                if started.elapsed().as_millis() >= 350 {
+                    info!("slow weather query: queue={:.1}ms reader={:.1}ms prepare={:.1}ms execute={:.1}ms decode={:.1}ms native={} compacted={} parquet_scans={}",
+                        queued.as_secs_f64() * 1000.0,
+                        (acquired - queued).as_secs_f64() * 1000.0,
+                        (prepared - acquired).as_secs_f64() * 1000.0,
+                        (executed - prepared).as_secs_f64() * 1000.0,
+                        (started.elapsed() - executed).as_secs_f64() * 1000.0,
+                        sql.contains("prepared.forecasts"), sql.contains("/.compact-"), sql.matches("read_parquet(").count());
+                }
                 Ok(rows)
             })();
-            connections
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push(connection);
+            if result.is_ok() || reader.detach().is_ok() {
+                connections
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(reader);
+            }
             result
         })
         .await?
@@ -735,6 +837,7 @@ impl WeatherData for WeatherAccess {
         station_ids: Vec<String>,
         days: UtcOffset,
     ) -> Result<Vec<Forecast>, Error> {
+        let began = Instant::now();
         let stations = station_condition(&station_ids)?;
         let now = OffsetDateTime::now_utc();
         let generated = forecast_generated_window(req, now);
@@ -756,14 +859,52 @@ impl WeatherData for WeatherAccess {
             return Ok(vec![]);
         }
         let parquet_files = self.file_access.grab_file_names(file_params).await?;
-        let files = self.forecast_files(parquet_files, &station_ids);
+        let files = self.forecast_files_for(parquet_files.clone(), &station_ids, Some(req));
         if files.is_empty() {
             return Ok(vec![]);
         }
         let query_sql = forecasts_sql(&files, stations.as_deref(), req, generated, days)?;
         let unit = req.temperature_unit;
-        self.query(query_sql, move |batches| decode_forecasts(batches, &unit))
-            .await
+        let generation = files
+            .native
+            .as_ref()
+            .map(|selected| selected.generation.clone());
+        let planning = began.elapsed();
+        let result = self
+            .query_prepared(query_sql, generation.clone(), move |batches| {
+                decode_forecasts(batches, &unit)
+            })
+            .await;
+        if began.elapsed().as_millis() >= 350 {
+            info!(
+                "slow forecast request: planning={:.1}ms query={:.1}ms native={} compacted={} typed_delta={} raw_delta={}",
+                planning.as_secs_f64() * 1000.0,
+                (began.elapsed() - planning).as_secs_f64() * 1000.0,
+                files.native.is_some(),
+                files.compacted.len(),
+                files.derived.len(),
+                files.source.len()
+            );
+        }
+        if let (Err(error), Some(generation)) = (&result, generation) {
+            warn!("native forecast reader failed; using complete Parquet selection: {error}");
+            // Rebuild from the original publication snapshot, including all
+            // sources that were removed from the native query's delta branch.
+            let fallback = self.forecast_files(parquet_files, &station_ids);
+            let sql = forecasts_sql(&fallback, stations.as_deref(), req, generated, days)?;
+            let fallback = self
+                .query(sql, move |batches| decode_forecasts(batches, &unit))
+                .await;
+            // A bad uncovered source fails both paths. Do not rebuild a
+            // healthy native generation just because that publication is bad.
+            if fallback.is_ok()
+                && let Some(prepared) = &self.prepared
+            {
+                prepared.reject(&generation);
+            }
+            return fallback;
+        }
+        result
     }
 
     async fn observation_data(
@@ -1128,8 +1269,10 @@ impl WeatherData for WeatherAccess {
             }
         }
         let mut days = std::collections::BTreeMap::<_, Vec<_>>::new();
-        for file in all_files {
-            days.entry(file.generated_at.date()).or_default().push(file);
+        for file in &all_files {
+            days.entry(file.generated_at.date())
+                .or_default()
+                .push(file.clone());
         }
         for (_, files) in days.into_iter().rev() {
             if stopping.is_cancelled() {
@@ -1142,6 +1285,55 @@ impl WeatherData for WeatherAccess {
                 derived.compact_day(&files)
             })
             .await??;
+        }
+        if let Some(prepared) = &self.prepared {
+            let now = OffsetDateTime::now_utc();
+            let mut validity_days = vec![now.date()];
+            // Yesterday's prewarmed generation remains usable after midnight
+            // while new publications are unioned and the next refresh runs.
+            if now.hour() >= 23
+                && let Some(tomorrow) = now.date().next_day()
+            {
+                validity_days.push(tomorrow);
+            }
+            for day in validity_days {
+                if stopping.is_cancelled() {
+                    break;
+                }
+                let prepared = prepared.clone();
+                let derived = derived.clone();
+                let files = all_files.clone();
+                let stopping = stopping.clone();
+                let connections = self.connections.clone();
+                let slot = self.slot().await?;
+                tokio::task::spawn_blocking(move || -> Result<(), Error> {
+                    let _slot = slot;
+                    // Release obsolete idle attachments. Busy readers retain
+                    // their generation lock until their query returns.
+                    let release_idle = || -> Result<(), Error> {
+                        connections
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .retain_mut(|reader| {
+                                if reader
+                                    .generation
+                                    .as_ref()
+                                    .is_some_and(|g| !prepared.is_current(g))
+                                {
+                                    return reader.detach().is_ok();
+                                }
+                                true
+                            });
+                        prepared.cleanup(now.date())?;
+                        Ok(())
+                    };
+                    release_idle()?;
+                    prepared.prepare_day(day, now.date(), &files, &derived, &stopping)?;
+                    release_idle()?;
+                    Ok(())
+                })
+                .await??;
+            }
         }
         let derived = derived.clone();
         let oldest = oldest.to_offset(UtcOffset::UTC).date().previous_day();
@@ -2775,6 +2967,440 @@ mod tests {
         }
     }
 
+    async fn prepare_native_fixture(
+        access: &WeatherAccess,
+        day: time::Date,
+        files: &[ParquetFileName],
+    ) {
+        let prepared = access.prepared.clone().unwrap();
+        let derived = access.derived.clone().unwrap();
+        let files = files.to_vec();
+        tokio::task::spawn_blocking(move || {
+            prepared.prepare_day(day, day, &files, &derived, &CancellationToken::new())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_forecasts_preserve_issue_publication_offset_and_unit_semantics() {
+        let directory = forecast_data_dir();
+        let published = access(&directory);
+        let native = derived_access(&directory);
+        let copied = derive_all(&native).await;
+        let names: Vec<_> = copied.into_iter().map(|(name, _)| name).collect();
+        let files: Vec<_> = names
+            .iter()
+            .map(|name| ParquetFileName::parse(name).unwrap())
+            .collect();
+        for day in [
+            time::macros::date!(2026 - 01 - 17),
+            time::macros::date!(2026 - 01 - 18),
+        ] {
+            prepare_native_fixture(&native, day, &files).await;
+        }
+        let mut active = 0;
+        let mut fallback = 0;
+        for (request, station_ids) in fixture_forecast_requests() {
+            if native
+                .forecast_files_for(names.clone(), &station_ids, Some(&request))
+                .native
+                .is_some()
+            {
+                active += 1;
+            } else {
+                fallback += 1;
+            }
+            for days in [UtcOffset::UTC, UtcOffset::from_hms(-5, 0, 0).unwrap()] {
+                let expected = published
+                    .local_forecasts(&request, station_ids.clone(), days)
+                    .await
+                    .unwrap();
+                let actual = native
+                    .local_forecasts(&request, station_ids.clone(), days)
+                    .await
+                    .unwrap();
+                assert_same_forecasts(&expected, &actual, "native validity-day coverage");
+            }
+        }
+        assert!(active >= 5, "the native path must actually run");
+        assert!(
+            fallback >= 2,
+            "long and unsupported windows retain Parquet fallback"
+        );
+        let (request, stations) = fixture_forecast_requests().remove(0);
+        let (first, second) = tokio::join!(
+            native.forecasts_data(&request, stations.clone()),
+            native.forecasts_data(&request, stations)
+        );
+        assert_same_forecasts(
+            &first.unwrap(),
+            &second.unwrap(),
+            "independent concurrent native readers",
+        );
+        assert!(
+            native
+                .prepared
+                .as_ref()
+                .unwrap()
+                .select(&request, &names)
+                .is_some(),
+            "concurrent attachment must not reject the native generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_forecasts_keep_overlap_old_issues_and_midnight_prewarm() {
+        let rows = forecast_rows(
+            "('KOLD', '2026-01-16T23:00:00Z', '2026-01-17T02:00:00Z', '2025-12-01T00:00:00Z', 30, 70, 'fahrenheit', 5, 10, 60, 30, 20, 0.1, 0, 10, 0),
+             ('KOLD', '2026-01-17T23:00:00Z', '2026-01-18T02:00:00Z', '2025-12-01T00:00:00Z', 35, 75, 'fahrenheit', 5, 10, 60, 30, 20, 0.1, 0, 10, 0),
+             ('KOLD', '2026-01-16T20:00:00Z', '2026-01-17T00:00:00Z', '2025-12-01T00:00:00Z', 20, 120, 'fahrenheit', 5, 10, 60, 30, 20, 0.1, 0, 10, 0)",
+        );
+        let directory = data_dir(&[("forecasts_2026-01-17T10:00:00Z.parquet", &rows)]);
+        let published = access(&directory);
+        let native = derived_access(&directory);
+        let names: Vec<_> = derive_all(&native)
+            .await
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        let files: Vec<_> = names
+            .iter()
+            .map(|n| ParquetFileName::parse(n).unwrap())
+            .collect();
+        let day = time::macros::date!(2026 - 01 - 17);
+        let tomorrow = day.next_day().unwrap();
+        prepare_native_fixture(&native, day, &files).await;
+        // A prewarm must use the actual current day for retirement, and the
+        // prepared tomorrow stays eligible across the UTC midnight boundary.
+        native
+            .prepared
+            .as_ref()
+            .unwrap()
+            .prepare_day(
+                tomorrow,
+                day,
+                &files,
+                native.derived.as_ref().unwrap(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        native.prepared.as_ref().unwrap().cleanup(tomorrow).unwrap();
+        for validity in [day, tomorrow] {
+            let request = ForecastRequest {
+                start: Some(validity.with_time(time::Time::MIDNIGHT).assume_utc()),
+                end: Some(
+                    validity
+                        .next_day()
+                        .unwrap()
+                        .with_time(time::Time::MIDNIGHT)
+                        .assume_utc(),
+                ),
+                generated_start: Some(time::macros::datetime!(2025-11-30 00:00 UTC)),
+                generated_end: Some(time::macros::datetime!(2026-01-17 11:00 UTC)),
+                station_ids: "KOLD".into(),
+                temperature_unit: TemperatureUnit::Fahrenheit,
+            };
+            assert!(
+                native
+                    .forecast_files_for(names.clone(), &request.station_ids(), Some(&request))
+                    .native
+                    .is_some()
+            );
+            let expected = published
+                .forecasts_data(&request, request.station_ids())
+                .await
+                .unwrap();
+            let actual = native
+                .forecasts_data(&request, request.station_ids())
+                .await
+                .unwrap();
+            assert!(!actual.is_empty());
+            assert!(
+                actual.iter().all(|row| row.temp_high <= 75),
+                "end == preparation start is excluded"
+            );
+            assert_same_forecasts(
+                &expected,
+                &actual,
+                "overlap and old issue in recent publication",
+            );
+        }
+        // An unrelated malformed new publication must not invalidate a healthy
+        // native generation when the complete-source fallback also fails.
+        let bad_name = "forecasts_2026-01-17T11:00:00Z.parquet";
+        std::fs::write(
+            directory.path().join("2026-01-17").join(bad_name),
+            b"broken parquet",
+        )
+        .unwrap();
+        let request = ForecastRequest {
+            start: Some(time::macros::datetime!(2026-01-17 00:00 UTC)),
+            end: Some(time::macros::datetime!(2026-01-18 00:00 UTC)),
+            generated_start: Some(time::macros::datetime!(2025-11-30 00:00 UTC)),
+            generated_end: Some(time::macros::datetime!(2026-01-17 12:00 UTC)),
+            station_ids: "KOLD".into(),
+            temperature_unit: TemperatureUnit::Fahrenheit,
+        };
+        assert!(
+            native
+                .forecasts_data(&request, request.station_ids())
+                .await
+                .is_err()
+        );
+        assert!(
+            native
+                .prepared
+                .as_ref()
+                .unwrap()
+                .select(&request, &names)
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_prepare_files_initializes_a_fresh_current_day() {
+        let now = OffsetDateTime::now_utc();
+        let start = now.replace_time(time::Time::MIDNIGHT);
+        let end = start + Duration::days(1);
+        let issue = now - Duration::hours(1);
+        let publication = now - Duration::minutes(30);
+        let name = format!(
+            "forecasts_{}.parquet",
+            publication.format(&Rfc3339).unwrap()
+        );
+        let rows = forecast_rows(&format!(
+            "('KTEST', '{}', '{}', '{}', 40, 70, 'fahrenheit', 7, 90, 80, 40, 20, 0.1, 0.0, NULL, 0.0)",
+            start.format(&Rfc3339).unwrap(),
+            end.format(&Rfc3339).unwrap(),
+            issue.format(&Rfc3339).unwrap()
+        ));
+        let directory = data_dir(&[(&name, &rows)]);
+        let native = derived_access(&directory);
+        assert!(
+            !directory
+                .path()
+                .join("derived/prepared-current-v1")
+                .exists()
+        );
+        native
+            .prepare_files(&CancellationToken::new())
+            .await
+            .unwrap();
+        let request = ForecastRequest {
+            start: Some(start),
+            end: Some(end),
+            generated_start: Some(issue - Duration::hours(1)),
+            generated_end: Some(now),
+            station_ids: "KTEST".into(),
+            temperature_unit: TemperatureUnit::Fahrenheit,
+        };
+        assert!(
+            native
+                .forecast_files_for(vec![name], &request.station_ids(), Some(&request))
+                .native
+                .is_some()
+        );
+        let rows = native
+            .forecasts_data(&request, request.station_ids())
+            .await
+            .unwrap();
+        assert_eq!(rows[0].temp_high, 70);
+    }
+
+    #[tokio::test]
+    async fn native_forecasts_merge_new_publications_retain_readers_and_recover_from_corruption() {
+        let directory = forecast_data_dir();
+        let published = access(&directory);
+        let native = derived_access(&directory);
+        let copied = derive_all(&native).await;
+        let mut names: Vec<_> = copied.into_iter().map(|(name, _)| name).collect();
+        let mut files: Vec<_> = names
+            .iter()
+            .map(|name| ParquetFileName::parse(name).unwrap())
+            .collect();
+        let day = time::macros::date!(2026 - 01 - 17);
+        prepare_native_fixture(&native, day, &files).await;
+        let (request, stations) = fixture_forecast_requests().remove(0);
+        let held = native
+            .prepared
+            .as_ref()
+            .unwrap()
+            .select(&request, &names)
+            .unwrap()
+            .0;
+        let old_path = held.generation.path.clone();
+        native
+            .forecasts_data(&request, stations.clone())
+            .await
+            .unwrap();
+
+        let name = "forecasts_2026-01-17T19:00:00Z.parquet";
+        let file = ParquetFileName::parse(name).unwrap();
+        let path = directory.path().join(format!("2026-01-17/{name}"));
+        let correction = forecast_rows(
+            "('KTEST', '2026-01-17T00:00:00Z', '2026-01-17T06:00:00Z', '2026-01-17T10:00:00Z', 20, 123, 'fahrenheit', 7, NULL, 90, 60, 25, 0.15, 1.5, 12.0, 0.0)",
+        );
+        open_connection()
+            .unwrap()
+            .execute_batch(&format!(
+                "COPY ({correction}) TO '{}' (FORMAT PARQUET)",
+                path.to_string_lossy().replace('\'', "''")
+            ))
+            .unwrap();
+        names.push(name.to_owned());
+        files.push(file.clone());
+        let split = native.forecast_files_for(names.clone(), &stations, Some(&request));
+        assert!(split.native.is_some());
+        assert_eq!(
+            split.source.len(),
+            1,
+            "new upload is not silently marked covered"
+        );
+        let expected = published
+            .forecasts_data(&request, stations.clone())
+            .await
+            .unwrap();
+        let actual = native
+            .forecasts_data(&request, stations.clone())
+            .await
+            .unwrap();
+        assert_same_forecasts(&expected, &actual, "new uncovered publication");
+        assert_eq!(
+            actual
+                .iter()
+                .find(|row| row.station_id == "KTEST")
+                .unwrap()
+                .temp_high,
+            123
+        );
+
+        native
+            .derived
+            .as_ref()
+            .unwrap()
+            .copy(&file, &path.to_string_lossy())
+            .unwrap();
+        let day_files: Vec<_> = files
+            .iter()
+            .filter(|file| file.generated_at.date() == day)
+            .cloned()
+            .collect();
+        native
+            .derived
+            .as_ref()
+            .unwrap()
+            .compact_day(&day_files)
+            .unwrap();
+        let delta = native.forecast_files_for(names.clone(), &stations, Some(&request));
+        assert!(delta.native.is_some());
+        assert!(
+            delta.compacted.is_empty(),
+            "one new publication must not expand into a whole-day scan"
+        );
+        assert_eq!(delta.derived.len(), 1);
+        let actual = native
+            .forecasts_data(&request, stations.clone())
+            .await
+            .unwrap();
+        assert_same_forecasts(
+            &expected,
+            &actual,
+            "correction after daily compaction, before native refresh",
+        );
+        drop(delta);
+        prepare_native_fixture(&native, day, &files).await;
+        let prepared = native.prepared.as_ref().unwrap();
+        prepared.cleanup(day).unwrap();
+        assert!(
+            old_path.exists(),
+            "attached/selected readers keep the retired generation alive"
+        );
+        drop(held);
+        drop(split);
+        native.connections.lock().unwrap().clear();
+        prepared.cleanup(day).unwrap();
+        assert!(
+            !old_path.exists(),
+            "unreferenced retired generations are reclaimed"
+        );
+
+        let selected = prepared.select(&request, &names).unwrap().0;
+        std::fs::write(&selected.generation.path, b"broken native database").unwrap();
+        let actual = native
+            .forecasts_data(&request, stations.clone())
+            .await
+            .unwrap();
+        assert_same_forecasts(
+            &expected,
+            &actual,
+            "complete-source fallback after native ATTACH failure",
+        );
+        assert!(
+            prepared.select(&request, &names).is_none(),
+            "failed generation is rejected"
+        );
+        drop(selected);
+        prepare_native_fixture(&native, day, &files).await;
+        assert!(
+            prepared.select(&request, &names).is_some(),
+            "same source set can rebuild a rejected generation"
+        );
+        let actual = native.forecasts_data(&request, stations).await.unwrap();
+        assert_same_forecasts(&expected, &actual, "repaired native generation");
+    }
+
+    #[tokio::test]
+    async fn native_preparation_keeps_published_state_on_cancellation_and_cleans_abandoned_files() {
+        let directory = forecast_data_dir();
+        let native = derived_access(&directory);
+        let names: Vec<_> = derive_all(&native)
+            .await
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        let files: Vec<_> = names
+            .iter()
+            .map(|name| ParquetFileName::parse(name).unwrap())
+            .collect();
+        let day = time::macros::date!(2026 - 01 - 17);
+        prepare_native_fixture(&native, day, &files).await;
+        let root = directory.path().join("derived/prepared-current-v1");
+        let manifest = std::fs::read(root.join(format!("{day}.json"))).unwrap();
+        let stop = CancellationToken::new();
+        stop.cancel();
+        assert!(
+            !native
+                .prepared
+                .as_ref()
+                .unwrap()
+                .prepare_day(
+                    day.next_day().unwrap(),
+                    day,
+                    &files,
+                    native.derived.as_ref().unwrap(),
+                    &stop
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            std::fs::read(root.join(format!("{day}.json"))).unwrap(),
+            manifest
+        );
+        std::fs::write(root.join("building-abandoned.duckdb"), b"abandoned").unwrap();
+        std::fs::create_dir(root.join("spill-abandoned")).unwrap();
+        std::fs::write(root.join("spill-abandoned/block"), b"abandoned").unwrap();
+        prepare_native_fixture(&native, day, &files).await;
+        assert!(!root.join("building-abandoned.duckdb").exists());
+        assert!(!root.join("spill-abandoned").exists());
+        assert_eq!(
+            std::fs::read(root.join(format!("{day}.json"))).unwrap(),
+            manifest,
+            "already prepared sources do not rebuild"
+        );
+    }
+
     #[tokio::test]
     async fn unreadable_forecast_files_are_read_directly_and_fail_like_before() {
         let bad = forecast_rows(
@@ -3010,6 +3636,11 @@ mod tests {
             "daily compaction ready in {:.1}s",
             started.elapsed().as_secs_f64()
         );
+        let native_files: Vec<_> = names
+            .iter()
+            .map(|name| ParquetFileName::parse(name).unwrap())
+            .collect();
+        prepare_native_fixture(&derived, newest.date(), &native_files).await;
         let now = newest;
         let today = now.replace_time(time::Time::MIDNIGHT);
         let airports: Vec<String> = "KATL,KLAX,KORD,KDFW,KDEN,KJFK,KSFO,KSEA,KLAS,KMCO,KEWR,KMIA,KPHX,KIAH,KBOS,KMSP,KFLL,KDTW,KPHL,KLGA,KBWI,KSLC,KDCA,KSAN,KTPA,KPDX,KSTL,KHNL,KBNA,KAUS,KMCI,KRDU,KMKE,KSMF,KCLT,KPIT,KSAT,KOAK,KCLE,KSJC,KIND,KCVG,KCMH,KJAN,KRSW,KABQ,KANC,KOMA,KBUF,KPBI,KBDL,KPVD,KBTV,KPWM,KMHT,KBOI,KBIL,KFSD,KFAR,KGEG,KICT,KLIT,KLEX,KBHM,KMEM,KJAX,KCHS,KRIC,KORF,KCRW,KPNS,KMOB,KSHV,KMSY,KTUL,KELP,KTUS,KCOS,KGRR,KDSM,KMSN,KDLH,KBZN,KGJT,KRAP,KFCA,KCYS,KJAR,KSGF,KFSM"
@@ -3037,6 +3668,10 @@ mod tests {
         let before = |time: OffsetDateTime| time - Duration::nanoseconds(1);
         let finished = today - Duration::hours(21);
         let cases = [
+            (
+                "API: 90 airports, today with default issues",
+                request(today, today + Duration::days(1), None, &airports),
+            ),
             (
                 "dashboard: 90 airports, today from yesterday's issues",
                 request(
@@ -3081,7 +3716,15 @@ mod tests {
             "\n| Query | Before (ms) | After, published files (ms) | After, derived files (ms) | Rows |"
         );
         println!("| --- | ---: | ---: | ---: | ---: |");
+        let mut native_cases = 0;
         for (name, (request, station_ids)) in cases {
+            if derived
+                .forecast_files_for(names.clone(), &station_ids, Some(&request))
+                .native
+                .is_some()
+            {
+                native_cases += 1;
+            }
             let started = std::time::Instant::now();
             let expected =
                 match legacy::forecasts_data(&published, &request, station_ids.clone()).await {
@@ -3121,5 +3764,9 @@ mod tests {
                 from_copies.len()
             );
         }
+        assert!(
+            native_cases >= 2,
+            "both broad default and historical issue queries must use native storage"
+        );
     }
 }

@@ -503,8 +503,11 @@ async fn log_request(request: Request<Body>, next: Next) -> impl IntoResponse {
         .map(|p| p.as_str().to_owned())
         .unwrap_or_default();
     info!(target: "http_request", "new request, {} {}", method, path);
-
+    let request_logging = started.elapsed();
+    let handling = std::time::Instant::now();
     let response = next.run(request).await;
+    let handled = handling.elapsed();
+    let logging = std::time::Instant::now();
     info!(
         target: "http_response",
         "response, code: {}, time: {:?}",
@@ -512,6 +515,11 @@ async fn log_request(request: Request<Body>, next: Next) -> impl IntoResponse {
         started.elapsed()
     );
 
+    let response_logging = logging.elapsed();
+    if started.elapsed().as_millis() >= 350 {
+        info!(target: "http_timing", "slow HTTP phases: request_log={:.1}ms handler={:.1}ms response_log={:.1}ms",
+            request_logging.as_secs_f64() * 1000.0, handled.as_secs_f64() * 1000.0, response_logging.as_secs_f64() * 1000.0);
+    }
     response
 }
 

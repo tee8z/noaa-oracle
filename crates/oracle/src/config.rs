@@ -273,6 +273,10 @@ fn parse_pubkeys(field: &'static str, values: &[String]) -> Result<Vec<PublicKey
 }
 
 pub fn setup_logger() -> Dispatch {
+    logger_to(std::io::stdout())
+}
+
+pub(crate) fn logger_to(output: impl Into<fern::Output>) -> Dispatch {
     let colors = ColoredLevelConfig::new()
         .trace(Color::White)
         .debug(Color::Cyan)
@@ -292,7 +296,7 @@ pub fn setup_logger() -> Dispatch {
                 message
             ));
         })
-        .chain(std::io::stdout())
+        .chain(output)
 }
 
 #[cfg(test)]
