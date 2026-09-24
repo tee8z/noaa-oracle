@@ -1,4 +1,4 @@
-use maud::{Markup, PreEscaped, html};
+use maud::{Markup, html};
 
 use crate::templates::components::{
     time as when,
@@ -154,8 +154,9 @@ pub fn forecast_detail(
     }
 }
 
-/// A map pin's station: its name, then the (cached) forecast detail.
-pub fn station_detail(station_id: &str, place: Option<&str>, forecast_html: &str) -> Markup {
+/// A map pin's station: its name, then the (cached) forecast detail or an
+/// error with a retry.
+pub fn station_detail(station_id: &str, place: Option<&str>, detail: Markup) -> Markup {
     html! {
         div class="station-detail" {
             div class="station-detail-head" {
@@ -165,7 +166,7 @@ pub fn station_detail(station_id: &str, place: Option<&str>, forecast_html: &str
                 }
                 a href=(format!("/?view=list&q={station_id}")) class="is-size-7" { "Show in the list" }
             }
-            (PreEscaped(forecast_html))
+            (detail)
         }
     }
 }

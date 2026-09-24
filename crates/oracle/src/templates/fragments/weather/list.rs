@@ -191,7 +191,8 @@ fn station_row(weather: &WeatherDisplay, context: &WeatherContext) -> Markup {
                 span class="wx-rain" data-label="Precip" { (values::precipitation(weather.rain_amt, "rain", 2)) }
                 span class="wx-snow" data-label="Snow" { (values::precipitation(weather.snow_amt, "snow", 2)) }
             }
-            div class="wx-forecast" {
+            div class="wx-forecast"
+                data-load-error="Couldn't load the forecast and history." {
                 p class="wx-loading" { span class="loader" {} " Loading forecast and history…" }
             }
         }

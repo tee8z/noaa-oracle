@@ -533,6 +533,62 @@ async fn forecast_fragment_handles_no_data() {
     assert!(html.contains("No forecast data available"));
 }
 
+/// A failed forecast query is not shown, or cached, as "no data": the
+/// reader gets an error with a retry, and the next request queries again.
+#[tokio::test]
+async fn failed_forecast_queries_offer_a_retry_and_are_not_cached() {
+    let broken = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut weather = MockWeatherAccess::new();
+    let failing = broken.clone();
+    weather.expect_forecasts_data().returning(move |_, _| {
+        if failing.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(oracle::weather_data::Error::InvalidStationId(
+                "broken".into(),
+            ))
+        } else {
+            Ok(mock_forecast_data())
+        }
+    });
+    weather
+        .expect_daily_observations()
+        .returning(|_, _| Ok(vec![]));
+    weather.expect_stations().returning(|| Ok(mock_stations()));
+    let app = spawn_app(Arc::new(weather)).await;
+
+    let (status, body) = app.get("/fragments/forecast/KORD").await;
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains("Try again"), "{html}");
+    assert!(
+        html.contains("hx-get=\"/fragments/forecast/KORD\""),
+        "{html}"
+    );
+    assert!(
+        html.contains("hx-target=\"closest .wx-forecast\""),
+        "{html}"
+    );
+    assert!(!html.contains("No forecast data available"), "{html}");
+
+    let (status, body) = app.get("/fragments/station/KORD").await;
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains("Chicago O"), "{html}");
+    assert!(
+        html.contains("hx-get=\"/fragments/station/KORD\""),
+        "{html}"
+    );
+    assert!(html.contains("hx-target=\"#map-station\""), "{html}");
+
+    broken.store(false, std::sync::atomic::Ordering::SeqCst);
+    let (status, body) = app.get("/fragments/forecast/KORD").await;
+    assert!(status.is_success());
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        html.contains("Forecasts and observations for KORD"),
+        "{html}"
+    );
+}
+
 /// Test that dashboard handles empty weather data gracefully
 #[tokio::test]
 async fn dashboard_handles_no_weather_data() {

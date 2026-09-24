@@ -1,3 +1,4 @@
+pub mod load_error;
 mod tabs;
 mod theme_toggle;
 pub mod time;

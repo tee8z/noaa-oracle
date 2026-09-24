@@ -5,17 +5,21 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
 };
-use futures::stream::{self, StreamExt};
-use log::info;
+use maud::PreEscaped;
 use serde::Deserialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use super::htmx::{Render, page_or_fragment, with_url};
+use super::{
+    forecast::forecast_html,
+    htmx::{Render, page_or_fragment, with_url},
+};
 use crate::{
-    AppState, ForecastRequest, ObservationRequest, TemperatureUnit,
-    templates::fragments::{
-        ForecastComparison, ForecastDisplay, WeatherContext, forecast_detail, station_detail,
-        weather::place_name, weather_list, weather_section,
+    AppState,
+    templates::{
+        components::load_error::load_error,
+        fragments::{
+            WeatherContext, station_detail, weather::place_name, weather_list, weather_section,
+        },
     },
     weather_data::validate_station_id,
 };
@@ -106,22 +110,33 @@ pub async fn station_handler(
     if validate_station_id(&station_id).is_err() {
         return (StatusCode::BAD_REQUEST, "invalid station id").into_response();
     }
-    let forecast = forecast_handler(State(state.clone()), Path(station_id.clone())).await;
-    let forecast = match axum::body::to_bytes(forecast.into_body(), usize::MAX).await {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    let (forecast, stations) = tokio::join!(forecast_html(&state, &station_id), state.stations());
+    let place = stations.ok().and_then(|stations| {
+        stations
+            .iter()
+            .find(|station| station.station_id == station_id)
+            .map(|station| place_name(&station.station_name, &station.state))
+    });
+    let (status, detail) = match forecast {
+        Ok(html) => (StatusCode::OK, PreEscaped(html)),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            load_error(
+                "Couldn't load this station's forecast and history.",
+                &format!("/fragments/station/{station_id}"),
+                "#map-station",
+            ),
+        ),
     };
-    let stations = state.stations().await.unwrap_or_default();
-    let place = stations
-        .iter()
-        .find(|station| station.station_id == station_id)
-        .map(|station| place_name(&station.station_name, &station.state));
-    Html(station_detail(&station_id, place.as_deref(), &forecast).into_string()).into_response()
+    (
+        status,
+        Html(station_detail(&station_id, place.as_deref(), detail).into_string()),
+    )
+        .into_response()
 }
 
-/// Handler for forecast detail fragment (GET /fragments/forecast/:station_id).
-/// Rejects invalid ids and caches only stations present in the data, so
-/// arbitrary paths cannot grow the cache.
+/// Handler for forecast detail fragment (GET /fragments/forecast/:station_id),
+/// which a list row loads when it opens.
 pub async fn forecast_handler(
     State(state): State<Arc<AppState>>,
     Path(station_id): Path<String>,
@@ -129,154 +144,19 @@ pub async fn forecast_handler(
     if validate_station_id(&station_id).is_err() {
         return (StatusCode::BAD_REQUEST, "invalid station id").into_response();
     }
-    if let Some(cached) = state.cached_forecast(&station_id) {
-        return Html(cached).into_response();
+    match forecast_html(&state, &station_id).await {
+        Ok(html) => Html(html).into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Html(
+                load_error(
+                    "Couldn't load the forecast and history.",
+                    &format!("/fragments/forecast/{station_id}"),
+                    "closest .wx-forecast",
+                )
+                .into_string(),
+            ),
+        )
+            .into_response(),
     }
-    let html = build_forecast_html(&state, &station_id).await;
-    if state.is_known_station(&station_id).await {
-        state.cache_forecast(station_id, html.clone());
-    }
-    Html(html).into_response()
-}
-
-/// Build the forecast detail HTML for a station (used by handler and cache warming)
-pub async fn build_forecast_html(state: &Arc<AppState>, station_id: &str) -> String {
-    let now = OffsetDateTime::now_utc();
-
-    // Forecasts and comparison observations use complete UTC calendar days.
-    let today = now.replace_time(time::Time::MIDNIGHT);
-    let future_end = today + time::Duration::days(7);
-    let future_req = ForecastRequest {
-        start: Some(today),
-        end: Some(future_end),
-        generated_start: None,
-        generated_end: None,
-        station_ids: station_id.to_string(),
-        temperature_unit: TemperatureUnit::Fahrenheit,
-    };
-
-    let forecasts = state
-        .weather_db
-        .forecasts_data(&future_req, vec![station_id.to_string()])
-        .await
-        .unwrap_or_default();
-
-    let today_key = today.date().to_string();
-    let mut forecast_displays: Vec<ForecastDisplay> = forecasts
-        .into_iter()
-        .filter(|forecast| {
-            forecast
-                .date
-                .get(..10)
-                .is_some_and(|date| date >= today_key.as_str())
-        })
-        .map(|f| ForecastDisplay {
-            date: f.date,
-            temp_high: f.temp_high,
-            temp_low: f.temp_low,
-            wind_speed: f.wind_speed,
-            wind_direction: f.wind_direction,
-            humidity_max: f.humidity_max,
-            humidity_min: f.humidity_min,
-            precip_chance: f.precip_chance,
-            rain_amt: f.rain_amt,
-            snow_amt: f.snow_amt,
-        })
-        .collect();
-
-    // Sort by date chronologically
-    forecast_displays.sort_by(|a, b| a.date.cmp(&b.date));
-
-    // Fetch past forecasts and daily observations in parallel (last 7 days)
-    let past_start = today - time::Duration::days(7);
-    let past_req = ForecastRequest {
-        start: Some(past_start),
-        end: Some(today),
-        generated_start: Some(past_start - time::Duration::days(1)),
-        generated_end: Some(now),
-        station_ids: station_id.to_string(),
-        temperature_unit: TemperatureUnit::Fahrenheit,
-    };
-
-    let obs_req = ObservationRequest {
-        start: Some(past_start),
-        end: Some(today - time::Duration::nanoseconds(1)),
-        station_ids: station_id.to_string(),
-        temperature_unit: TemperatureUnit::Fahrenheit,
-    };
-
-    let (past_forecasts, daily_obs) = tokio::join!(
-        state
-            .weather_db
-            .forecasts_data(&past_req, vec![station_id.to_string()]),
-        state
-            .weather_db
-            .daily_observations(&obs_req, vec![station_id.to_string()])
-    );
-
-    let past_forecasts = past_forecasts.unwrap_or_default();
-    let daily_obs = daily_obs.unwrap_or_default();
-
-    // Build comparison data by matching forecast dates to observation dates
-    let past_key = past_start.date().to_string();
-    let mut comparisons: Vec<ForecastComparison> = past_forecasts
-        .into_iter()
-        .filter(|forecast| {
-            forecast
-                .date
-                .get(..10)
-                .is_some_and(|date| date >= past_key.as_str() && date < today_key.as_str())
-        })
-        .map(|f| {
-            let obs = daily_obs
-                .iter()
-                .find(|o| o.date.get(..10) == f.date.get(..10));
-            ForecastComparison {
-                date: f.date,
-                forecast_high: f.temp_high,
-                forecast_low: f.temp_low,
-                forecast_wind: f.wind_speed,
-                forecast_humidity_max: f.humidity_max,
-                forecast_humidity_min: f.humidity_min,
-                forecast_rain: f.rain_amt,
-                forecast_snow: f.snow_amt,
-                actual_high: obs.map(|o| o.temp_high),
-                actual_low: obs.map(|o| o.temp_low),
-                actual_wind: obs.and_then(|o| o.wind_speed),
-                actual_humidity: obs.and_then(|o| o.humidity),
-                actual_rain: obs.and_then(|o| o.rain_amt),
-                actual_snow: obs.and_then(|o| o.snow_amt),
-            }
-        })
-        .collect();
-
-    // Sort comparisons by date (most recent first)
-    comparisons.sort_by(|a, b| b.date.cmp(&a.date));
-
-    forecast_detail(station_id, &comparisons, &forecast_displays).into_string()
-}
-
-/// Pre-warm the forecast cache for all default stations.
-/// Called at startup and every 30 minutes by the background refresh task.
-pub async fn warm_forecast_cache(state: &Arc<AppState>) {
-    let airports = super::weather::default_airports();
-    info!("Warming forecast cache for {} stations...", airports.len());
-
-    let futs: Vec<_> = airports
-        .into_iter()
-        .map(|station_id| {
-            let state = state.clone();
-            async move {
-                let html = build_forecast_html(&state, &station_id).await;
-                state.cache_forecast(station_id, html);
-            }
-        })
-        .collect();
-
-    stream::iter(futs)
-        .buffer_unordered(10)
-        .collect::<Vec<()>>()
-        .await;
-
-    info!("Forecast cache warming complete.");
 }
