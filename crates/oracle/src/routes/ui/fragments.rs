@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
 };
 use futures::stream::{self, StreamExt};
 use log::info;
 use serde::Deserialize;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 use crate::{
     AppState, ForecastRequest, ObservationRequest, TemperatureUnit,
@@ -70,6 +70,7 @@ pub async fn event_stats_handler(State(state): State<Arc<AppState>>) -> Html<Str
 
 /// Handler for weather table fragment (GET /fragments/weather)
 pub async fn weather_handler(
+    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(query): Query<WeatherQuery>,
 ) -> Html<String> {
@@ -99,37 +100,57 @@ pub async fn weather_handler(
         .end
         .as_deref()
         .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok());
-    let weather = super::weather::load_weather(&state, &station_ids, start, end).await;
+    let days = super::local_day::reader_offset(&headers);
+    let weather = super::weather::load_weather(&state, &station_ids, start, end, days).await;
     let refresh_path = super::weather::refresh_path(&station_ids, start, end);
     Html(weather_table_body_with_refresh(&weather, &refresh_path).into_string())
 }
 
 /// Handler for forecast detail fragment (GET /fragments/forecast/:station_id).
-/// Rejects invalid ids and caches only stations present in the data, so
-/// arbitrary paths cannot grow the cache.
+/// Days are the reader's (see [`super::local_day`]). Rejects invalid ids and
+/// caches only stations present in the data, so arbitrary paths cannot grow
+/// the cache.
 pub async fn forecast_handler(
+    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Path(station_id): Path<String>,
 ) -> Response {
     if validate_station_id(&station_id).is_err() {
         return (StatusCode::BAD_REQUEST, "invalid station id").into_response();
     }
-    if let Some(cached) = state.cached_forecast(&station_id) {
+    let days = super::local_day::reader_offset(&headers);
+    let key = forecast_cache_key(&station_id, days);
+    if let Some(cached) = state.cached_forecast(&key) {
         return Html(cached).into_response();
     }
-    let html = build_forecast_html(&state, &station_id).await;
+    let html = build_forecast_html(&state, &station_id, days).await;
     if state.is_known_station(&station_id).await {
-        state.cache_forecast(station_id, html.clone());
+        state.cache_forecast(key, html.clone());
     }
     Html(html).into_response()
 }
 
+/// Forecast fragments differ by the reader's calendar; UTC keeps the plain
+/// station id the cache warmer uses.
+fn forecast_cache_key(station_id: &str, days: UtcOffset) -> String {
+    if days == UtcOffset::UTC {
+        station_id.to_owned()
+    } else {
+        format!("{station_id}@{}", days.whole_minutes())
+    }
+}
+
 /// Build the forecast detail HTML for a station (used by handler and cache warming)
-pub async fn build_forecast_html(state: &Arc<AppState>, station_id: &str) -> String {
+pub async fn build_forecast_html(
+    state: &Arc<AppState>,
+    station_id: &str,
+    days: UtcOffset,
+) -> String {
     let now = OffsetDateTime::now_utc();
 
-    // Forecasts and comparison observations use complete UTC calendar days.
-    let today = now.replace_time(time::Time::MIDNIGHT);
+    // Forecasts and comparison observations use complete calendar days at
+    // `days` from UTC.
+    let today = super::local_day::start_of_today(now, days);
     let future_end = today + time::Duration::days(7);
     let future_req = ForecastRequest {
         start: Some(today),
@@ -142,7 +163,7 @@ pub async fn build_forecast_html(state: &Arc<AppState>, station_id: &str) -> Str
 
     let forecasts = state
         .weather_db
-        .forecasts_data(&future_req, vec![station_id.to_string()])
+        .local_forecasts(&future_req, vec![station_id.to_string()], days)
         .await
         .unwrap_or_default();
 
@@ -193,10 +214,10 @@ pub async fn build_forecast_html(state: &Arc<AppState>, station_id: &str) -> Str
     let (past_forecasts, daily_obs) = tokio::join!(
         state
             .weather_db
-            .forecasts_data(&past_req, vec![station_id.to_string()]),
+            .local_forecasts(&past_req, vec![station_id.to_string()], days),
         state
             .weather_db
-            .daily_observations(&obs_req, vec![station_id.to_string()])
+            .local_daily_observations(&obs_req, vec![station_id.to_string()], days)
     );
 
     let past_forecasts = past_forecasts.unwrap_or_default();
@@ -255,7 +276,7 @@ pub async fn warm_forecast_cache(state: &Arc<AppState>) {
             let state = state.clone();
             let station_id = station_id.to_string();
             async move {
-                let html = build_forecast_html(&state, &station_id).await;
+                let html = build_forecast_html(&state, &station_id, UtcOffset::UTC).await;
                 state.cache_forecast(station_id, html);
             }
         })

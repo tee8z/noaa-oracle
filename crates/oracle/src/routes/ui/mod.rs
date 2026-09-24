@@ -2,6 +2,7 @@ mod dashboard;
 mod event_detail;
 mod events;
 mod fragments;
+mod local_day;
 mod raw_data;
 mod weather;
 

@@ -28,6 +28,7 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
                 script src="https://cdn.jsdelivr.net/npm/htmx.org@1.9.10/dist/htmx.min.js" {}
                 // Apply saved theme before page renders to prevent flash
                 script { (PreEscaped(THEME_INIT_SCRIPT)) }
+                script { (PreEscaped(LOCAL_DAY_SCRIPT)) }
             }
             body {
                 script {
@@ -84,6 +85,10 @@ const THEME_INIT_SCRIPT: &str = r#"
     }
 })();
 "#;
+
+/// Tells the server the reader's UTC offset, in minutes east of UTC, so
+/// "today" is the reader's calendar day (`routes::ui::local_day`).
+const LOCAL_DAY_SCRIPT: &str = r#"document.cookie="utc_offset="+-new Date().getTimezoneOffset()+"; path=/; max-age=31536000; samesite=lax";"#;
 
 fn github_icon() -> Markup {
     html! {

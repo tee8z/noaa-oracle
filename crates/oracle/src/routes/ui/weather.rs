@@ -49,19 +49,23 @@ fn encode_query_value(value: &str) -> String {
 }
 
 /// Use the same observation period and forecast vintage on initial load and refresh.
+/// Without a selected period, today is the reader's day at `days` from UTC
+/// (see [`super::local_day`]); a selected period keeps UTC days.
 pub(super) async fn load_weather(
     state: &Arc<AppState>,
     station_ids: &[String],
     start: Option<OffsetDateTime>,
     end: Option<OffsetDateTime>,
+    days: UtcOffset,
 ) -> Vec<WeatherDisplay> {
     let now = OffsetDateTime::now_utc();
     let selected = start.is_some() || end.is_some();
+    let days = if selected { UtcOffset::UTC } else { days };
     let start = start
-        .unwrap_or_else(|| now.replace_time(Time::MIDNIGHT))
+        .unwrap_or_else(|| super::local_day::start_of_today(now, days))
         .to_offset(UtcOffset::UTC);
     let end = end.unwrap_or(now).to_offset(UtcOffset::UTC);
-    let day_start = start.replace_time(Time::MIDNIGHT);
+    let day_start = start.to_offset(days).replace_time(Time::MIDNIGHT);
     let day_end = day_start.saturating_add(Duration::days(1));
     let single_day = start <= end && end <= day_end;
     let period = if selected {
@@ -117,7 +121,7 @@ pub(super) async fn load_weather(
             if single_day {
                 state
                     .weather_db
-                    .forecasts_data(&forecast_request, station_ids.to_vec())
+                    .local_forecasts(&forecast_request, station_ids.to_vec(), days)
                     .await
                     .unwrap_or_else(|error| {
                         log::error!("failed to read forecasts for the weather table: {error:#}");

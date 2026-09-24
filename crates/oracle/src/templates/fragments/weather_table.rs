@@ -11,7 +11,7 @@ pub enum ObservationPeriod {
 impl ObservationPeriod {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Today => "Today so far (UTC)",
+            Self::Today => "Today so far",
             Self::Selected { .. } => "Selected period (UTC)",
         }
     }

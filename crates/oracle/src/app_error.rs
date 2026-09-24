@@ -41,7 +41,8 @@ impl IntoResponse for AppError {
                 | weather_data::Error::TimeParse(_)
                 | weather_data::Error::FileAccess(_)
                 | weather_data::Error::Schema { .. }
-                | weather_data::Error::Task(_),
+                | weather_data::Error::Task(_)
+                | weather_data::Error::Io(_),
             ) => internal(),
             AppError::FileAccess(file_access::Error::NotFound(_)) => {
                 (StatusCode::NOT_FOUND, String::from("file not found"))

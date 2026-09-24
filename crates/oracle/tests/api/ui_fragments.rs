@@ -56,7 +56,7 @@ async fn dashboard_returns_current_day_observations() {
     assert!(html.contains("Latest observed"));
     assert!(html.contains("63°F"));
     assert!(html.contains("2024-08-12T23:53:00Z"));
-    assert!(html.contains("Today so far (UTC)"));
+    assert!(html.contains("Today so far"));
 }
 
 /// Test that the weather fragment endpoint filters by time range
@@ -94,6 +94,101 @@ async fn weather_fragment_uses_same_current_day_and_latest_report_windows() {
         .expect("Failed to execute request.");
 
     assert!(response.status().is_success());
+}
+
+/// The `utc_offset` cookie makes today the reader's day: observations from
+/// their midnight, and the forecast issued before it.
+#[tokio::test]
+async fn offset_cookie_makes_today_the_readers_day() {
+    let eastern = time::UtcOffset::from_hms(-4, 0, 0).unwrap();
+    let midnight = OffsetDateTime::now_utc()
+        .to_offset(eastern)
+        .replace_time(Time::MIDNIGHT);
+    let mut weather = MockWeatherAccess::new();
+    weather
+        .expect_observation_data()
+        .withf(move |request, _| request.start == Some(midnight))
+        .times(1)
+        .returning(|_, _| Ok(mock_observation_data()));
+    weather
+        .expect_observation_data()
+        .withf(|request, _| {
+            request
+                .start
+                .zip(request.end)
+                .is_some_and(|(start, end)| end - start == Duration::hours(24))
+        })
+        .times(1)
+        .returning(|_, _| Ok(mock_observation_data()));
+    weather
+        .expect_forecasts_data()
+        .withf(move |request, _| {
+            request.start == Some(midnight)
+                && request.end == Some(midnight + Duration::days(1))
+                && request.generated_end == Some(midnight - Duration::nanoseconds(1))
+        })
+        .times(1)
+        .returning(|_, _| Ok(vec![]));
+    weather
+        .expect_stations()
+        .times(1)
+        .returning(|| Ok(mock_stations()));
+    let app = spawn_app(Arc::new(weather)).await;
+    let (status, body) = app
+        .send(
+            Request::get("/fragments/weather")
+                .header(header::COOKIE, "weather_view=list; utc_offset=-240")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    assert!(status.is_success());
+    assert!(
+        String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("Today so far")
+    );
+}
+
+/// The forecast detail's days follow the cookie too, and are cached apart
+/// from the UTC version.
+#[tokio::test]
+async fn forecast_detail_uses_the_readers_days() {
+    let eastern = time::UtcOffset::from_hms(-4, 0, 0).unwrap();
+    let midnight = OffsetDateTime::now_utc()
+        .to_offset(eastern)
+        .replace_time(Time::MIDNIGHT);
+    let mut weather = MockWeatherAccess::new();
+    weather
+        .expect_forecasts_data()
+        .withf(move |request, _| request.start == Some(midnight))
+        .times(1)
+        .returning(|_, _| Ok(mock_forecast_data()));
+    weather
+        .expect_forecasts_data()
+        .withf(move |request, _| {
+            request.start == Some(midnight - Duration::days(7)) && request.end == Some(midnight)
+        })
+        .times(1)
+        .returning(|_, _| Ok(vec![]));
+    weather
+        .expect_daily_observations()
+        .withf(move |request, _| request.end == Some(midnight - Duration::nanoseconds(1)))
+        .times(1)
+        .returning(|_, _| Ok(vec![]));
+    weather.expect_stations().returning(|| Ok(mock_stations()));
+    let app = spawn_app(Arc::new(weather)).await;
+    for _ in 0..2 {
+        let (status, _) = app
+            .send(
+                Request::get("/fragments/forecast/KORD")
+                    .header(header::COOKIE, "utc_offset=-240")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert!(status.is_success());
+    }
 }
 
 #[tokio::test]
@@ -197,7 +292,7 @@ async fn start_only_weather_selection_keeps_its_bound_and_refresh_context() {
     assert!(status.is_success());
     let html = String::from_utf8(body.to_vec()).unwrap();
     assert!(html.contains("Selected period (UTC)"));
-    assert!(!html.contains("Today so far (UTC)"));
+    assert!(!html.contains("Today so far"));
     let refresh = weather_refresh_url(&html);
     assert_eq!(
         refresh,
@@ -305,7 +400,7 @@ async fn latest_report_remains_visible_before_the_first_observation_of_today() {
     assert!(html.contains("KORD"));
     assert!(html.contains("63°F"));
     assert!(html.contains("Latest observed"));
-    assert!(html.contains("Today so far (UTC)"));
+    assert!(html.contains("Today so far"));
     assert!(html.contains("23:59:59.999999999Z"));
     assert!(!html.contains("75°F"));
     assert!(!html.contains("55°F"));

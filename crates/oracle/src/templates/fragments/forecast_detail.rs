@@ -61,7 +61,7 @@ pub fn forecast_detail(
                         }
                     }
                     p class="is-size-7 has-text-grey mb-2" {
-                        "Latest available forecasts and observations by UTC day. Differences = forecast − observed; + means the forecast was higher. — means unavailable."
+                        "Latest available forecasts and observations by day in your time zone. Differences = forecast − observed; + means the forecast was higher. — means unavailable."
                     }
                     div class="table-container" {
                         table class="table is-fullwidth is-narrow is-size-7" {
@@ -215,7 +215,7 @@ pub fn forecast_detail(
                 h4 class="title is-6 mb-3" {
                     "Upcoming forecast"
                 }
-                p class="is-size-7 has-text-grey mb-2" { "Forecast values by UTC date." }
+                p class="is-size-7 has-text-grey mb-2" { "Forecast values by date in your time zone." }
                 @if forecasts.is_empty() {
                     p class="has-text-grey" { "No forecast data available." }
                 } @else {

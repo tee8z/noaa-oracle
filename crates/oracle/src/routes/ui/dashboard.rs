@@ -53,7 +53,8 @@ pub async fn dashboard_handler(
             .map(str::to_string)
             .collect::<Vec<_>>()
     });
-    let data = build_dashboard_data(&state, station_ids.as_deref(), start, end).await;
+    let days = super::local_day::reader_offset(&headers);
+    let data = build_dashboard_data(&state, station_ids.as_deref(), start, end, days).await;
 
     // Check if this is an HTMX request
     if headers.contains_key("hx-request") {
@@ -70,6 +71,7 @@ async fn build_dashboard_data(
     station_ids: Option<&[String]>,
     start: Option<OffsetDateTime>,
     end: Option<OffsetDateTime>,
+    days: time::UtcOffset,
 ) -> DashboardData {
     // Get oracle identity
     let pubkey = state.oracle.public_key_base64();
@@ -93,7 +95,7 @@ async fn build_dashboard_data(
         }
     }
 
-    let weather = get_latest_weather(state, station_ids, start, end).await;
+    let weather = get_latest_weather(state, station_ids, start, end, days).await;
     let displayed_ids: Vec<String> = weather
         .iter()
         .map(|weather| weather.station_id.clone())
@@ -237,9 +239,11 @@ async fn get_latest_weather(
     station_ids: Option<&[String]>,
     start: Option<OffsetDateTime>,
     end: Option<OffsetDateTime>,
+    days: time::UtcOffset,
 ) -> Vec<WeatherDisplay> {
     if let Some(station_ids) = station_ids {
-        let mut weather_data = super::weather::load_weather(state, station_ids, start, end).await;
+        let mut weather_data =
+            super::weather::load_weather(state, station_ids, start, end, days).await;
         weather_data.sort_by(|a, b| a.station_id.cmp(&b.station_id));
         return weather_data;
     }
@@ -249,7 +253,7 @@ async fn get_latest_weather(
         .iter()
         .map(|station| station.to_string())
         .collect();
-    let mut weather_data = super::weather::load_weather(state, &airports, start, end).await;
+    let mut weather_data = super::weather::load_weather(state, &airports, start, end, days).await;
     if !weather_data.is_empty() {
         weather_data.sort_by(|a, b| {
             get_region(b.longitude)
@@ -258,7 +262,7 @@ async fn get_latest_weather(
         });
     } else {
         // Data without any default airport: show the first stations reporting.
-        weather_data = super::weather::load_weather(state, &[], start, end).await;
+        weather_data = super::weather::load_weather(state, &[], start, end, days).await;
         weather_data.sort_by(|a, b| a.station_id.cmp(&b.station_id));
         weather_data.truncate(20);
     }
