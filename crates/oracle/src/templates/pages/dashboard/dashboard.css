@@ -1,0 +1,59 @@
+/* Event counts: one row of four, two by two on phones. */
+.event-stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 0.5rem;
+    padding: 0.75rem;
+}
+
+@media screen and (max-width: 480px) {
+    .event-stats {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+.stat-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 0.35rem;
+    border-radius: 6px;
+    color: inherit;
+}
+
+.stat-card:hover {
+    background: var(--bulma-scheme-main-bis);
+}
+
+.stat-value {
+    font-size: 1.5rem;
+    font-weight: 700;
+    line-height: 1.2;
+}
+
+.stat-label {
+    font-size: 0.75rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.stat-live { color: var(--delta-close); }
+.stat-running { color: var(--delta-off); }
+.stat-completed { color: var(--temp-low); }
+.stat-signed { color: var(--snow); }
+
+.oracle-info > summary {
+    font-weight: 600;
+}
+
+.oracle-info dl {
+    margin-top: 0.75rem;
+    font-size: 0.85rem;
+}
+
+.oracle-info dt {
+    font-size: 0.75rem;
+    color: var(--muted);
+    margin-top: 0.5rem;
+}

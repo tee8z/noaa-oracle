@@ -1,715 +1,145 @@
-/* Oracle UI Custom Styles */
+/* Base styles, bundled before every component's own stylesheet. */
 
-/* Theme toggle button */
-#theme-toggle {
-    background: transparent;
-    border: 1px solid var(--bulma-border);
-    border-radius: 4px;
-    padding: 0.25rem 0.5rem;
-    cursor: pointer;
-    display: inline-flex;
+/* One font everywhere; digits of equal width so columns line up. */
+:root {
+    --muted: #5f6368;
+    --temp-high: #a34a00;
+    --temp-low: #1d4ed8;
+    --rain: #0e6f86;
+    --snow: #6d28d9;
+    --delta-close: #15803d;
+    --delta-off: #8a5a00;
+    --delta-far: #b91c1c;
+    --pin-ring: #ffffff;
+    --pin-middle: #d9d7d0;
+    --key: #6b21a8;
+}
+
+[data-theme="dark"] {
+    --muted: #a3a3a3;
+    --temp-high: #fbbf24;
+    --temp-low: #93c5fd;
+    --rain: #67e8f9;
+    --snow: #c4b5fd;
+    --delta-close: #4ade80;
+    --delta-off: #facc15;
+    --delta-far: #f87171;
+    --pin-ring: #1a1a19;
+    --pin-middle: #8f8d86;
+    --key: #d8b4fe;
+}
+
+body {
+    font-variant-numeric: tabular-nums;
+}
+
+.site {
+    padding: 1rem 0.75rem 3rem;
+}
+
+.site-header {
+    display: flex;
     align-items: center;
-    justify-content: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin-bottom: 0.75rem;
 }
 
-#theme-toggle:hover {
-    background: var(--bulma-scheme-main-bis);
+.site-title {
+    font-size: 1.35rem;
+    font-weight: 700;
+    color: var(--bulma-text-strong);
 }
 
-#theme-toggle .icon {
-    display: inline-flex;
+.site-actions {
+    display: flex;
     align-items: center;
-    justify-content: center;
+    gap: 0.5rem;
 }
 
-/* Status badge colors */
-.tag.is-live {
-    background-color: #48c78e;
-    color: #fff;
+.site-github {
+    display: inline-flex;
+    color: var(--bulma-text);
 }
 
-.tag.is-running {
-    background-color: #ffe08a;
-    color: rgba(0, 0, 0, 0.7);
+/* The page tabs stay visible on phones; they scroll if they must. */
+.site-tabs {
+    margin-bottom: 1rem !important;
 }
 
-.tag.is-completed {
-    background-color: #3e8ed0;
-    color: #fff;
+.site-tabs a {
+    white-space: nowrap;
 }
 
-.tag.is-signed {
-    background-color: #7c3aed;
-    color: #fff;
+@media screen and (max-width: 480px) {
+    .site-title {
+        font-size: 1.1rem;
+    }
+
+    .site-actions .button:not(#theme-toggle) {
+        display: none;
+    }
 }
 
-/* IATA airport code badge - ensure visibility in both light and dark modes */
+/* Event status colours, readable in both themes. */
+.tag.is-live { background-color: #15803d; color: #fff; }
+.tag.is-running { background-color: #fde68a; color: #422006; }
+.tag.is-completed { background-color: #1d4ed8; color: #fff; }
+.tag.is-signed { background-color: #6d28d9; color: #fff; }
+
+[data-theme="dark"] .tag.is-running {
+    background-color: #b45309;
+    color: #fffbeb;
+}
+
 .tag.is-iata {
     background-color: #6b7280;
     color: #fff;
+    font-size: 0.65rem;
+    height: 1.5em;
+    padding: 0 0.4em;
+    vertical-align: middle;
 }
 
-/* Weather row expansion */
-.weather-row {
-    cursor: pointer;
+.muted {
+    color: var(--muted);
 }
 
-.weather-row.is-expanded {
-    background-color: var(--bulma-scheme-main-bis) !important;
-}
-
-.forecast-row {
-    background-color: var(--bulma-scheme-main-bis);
-}
-
-.forecast-row td {
-    padding: 0 !important;
-}
-
-.forecast-detail {
-    background-color: var(--bulma-scheme-main-ter);
-    border-radius: 4px;
-    margin: 0.5rem;
-}
-
-.forecast-day {
-    background-color: var(--bulma-scheme-main) !important;
-}
-
-/* Past performance section */
-.past-performance {
-    border-left: 4px solid #f59e0b;
-    padding-left: 0.75rem;
-}
-
-.past-performance .table th {
-    white-space: nowrap;
-    font-size: 0.7rem;
-}
-
-.past-performance .table td {
-    white-space: nowrap;
-}
-
-.past-subheader th {
-    color: var(--bulma-text-weak) !important;
-    font-weight: 400 !important;
-    font-size: 0.65rem !important;
-    padding-top: 0 !important;
-}
-
-/* Upcoming forecast section */
-.upcoming-forecast {
-    border-left: 4px solid #10b981;
-    padding-left: 0.75rem;
-}
-
-/* Card improvements */
-.box {
-    transition: box-shadow 0.2s ease;
-}
-
-.box:hover {
-    box-shadow:
-        0 0.5em 1em -0.125em rgba(10, 10, 10, 0.15),
-        0 0px 0 1px rgba(10, 10, 10, 0.02);
-}
-
-/* Stat cards */
-.stat-card {
-    text-align: center;
-    padding: 1rem;
-}
-
-.stat-card .stat-value {
-    font-size: 2rem;
-    font-weight: bold;
-    line-height: 1.2;
-}
-
-.stat-card .stat-value.stat-running {
-    color: #8a5a00; /* Dark amber: readable on the light card */
-}
-
-[data-theme="dark"] .stat-card .stat-value.stat-running {
-    color: #fbbf24; /* Bright amber: readable on the dark card */
-}
-
-.stat-card .stat-label {
-    font-size: 0.875rem;
-    color: var(--bulma-text-weak);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-}
-
-/* Oracle info card */
-.oracle-info .info-label {
-    font-size: 0.75rem;
-    color: var(--bulma-text-weak);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    margin-bottom: 0.25rem;
-}
-
-.oracle-info .info-value {
-    font-family: monospace;
-    font-size: 0.875rem;
+code.key {
+    color: var(--key);
     word-break: break-all;
-    background: var(--bulma-scheme-main-bis);
-    padding: 0.5rem;
-    border-radius: 4px;
-    color: #b86bff; /* Purple color for keys */
+    user-select: all;
 }
 
-/* Copy button */
-.copy-btn {
-    cursor: pointer;
-    opacity: 0.7;
-    transition: opacity 0.2s ease;
-}
-
-.copy-btn:hover {
-    opacity: 1;
-}
-
-.copy-btn.copied {
-    color: #48c78e;
-}
-
-/* Table improvements */
 .table-container {
     overflow-x: auto;
-    -webkit-overflow-scrolling: touch;
 }
 
 .table th {
     white-space: nowrap;
 }
 
-/* Query result table wrapper - ensures horizontal scroll works */
-.query-result-wrapper {
-    overflow-x: auto;
-    -webkit-overflow-scrolling: touch;
-    max-width: 100%;
-    cursor: grab;
-}
-
-.query-result-wrapper.dragging {
-    cursor: grabbing;
-    user-select: none;
-}
-
-.query-result-wrapper table {
-    white-space: nowrap;
-}
-
-.query-result-wrapper td,
-.query-result-wrapper th {
-    max-width: 300px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-/* Clickable table rows */
-.table tr.is-clickable {
-    cursor: pointer;
-    transition: background-color 0.15s ease;
-}
-
-.table tr.is-clickable:hover {
-    background-color: var(--bulma-scheme-main-bis) !important;
-}
-
-/* Weather value styling */
-.weather-value {
-    font-family: monospace;
-    font-weight: 500;
-}
-
-.weather-value.temp-high {
-    color: #b8956e; /* Muted warm tan - subtle warmth for hot */
-}
-
-.weather-value.temp-low {
-    color: #60a5fa; /* Soft cool blue - intuitive for cold */
-}
-
-.weather-value.wind {
-    color: var(--bulma-text-weak);
-}
-
-.weather-period-note {
-    margin: 0.75rem 0;
-    font-size: 0.8125rem;
-    color: var(--bulma-text-weak);
-}
-
-.weather-observations-table {
-    font-size: 0.875rem;
-}
-
-.weather-observations-table td {
-    vertical-align: middle;
-}
-
-.weather-observations-table .weather-value {
-    white-space: nowrap;
-}
-
-.weather-station-description,
-.weather-column-context,
-.weather-latest-time {
-    display: block;
-    font-size: 0.75rem;
-    font-weight: 400;
-    color: var(--bulma-text-weak);
-}
-
-.weather-column-context {
-    white-space: normal;
-}
-
-.weather-station-description {
-    min-width: 8rem;
-    margin-top: 0.2rem;
-}
-
-.weather-latest-value {
-    font-size: 1.5rem;
-    line-height: 1.2;
-}
-
-.weather-latest-value .weather-value {
-    font-weight: 600;
-}
-
-.weather-latest-time {
-    margin-top: 0.25rem;
-    line-height: 1.4;
-}
-
-.weather-latest-cell {
-    min-width: 10rem;
-}
-
-.weather-forecast-comparison {
-    display: grid;
-    grid-template-columns: 2rem 3.5rem minmax(4.5rem, 1fr);
-    align-items: baseline;
-    gap: 0.4rem;
-    margin: 0.25rem 0;
-    white-space: nowrap;
-}
-
-.weather-comparison-label,
-.weather-comparison-difference {
-    font-size: 0.75rem;
-}
-
-.weather-comparison-label {
-    color: var(--bulma-text-weak);
-}
-
-.weather-forecast-link {
-    padding: 0;
-    margin-top: 0.3rem;
-    background: transparent;
-    border: 0;
-    color: var(--bulma-link-text);
-    cursor: pointer;
-    font-size: 0.75rem;
-    text-decoration: underline;
-    text-underline-offset: 0.15rem;
-}
-
-/* Station selector */
-.station-selector {
-    max-height: 300px;
-    overflow-y: auto;
-}
-
-/* Event detail page */
-.event-detail-header {
-    display: flex;
-    align-items: center;
-    gap: 1rem;
-    margin-bottom: 1.5rem;
-}
-
-.event-detail-header .back-btn {
-    flex-shrink: 0;
-}
-
-/* DLC info styling */
-.dlc-info {
-    font-family: monospace;
-    font-size: 0.75rem;
-    background: var(--bulma-scheme-main-bis);
-    padding: 0.75rem;
-    border-radius: 4px;
-    overflow-x: auto;
-}
-
-/* Loading indicator */
-.htmx-request .htmx-indicator {
-    display: inline-block;
-}
-
+/* htmx loading states */
 .htmx-indicator {
     display: none;
 }
 
-/* Mobile event cards */
-.event-card {
-    padding: 0.75rem;
+.htmx-request .htmx-indicator,
+.htmx-request.htmx-indicator {
+    display: inline-block;
 }
 
-.event-card-label {
-    font-size: 0.7rem;
-    color: var(--bulma-text-weak);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    margin-bottom: 0.15rem;
-}
-
-/* Weather station cards (mobile) */
-.weather-card {
-    padding: 0.75rem;
-}
-
-.weather-card-grid {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 0.5rem;
-    padding-top: 0.75rem;
-    border-top: 1px solid var(--bulma-border);
-}
-
-.weather-card-item {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    text-align: center;
-}
-
-.weather-card-label {
-    font-size: 0.6875rem;
-    color: var(--bulma-text-weak);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    margin-bottom: 0.1rem;
-}
-
-.weather-card.is-expanded {
-    background-color: var(--bulma-scheme-main-bis);
-}
-
-.weather-card-latest {
-    margin: 0.75rem 0;
-}
-
-.weather-card-latest .weather-latest-value {
-    font-size: 2rem;
-}
-
-.weather-card-period {
-    padding-top: 0.75rem;
-    border-top: 1px solid var(--bulma-border);
-    font-size: 0.8125rem;
-    font-weight: 600;
-}
-
-.weather-temperature-comparison {
-    width: 100%;
-    table-layout: fixed;
-    margin: 0.5rem 0 0.75rem;
-    font-size: 0.8125rem;
-}
-
-.weather-temperature-comparison th,
-.weather-temperature-comparison td {
-    padding: 0.25rem 0.15rem;
-    text-align: right;
-    vertical-align: middle;
-}
-
-.weather-temperature-comparison th:first-child {
-    width: 50%;
-    text-align: left;
-}
-
-.weather-temperature-comparison th {
-    color: var(--bulma-text-weak);
-    font-weight: 400;
-}
-
-.weather-temperature-comparison .weather-value {
-    white-space: nowrap;
-}
-
-.weather-observation-window {
-    margin-top: 0.75rem;
-    padding-top: 0.75rem;
-    border-top: 1px solid var(--bulma-border);
-}
-
-.weather-observation-window .weather-card-label {
+p.htmx-indicator.htmx-request {
     display: block;
 }
 
-.weather-forecast-action {
-    margin-top: 0.75rem;
-    gap: 0.5rem;
-}
-
-.card-forecast {
-    margin-top: 0.75rem;
-    padding-top: 0.75rem;
-    border-top: 1px solid var(--bulma-border);
-}
-
-.weather-region-header {
-    font-weight: 600;
-    font-size: 0.875rem;
-    padding: 0.5rem 0.75rem;
-    margin-top: 0.5rem;
-    margin-bottom: 0.5rem;
-    border-left: 4px solid;
-    border-radius: 2px;
-    background-color: var(--bulma-scheme-main-bis);
-}
-
-.weather-region-header.region-alaska-hawaii {
-    border-left-color: #8b5cf6;
-    background-color: rgba(139, 92, 246, 0.1);
-}
-
-.weather-region-header.region-pacific {
-    border-left-color: #a855f7;
-    background-color: rgba(168, 85, 247, 0.1);
-}
-
-.weather-region-header.region-mountain {
-    border-left-color: #10b981;
-    background-color: rgba(16, 185, 129, 0.1);
-}
-
-.weather-region-header.region-central {
-    border-left-color: #f59e0b;
-    background-color: rgba(245, 158, 11, 0.1);
-}
-
-.weather-region-header.region-eastern {
-    border-left-color: #06b6d4;
-    background-color: rgba(6, 182, 212, 0.1);
-}
-
-/* Mobile-specific adjustments */
-@media screen and (max-width: 768px) {
-    /* Reduce padding on mobile */
-    .section {
-        padding: 1.5rem 1rem;
-    }
-
-    /* Stack level items vertically on mobile */
-    .level {
-        display: block;
-    }
-
-    .level-left,
-    .level-right {
-        display: flex;
-        justify-content: center;
-        margin-bottom: 0.5rem;
-    }
-
-    .level-right {
-        margin-bottom: 0;
-    }
-
-    /* Smaller title on mobile */
-    .title {
-        font-size: 1.5rem;
-    }
-
-    /* Stat cards adjust */
-    .stat-card .stat-value {
-        font-size: 1.5rem;
-    }
-
-    /* Table font size reduction */
-    .table {
-        font-size: 0.875rem;
-    }
-
-    /* Oracle info smaller on mobile */
-    .oracle-info .info-value {
-        font-size: 0.75rem;
-    }
-
-    /* Event detail adjustments */
-    .event-detail-header {
-        flex-direction: column;
-        align-items: flex-start;
-    }
-}
-
-/* Tablet adjustments */
-@media screen and (min-width: 769px) and (max-width: 1023px) {
-    .stat-card .stat-value {
-        font-size: 1.75rem;
-    }
-}
-
-/* Active navbar item styling */
-.navbar-item.is-active {
-    font-weight: 600;
-    background-color: var(--bulma-primary);
-    color: #fff !important;
-    border-radius: 4px;
-}
-
-.navbar-item.is-active .icon {
-    color: #fff !important;
-}
-
-.navbar-item.is-active:hover {
-    background-color: var(--bulma-primary) !important;
-    color: #fff !important;
-}
-
-/* Dark mode overrides */
-[data-theme="dark"] .navbar {
-    background-color: var(--bulma-scheme-main-bis);
-}
-
-[data-theme="dark"] .tag.is-running {
-    background-color: #b45309;
-    color: #fef3c7;
-}
-
-[data-theme="dark"] .tag.is-light {
-    background-color: rgba(255, 255, 255, 0.1);
-    color: var(--bulma-text);
-}
-
-[data-theme="dark"] .button.is-light,
-[data-theme="dark"] .button.is-info.is-light,
-[data-theme="dark"] .button.is-link.is-light {
-    background-color: rgba(255, 255, 255, 0.08);
-    color: var(--bulma-text);
-    border-color: var(--bulma-border);
-}
-
-[data-theme="dark"] .button.is-light:hover,
-[data-theme="dark"] .button.is-info.is-light:hover,
-[data-theme="dark"] .button.is-link.is-light:hover {
-    background-color: rgba(255, 255, 255, 0.15);
-    color: var(--bulma-text);
-}
-
-[data-theme="dark"] code {
-    background-color: rgba(255, 255, 255, 0.08);
-    color: #b86bff;
-}
-
-[data-theme="dark"]
-    .table.is-striped
-    tbody
-    tr:not(.is-selected):nth-child(even) {
-    background-color: rgba(255, 255, 255, 0.03);
-}
-
-[data-theme="dark"] .box:hover {
-    box-shadow:
-        0 0.5em 1em -0.125em rgba(0, 0, 0, 0.3),
-        0 0px 0 1px rgba(255, 255, 255, 0.05);
-}
-
-[data-theme="dark"] .navbar-burger span {
-    color: var(--bulma-text);
-}
-
-/* Smooth transitions for HTMX content swaps */
-#main-content {
-    transition: opacity 0.15s ease;
-}
-
-.htmx-swapping #main-content {
-    opacity: 0.5;
-}
-
-/* Truncate long text with ellipsis */
-.truncate {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
-/* Entry score styling */
-.entry-score {
-    font-weight: bold;
-    font-family: monospace;
-}
-
-.entry-score.winner {
-    color: #48c78e;
-}
-
-/* Weather comparison table */
-.weather-comparison .forecast-value {
-    color: var(--bulma-text-weak);
-    font-style: italic;
-}
-
-.weather-comparison .observed-value {
-    font-weight: 600;
-}
-
-.weather-comparison .match {
-    color: #48c78e;
-}
-
-.weather-comparison .mismatch {
-    color: #f14668;
-}
-
-/* Schema box styling */
-.schema-box {
-    border: 1px solid var(--bulma-border);
-    border-radius: 6px;
-    overflow: hidden;
-}
-
-.schema-header {
-    background: var(--bulma-scheme-main-bis);
-    padding: 0.75rem 1rem;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    user-select: none;
-}
-
-.schema-title {
-    display: flex;
-    align-items: center;
-    font-weight: 600;
-    font-size: 0.875rem;
-}
-
-.schema-loading {
-    padding: 1rem;
-    display: flex;
-    align-items: center;
-    color: var(--bulma-text-weak);
-    font-size: 0.875rem;
-}
-
 .loader {
-    width: 16px;
-    height: 16px;
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    vertical-align: middle;
     border: 2px solid var(--bulma-border);
-    border-top-color: var(--bulma-primary);
+    border-top-color: var(--bulma-link);
     border-radius: 50%;
     animation: spin 0.8s linear infinite;
 }
@@ -720,416 +150,13 @@
     }
 }
 
-textarea.schema-content {
-    margin: 0;
-    padding: 1rem;
-    width: 100%;
-    min-height: 120px;
-    max-height: none;
-    background: var(--bulma-scheme-main);
-    border: none;
-    border-top: 1px solid var(--bulma-border);
-    border-radius: 0 0 6px 6px;
-    font-family: monospace;
-    resize: vertical;
-    color: var(--bulma-text);
+@media (prefers-reduced-motion: reduce) {
+    .loader {
+        animation-duration: 3s;
+    }
 }
 
-textarea.schema-content:focus {
-    outline: none;
-    box-shadow: inset 0 0 0 2px var(--bulma-primary);
-}
-
-/* Status tags for schema */
-.schema-box .tag.is-success {
-    background-color: #48c78e;
-    color: #fff;
-}
-
-.schema-box .tag.is-warning {
-    background-color: #ffe08a;
-    color: rgba(0, 0, 0, 0.7);
-}
-
-/* ================================
-   Weather Map Styles
-   ================================ */
-
-/* Map container */
-.weather-map-container {
-    position: relative;
-    width: 100%;
-}
-
-.map-wrapper {
-    position: relative;
-    width: 100%;
-}
-
-.usa-map {
-    width: 100%;
-    height: auto;
-    display: block;
-}
-
-/* Station markers overlay */
-.station-markers {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    pointer-events: none;
-}
-
-.station-marker {
+/* Closed <details> hide their content; a marker shows they open. */
+details > summary {
     cursor: pointer;
-    pointer-events: auto;
-    transition: transform 0.15s ease;
-    stroke: #fff;
-    stroke-width: 1.5;
-    transform-origin: center;
-    transform-box: fill-box;
-}
-
-.station-marker:hover {
-    transform: scale(1.5);
-}
-
-/* Region colors for markers */
-.station-marker.region-alaska-hawaii {
-    fill: #8b5cf6; /* Purple */
-}
-
-.station-marker.region-pacific {
-    fill: #a855f7; /* Purple */
-}
-
-.station-marker.region-mountain {
-    fill: #10b981; /* Green */
-}
-
-.station-marker.region-central {
-    fill: #f59e0b; /* Amber */
-}
-
-.station-marker.region-eastern {
-    fill: #06b6d4; /* Cyan */
-}
-
-/* Station popup */
-.station-popup {
-    position: absolute;
-    z-index: 100;
-    background: var(--bulma-scheme-main);
-    border: 1px solid var(--bulma-border);
-    border-radius: 6px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-    padding: 0.75rem;
-    box-sizing: border-box;
-    width: min(460px, calc(100vw - 20px));
-    min-width: 0;
-    max-height: calc(100vh - 2rem);
-    overflow-y: auto;
-    overscroll-behavior: contain;
-}
-
-.popup-header {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    margin-bottom: 0.5rem;
-}
-
-.popup-station-id {
-    font-size: 1rem;
-}
-
-.popup-close {
-    margin-left: auto;
-}
-
-.popup-name {
-    font-size: 0.875rem;
-    color: var(--bulma-text-weak);
-    margin-bottom: 0.75rem;
-}
-
-.popup-details {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 0.25rem 1rem;
-    font-size: 0.875rem;
-    margin-bottom: 0.75rem;
-}
-
-.popup-row {
-    display: flex;
-    justify-content: space-between;
-}
-
-.popup-label {
-    color: var(--bulma-text-weak);
-}
-
-.popup-value {
-    font-family: monospace;
-    font-weight: 500;
-}
-
-.popup-temp-high {
-    color: #b8956e;
-}
-
-.popup-temp-low {
-    color: #60a5fa;
-}
-
-.popup-footer {
-    text-align: center;
-}
-
-/* Popup forecast grid */
-.popup-forecast-grid {
-    font-size: 0.75rem;
-}
-
-.forecast-header-row,
-.forecast-data-row {
-    display: grid;
-    grid-template-columns: 70px repeat(3, minmax(0, 1fr));
-    gap: 0.25rem;
-    align-items: center;
-}
-
-.forecast-header-row {
-    font-weight: 600;
-    color: var(--bulma-text);
-    margin-bottom: 0.25rem;
-    padding-bottom: 0.5rem;
-    border-bottom: 1px solid var(--bulma-border);
-}
-
-.forecast-data-row {
-    padding: 0.4rem 0;
-}
-
-.forecast-data-row:not(:last-child) {
-    border-bottom: 1px dotted var(--bulma-border-weak);
-}
-
-.forecast-col-label {
-    font-size: 0.7rem;
-    color: var(--bulma-text-weak);
-    line-height: 1.35;
-}
-
-.forecast-col-label .icon {
-    margin-right: 0.15rem;
-}
-
-.forecast-col {
-    min-width: 0;
-    text-align: center;
-    font-family: monospace;
-    line-height: 1.4;
-}
-
-.forecast-header-row .forecast-col {
-    align-self: start;
-    font-family: inherit;
-}
-
-.forecast-day-context,
-.forecast-metric-context {
-    display: block;
-    font-size: 0.6875rem;
-    font-weight: 400;
-    color: var(--bulma-text-weak);
-}
-
-.forecast-day-context {
-    margin-top: 0.15rem;
-}
-
-.obs-value,
-.fcst-value.forecast-primary {
-    font-size: 0.8125rem;
-    font-weight: 600;
-}
-
-.fcst-value {
-    display: flex;
-    flex-wrap: wrap;
-    justify-content: center;
-    align-items: baseline;
-    column-gap: 0.25rem;
-    margin-top: 0.15rem;
-    font-size: 0.75rem;
-    color: var(--bulma-text);
-}
-
-.forecast-value-label {
-    font-family: var(--bulma-family-primary);
-    font-size: 0.6875rem;
-    color: var(--bulma-text-weak);
-}
-
-.forecast-col [data-field] {
-    white-space: nowrap;
-}
-
-.fcst-value.forecast-primary {
-    margin-top: 0;
-}
-
-.popup-data-note {
-    margin-top: 0.75rem;
-    font-size: 0.6875rem;
-    color: var(--bulma-text-weak);
-}
-
-.popup-loading,
-.popup-error {
-    padding: 0.35rem 0;
-    margin-bottom: 0.5rem;
-    font-size: 0.8125rem;
-    color: var(--bulma-text-weak);
-}
-
-.popup-loading .loader {
-    display: inline-block;
-    vertical-align: middle;
-    margin-right: 0.35rem;
-}
-
-.popup-error {
-    color: var(--bulma-danger-text, #c0392b);
-}
-
-.popup-error .popup-retry {
-    height: auto;
-    padding: 0 0.25rem;
-    font-size: 0.8125rem;
-}
-
-/* ================================
-   Region Header Styles (Table)
-   ================================ */
-
-.region-header td {
-    font-weight: 600;
-    font-size: 0.875rem;
-    padding: 0.5rem 1rem !important;
-    background-color: var(--bulma-scheme-main-bis);
-    border-left: 4px solid;
-}
-
-.region-header.region-alaska-hawaii td {
-    border-left-color: #8b5cf6;
-    background-color: rgba(139, 92, 246, 0.1);
-}
-
-.region-header.region-pacific td {
-    border-left-color: #a855f7;
-    background-color: rgba(168, 85, 247, 0.1);
-}
-
-.region-header.region-mountain td {
-    border-left-color: #10b981;
-    background-color: rgba(16, 185, 129, 0.1);
-}
-
-.region-header.region-central td {
-    border-left-color: #f59e0b;
-    background-color: rgba(245, 158, 11, 0.1);
-}
-
-.region-header.region-eastern td {
-    border-left-color: #06b6d4;
-    background-color: rgba(6, 182, 212, 0.1);
-}
-
-/* Make region headers not clickable */
-.region-header {
-    cursor: default;
-}
-
-.region-header:hover {
-    background-color: inherit !important;
-}
-
-/* ================================
-   Weather View Toggle
-   ================================ */
-
-.tabs.is-boxed {
-    margin-bottom: 0 !important;
-}
-
-.tabs.is-boxed ul {
-    border-bottom-color: var(--bulma-border);
-}
-
-.tabs.is-boxed li[data-view] {
-    cursor: pointer;
-}
-
-.tabs.is-boxed li[data-view] a {
-    display: flex;
-    align-items: center;
-    gap: 0.25rem;
-}
-
-/* ================================
-   Responsive Map Adjustments
-   ================================ */
-
-@media screen and (max-width: 768px) {
-    .station-marker {
-        stroke-width: 1;
-    }
-
-    .station-popup {
-        padding: 0.625rem;
-        font-size: 0.75rem;
-    }
-
-    /* The map is too short on phones to hold the popup: use a bottom sheet. */
-    .station-popup.is-sheet {
-        position: fixed;
-        top: auto;
-        left: 0;
-        right: 0;
-        bottom: 0;
-        width: 100%;
-        max-height: 70vh;
-        z-index: 50;
-        padding: 0.875rem 0.875rem calc(0.875rem + env(safe-area-inset-bottom));
-        border-radius: 12px 12px 0 0;
-        box-shadow: 0 -6px 20px rgba(0, 0, 0, 0.25);
-    }
-
-    .popup-details {
-        grid-template-columns: 1fr;
-    }
-
-    .forecast-header-row,
-    .forecast-data-row {
-        grid-template-columns: 52px repeat(3, minmax(0, 1fr));
-        gap: 0.15rem;
-    }
-
-    .forecast-col-label {
-        font-size: 0.65rem;
-    }
-
-    .forecast-col-label .icon {
-        display: none;
-    }
-
-    .obs-value,
-    .fcst-value.forecast-primary {
-        font-size: 0.75rem;
-    }
 }

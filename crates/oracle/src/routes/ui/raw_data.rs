@@ -1,22 +1,18 @@
-use std::sync::Arc;
+use axum::{http::HeaderMap, response::Response};
+use time::OffsetDateTime;
 
-use axum::{extract::State, http::HeaderMap, response::Response};
-
-use super::htmx::{page_or_fragment, wants_fragment};
-use crate::{
-    AppState,
-    templates::{pages::raw_data::raw_data_content, raw_data_page},
-};
+use super::htmx::{Render, page_or_fragment};
+use crate::templates::pages::raw_data::{raw_data_fragment, raw_data_page};
 
 /// Handler for the raw data page (GET /raw)
 /// Returns full page for normal requests, content only for HTMX requests
-pub async fn raw_data_handler(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> Response {
-    page_or_fragment(if wants_fragment(&headers) {
-        raw_data_content().into_string()
-    } else {
-        raw_data_page(&state.remote_url).into_string()
-    })
+pub async fn raw_data_handler(headers: HeaderMap) -> Response {
+    let now = OffsetDateTime::now_utc();
+    page_or_fragment(
+        match super::htmx::render(&headers) {
+            Render::Page => raw_data_page(now),
+            _ => raw_data_fragment(now),
+        }
+        .into_string(),
+    )
 }

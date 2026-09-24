@@ -1,0 +1,35 @@
+/* Weather values: one font, digits of equal width, readable in both themes. */
+.val,
+.delta {
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.val.is-missing,
+.val.is-zero {
+    color: var(--muted);
+}
+
+.val.temp-high { color: var(--temp-high); }
+.val.temp-low { color: var(--temp-low); }
+.val.rain { color: var(--rain); }
+.val.snow { color: var(--snow); }
+
+.compass {
+    color: var(--muted);
+    font-size: 0.8em;
+}
+
+.delta {
+    font-size: 0.85em;
+    font-weight: 600;
+}
+
+.delta.is-close { color: var(--delta-close); }
+.delta.is-off { color: var(--delta-off); }
+.delta.is-far { color: var(--delta-far); }
+
+.delta.is-provisional {
+    color: var(--muted);
+    font-weight: 400;
+}

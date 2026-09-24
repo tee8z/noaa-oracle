@@ -14,11 +14,10 @@ use crate::{
     oracle::{Oracle, system_clock},
     routes::{
         add_event_entries, create_event, daily_observations, dashboard_handler, download,
-        event_detail_handler, event_stats_handler, events_cards_handler, events_handler,
-        events_rows_handler, files, forecast_handler, forecasts, get_event, get_event_entry,
-        get_npub, get_pubkey, get_stations, healthy, list_events, list_sources, observations,
-        oracle_info_handler, raw_data_handler, ready, update_data, upload, warm_forecast_cache,
-        weather_handler,
+        event_detail_handler, event_stats_handler, events_handler, files, forecast_handler,
+        forecasts, get_event, get_event_entry, get_npub, get_pubkey, get_stations, healthy,
+        list_events, list_sources, observations, oracle_info_handler, raw_data_handler, ready,
+        station_handler, update_data, upload, warm_forecast_cache, weather_handler,
     },
     sources::{NoaaWeather, Sources},
     weather_data::{self, Station, WeatherAccess, WeatherData},
@@ -401,8 +400,7 @@ pub fn app(app_state: Arc<AppState>) -> Router {
         .route("/fragments/event-stats", get(event_stats_handler))
         .route("/fragments/weather", get(weather_handler))
         .route("/fragments/forecast/{station_id}", get(forecast_handler))
-        .route("/fragments/events-rows", get(events_rows_handler))
-        .route("/fragments/events-cards", get(events_cards_handler))
+        .route("/fragments/station/{station_id}", get(station_handler))
         // Probes
         .route("/health", get(ready))
         .route("/ready", get(ready))

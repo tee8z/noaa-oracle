@@ -2,19 +2,19 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, HeaderValue, header},
     response::Response,
 };
 use serde::Deserialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use super::htmx::{page_or_fragment, wants_fragment};
+use super::htmx::{Render, page_or_fragment};
 use crate::{
     AppState,
     events::EventStatus,
     templates::{
-        EventStats, WeatherDisplay, dashboard_page,
-        pages::dashboard::{DashboardData, dashboard_content},
+        fragments::{EventStats, WeatherContext, WeatherDisplay, WeatherView, weather_section},
+        pages::dashboard::{DashboardData, dashboard_fragment, dashboard_page},
     },
 };
 
@@ -26,6 +26,40 @@ pub struct DashboardQuery {
     pub start: Option<String>,
     /// End time for observation data (RFC3339 format)
     pub end: Option<String>,
+    /// `map` or `list`; defaults to the reader's last choice.
+    pub view: Option<String>,
+    /// Station search in the list.
+    pub q: Option<String>,
+}
+
+/// The cookie that remembers Map or List between visits.
+pub(super) const VIEW_COOKIE: &str = "weather_view";
+
+/// The view asked for, else the one remembered in the cookie, else the map.
+pub(super) fn chosen_view(asked: Option<&str>, headers: &HeaderMap) -> WeatherView {
+    WeatherView::parse(asked)
+        .or_else(|| {
+            headers
+                .get_all(header::COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .flat_map(|cookies| cookies.split(';'))
+                .filter_map(|cookie| cookie.trim().split_once('='))
+                .find(|(name, _)| *name == VIEW_COOKIE)
+                .and_then(|(_, value)| WeatherView::parse(Some(value)))
+        })
+        .unwrap_or_default()
+}
+
+/// Remembers the view for a year.
+pub(super) fn remember_view(response: &mut Response, view: WeatherView) {
+    let cookie = format!(
+        "{VIEW_COOKIE}={}; Path=/; Max-Age=31536000; SameSite=Lax",
+        view.as_str()
+    );
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
 }
 
 /// Handler for the dashboard page (GET /)
@@ -54,21 +88,36 @@ pub async fn dashboard_handler(
             .map(str::to_string)
             .collect::<Vec<_>>()
     });
-    let data = build_dashboard_data(&state, station_ids.as_deref(), start, end).await;
+    let (data, selection_path) =
+        build_dashboard_data(&state, station_ids.as_deref(), start, end).await;
+    let stations = state.stations().await.unwrap_or_default();
+    let view = chosen_view(query.view.as_deref(), &headers);
+    let context = WeatherContext {
+        view,
+        query: query.q.as_deref().unwrap_or_default(),
+        selection_path: &selection_path,
+        stations: &stations,
+        now: OffsetDateTime::now_utc(),
+    };
 
-    page_or_fragment(if wants_fragment(&headers) {
-        dashboard_content(&data).into_string()
-    } else {
-        dashboard_page(&state.remote_url, &data).into_string()
-    })
+    let mut response = page_or_fragment(match super::htmx::render(&headers) {
+        Render::Page => dashboard_page(&data, &context).into_string(),
+        Render::Content => dashboard_fragment(&data, &context).into_string(),
+        Render::Part(_) => weather_section(&data.weather, &context).into_string(),
+    });
+    if query.view.is_some() {
+        remember_view(&mut response, view);
+    }
+    response
 }
 
+/// The dashboard's data and the `/fragments/weather` path that refreshes it.
 async fn build_dashboard_data(
     state: &Arc<AppState>,
     station_ids: Option<&[String]>,
     start: Option<OffsetDateTime>,
     end: Option<OffsetDateTime>,
-) -> DashboardData {
+) -> (DashboardData, String) {
     // Get oracle identity
     let pubkey = state.oracle.public_key_base64();
     let npub = state.oracle.npub();
@@ -91,29 +140,29 @@ async fn build_dashboard_data(
         }
     }
 
-    let weather = get_latest_weather(state, station_ids, start, end).await;
-    let displayed_ids: Vec<String> = weather
-        .iter()
-        .map(|weather| weather.station_id.clone())
-        .collect();
-    let weather_refresh_path =
+    let (weather, default_airports) = get_latest_weather(state, station_ids, start, end).await;
+    // The default airports refresh without naming them, which keeps the
+    // address bar short; any other selection names its stations.
+    let displayed_ids: Vec<String> = if default_airports {
+        vec![]
+    } else {
+        weather
+            .iter()
+            .map(|weather| weather.station_id.clone())
+            .collect()
+    };
+    let selection_path =
         super::weather::refresh_path(station_ids.unwrap_or(&displayed_ids), start, end);
 
-    // The selector remains useful when the current selection has no reports.
-    let available_stations = state.stations().await.unwrap_or_default();
-    let all_stations: Vec<(String, String)> = available_stations
-        .iter()
-        .map(|station| (station.station_id.clone(), station.station_name.clone()))
-        .collect();
-
-    DashboardData {
-        pubkey,
-        npub,
-        stats,
-        weather,
-        all_stations,
-        weather_refresh_path,
-    }
+    (
+        DashboardData {
+            pubkey,
+            npub,
+            stats,
+            weather,
+        },
+        selection_path,
+    )
 }
 
 /// Top 100 major US airport station IDs to show by default
@@ -214,32 +263,17 @@ const DEFAULT_MAJOR_AIRPORTS: &[&str] = &[
     "KFSM", // Fort Smith AR
 ];
 
-/// Geographic region based on longitude, ordered West to East
-fn get_region(longitude: f64) -> u8 {
-    if longitude < -140.0 {
-        0 // Alaska/Hawaii (far west)
-    } else if longitude < -115.0 {
-        1 // Pacific (West Coast)
-    } else if longitude < -100.0 {
-        2 // Mountain
-    } else if longitude < -85.0 {
-        3 // Central (Midwest/South Central)
-    } else {
-        4 // Eastern (East Coast + Southeast)
-    }
-}
-
-/// Get weather from the latest available observation files
+/// Get weather from the latest available observation files. Also says
+/// whether these are the default airports, which need not be named.
 async fn get_latest_weather(
     state: &Arc<AppState>,
     station_ids: Option<&[String]>,
     start: Option<OffsetDateTime>,
     end: Option<OffsetDateTime>,
-) -> Vec<WeatherDisplay> {
+) -> (Vec<WeatherDisplay>, bool) {
     if let Some(station_ids) = station_ids {
-        let mut weather_data = super::weather::load_weather(state, station_ids, start, end).await;
-        weather_data.sort_by(|a, b| a.station_id.cmp(&b.station_id));
-        return weather_data;
+        let weather_data = super::weather::load_weather(state, station_ids, start, end).await;
+        return (weather_data, false);
     }
     // Query only the default airports: a forecast query over every station
     // exceeds the per-query memory limit, which left the forecast column empty.
@@ -247,18 +281,13 @@ async fn get_latest_weather(
         .iter()
         .map(|station| station.to_string())
         .collect();
-    let mut weather_data = super::weather::load_weather(state, &airports, start, end).await;
+    let weather_data = super::weather::load_weather(state, &airports, start, end).await;
     if !weather_data.is_empty() {
-        weather_data.sort_by(|a, b| {
-            get_region(b.longitude)
-                .cmp(&get_region(a.longitude))
-                .then_with(|| b.latitude.total_cmp(&a.latitude))
-        });
-    } else {
-        // Data without any default airport: show the first stations reporting.
-        weather_data = super::weather::load_weather(state, &[], start, end).await;
-        weather_data.sort_by(|a, b| a.station_id.cmp(&b.station_id));
-        weather_data.truncate(20);
+        return (weather_data, true);
     }
-    weather_data
+    // Data without any default airport: show the first stations reporting.
+    let mut weather_data = super::weather::load_weather(state, &[], start, end).await;
+    weather_data.sort_by(|a, b| a.station_id.cmp(&b.station_id));
+    weather_data.truncate(20);
+    (weather_data, false)
 }
