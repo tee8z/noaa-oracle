@@ -46,13 +46,14 @@ pub(super) fn render(headers: &HeaderMap) -> Render {
     }
 }
 
-/// The same URL returns a page or a fragment, so caches must key on the
-/// htmx headers.
+/// The same URL returns a page or a fragment, and pages follow the
+/// reader's cookies (their time zone and remembered view), so caches must
+/// key on the htmx headers and the cookies.
 pub(super) fn page_or_fragment(html: String) -> Response {
     let mut response = Html(html).into_response();
     response.headers_mut().insert(
         header::VARY,
-        HeaderValue::from_static("HX-Request, HX-Target, HX-History-Restore-Request"),
+        HeaderValue::from_static("HX-Request, HX-Target, HX-History-Restore-Request, Cookie"),
     );
     response
 }

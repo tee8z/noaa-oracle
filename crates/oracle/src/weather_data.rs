@@ -13,6 +13,7 @@
 //! up by name, never panics, and keeps missing values missing.
 
 use crate::{
+    calendar::Calendar,
     file_access::{self, FileData, FileParams, ParquetFileName},
     routes::{ForecastRequest, ObservationRequest, TemperatureUnit},
 };
@@ -215,6 +216,31 @@ pub trait WeatherData: Sync + Send {
     ) -> Result<Vec<DailyObservation>, Error>;
     async fn stations(&self) -> Result<Vec<Station>, Error>;
 
+    /// [`WeatherData::forecasts_data`] with each `date` a day of
+    /// `calendar`, for a reader's local days. Implementations without
+    /// calendars group by UTC day.
+    async fn calendar_forecasts(
+        &self,
+        req: &ForecastRequest,
+        station_ids: Vec<String>,
+        calendar: Calendar,
+    ) -> Result<Vec<Forecast>, Error> {
+        let _ = calendar;
+        self.forecasts_data(req, station_ids).await
+    }
+
+    /// [`WeatherData::daily_observations`] with each `date` a day of
+    /// `calendar`. Implementations without calendars group by UTC day.
+    async fn calendar_daily_observations(
+        &self,
+        req: &ObservationRequest,
+        station_ids: Vec<String>,
+        calendar: Calendar,
+    ) -> Result<Vec<DailyObservation>, Error> {
+        let _ = calendar;
+        self.daily_observations(req, station_ids).await
+    }
+
     /// Makes query-ready copies of recent forecast files that lack one and
     /// drops old copies, stopping early when `stopping` is cancelled.
     /// Returns how many copies were made.
@@ -400,11 +426,21 @@ fn precipitation_sql(name: &str, value: &str, extra_columns: &str, sums: &str) -
 
 /// Daily forecasts from `rows`, forecast rows (see [`FORECAST_ROW_COLUMNS`])
 /// already restricted to the request: for each station and forecast period,
-/// the newest issue, then the newest publication of it; then per UTC day
-/// the extremes, peak wind with its direction, humidity range,
+/// the newest issue, then the newest publication of it; then per day of
+/// `calendar` the extremes, peak wind with its direction, humidity range,
 /// precipitation chance, and precipitation totals. Rain is QPF minus the
 /// liquid equivalent of snow and ice, never below zero.
-fn forecasts_sql(rows: &str, req: &ForecastRequest) -> Result<String, Error> {
+fn forecasts_sql(
+    rows: &str,
+    req: &ForecastRequest,
+    calendar: Calendar,
+    (generated_start, generated_end): (OffsetDateTime, OffsetDateTime),
+) -> Result<String, Error> {
+    let date = calendar.day_sql(
+        "begin_ts",
+        req.start.unwrap_or(generated_start),
+        req.end.unwrap_or(generated_end + FORECAST_LOOKBACK),
+    );
     let start_time = match &req.start {
         Some(start) => format!(
             "GREATEST('{}'::TIMESTAMPTZ, d.start_time)",
@@ -448,7 +484,7 @@ fn forecasts_sql(rows: &str, req: &ForecastRequest) -> Result<String, Error> {
     -- publication of that issue. Value ties are deterministic.
     deduped AS (
         SELECT station_id, begin_ts, end_ts, picked.*,
-            DATE_TRUNC('day', begin_ts AT TIME ZONE 'UTC')::VARCHAR AS date,
+            {date} AS date,
             EXTRACT(EPOCH FROM (end_ts - begin_ts)) AS duration_secs
         FROM (
             SELECT station_id, begin_ts, end_ts,
@@ -714,6 +750,16 @@ impl WeatherData for WeatherAccess {
         req: &ForecastRequest,
         station_ids: Vec<String>,
     ) -> Result<Vec<Forecast>, Error> {
+        self.calendar_forecasts(req, station_ids, Calendar::Utc)
+            .await
+    }
+
+    async fn calendar_forecasts(
+        &self,
+        req: &ForecastRequest,
+        station_ids: Vec<String>,
+        calendar: Calendar,
+    ) -> Result<Vec<Forecast>, Error> {
         let stations = station_condition(&station_ids)?;
         let now = OffsetDateTime::now_utc();
         let window = forecast_generated_window(req, now);
@@ -736,7 +782,7 @@ impl WeatherData for WeatherAccess {
         if rows.is_empty() {
             return Ok(vec![]);
         }
-        let query_sql = forecasts_sql(&rows, req)?;
+        let query_sql = forecasts_sql(&rows, req, calendar, window)?;
         let unit = req.temperature_unit;
         self.query(query_sql, move |batches| decode_forecasts(batches, &unit))
             .await
@@ -892,6 +938,22 @@ impl WeatherData for WeatherAccess {
         req: &ObservationRequest,
         station_ids: Vec<String>,
     ) -> Result<Vec<DailyObservation>, Error> {
+        self.calendar_daily_observations(req, station_ids, Calendar::Utc)
+            .await
+    }
+
+    async fn calendar_daily_observations(
+        &self,
+        req: &ObservationRequest,
+        station_ids: Vec<String>,
+        calendar: Calendar,
+    ) -> Result<Vec<DailyObservation>, Error> {
+        let now = OffsetDateTime::now_utc();
+        let date = calendar.day_sql(
+            "generated_at::TIMESTAMPTZ",
+            req.start.unwrap_or(now - FORECAST_LOOKBACK),
+            req.end.unwrap_or(now),
+        );
         let station_filter = station_filter(&station_ids)?;
         let file_params = observation_file_params(req, OffsetDateTime::now_utc());
         if empty_publication_window(&file_params) {
@@ -958,7 +1020,7 @@ impl WeatherData for WeatherAccess {
             )
             SELECT
                 station_id::VARCHAR AS station_id,
-                DATE_TRUNC('day', generated_at::TIMESTAMPTZ AT TIME ZONE 'UTC')::VARCHAR AS date,
+                {date} AS date,
                 (MIN(temperature_value) FILTER (WHERE temperature_value IS NOT NULL))::DOUBLE AS temp_low,
                 (MAX(temperature_value) FILTER (WHERE temperature_value IS NOT NULL))::DOUBLE AS temp_high,
                 (MAX(wind_speed) FILTER (WHERE wind_speed IS NOT NULL AND wind_speed >= 0 AND wind_speed <= 500))::BIGINT AS wind_speed,
@@ -978,7 +1040,7 @@ impl WeatherData for WeatherAccess {
                 SUM(CASE WHEN precip_type = 'ice' THEN precip_in ELSE 0 END)
                     FILTER (WHERE precip_in IS NOT NULL AND isfinite(precip_in) AND precip_in >= 0)::DOUBLE AS ice_amt
             FROM classified
-            GROUP BY station_id, DATE_TRUNC('day', generated_at::TIMESTAMPTZ AT TIME ZONE 'UTC')::TEXT
+            GROUP BY station_id, {date}
             "#,
             sql_string_list(&file_paths),
             station_filter,
@@ -2763,6 +2825,95 @@ mod tests {
             .unwrap();
         assert_eq!(files(&root), 0, "days before the oldest kept day go");
         assert!(!root.join("2026-01-17.json").exists());
+    }
+
+    #[tokio::test]
+    async fn local_days_group_forecasts_and_observations_by_the_readers_calendar() {
+        // New York is UTC-5 until 2026-03-08 02:00 local, then UTC-4.
+        let directory = data_dir(&[
+            (
+                "forecasts_2026-03-06T12:00:00Z.parquet",
+                "SELECT 'KTEST' AS station_id, begin_time, end_time, '2026-03-06T12:00:00Z' AS generated_at,
+                        30::BIGINT AS min_temp, max_temp::BIGINT AS max_temp, 'fahrenheit' AS temperature_unit_code
+                 FROM (VALUES ('2026-03-07T03:00:00Z', '2026-03-07T04:00:00Z', 50),
+                              ('2026-03-07T06:00:00Z', '2026-03-07T07:00:00Z', 60),
+                              ('2026-03-09T04:30:00Z', '2026-03-09T05:30:00Z', 70))
+                      AS periods(begin_time, end_time, max_temp)",
+            ),
+            (
+                "observations_2026-03-09T06:00:00Z.parquet",
+                "SELECT 'KTEST' AS station_id, generated_at, temperature_value::DOUBLE AS temperature_value,
+                        'fahrenheit' AS temperature_unit_code
+                 FROM (VALUES ('2026-03-07T03:00:00Z', 40), ('2026-03-07T06:00:00Z', 45),
+                              ('2026-03-09T04:30:00Z', 55))
+                      AS reports(generated_at, temperature_value)",
+            ),
+        ]);
+        let access = access(&directory);
+        let new_york = Calendar::from_zone_name("America/New_York").unwrap();
+        let forecasts = ForecastRequest {
+            start: Some(time::macros::datetime!(2026-03-06 00:00 UTC)),
+            end: Some(time::macros::datetime!(2026-03-10 00:00 UTC)),
+            generated_start: Some(time::macros::datetime!(2026-03-06 00:00 UTC)),
+            generated_end: Some(time::macros::datetime!(2026-03-07 00:00 UTC)),
+            station_ids: "KTEST".into(),
+            temperature_unit: TemperatureUnit::Fahrenheit,
+        };
+        let highs = |rows: Vec<Forecast>| {
+            rows.into_iter()
+                .map(|row| (row.date, row.temp_high))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            highs(
+                access
+                    .calendar_forecasts(&forecasts, vec!["KTEST".into()], new_york)
+                    .await
+                    .unwrap()
+            ),
+            vec![
+                ("2026-03-06 00:00:00".to_owned(), 50),
+                ("2026-03-07 00:00:00".to_owned(), 60),
+                // 00:30 EDT on the 9th; a fixed EST offset would say the 8th.
+                ("2026-03-09 00:00:00".to_owned(), 70),
+            ]
+        );
+        assert_eq!(
+            highs(
+                access
+                    .calendar_forecasts(&forecasts, vec!["KTEST".into()], Calendar::Utc)
+                    .await
+                    .unwrap()
+            ),
+            highs(
+                access
+                    .forecasts_data(&forecasts, vec!["KTEST".into()])
+                    .await
+                    .unwrap()
+            ),
+        );
+        let observations = ObservationRequest {
+            start: forecasts.start,
+            end: forecasts.end,
+            station_ids: "KTEST".into(),
+            temperature_unit: TemperatureUnit::Fahrenheit,
+        };
+        let mut daily = access
+            .calendar_daily_observations(&observations, vec!["KTEST".into()], new_york)
+            .await
+            .unwrap();
+        daily.sort_by(|a, b| a.date.cmp(&b.date));
+        assert_eq!(
+            daily
+                .iter()
+                .map(|day| (day.date.as_str(), day.temp_high.round() as i64))
+                .collect::<Vec<_>>(),
+            vec![
+                ("2026-03-06 00:00:00", 40),
+                ("2026-03-07 00:00:00", 45),
+                ("2026-03-09 00:00:00", 55),
+            ]
+        );
     }
 
     #[test]

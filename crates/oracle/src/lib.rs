@@ -7,6 +7,7 @@
 
 mod app_error;
 pub mod auth;
+pub mod calendar;
 pub mod config;
 pub mod database;
 pub mod events;

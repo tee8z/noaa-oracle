@@ -11,6 +11,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use super::htmx::{Render, page_or_fragment};
 use crate::{
     AppState,
+    calendar::Calendar,
     templates::{
         fragments::{WeatherContext, WeatherDisplay, WeatherView, weather_section},
         pages::dashboard::{DashboardData, dashboard_fragment, dashboard_page},
@@ -37,16 +38,7 @@ pub(super) const VIEW_COOKIE: &str = "weather_view";
 /// The view asked for, else the one remembered in the cookie, else the map.
 pub(super) fn chosen_view(asked: Option<&str>, headers: &HeaderMap) -> WeatherView {
     WeatherView::parse(asked)
-        .or_else(|| {
-            headers
-                .get_all(header::COOKIE)
-                .iter()
-                .filter_map(|value| value.to_str().ok())
-                .flat_map(|cookies| cookies.split(';'))
-                .filter_map(|cookie| cookie.trim().split_once('='))
-                .find(|(name, _)| *name == VIEW_COOKIE)
-                .and_then(|(_, value)| WeatherView::parse(Some(value)))
-        })
+        .or_else(|| WeatherView::parse(super::local_day::cookie(headers, VIEW_COOKIE)))
         .unwrap_or_default()
 }
 
@@ -63,7 +55,7 @@ pub(super) fn remember_view(response: &mut Response, view: WeatherView) {
 
 /// Handler for the dashboard page (GET /)
 /// Returns full page for normal requests, content only for HTMX requests
-/// Optional `start` and `end` query params override the default UTC day so far.
+/// Optional `start` and `end` query params override the reader's day so far.
 pub async fn dashboard_handler(
     headers: HeaderMap,
     Query(query): Query<DashboardQuery>,
@@ -80,8 +72,9 @@ pub async fn dashboard_handler(
         .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok());
 
     let station_ids = super::weather::requested_stations(query.stations.as_deref());
+    let calendar = super::local_day::reader_calendar(&headers);
     let (data, selection_path) =
-        build_dashboard_data(&state, station_ids.as_deref(), start, end).await;
+        build_dashboard_data(&state, station_ids.as_deref(), start, end, calendar).await;
     let stations = state.stations().await.unwrap_or_default();
     let view = chosen_view(query.view.as_deref(), &headers);
     let context = WeatherContext {
@@ -109,6 +102,7 @@ async fn build_dashboard_data(
     station_ids: Option<&[String]>,
     start: Option<OffsetDateTime>,
     end: Option<OffsetDateTime>,
+    calendar: Calendar,
 ) -> (DashboardData, String) {
     // Get oracle identity
     let pubkey = state.oracle.public_key_base64();
@@ -117,7 +111,7 @@ async fn build_dashboard_data(
     // The cards link to the events list, which leaves out unlisted events.
     let (counts, (weather, default_airports)) = tokio::join!(
         state.oracle.event_counts(false),
-        get_latest_weather(state, station_ids, start, end)
+        get_latest_weather(state, station_ids, start, end, calendar)
     );
     let counts = counts.unwrap_or_else(|error| {
         log::error!("event counts: {error:#}");
@@ -154,15 +148,23 @@ async fn get_latest_weather(
     station_ids: Option<&[String]>,
     start: Option<OffsetDateTime>,
     end: Option<OffsetDateTime>,
+    calendar: Calendar,
 ) -> (Vec<WeatherDisplay>, bool) {
     if let Some(station_ids) = station_ids {
-        let weather_data = super::weather::load_weather(state, station_ids, start, end).await;
+        let weather_data =
+            super::weather::load_weather(state, station_ids, start, end, calendar).await;
         return (weather_data, false);
     }
     // Query only the default airports: a forecast query over every station
     // exceeds the per-query memory limit, which left the forecast column empty.
-    let weather_data =
-        super::weather::load_weather(state, &super::weather::default_airports(), start, end).await;
+    let weather_data = super::weather::load_weather(
+        state,
+        &super::weather::default_airports(),
+        start,
+        end,
+        calendar,
+    )
+    .await;
     if !weather_data.is_empty() {
         return (weather_data, true);
     }
@@ -177,7 +179,7 @@ async fn get_latest_weather(
     if first.is_empty() {
         return (vec![], false);
     }
-    let mut weather_data = super::weather::load_weather(state, &first, start, end).await;
+    let mut weather_data = super::weather::load_weather(state, &first, start, end, calendar).await;
     weather_data.sort_by(|a, b| a.station_id.cmp(&b.station_id));
     (weather_data, false)
 }

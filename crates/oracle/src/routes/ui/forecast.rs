@@ -1,6 +1,8 @@
 //! A station's forecast detail: the past week's forecasts against what was
-//! observed, and the coming days. Built when a reader opens a station, or
-//! ahead of time for the default airports, and cached for known stations.
+//! observed, and the coming days, in the reader's calendar days (see
+//! [`super::local_day`]). Built when a reader opens a station, or ahead of
+//! time for the default airports in UTC days, and cached per calendar and
+//! day for known stations.
 //! A query that fails or runs too long is logged and not cached; the reader
 //! gets an error with a retry instead of an empty table.
 
@@ -8,10 +10,11 @@ use std::{sync::Arc, time::Duration as StdDuration};
 
 use futures::stream::{self, StreamExt};
 use log::{error, info};
-use time::{Duration, OffsetDateTime, Time};
+use time::{Date, Duration, OffsetDateTime};
 
 use crate::{
     AppState, ForecastRequest, ObservationRequest, TemperatureUnit,
+    calendar::Calendar,
     templates::fragments::{ForecastComparison, ForecastDisplay, forecast_detail},
     weather_data::{self, DailyObservation, Forecast},
 };
@@ -37,19 +40,28 @@ pub(super) enum ForecastError {
 pub(super) async fn forecast_html(
     state: &Arc<AppState>,
     station_id: &str,
+    calendar: Calendar,
 ) -> Result<String, ForecastError> {
-    if let Some(cached) = state.cached_forecast(station_id) {
+    let key = cache_key(station_id, calendar, OffsetDateTime::now_utc());
+    if let Some(cached) = state.cached_forecast(&key) {
         return Ok(cached);
     }
-    let built = match tokio::time::timeout(FORECAST_TIMEOUT, build(state, station_id)).await {
-        Ok(built) => built.map_err(ForecastError::from),
-        Err(_) => Err(ForecastError::TimedOut),
-    };
+    let built =
+        match tokio::time::timeout(FORECAST_TIMEOUT, build(state, station_id, calendar)).await {
+            Ok(built) => built.map_err(ForecastError::from),
+            Err(_) => Err(ForecastError::TimedOut),
+        };
     let html = built.inspect_err(|error| error!("forecast detail for {station_id}: {error}"))?;
     if state.is_known_station(station_id).await {
-        state.cache_forecast(station_id.to_string(), html.clone());
+        state.cache_forecast(key, html.clone());
     }
     Ok(html)
+}
+
+/// A station's detail differs by calendar and changes at the reader's
+/// midnight.
+fn cache_key(station_id: &str, calendar: Calendar, now: OffsetDateTime) -> String {
+    format!("{station_id}@{}@{}", calendar.name(), calendar.date_of(now))
 }
 
 /// Pre-warms the forecast cache for the default airports. Called at startup
@@ -59,8 +71,11 @@ pub async fn warm_forecast_cache(state: &Arc<AppState>) {
     info!("Warming forecast cache for {} stations...", airports.len());
     stream::iter(airports)
         .for_each_concurrent(WARM_CONCURRENCY, |station_id| async move {
-            match build(state, &station_id).await {
-                Ok(html) => state.cache_forecast(station_id, html),
+            match build(state, &station_id, Calendar::Utc).await {
+                Ok(html) => {
+                    let key = cache_key(&station_id, Calendar::Utc, OffsetDateTime::now_utc());
+                    state.cache_forecast(key, html)
+                }
                 Err(error) => error!("warming the forecast detail for {station_id}: {error}"),
             }
         })
@@ -68,26 +83,31 @@ pub async fn warm_forecast_cache(state: &Arc<AppState>) {
     info!("Forecast cache warming complete.");
 }
 
-async fn build(state: &Arc<AppState>, station_id: &str) -> Result<String, weather_data::Error> {
-    // Forecasts and comparison observations use complete UTC calendar days.
+async fn build(
+    state: &Arc<AppState>,
+    station_id: &str,
+    calendar: Calendar,
+) -> Result<String, weather_data::Error> {
+    // Forecasts and comparison observations use complete calendar days.
     let now = OffsetDateTime::now_utc();
-    let today = now.replace_time(Time::MIDNIGHT);
+    let today = calendar.date_of(now);
     let (coming, past) = tokio::try_join!(
-        coming_days(state, station_id, today),
-        past_week(state, station_id, today, now)
+        coming_days(state, station_id, today, calendar),
+        past_week(state, station_id, today, now, calendar)
     )?;
-    Ok(forecast_detail(station_id, &past, &coming).into_string())
+    Ok(forecast_detail(station_id, &past, &coming, &calendar.place()).into_string())
 }
 
 /// The latest forecast for today and the next six days, oldest first.
 async fn coming_days(
     state: &Arc<AppState>,
     station_id: &str,
-    today: OffsetDateTime,
+    today: Date,
+    calendar: Calendar,
 ) -> Result<Vec<ForecastDisplay>, weather_data::Error> {
     let request = ForecastRequest {
-        start: Some(today),
-        end: Some(today + Duration::days(7)),
+        start: Some(calendar.start_of(today)),
+        end: Some(calendar.start_of(today + Duration::days(7))),
         generated_start: None,
         generated_end: None,
         station_ids: station_id.to_string(),
@@ -95,9 +115,9 @@ async fn coming_days(
     };
     let forecasts = state
         .weather_db
-        .forecasts_data(&request, vec![station_id.to_string()])
+        .calendar_forecasts(&request, vec![station_id.to_string()], calendar)
         .await?;
-    let today = today.date().to_string();
+    let today = today.to_string();
     let mut days: Vec<_> = forecasts
         .into_iter()
         .filter(|forecast| day(&forecast.date).is_some_and(|date| date >= today.as_str()))
@@ -107,18 +127,20 @@ async fn coming_days(
     Ok(days)
 }
 
-/// The seven complete UTC days before today: each day's forecast, issued
-/// the day before, against what was observed. Newest first.
+/// The seven complete days before today: each day's forecast, issued the
+/// day before, against what was observed. Newest first.
 async fn past_week(
     state: &Arc<AppState>,
     station_id: &str,
-    today: OffsetDateTime,
+    today: Date,
     now: OffsetDateTime,
+    calendar: Calendar,
 ) -> Result<Vec<ForecastComparison>, weather_data::Error> {
-    let start = today - Duration::days(7);
+    let first = today - Duration::days(7);
+    let (start, end) = (calendar.start_of(first), calendar.start_of(today));
     let forecasts = ForecastRequest {
         start: Some(start),
-        end: Some(today),
+        end: Some(end),
         generated_start: Some(start - Duration::days(1)),
         generated_end: Some(now),
         station_ids: station_id.to_string(),
@@ -126,7 +148,7 @@ async fn past_week(
     };
     let observations = ObservationRequest {
         start: Some(start),
-        end: Some(today - Duration::nanoseconds(1)),
+        end: Some(end - Duration::nanoseconds(1)),
         station_ids: station_id.to_string(),
         temperature_unit: TemperatureUnit::Fahrenheit,
     };
@@ -134,10 +156,12 @@ async fn past_week(
     let (forecasts, observed) = tokio::try_join!(
         state
             .weather_db
-            .forecasts_data(&forecasts, stations.clone()),
-        state.weather_db.daily_observations(&observations, stations)
+            .calendar_forecasts(&forecasts, stations.clone(), calendar),
+        state
+            .weather_db
+            .calendar_daily_observations(&observations, stations, calendar)
     )?;
-    let (start, today) = (start.date().to_string(), today.date().to_string());
+    let (start, today) = (first.to_string(), today.to_string());
     let mut days: Vec<_> = forecasts
         .into_iter()
         .filter(|forecast| {

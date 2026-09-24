@@ -66,8 +66,8 @@ const MAX_BODY_BYTES: usize = 256 * 1024;
 /// Source data arrives hourly, so a 30 minute refresh keeps the cache at
 /// most 30 minutes stale.
 const FORECAST_CACHE_REFRESH: Duration = Duration::from_secs(30 * 60);
-/// Forecast fragments kept in memory. Only known stations are cached, so
-/// this bounds memory even if the station list grows unexpectedly.
+/// Forecast fragments kept in memory, the least recently used dropped
+/// first: known stations in the readers' time zones.
 const MAX_CACHED_FORECASTS: usize = 4_096;
 /// How often recent forecast files are checked for query-ready copies and
 /// folds, besides after each upload: catches files another oracle process
@@ -101,6 +101,45 @@ impl Background {
     }
 }
 
+/// Rendered forecast fragments by key, dropping the least recently used
+/// once full. Eviction scans all entries, which is cheap at this size and
+/// only happens when a new key arrives.
+#[derive(Default)]
+struct ForecastCache {
+    entries: HashMap<String, (u64, String)>,
+    uses: u64,
+}
+
+impl ForecastCache {
+    fn get(&mut self, key: &str) -> Option<String> {
+        self.uses += 1;
+        let uses = self.uses;
+        self.entries.get_mut(key).map(|(used, html)| {
+            *used = uses;
+            html.clone()
+        })
+    }
+
+    fn insert(&mut self, key: String, html: String) {
+        self.uses += 1;
+        if self.entries.len() >= MAX_CACHED_FORECASTS
+            && !self.entries.contains_key(&key)
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (used, _))| *used)
+                .map(|(key, _)| key.clone())
+        {
+            self.entries.remove(&oldest);
+        }
+        self.entries.insert(key, (self.uses, html));
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
 /// The station list and when it was read. It only changes when new files
 /// add a station, and reading it scans a month of observation files, so
 /// pages get the list last read while a refresh runs in the background.
@@ -122,7 +161,7 @@ pub struct AppState {
     pub weather_db: Arc<dyn WeatherData>,
     pub oracle: Arc<Oracle>,
     pub database: Database,
-    forecast_cache: Mutex<HashMap<String, String>>,
+    forecast_cache: Mutex<ForecastCache>,
     stations: Arc<StationList>,
     background: Background,
     etl_slot: Arc<Semaphore>,
@@ -177,7 +216,7 @@ impl AppState {
             weather_db,
             oracle,
             database,
-            forecast_cache: Mutex::new(HashMap::new()),
+            forecast_cache: Mutex::default(),
             stations: Arc::default(),
             background,
             etl_slot: Arc::new(Semaphore::new(1)),
@@ -186,23 +225,19 @@ impl AppState {
         }
     }
 
-    pub fn cached_forecast(&self, station_id: &str) -> Option<String> {
+    pub fn cached_forecast(&self, key: &str) -> Option<String> {
         self.forecast_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(station_id)
-            .cloned()
+            .get(key)
     }
 
     /// Caches a rendered forecast. Callers pass only known station ids.
-    pub fn cache_forecast(&self, station_id: String, html: String) {
-        let mut cache = self
-            .forecast_cache
+    pub fn cache_forecast(&self, key: String, html: String) {
+        self.forecast_cache
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if cache.len() < MAX_CACHED_FORECASTS || cache.contains_key(&station_id) {
-            cache.insert(station_id, html);
-        }
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key, html);
     }
 
     /// A data file was published: prepare it for queries.
@@ -853,3 +888,27 @@ fn install_termination_signal(requested: CancellationToken) -> Result<JoinHandle
 
 #[cfg(test)]
 mod lifecycle_tests;
+
+#[cfg(test)]
+mod forecast_cache_tests {
+    use super::*;
+
+    #[test]
+    fn a_full_cache_drops_the_least_recently_used_forecast() {
+        let mut cache = ForecastCache::default();
+        for index in 0..MAX_CACHED_FORECASTS {
+            cache.insert(format!("K{index}"), index.to_string());
+        }
+        // Reading the oldest makes the second oldest the least recent.
+        assert_eq!(cache.get("K0").as_deref(), Some("0"));
+        cache.insert("KNEW".into(), "new".into());
+        assert_eq!(cache.entries.len(), MAX_CACHED_FORECASTS);
+        assert_eq!(cache.get("K1"), None);
+        assert_eq!(cache.get("K0").as_deref(), Some("0"));
+        assert_eq!(cache.get("KNEW").as_deref(), Some("new"));
+        // Replacing an entry never evicts another.
+        cache.insert("K2".into(), "two".into());
+        assert_eq!(cache.entries.len(), MAX_CACHED_FORECASTS);
+        assert_eq!(cache.get("K3").as_deref(), Some("3"));
+    }
+}

@@ -12,6 +12,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use super::{
     forecast::forecast_html,
     htmx::{Render, page_or_fragment, with_url},
+    local_day::{reader_calendar, vary_on_cookie},
 };
 use crate::{
     AppState,
@@ -66,7 +67,13 @@ pub async fn weather_handler(
         .as_deref()
         .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok());
     let (weather, stations) = tokio::join!(
-        super::weather::load_weather(&state, &station_ids, start, end),
+        super::weather::load_weather(
+            &state,
+            &station_ids,
+            start,
+            end,
+            super::local_day::reader_calendar(&headers),
+        ),
         state.stations()
     );
     let stations = stations.unwrap_or_default();
@@ -104,13 +111,18 @@ pub async fn weather_handler(
 /// A map pin's station (GET /fragments/station/{id}): its name, then the
 /// same cached forecast detail the list shows.
 pub async fn station_handler(
+    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Path(station_id): Path<String>,
 ) -> Response {
     if validate_station_id(&station_id).is_err() {
         return (StatusCode::BAD_REQUEST, "invalid station id").into_response();
     }
-    let (forecast, stations) = tokio::join!(forecast_html(&state, &station_id), state.stations());
+    let calendar = reader_calendar(&headers);
+    let (forecast, stations) = tokio::join!(
+        forecast_html(&state, &station_id, calendar),
+        state.stations()
+    );
     let place = stations.ok().and_then(|stations| {
         stations
             .iter()
@@ -128,23 +140,26 @@ pub async fn station_handler(
             ),
         ),
     };
-    (
+    let mut response = (
         status,
         Html(station_detail(&station_id, place.as_deref(), detail).into_string()),
     )
-        .into_response()
+        .into_response();
+    vary_on_cookie(response.headers_mut());
+    response
 }
 
 /// Handler for forecast detail fragment (GET /fragments/forecast/:station_id),
-/// which a list row loads when it opens.
+/// which a list row loads when it opens. Days are the reader's.
 pub async fn forecast_handler(
+    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Path(station_id): Path<String>,
 ) -> Response {
     if validate_station_id(&station_id).is_err() {
         return (StatusCode::BAD_REQUEST, "invalid station id").into_response();
     }
-    match forecast_html(&state, &station_id).await {
+    let mut response = match forecast_html(&state, &station_id, reader_calendar(&headers)).await {
         Ok(html) => Html(html).into_response(),
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -158,5 +173,7 @@ pub async fn forecast_handler(
             ),
         )
             .into_response(),
-    }
+    };
+    vary_on_cookie(response.headers_mut());
+    response
 }

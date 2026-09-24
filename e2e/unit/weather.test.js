@@ -61,3 +61,31 @@ test("a refresh that returns while the reader is busy is not swapped in", () => 
   listeners["htmx:before:swap"](search);
   assert.equal(search.prevented, false);
 });
+
+test("a page rendered before the time zone was known fetches its weather once more", () => {
+  const listeners = {};
+  const requests = [];
+  const section = {
+    id: "weather-table-container",
+    getAttribute: () => "/fragments/weather?view=list",
+  };
+  const document = {
+    documentElement: { dataset: { zoneChanged: "true" } },
+    addEventListener(name, listener) {
+      listeners[name] = listener;
+    },
+    getElementById: () => section,
+  };
+  const htmx = { ajax: (...request) => requests.push(request) };
+  vm.runInNewContext(fs.readFileSync(script, "utf8"), { document, htmx });
+  listeners["DOMContentLoaded"]();
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0].slice(0, 2), ["GET", "/fragments/weather?view=list"]);
+  assert.equal(document.documentElement.dataset.zoneChanged, undefined);
+  // A known zone, or an explicit period in UTC days: no second request.
+  listeners["DOMContentLoaded"]();
+  document.documentElement.dataset.zoneChanged = "true";
+  section.getAttribute = () => "/fragments/weather?start=2026-09-20T00%3A00%3A00Z";
+  listeners["DOMContentLoaded"]();
+  assert.equal(requests.length, 1);
+});

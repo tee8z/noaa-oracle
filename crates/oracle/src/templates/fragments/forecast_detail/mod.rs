@@ -45,29 +45,31 @@ pub struct ForecastComparison {
 }
 
 /// A station's recent forecasts against what was observed, and its coming
-/// week. Shown when a list row opens or a map pin is clicked.
+/// week, by day in `days` (such as `UTC` or `New York time`). Shown when a
+/// list row opens or a map pin is clicked.
 pub fn forecast_detail(
     station_id: &str,
     comparisons: &[ForecastComparison],
     forecasts: &[ForecastDisplay],
+    days: &str,
 ) -> Markup {
     html! {
         div class="forecast-detail" {
             h3 class="is-sr-only" { "Forecasts and observations for " (station_id) }
             @if !comparisons.is_empty() {
-                (past_week(comparisons))
+                (past_week(comparisons, days))
             }
             (coming_days(forecasts))
         }
     }
 }
 
-fn past_week(comparisons: &[ForecastComparison]) -> Markup {
+fn past_week(comparisons: &[ForecastComparison], days: &str) -> Markup {
     html! {
         section class="past-performance" {
             h4 class="title is-6" { "Past week: forecast vs observed" }
             p class="forecast-note" {
-                "By UTC day. Each forecast was issued the day before. Differences are observed − forecast; + means it came in higher."
+                "By day (" (days) "). Each forecast was issued the day before. Differences are observed − forecast; + means it came in higher."
             }
             div class="table-container" {
                 table class="table is-narrow is-fullwidth past-table" {
@@ -243,7 +245,7 @@ mod tests {
             actual_rain: None,
             actual_snow: None,
         };
-        let html = forecast_detail("KPWM", &[comparison], &[]).into_string();
+        let html = forecast_detail("KPWM", &[comparison], &[], "UTC").into_string();
         assert_eq!(html.matches("55°F").count(), 2);
         assert_eq!(html.matches("-3°F").count(), 2);
         assert!(!html.contains("54°F"));
@@ -270,7 +272,7 @@ mod tests {
             actual_rain: None,
             actual_snow: None,
         };
-        let html = forecast_detail("KPWM", &[comparison], &[]).into_string();
+        let html = forecast_detail("KPWM", &[comparison], &[], "UTC").into_string();
         assert!(html.contains("+5°F"), "{html}");
         assert!(html.contains("-2°F"), "{html}");
         assert!(html.contains("+4 kt"), "{html}");

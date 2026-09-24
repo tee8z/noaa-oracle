@@ -197,7 +197,7 @@ mod tests {
             iata_id: String::new(),
             latest_temp: Some(50.0),
             latest_temp_time: None,
-            observation_period: super::super::ObservationPeriod::Today,
+            observation_period: super::super::ObservationPeriod::Today { zone: "UTC".into() },
             temp_high: None,
             temp_low: None,
             wind_speed: None,

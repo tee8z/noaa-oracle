@@ -895,7 +895,7 @@ async fn station_search_returns_only_the_list_to_htmx() {
     );
     assert_eq!(
         response.headers()[header::VARY],
-        "HX-Request, HX-Target, HX-History-Restore-Request"
+        "HX-Request, HX-Target, HX-History-Restore-Request, Cookie"
     );
 
     // Without a match the list says so.
@@ -954,4 +954,91 @@ async fn map_station_panel_names_the_station() {
     assert!(html.contains("Forecasts and observations for KORD"));
     let (status, _) = app.get("/fragments/station/KORD%27x").await;
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+}
+
+/// A reader in New York gets their own day: it starts at their midnight,
+/// and "yesterday's forecast" is the one issued in the day before it.
+#[tokio::test]
+async fn the_time_zone_cookie_sets_the_dashboards_day() {
+    let new_york = oracle::calendar::Calendar::from_zone_name("America/New_York").unwrap();
+    let midnight = new_york.start_of_day(OffsetDateTime::now_utc());
+    let mut weather = MockWeatherAccess::new();
+    weather
+        .expect_observation_data()
+        .withf(move |request, _| request.start == Some(midnight))
+        .times(1)
+        .returning(|_, _| Ok(mock_observation_data()));
+    weather
+        .expect_observation_data()
+        .withf(|request, _| {
+            request
+                .start
+                .zip(request.end)
+                .is_some_and(|(start, end)| end - start == Duration::hours(24))
+        })
+        .times(1)
+        .returning(|_, _| Ok(mock_observation_data()));
+    weather
+        .expect_forecasts_data()
+        .withf(move |request, _| {
+            request.start == Some(midnight)
+                && request.generated_end == Some(midnight - Duration::nanoseconds(1))
+                && request.generated_start == Some(midnight - Duration::days(1))
+        })
+        .times(1)
+        .returning(|_, _| Ok(vec![]));
+    weather.expect_stations().returning(|| Ok(mock_stations()));
+    let app = spawn_app(Arc::new(weather)).await;
+    let request = Request::get("/fragments/weather?view=list")
+        .header("HX-Request", "true")
+        .header(header::COOKIE, "weather_view=map; tz=America/New_York")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.app.clone().oneshot(request).await.unwrap();
+    assert!(response.status().is_success());
+    let vary = response.headers()[header::VARY].to_str().unwrap();
+    assert!(vary.contains("Cookie"), "{vary}");
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains("Today so far (New York time)"), "{html}");
+}
+
+/// Forecast details depend on the reader's calendar: they say so to caches,
+/// and each calendar gets its own cached copy.
+#[tokio::test]
+async fn forecast_details_vary_by_the_readers_calendar() {
+    let mut weather = MockWeatherAccess::new();
+    // Future and past forecasts, for UTC and then for New York; the second
+    // request in each calendar comes from the cache.
+    weather
+        .expect_forecasts_data()
+        .times(4)
+        .returning(|_, _| Ok(mock_forecast_data()));
+    weather
+        .expect_daily_observations()
+        .times(2)
+        .returning(|_, _| Ok(vec![]));
+    weather.expect_stations().returning(|| Ok(mock_stations()));
+    let app = spawn_app(Arc::new(weather)).await;
+    for cookie in [
+        None,
+        None,
+        Some("tz=America/New_York"),
+        Some("tz=America/New_York"),
+    ] {
+        for path in ["/fragments/forecast/KORD", "/fragments/station/KORD"] {
+            let mut request = Request::get(path).header("HX-Request", "true");
+            if let Some(cookie) = cookie {
+                request = request.header(header::COOKIE, cookie);
+            }
+            let response = app
+                .app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert!(response.status().is_success(), "{path}");
+            assert_eq!(response.headers()[header::VARY], "Cookie", "{path}");
+        }
+    }
 }
