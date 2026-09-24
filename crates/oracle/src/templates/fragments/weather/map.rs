@@ -146,7 +146,9 @@ pub(super) fn weather_map(weather: &[WeatherDisplay], context: &WeatherContext) 
             p id="map-station-loading" class="htmx-indicator map-loading" role="status" {
                 span class="loader" {} " Loading station…"
             }
-            div id="map-station" aria-live="polite"
+            // The five-minute refresh replaces the map but keeps the open
+            // station.
+            div id="map-station" aria-live="polite" hx-preserve
                 data-load-error="Couldn't load this station's forecast and history." {}
         }
     }

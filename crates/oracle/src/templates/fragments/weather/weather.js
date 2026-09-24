@@ -1,8 +1,9 @@
 // The weather section refreshes itself every five minutes. Skip a refresh
-// while the reader has a station open or is typing a search, so it doesn't
-// close what they are reading.
+// while the reader has a list row open or is typing a search, so it doesn't
+// close what they are reading. A station opened from the map survives the
+// refresh (hx-preserve), so the map keeps refreshing.
 function weatherBusy(section) {
-  return section.querySelector("details.wx-station[open], #weather-search:focus, #map-station > *");
+  return section.querySelector("details.wx-station[open], #weather-search:focus");
 }
 
 document.addEventListener("htmx:config:request", function (event) {
