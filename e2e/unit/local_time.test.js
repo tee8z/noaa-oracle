@@ -63,3 +63,31 @@ test("htmx swaps are localized too, and only once", () => {
   assert.equal(time.textContent, first);
   assert.equal(time.title, "x");
 });
+
+
+test("a new calendar day refreshes weather even when its UTC offset is unchanged", () => {
+  const cookies = new Map();
+  const head = fs.readFileSync(path.resolve(__dirname, "../../crates/oracle/src/templates/layouts/head.js"), "utf8");
+  function runHead() {
+    const document = {
+      documentElement: { dataset: {}, setAttribute() {} },
+      get cookie() { return [...cookies].map(([key, value]) => `${key}=${value}`).join("; "); },
+      set cookie(text) {
+        const [key, value] = text.split(";")[0].split("=");
+        cookies.set(key, value);
+      },
+    };
+    class FixedDate extends Date {
+      constructor(...args) { super(...(args.length ? args : ["2026-09-24T18:00:00Z"])); }
+    }
+    vm.runInNewContext(head, {
+      document, Date: FixedDate,
+      localStorage: { getItem() { return "dark"; } },
+    });
+    return document.documentElement.dataset.localDayChanged;
+  }
+  assert.equal(runHead(), "true", "first visit needs local weather");
+  assert.equal(runHead(), undefined, "the same calendar day is already current");
+  cookies.set("local_midnight", String(Number(cookies.get("local_midnight")) - 86400));
+  assert.equal(runHead(), "true", "yesterday's cookie requires a refresh");
+});
