@@ -66,6 +66,10 @@ const FORECAST_CACHE_REFRESH: Duration = Duration::from_secs(30 * 60);
 /// Forecast fragments kept in memory. Only known stations are cached, so
 /// this bounds memory even if the station list grows unexpectedly.
 const MAX_CACHED_FORECASTS: usize = 4_096;
+/// How often recent forecast files are checked for query-ready copies and
+/// folds, besides after each upload: catches files another oracle process
+/// received.
+const PREPARE_FILES_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 type TaskResult = Result<Result<()>, JoinError>;
 
@@ -111,6 +115,8 @@ pub struct AppState {
     etl_slot: Arc<Semaphore>,
     /// This process, as a lease holder. Unique per start.
     instance: String,
+    /// Wakes the task that prepares new data files for queries.
+    files_added: tokio::sync::Notify,
 }
 
 /// Processing scores entries and signs attestations. During a blue/green
@@ -163,6 +169,7 @@ impl AppState {
             background,
             etl_slot: Arc::new(Semaphore::new(1)),
             instance: format!("oracle-{}", uuid::Uuid::now_v7()),
+            files_added: tokio::sync::Notify::new(),
         }
     }
 
@@ -183,6 +190,11 @@ impl AppState {
         if cache.len() < MAX_CACHED_FORECASTS || cache.contains_key(&station_id) {
             cache.insert(station_id, html);
         }
+    }
+
+    /// A data file was published: prepare it for queries.
+    pub fn file_added(&self) {
+        self.files_added.notify_one();
     }
 
     /// Drops cached forecasts and the station list after new data arrives.
@@ -346,7 +358,10 @@ async fn build_app_state(
     let local_file_access: Arc<dyn FileData> = Arc::new(FileAccess::new(
         configuration.weather_dir.to_string_lossy().into_owned(),
     ));
-    let weather_db: Arc<dyn WeatherData> = Arc::new(WeatherAccess::new(local_file_access));
+    let weather_db: Arc<dyn WeatherData> = Arc::new(WeatherAccess::with_derived_forecasts(
+        local_file_access,
+        &configuration.weather_dir.join("derived"),
+    ));
     let sources = Sources::new(Arc::new(NoaaWeather::new(weather_db.clone())), []);
     let oracle = Oracle::new(
         database.clone(),
@@ -543,6 +558,7 @@ impl ApplicationRuntime {
                 return first_failure(result.map(|_| ()), cleanup).map(|()| None);
             }
         };
+        spawn_file_preparation(&state);
         spawn_cache_warmer(&state);
         spawn_etl_schedule(&state, configuration.etl_interval);
         spawn_lease_release(&state);
@@ -635,6 +651,35 @@ impl Drop for ApplicationRuntime {
         // Dropping a JoinHandle detaches it; never leave an unsupervised task.
         self.abort_tasks();
     }
+}
+
+/// Makes query-ready copies and folds of new forecast files (see
+/// [`weather_data::DerivedForecasts`] and [`weather_data::Folds`]): at
+/// start, after each upload, and every [`PREPARE_FILES_INTERVAL`]. Queries
+/// read the published files until then, with the same results. Stops
+/// between files on shutdown.
+fn spawn_file_preparation(state: &Arc<AppState>) {
+    let state = state.clone();
+    let stopping = state.background.stopping.clone();
+    state.background.tasks.clone().spawn(async move {
+        loop {
+            let started = std::time::Instant::now();
+            match state.weather_db.prepare_files(&stopping).await {
+                Ok(0) => {}
+                Ok(made) => info!(
+                    "prepared {made} forecast files in {:.1}s",
+                    started.elapsed().as_secs_f64()
+                ),
+                Err(error) => warn!("cannot prepare forecast files for queries: {error}"),
+            }
+            tokio::select! {
+                biased;
+                () = stopping.cancelled() => break,
+                () = state.files_added.notified() => {}
+                () = tokio::time::sleep(PREPARE_FILES_INTERVAL) => {}
+            }
+        }
+    });
 }
 
 fn spawn_cache_warmer(state: &Arc<AppState>) {
