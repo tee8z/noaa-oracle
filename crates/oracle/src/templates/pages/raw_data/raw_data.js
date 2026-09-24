@@ -1,23 +1,27 @@
 // Raw Data Page - DuckDB-based parquet file analyzer
 // Only initializes when on the /raw page
 
+// DuckDB-WASM is large, so only this page loads it, and only once.
+const DUCKDB_MODULE =
+  "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm";
 let db = null;
 let duckdb = null;
 
 async function initRawDataPage() {
-  // Only run on raw data page
-  if (!document.getElementById("submit")) {
+  // Only run on the raw data page, once per visit.
+  const page = document.getElementById("raw-data");
+  if (!page || page.dataset.ready) {
     return;
   }
+  page.dataset.ready = "true";
 
-  duckdb = window.duckdb;
-  if (!duckdb) {
-    console.error("DuckDB not loaded");
+  try {
+    duckdb = duckdb || (await import(DUCKDB_MODULE));
+  } catch (error) {
+    console.error("DuckDB could not be loaded:", error);
+    setStatus("DuckDB could not be loaded, so queries are unavailable.");
     return;
   }
-
-  // Use API_BASE if available, otherwise use relative URLs
-  window.API_BASE = window.API_BASE || "";
 
   // Setup duckdb
   const JSDELIVR_BUNDLES = duckdb.getJsDelivrBundles();
@@ -34,9 +38,6 @@ async function initRawDataPage() {
   db = new duckdb.AsyncDuckDB(logger, worker);
   await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
   URL.revokeObjectURL(worker_url);
-
-  const apiBase = window.API_BASE;
-  console.log("api location:", apiBase);
 
   // Wire up buttons
   const submitButton = document.getElementById("submit");
@@ -62,45 +63,17 @@ async function initRawDataPage() {
   // Setup drag-to-scroll for query results
   setupDragScroll("queryResult-container");
 
-  // Setting the date (4-hour window to avoid loading too much data)
-  const currentUTCDate = new Date();
-  const windowStartDate = new Date(
-    currentUTCDate.getTime() - 4 * 60 * 60 * 1000,
-  );
+  // Files are large (a day of forecasts is over 100 MB), so nothing
+  // downloads until the reader asks.
+  page.querySelectorAll("button[data-needs-db]").forEach((button) => {
+    button.disabled = false;
+  });
+  setStatus("Ready. Choose a window and load the files.");
+}
 
-  // Format for datetime-local input (YYYY-MM-DDTHH:MM)
-  const formatForInput = (date) => {
-    return date.toISOString().slice(0, 16);
-  };
-
-  const startTime = document.getElementById("start");
-  if (startTime) {
-    startTime.value = formatForInput(windowStartDate);
-  }
-
-  const endTime = document.getElementById("end");
-  if (endTime) {
-    endTime.value = formatForInput(currentUTCDate);
-  }
-
-  const forecasts = document.getElementById("forecasts");
-  if (forecasts) {
-    forecasts.checked = true;
-  }
-
-  const observations = document.getElementById("observations");
-  if (observations) {
-    observations.checked = true;
-  }
-
-  const example_query = document.getElementById("customQuery");
-  if (example_query) {
-    example_query.value =
-      "SELECT * FROM observations ORDER BY station_id, generated_at DESC LIMIT 200";
-  }
-
-  // Download files and run sample query on initial load
-  submitDownloadRequest(null, true);
+function setStatus(text) {
+  const status = document.getElementById("raw-data-status");
+  if (status) status.textContent = text;
 }
 
 async function submitDownloadRequest(event, autoRunQuery = false) {
@@ -113,9 +86,9 @@ async function submitDownloadRequest(event, autoRunQuery = false) {
     showSchemaLoading("observations", true);
 
     const fileNames = await fetchFileNames();
-    console.log(`Files to download: ${fileNames}`);
+    setStatus(`Loading ${fileNames.length} files…`);
     await loadFiles(fileNames);
-    console.log("Successfully downloaded parquet files");
+    setStatus(`Loaded ${fileNames.length} files. Run a query below.`);
 
     // Hide loading states
     showSchemaLoading("forecasts", false);
@@ -127,6 +100,7 @@ async function submitDownloadRequest(event, autoRunQuery = false) {
     }
   } catch (error) {
     console.error("Error downloading files:", error);
+    setStatus("The files could not be loaded.");
     // Hide loading on error
     showSchemaLoading("forecasts", false);
     showSchemaLoading("observations", false);
@@ -146,10 +120,8 @@ function fetchFileNames() {
 
   const forecasts = document.getElementById("forecasts").checked;
   const observations = document.getElementById("observations").checked;
-  const apiBase = window.API_BASE;
-
   return new Promise((resolve, reject) => {
-    let url = `${apiBase}/files?start=${startTime}&end=${endTime}&observations=${observations}&forecasts=${forecasts}`;
+    let url = `/files?start=${startTime}&end=${endTime}&observations=${observations}&forecasts=${forecasts}`;
     console.log(`Requesting: ${url}`);
     fetch(url)
       .then((response) => {
@@ -170,8 +142,8 @@ function fetchFileNames() {
 }
 
 async function loadFiles(fileNames) {
-  // Use absolute URL for DuckDB-WASM (it needs full URLs, not relative paths)
-  const apiBase = window.API_BASE || window.location.origin;
+  // DuckDB-WASM needs absolute URLs, not relative paths.
+  const apiBase = window.location.origin;
   const conn = await db.connect();
   let observation_files = [];
   let forecast_files = [];
@@ -188,11 +160,6 @@ async function loadFiles(fileNames) {
       url,
       duckdb.DuckDBDataProtocol.HTTP,
       false,
-    );
-    const res = await fetch(url);
-    await db.registerFileBuffer(
-      "buffer.parquet",
-      new Uint8Array(await res.arrayBuffer()),
     );
   }
 
@@ -545,158 +512,16 @@ function setupDragScroll(containerId) {
   });
 }
 
-// Example queries - these match the server-side queries that power the UI
-// The server reads from parquet files; here the data is already loaded into
-// the 'observations' and 'forecasts' tables by DuckDB-WASM.
-const EXAMPLE_QUERIES = {
-  daily_observations: `-- Daily observations: powers the weather map and dashboard
--- Groups hourly observations by station and day, classifies precipitation
--- using METAR weather codes, and derives humidity via the Magnus formula
-WITH classified AS (
-    SELECT *,
-        CASE
-            WHEN wx_string IS NOT NULL AND wx_string != '' THEN
-                CASE
-                    WHEN regexp_matches(wx_string, '(^|\\s)[-+]?(VC)?(([A-Z]{2})*(PL|GR|GS|IC)|FZ(RA|DZ))(\\s|$|[A-Z])') THEN 'ice'
-                    WHEN regexp_matches(wx_string, '(^|\\s)[-+]?(VC)?([A-Z]{2})*(SN|SG)(\\s|$|[A-Z])') THEN 'snow'
-                    ELSE 'rain'
-                END
-            WHEN temperature_value IS NOT NULL AND temperature_value <= 2.0 THEN 'snow'
-            ELSE 'rain'
-        END AS precip_type
-    FROM observations
-)
-SELECT
-    station_id,
-    DATE_TRUNC('day', generated_at::TIMESTAMP)::TEXT AS date,
-    MIN(temperature_value) FILTER (WHERE temperature_value IS NOT NULL) AS temp_low,
-    MAX(temperature_value) FILTER (WHERE temperature_value IS NOT NULL) AS temp_high,
-    MAX(wind_speed) FILTER (WHERE wind_speed IS NOT NULL AND wind_speed >= 0 AND wind_speed <= 500) AS wind_speed,
-    MAX(wind_direction) FILTER (WHERE wind_direction IS NOT NULL AND wind_direction >= 0 AND wind_direction <= 360) AS wind_direction,
-    MAX(temperature_unit_code) AS temperature_unit_code,
-    CASE
-        WHEN AVG(dewpoint_value) IS NOT NULL AND AVG(temperature_value) IS NOT NULL
-        THEN ROUND(100.0 * EXP((17.625 * AVG(dewpoint_value)) / (243.04 + AVG(dewpoint_value)))
-             / EXP((17.625 * AVG(temperature_value)) / (243.04 + AVG(temperature_value))))::BIGINT
-        ELSE NULL
-    END AS humidity,
-    SUM(precip_in) FILTER (WHERE precip_in IS NOT NULL AND precip_in >= 0 AND precip_type = 'rain') AS rain_amt,
-    SUM(precip_in * 10.0) FILTER (WHERE precip_in IS NOT NULL AND precip_in >= 0 AND precip_type = 'snow') AS snow_amt,
-    SUM(precip_in) FILTER (WHERE precip_in IS NOT NULL AND precip_in >= 0 AND precip_type = 'ice') AS ice_amt
-FROM classified
-GROUP BY station_id, DATE_TRUNC('day', generated_at::TIMESTAMP)::TEXT
-ORDER BY station_id, date`,
-
-  daily_forecast: `-- Daily forecast summary: powers the forecast detail page
--- Deduplicates overlapping forecast windows (keeps latest generated_at),
--- then aggregates to daily granularity with rain/snow/ice separation
-WITH deduped_forecasts AS (
-    SELECT DISTINCT ON (station_id, begin_time, end_time)
-        station_id, begin_time, end_time, min_temp, max_temp,
-        wind_speed, wind_direction, relative_humidity_max, relative_humidity_min,
-        temperature_unit_code, twelve_hour_probability_of_precipitation,
-        liquid_precipitation_amt, snow_amt, snow_ratio, ice_amt, generated_at
-    FROM forecasts
-    ORDER BY station_id, begin_time, end_time, generated_at DESC
-),
-daily_forecasts AS (
-    SELECT
-        station_id,
-        DATE_TRUNC('day', begin_time::TIMESTAMP)::TEXT AS date,
-        MIN(begin_time) AS start_time,
-        MAX(end_time) AS end_time,
-        MIN(min_temp) FILTER (WHERE min_temp IS NOT NULL AND min_temp >= -200 AND min_temp <= 200) AS temp_low,
-        MAX(max_temp) FILTER (WHERE max_temp IS NOT NULL AND max_temp >= -200 AND max_temp <= 200) AS temp_high,
-        MAX(wind_speed) FILTER (WHERE wind_speed IS NOT NULL AND wind_speed >= 0 AND wind_speed <= 500) AS wind_speed,
-        MAX(wind_direction) FILTER (WHERE wind_direction IS NOT NULL AND wind_direction >= 0 AND wind_direction <= 360) AS wind_direction,
-        MAX(relative_humidity_max) FILTER (WHERE relative_humidity_max IS NOT NULL AND relative_humidity_max >= 0 AND relative_humidity_max <= 100) AS humidity_max,
-        MIN(relative_humidity_min) FILTER (WHERE relative_humidity_min IS NOT NULL AND relative_humidity_min >= 0 AND relative_humidity_min <= 100) AS humidity_min,
-        MAX(temperature_unit_code) AS temperature_unit_code,
-        MAX(twelve_hour_probability_of_precipitation) FILTER (WHERE twelve_hour_probability_of_precipitation IS NOT NULL) AS precip_chance,
-        SUM(liquid_precipitation_amt) FILTER (WHERE liquid_precipitation_amt IS NOT NULL AND liquid_precipitation_amt >= 0) AS total_qpf,
-        SUM(snow_amt) FILTER (WHERE snow_amt IS NOT NULL AND snow_amt >= 0) AS snow_amt,
-        AVG(snow_ratio) FILTER (WHERE snow_ratio IS NOT NULL AND snow_ratio > 0) AS avg_snow_ratio,
-        SUM(ice_amt) FILTER (WHERE ice_amt IS NOT NULL AND ice_amt >= 0) AS ice_amt
-    FROM deduped_forecasts
-    GROUP BY station_id, DATE_TRUNC('day', begin_time::TIMESTAMP)::TEXT
-)
-SELECT
-    station_id, date, MIN(start_time) AS start_time, MAX(end_time) AS end_time,
-    MIN(temp_low) AS temp_low, MAX(temp_high) AS temp_high,
-    MAX(wind_speed) AS wind_speed, MAX(wind_direction) AS wind_direction,
-    MAX(humidity_max) AS humidity_max, MIN(humidity_min) AS humidity_min,
-    MAX(temperature_unit_code) AS temperature_unit_code,
-    MAX(precip_chance) AS precip_chance,
-    GREATEST(0, COALESCE(
-        SUM(total_qpf) - (SUM(snow_amt) / NULLIF(AVG(avg_snow_ratio), 0)) - COALESCE(SUM(ice_amt), 0),
-        SUM(total_qpf) - COALESCE(SUM(ice_amt), 0)
-    )) AS rain_amt,
-    SUM(snow_amt) AS snow_amt,
-    SUM(ice_amt) AS ice_amt
-FROM daily_forecasts
-GROUP BY station_id, date
-ORDER BY station_id, date`,
-
-  forecast_vs_observed: `-- Forecast vs Observed: compares forecast accuracy by joining
--- daily forecast aggregates with daily observation aggregates
-WITH deduped_forecasts AS (
-    SELECT DISTINCT ON (station_id, begin_time, end_time)
-        station_id, begin_time, end_time, min_temp, max_temp, generated_at
-    FROM forecasts
-    ORDER BY station_id, begin_time, end_time, generated_at DESC
-),
-daily_fcst AS (
-    SELECT
-        station_id,
-        DATE_TRUNC('day', begin_time::TIMESTAMP)::TEXT AS date,
-        MIN(min_temp) FILTER (WHERE min_temp >= -200 AND min_temp <= 200) AS temp_low,
-        MAX(max_temp) FILTER (WHERE max_temp >= -200 AND max_temp <= 200) AS temp_high
-    FROM deduped_forecasts
-    GROUP BY station_id, DATE_TRUNC('day', begin_time::TIMESTAMP)::TEXT
-),
-daily_obs AS (
-    SELECT
-        station_id,
-        DATE_TRUNC('day', generated_at::TIMESTAMP)::TEXT AS date,
-        MIN(temperature_value) FILTER (WHERE temperature_value IS NOT NULL) AS temp_low,
-        MAX(temperature_value) FILTER (WHERE temperature_value IS NOT NULL) AS temp_high
-    FROM observations
-    GROUP BY station_id, DATE_TRUNC('day', generated_at::TIMESTAMP)::TEXT
-)
-SELECT
-    f.station_id, f.date,
-    f.temp_high AS forecast_high, f.temp_low AS forecast_low,
-    o.temp_high AS observed_high, o.temp_low AS observed_low,
-    f.temp_high - o.temp_high AS high_error,
-    f.temp_low - o.temp_low AS low_error
-FROM daily_fcst f
-JOIN daily_obs o ON f.station_id = o.station_id AND f.date = o.date
-ORDER BY f.station_id, f.date`,
-
-  stations: `-- Station list: all unique stations with metadata
-SELECT DISTINCT
-    station_id,
-    COALESCE(station_name, '') AS station_name,
-    COALESCE(state, '') AS state,
-    COALESCE(iata_id, '') AS iata_id,
-    elevation_m, latitude, longitude
-FROM observations
-ORDER BY state, station_id`,
-};
-
-window.loadExampleQuery = function (name) {
-  const query = EXAMPLE_QUERIES[name];
-  if (!query) return;
-
+// Example query buttons carry their SQL in data-query (the server renders
+// it from the .sql files beside this script).
+document.addEventListener("click", function (event) {
+  const example = event.target.closest("[data-query]");
+  if (!example || !db) return;
   const textarea = document.getElementById("customQuery");
-  if (textarea) {
-    textarea.value = query;
-  }
-
-  // Auto-run the query
+  if (textarea) textarea.value = example.dataset.query;
   runQuery(null);
-};
+});
 
 // Initialize when DOM is ready and on page navigation (HTMX)
 document.addEventListener("DOMContentLoaded", initRawDataPage);
-document.body.addEventListener("htmx:afterSwap", initRawDataPage);
+document.addEventListener("htmx:afterSettle", initRawDataPage);

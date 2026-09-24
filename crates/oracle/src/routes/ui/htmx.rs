@@ -1,20 +1,57 @@
+//! One URL serves a page and its parts: a normal load gets the whole page,
+//! an htmx swap into `#main-content` gets the page's content, and a swap
+//! into a smaller target gets only that part.
+
 use axum::{
-    http::{HeaderMap, HeaderValue, header},
+    http::{HeaderMap, HeaderName, HeaderValue, header},
     response::{Html, IntoResponse, Response},
 };
 
-/// True when htmx swaps the response into `#main-content`. A history restore
-/// replaces the whole body, so it gets the full page like a normal load.
-pub(super) fn wants_fragment(headers: &HeaderMap) -> bool {
-    headers.contains_key("hx-request") && !headers.contains_key("hx-history-restore-request")
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Render {
+    /// The whole document.
+    Page,
+    /// What goes into `#main-content`.
+    Content,
+    /// Only the element with this id.
+    Part(String),
 }
 
-/// The same URL returns a page or a fragment, so caches must key on the header.
+/// A history restore replaces the whole body, so it gets the full page like
+/// a normal load.
+pub(super) fn render(headers: &HeaderMap) -> Render {
+    if !headers.contains_key("hx-request") || headers.contains_key("hx-history-restore-request") {
+        return Render::Page;
+    }
+    match headers
+        .get("hx-target")
+        .and_then(|target| target.to_str().ok())
+    {
+        Some(target) if !target.is_empty() && target != "main-content" => {
+            Render::Part(target.to_string())
+        }
+        _ => Render::Content,
+    }
+}
+
+/// The same URL returns a page or a fragment, so caches must key on the
+/// htmx headers.
 pub(super) fn page_or_fragment(html: String) -> Response {
     let mut response = Html(html).into_response();
+    response.headers_mut().insert(
+        header::VARY,
+        HeaderValue::from_static("HX-Request, HX-Target"),
+    );
     response
-        .headers_mut()
-        .insert(header::VARY, HeaderValue::from_static("HX-Request"));
+}
+
+/// Tells htmx which page URL shows what this fragment shows.
+pub(super) fn with_url(mut response: Response, name: &'static str, url: &str) -> Response {
+    if let Ok(value) = HeaderValue::from_str(url) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static(name), value);
+    }
     response
 }
 
@@ -22,16 +59,39 @@ pub(super) fn page_or_fragment(html: String) -> Response {
 mod tests {
     use super::*;
 
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(*name, HeaderValue::from_static(value));
+        }
+        headers
+    }
+
     #[test]
     fn only_htmx_swaps_get_fragments() {
-        let mut headers = HeaderMap::new();
-        assert!(!wants_fragment(&headers));
-        headers.insert("hx-request", HeaderValue::from_static("true"));
-        assert!(wants_fragment(&headers));
-        headers.insert(
-            "hx-history-restore-request",
-            HeaderValue::from_static("true"),
+        assert_eq!(render(&headers(&[])), Render::Page);
+        assert_eq!(render(&headers(&[("hx-request", "true")])), Render::Content);
+        assert_eq!(
+            render(&headers(&[
+                ("hx-request", "true"),
+                ("hx-target", "main-content")
+            ])),
+            Render::Content
         );
-        assert!(!wants_fragment(&headers));
+        assert_eq!(
+            render(&headers(&[
+                ("hx-request", "true"),
+                ("hx-target", "events-list")
+            ])),
+            Render::Part("events-list".into())
+        );
+        assert_eq!(
+            render(&headers(&[
+                ("hx-request", "true"),
+                ("hx-target", "events-list"),
+                ("hx-history-restore-request", "true")
+            ])),
+            Render::Page
+        );
     }
 }

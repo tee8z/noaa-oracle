@@ -1,6 +1,6 @@
 use maud::{Markup, html};
 
-/// Event statistics data
+/// Event counts by status.
 #[derive(Default)]
 pub struct EventStats {
     pub live_count: usize,
@@ -9,56 +9,23 @@ pub struct EventStats {
     pub signed_count: usize,
 }
 
-/// Event statistics display fragment
-/// Shows counts of events by status in a responsive grid
+/// One line of counts; each opens the events list filtered to that status.
 pub fn event_stats(stats: &EventStats) -> Markup {
     html! {
-        div class="box" {
-            h2 class="title is-5 mb-4" { "Event Statistics" }
-
-            div class="columns is-multiline is-mobile" {
-                // Live events
-                div class="column is-half-mobile is-one-quarter-tablet" {
-                    div class="stat-card" {
-                        div class="stat-value has-text-success" {
-                            (stats.live_count)
-                        }
-                        div class="stat-label" { "Live" }
-                        p class="is-size-7 has-text-grey" { "Accepting entries" }
-                    }
-                }
-
-                // Running events
-                div class="column is-half-mobile is-one-quarter-tablet" {
-                    div class="stat-card" {
-                        div class="stat-value stat-running" {
-                            (stats.running_count)
-                        }
-                        div class="stat-label" { "Running" }
-                        p class="is-size-7 has-text-grey" { "Observing weather" }
-                    }
-                }
-
-                // Completed events
-                div class="column is-half-mobile is-one-quarter-tablet" {
-                    div class="stat-card" {
-                        div class="stat-value has-text-info" {
-                            (stats.completed_count)
-                        }
-                        div class="stat-label" { "Completed" }
-                        p class="is-size-7 has-text-grey" { "Awaiting signature" }
-                    }
-                }
-
-                // Signed events
-                div class="column is-half-mobile is-one-quarter-tablet" {
-                    div class="stat-card" {
-                        div class="stat-value has-text-primary" {
-                            (stats.signed_count)
-                        }
-                        div class="stat-label" { "Signed" }
-                        p class="is-size-7 has-text-grey" { "Attested" }
-                    }
+        section class="box event-stats" aria-label="Events by status" {
+            @for (status, count, label, hint) in [
+                ("live", stats.live_count, "Live", "Accepting entries"),
+                ("running", stats.running_count, "Running", "Observing weather"),
+                ("completed", stats.completed_count, "Completed", "Awaiting signature"),
+                ("signed", stats.signed_count, "Signed", "Attested"),
+            ] {
+                a class="stat-card" href=(format!("/events?status={status}"))
+                  hx-get=(format!("/events?status={status}"))
+                  hx-target="#main-content"
+                  hx-push-url="true"
+                  title=(hint) {
+                    span class={ "stat-value stat-" (status) } { (count) }
+                    span class="stat-label" { (label) }
                 }
             }
         }

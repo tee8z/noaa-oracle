@@ -1,0 +1,91 @@
+.raw-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: 0.75rem 1rem;
+}
+
+.raw-controls .field {
+    margin-bottom: 0;
+}
+
+.raw-kinds {
+    border: 0;
+    padding: 0;
+    display: flex;
+    gap: 1rem;
+    flex-wrap: wrap;
+}
+
+.raw-kinds legend {
+    width: 100%;
+}
+
+.raw-status {
+    margin: 0.5rem 0 1rem;
+    font-size: 0.8rem;
+    color: var(--muted);
+}
+
+.schema-box {
+    border: 1px solid var(--bulma-border);
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+.schema-header {
+    background: var(--bulma-scheme-main-bis);
+    padding: 0.5rem 0.75rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.schema-title {
+    font-weight: 600;
+    font-size: 0.85rem;
+}
+
+.schema-loading {
+    padding: 1rem;
+    align-items: center;
+    color: var(--muted);
+    font-size: 0.85rem;
+}
+
+textarea.schema-content {
+    display: block;
+    width: 100%;
+    min-height: 120px;
+    margin: 0;
+    padding: 0.75rem;
+    border: 0;
+    border-top: 1px solid var(--bulma-border);
+    background: var(--bulma-scheme-main);
+    color: var(--bulma-text);
+    font-family: monospace;
+    resize: vertical;
+}
+
+.query-result-wrapper {
+    overflow-x: auto;
+    max-width: 100%;
+    cursor: grab;
+}
+
+.query-result-wrapper.dragging {
+    cursor: grabbing;
+    user-select: none;
+}
+
+.query-result-wrapper table {
+    white-space: nowrap;
+    font-size: 0.8rem;
+}
+
+.query-result-wrapper td,
+.query-result-wrapper th {
+    max-width: 300px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}

@@ -288,20 +288,24 @@ async fn event_pages_return_only_their_content_to_htmx() {
         assert_eq!(status, StatusCode::OK);
         let page = String::from_utf8(page.to_vec()).unwrap();
         assert!(page.starts_with("<!DOCTYPE html>"), "{path}");
-        assert_eq!(page.matches("4cast Truth Oracle</h1>").count(), 1);
+        assert_eq!(page.matches("class=\"site-header\"").count(), 1);
 
         let request = Request::get(&path)
             .header("hx-request", "true")
+            .header("hx-target", "main-content")
             .body(Body::empty())
             .unwrap();
         let response = test_app.app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()[header::VARY], "HX-Request");
+        assert_eq!(response.headers()[header::VARY], "HX-Request, HX-Target");
         let fragment = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let fragment = String::from_utf8(fragment.to_vec()).unwrap();
         assert!(!fragment.contains("<html"), "{path}");
-        assert!(!fragment.contains("4cast Truth Oracle</h1>"), "{path}");
-        assert!(!fragment.contains("navbar"), "{path}");
+        assert!(!fragment.contains("site-header"), "{path}");
+        // The tabs come along out of band so the current page stays marked.
+        assert!(fragment.contains("id=\"site-tabs\""), "{path}");
+        assert!(fragment.contains("hx-swap-oob=\"true\""), "{path}");
+        assert!(fragment.contains("aria-current=\"page\""), "{path}");
         assert!(fragment.contains(&event.id.to_string()[..8]), "{path}");
 
         // htmx restores history by replacing the body, so it needs the page.
@@ -316,4 +320,35 @@ async fn event_pages_return_only_their_content_to_htmx() {
             .await;
         assert!(restored.starts_with(b"<!DOCTYPE html>"), "{path}");
     }
+}
+
+/// Filters replace the section, the refresh replaces only the rows, and
+/// both keep the filters.
+#[tokio::test]
+async fn event_filters_render_the_matching_part() {
+    let test_app = app().await;
+    let event = created(&test_app).await;
+    let short_id = &event.id.to_string()[..8];
+
+    let part = |target: &'static str, path: &'static str| {
+        Request::get(path)
+            .header("hx-request", "true")
+            .header("hx-target", target)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (_, body) = test_app.send(part("events", "/events?status=live")).await;
+    let section = String::from_utf8(body.to_vec()).unwrap();
+    assert!(section.starts_with("<section id=\"events\""), "{section}");
+    assert!(section.contains(short_id));
+    assert!(section.contains("hx-get=\"/events?status=live\""));
+
+    let (_, body) = test_app
+        .send(part("events-list", "/events?status=signed"))
+        .await;
+    let list = String::from_utf8(body.to_vec()).unwrap();
+    assert!(list.starts_with("<div id=\"events-list\""), "{list}");
+    assert!(!list.contains(short_id));
+    assert!(list.contains("No events match these filters."));
+    assert!(!list.contains("status-filter"));
 }

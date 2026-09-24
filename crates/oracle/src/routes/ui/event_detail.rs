@@ -7,10 +7,10 @@ use axum::{
 };
 use uuid::Uuid;
 
-use super::htmx::{page_or_fragment, wants_fragment};
+use super::htmx::{Render, page_or_fragment};
 use crate::{
     AppState,
-    templates::{event_detail_page, pages::event_detail::event_detail_content},
+    templates::pages::event_detail::{event_detail_fragment, event_detail_page},
 };
 
 /// Handler for the event detail page (GET /events/{id}).
@@ -22,11 +22,16 @@ pub async fn event_detail_handler(
     Path(event_id): Path<Uuid>,
 ) -> Response {
     match state.oracle.get_event(event_id).await {
-        Ok(event) => page_or_fragment(if wants_fragment(&headers) {
-            event_detail_content(&event).into_string()
-        } else {
-            event_detail_page(&state.remote_url, &event).into_string()
-        }),
+        Ok(event) => {
+            let now = time::OffsetDateTime::now_utc();
+            page_or_fragment(
+                match super::htmx::render(&headers) {
+                    Render::Page => event_detail_page(&event, now),
+                    _ => event_detail_fragment(&event, now),
+                }
+                .into_string(),
+            )
+        }
         Err(crate::oracle::Error::EventNotFound(_)) => (
             StatusCode::NOT_FOUND,
             Html(not_found_page(&event_id.to_string())),

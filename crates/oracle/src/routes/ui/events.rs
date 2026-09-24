@@ -1,43 +1,50 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::HeaderMap,
-    response::{Html, Response},
+    response::Response,
 };
-use time::format_description::well_known::Rfc3339;
+use serde::Deserialize;
+use time::OffsetDateTime;
 
-use super::htmx::{page_or_fragment, wants_fragment};
+use super::htmx::{Render, page_or_fragment};
 use crate::{
     AppState,
     events::EventFilter,
     templates::{
-        EventView, events_page, events_table_cards, events_table_rows,
-        pages::events::events_content,
+        fragments::events::{EventFilters, EventView, events_list, events_section},
+        pages::events::{events_fragment, events_page},
     },
 };
 
-/// Handler for the events page (GET /events)
-/// Returns full page for normal requests, content only for HTMX requests
-pub async fn events_handler(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
-    let events = build_events_view(&state).await;
-    page_or_fragment(if wants_fragment(&headers) {
-        events_content(&events).into_string()
-    } else {
-        events_page(&state.remote_url, &events).into_string()
-    })
+#[derive(Debug, Deserialize, Default)]
+pub struct EventsQuery {
+    /// `live`, `running`, `completed` or `signed`; empty for all.
+    pub status: Option<String>,
+    /// `show` to include test events.
+    pub tests: Option<String>,
 }
 
-/// Handler for events table rows only (HTMX partial for auto-refresh)
-pub async fn events_rows_handler(State(state): State<Arc<AppState>>) -> Html<String> {
+/// Handler for the events page (GET /events). The filters replace
+/// `#events`; the 30-second refresh replaces `#events-list`.
+pub async fn events_handler(
+    headers: HeaderMap,
+    Query(query): Query<EventsQuery>,
+    State(state): State<Arc<AppState>>,
+) -> Response {
     let events = build_events_view(&state).await;
-    Html(events_table_rows(&events).into_string())
-}
-
-/// Handler for events cards (mobile view) - HTMX partial for auto-refresh
-pub async fn events_cards_handler(State(state): State<Arc<AppState>>) -> Html<String> {
-    let events = build_events_view(&state).await;
-    Html(events_table_cards(&events).into_string())
+    let filters = EventFilters::parse(query.status.as_deref(), query.tests.as_deref());
+    let now = OffsetDateTime::now_utc();
+    page_or_fragment(
+        match super::htmx::render(&headers) {
+            Render::Page => events_page(&events, filters, now),
+            Render::Content => events_fragment(&events, filters, now),
+            Render::Part(target) if target == "events-list" => events_list(&events, filters, now),
+            Render::Part(_) => events_section(&events, filters, now),
+        }
+        .into_string(),
+    )
 }
 
 async fn build_events_view(state: &Arc<AppState>) -> Vec<EventView> {
@@ -53,18 +60,9 @@ async fn build_events_view(state: &Arc<AppState>) -> Vec<EventView> {
             id: e.id.to_string(),
             locations: e.locations,
             status: e.status,
-            start_observation: e
-                .start_observation_date
-                .format(&Rfc3339)
-                .unwrap_or_else(|_| "Invalid".to_string()),
-            end_observation: e
-                .end_observation_date
-                .format(&Rfc3339)
-                .unwrap_or_else(|_| "Invalid".to_string()),
-            signing_date: e
-                .signing_date
-                .format(&Rfc3339)
-                .unwrap_or_else(|_| "Invalid".to_string()),
+            start_observation: e.start_observation_date,
+            end_observation: e.end_observation_date,
+            signing_date: e.signing_date,
             total_entries: e.total_entries,
             total_allowed_entries: e.total_allowed_entries,
             number_of_places_win: e.number_of_places_win,

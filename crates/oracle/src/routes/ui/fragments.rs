@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
 };
 use futures::stream::{self, StreamExt};
@@ -10,12 +10,13 @@ use log::info;
 use serde::Deserialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+use super::htmx::{Render, page_or_fragment, with_url};
 use crate::{
     AppState, ForecastRequest, ObservationRequest, TemperatureUnit,
     events::EventStatus,
-    templates::{
-        EventStats, ForecastComparison, ForecastDisplay,
-        fragments::{event_stats, forecast_detail, oracle_info, weather_table_body_with_refresh},
+    templates::fragments::{
+        EventStats, ForecastComparison, ForecastDisplay, WeatherContext, event_stats,
+        forecast_detail, oracle_info, station_detail, weather_list, weather_section,
     },
     weather_data::validate_station_id,
 };
@@ -38,6 +39,10 @@ pub struct WeatherQuery {
     pub add_station: Option<String>,
     pub start: Option<String>,
     pub end: Option<String>,
+    /// `map` or `list`
+    pub view: Option<String>,
+    /// Station search in the list.
+    pub q: Option<String>,
 }
 
 /// Handler for oracle info fragment (GET /fragments/oracle-info)
@@ -68,12 +73,16 @@ pub async fn event_stats_handler(State(state): State<Arc<AppState>>) -> Html<Str
     Html(event_stats(&stats).into_string())
 }
 
-/// Handler for weather table fragment (GET /fragments/weather)
+/// Handler for the weather section (GET /fragments/weather): the Map/List
+/// tabs, adding a station and the five-minute refresh get the section; a
+/// search (`HX-Target: weather-list`) gets only the list.
 pub async fn weather_handler(
+    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(query): Query<WeatherQuery>,
-) -> Html<String> {
+) -> Response {
     // Get stations from query or use default major airports
+    let requested = query.stations.is_some() || query.add_station.is_some();
     let mut station_ids: Vec<String> = if let Some(stations) = &query.stations {
         stations.split(',').map(|s| s.trim().to_string()).collect()
     } else {
@@ -99,9 +108,68 @@ pub async fn weather_handler(
         .end
         .as_deref()
         .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok());
-    let weather = super::weather::load_weather(&state, &station_ids, start, end).await;
-    let refresh_path = super::weather::refresh_path(&station_ids, start, end);
-    Html(weather_table_body_with_refresh(&weather, &refresh_path).into_string())
+    let (weather, stations) = tokio::join!(
+        super::weather::load_weather(&state, &station_ids, start, end),
+        state.stations()
+    );
+    let stations = stations.unwrap_or_default();
+    // The default airports refresh without naming them.
+    let selection: &[String] = if requested { &station_ids } else { &[] };
+    let selection_path = super::weather::refresh_path(selection, start, end);
+    let view = super::dashboard::chosen_view(query.view.as_deref(), &headers);
+    let context = WeatherContext {
+        view,
+        query: query.q.as_deref().unwrap_or_default(),
+        selection_path: &selection_path,
+        stations: &stations,
+        now: OffsetDateTime::now_utc(),
+    };
+    let only_list = super::htmx::render(&headers) == Render::Part("weather-list".into());
+    let mut response = page_or_fragment(if only_list {
+        weather_list(&weather, &context).into_string()
+    } else {
+        weather_section(&weather, &context).into_string()
+    });
+    if query.view.is_some() {
+        super::dashboard::remember_view(&mut response, view);
+    }
+    if !headers.contains_key("hx-request") {
+        response
+    } else if query.add_station.is_some() {
+        with_url(response, "hx-push-url", &context.page_url(view))
+    } else if only_list {
+        with_url(response, "hx-replace-url", &context.page_url(view))
+    } else {
+        response
+    }
+}
+
+/// A map pin's station (GET /fragments/station/{id}): its name, then the
+/// same cached forecast detail the list shows.
+pub async fn station_handler(
+    State(state): State<Arc<AppState>>,
+    Path(station_id): Path<String>,
+) -> Response {
+    if validate_station_id(&station_id).is_err() {
+        return (StatusCode::BAD_REQUEST, "invalid station id").into_response();
+    }
+    let forecast = forecast_handler(State(state.clone()), Path(station_id.clone())).await;
+    let forecast = match axum::body::to_bytes(forecast.into_body(), usize::MAX).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let stations = state.stations().await.unwrap_or_default();
+    let place = stations
+        .iter()
+        .find(|station| station.station_id == station_id)
+        .map(|station| {
+            if station.state.is_empty() {
+                station.station_name.clone()
+            } else {
+                format!("{}, {}", station.station_name, station.state)
+            }
+        });
+    Html(station_detail(&station_id, place.as_deref(), &forecast).into_string()).into_response()
 }
 
 /// Handler for forecast detail fragment (GET /fragments/forecast/:station_id).
