@@ -1,6 +1,7 @@
 use maud::{Markup, html};
 use std::cmp::Reverse;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use crate::events::{Event, EventStatus, Weather, WeatherEntry};
 use crate::templates::{
@@ -26,6 +27,32 @@ pub fn event_detail_page(event: &Event, now: OffsetDateTime) -> Markup {
 pub fn event_detail_fragment(event: &Event, now: OffsetDateTime) -> Markup {
     let (title, current_page) = config(event);
     page_fragment(&PageConfig { title: &title, current_page }, event_detail_content(event, now))
+}
+
+const NOT_FOUND: PageConfig<'static> = PageConfig {
+    title: "Event not found - 4cast Truth Oracle",
+    current_page: CurrentPage::Events,
+};
+
+pub fn event_not_found_page(event_id: Uuid) -> Markup {
+    base(&NOT_FOUND, event_not_found_content(event_id))
+}
+
+pub fn event_not_found_fragment(event_id: Uuid) -> Markup {
+    page_fragment(&NOT_FOUND, event_not_found_content(event_id))
+}
+
+fn event_not_found_content(event_id: Uuid) -> Markup {
+    html! {
+        section class="box" {
+            h2 class="title is-5" { "Event not found" }
+            p { "No event has the ID " code { (event_id) } "." }
+            a href="/events" class="button is-small mt-3"
+              hx-get="/events" hx-target="#main-content" hx-push-url="true" {
+                "All events"
+            }
+        }
+    }
 }
 
 /// The attestation is a scalar; show it as hex, like the API does.

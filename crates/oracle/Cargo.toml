@@ -77,14 +77,15 @@ itertools = "0.15"
 async-trait = "0.1"
 
 [build-dependencies]
-lightningcss = { version = "=1.0.0-alpha.72", default-features = false }
-better-minify-js = "0.7"
-walkdir = "2.5"
-sha2 = "0.11"
+flate2 = "1.1"
 hex = "0.4"
+lightningcss = { version = "=1.0.0-alpha.72", default-features = false }
+oxc = { version = "0.146", default-features = false, features = ["codegen", "minifier"] }
+sha2 = "0.11"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+flate2 = "1.1"
 mockall = "0.15"
 tempfile.workspace = true
 toml.workspace = true
@@ -96,7 +97,7 @@ slog.workspace = true
 futures = { workspace = true, features = ["async-await"] }
 
 [package.metadata.cargo-machete]
-ignored = ["better-minify-js", "hex", "lightningcss", "walkdir"]
+ignored = ["flate2", "hex", "lightningcss", "oxc"]
 
 [lints]
 workspace = true

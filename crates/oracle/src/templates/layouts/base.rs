@@ -1,4 +1,4 @@
-use maud::{DOCTYPE, Markup, PreEscaped, html};
+use maud::{DOCTYPE, Markup, html};
 
 use crate::templates::{
     assets,
@@ -25,12 +25,16 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
                 meta charset="UTF-8";
                 meta name="viewport" content="width=device-width, initial-scale=1.0";
                 title { (config.title) }
+                meta name="htmx-config" content=(HTMX_CONFIG);
+                // Applies the saved theme before the page paints.
+                script src=(assets::HEAD_JS.url) {}
                 link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@1.0.4/css/bulma.min.css";
-                link rel="stylesheet" href=(assets::CSS_URL);
-                script defer src="https://cdn.jsdelivr.net/npm/htmx.org@1.9.10/dist/htmx.min.js" {}
-                script defer src=(assets::JS_URL) {}
-                // Apply the saved theme before the page paints.
-                script { (PreEscaped(THEME_INIT_SCRIPT)) }
+                link rel="stylesheet" href=(assets::SITE_CSS.url);
+                script defer src=(assets::HTMX_JS.url) {}
+                script defer src=(assets::SITE_JS.url) {}
+                @if config.current_page == CurrentPage::RawData {
+                    script defer src=(assets::RAW_DATA_JS.url) {}
+                }
             }
             body {
                 div class="container site" {
@@ -65,9 +69,12 @@ pub fn page_fragment(config: &PageConfig, content: Markup) -> Markup {
     }
 }
 
-/// Sets `data-theme` from the saved choice, else the system preference.
-const THEME_INIT_SCRIPT: &str = "document.documentElement.setAttribute('data-theme',\
-localStorage.getItem('theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'));";
+/// htmx settings that suit the Content-Security-Policy: no `eval` (so no
+/// `hx-on`, `js:` values or trigger filters), no scripts run from swapped
+/// HTML, requests only to this site, no inline indicator styles, and a full
+/// load when a page is missing from htmx's history cache, so each page gets
+/// its own policy and scripts.
+pub const HTMX_CONFIG: &str = r#"{"allowEval":false,"allowScriptTags":false,"selfRequestsOnly":true,"includeIndicatorStyles":false,"refreshOnHistoryMiss":true}"#;
 
 fn github_icon() -> Markup {
     html! {

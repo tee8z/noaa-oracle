@@ -50,9 +50,18 @@ async fn dashboard_returns_current_day_observations() {
         response.headers()[header::SET_COOKIE],
         "weather_view=list; Path=/; Max-Age=31536000; SameSite=Lax"
     );
+    let policy = response.headers()[header::CONTENT_SECURITY_POLICY]
+        .to_str()
+        .unwrap();
+    assert!(policy.starts_with("script-src 'self';"), "{policy}");
 
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let html = String::from_utf8(body.to_vec()).unwrap();
+    // Trigger filters are JavaScript, which htmx may not evaluate here.
+    for trigger in html.split("hx-trigger=\"").skip(1) {
+        let trigger = trigger.split_once('"').unwrap().0;
+        assert!(!trigger.contains('['), "{trigger}");
+    }
 
     // Verify the response contains weather data
     assert!(html.contains("Current weather"));

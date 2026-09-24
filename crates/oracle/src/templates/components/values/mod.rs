@@ -140,7 +140,8 @@ mod tests {
     fn zero_precipitation_is_dimmed() {
         assert!(precipitation(Some(0.0), "rain", 2).into_string().contains("is-zero"));
         let rain = precipitation(Some(0.25), "rain", 2).into_string();
-        assert!(rain.contains("0.25\"") && !rain.contains("is-zero"));
+        // maud escapes the inch mark in text.
+        assert!(rain.contains("0.25&quot;") && !rain.contains("is-zero"), "{rain}");
         assert!(precipitation(None, "rain", 2).into_string().contains("—"));
     }
 }

@@ -49,7 +49,6 @@ pub struct WeatherDisplay {
     pub station_name: String,
     pub state: String,
     pub iata_id: String,
-    pub elevation_m: Option<f64>,
     /// Most recent temperature report, independent of the aggregate window.
     pub latest_temp: Option<f64>,
     pub latest_temp_time: Option<String>,
@@ -159,13 +158,13 @@ fn encode(value: &str) -> String {
 }
 
 /// The weather section. It refreshes itself every five minutes, but not
-/// while the reader has a station open or is typing a search.
+/// while the reader has a station open or is typing a search (`weather.js`).
 pub fn weather_section(weather: &[WeatherDisplay], context: &WeatherContext) -> Markup {
     let refresh = context.fragment_url(context.view);
     html! {
         section id="weather-table-container"
             hx-get=(refresh)
-            hx-trigger="every 300s [!document.querySelector('#weather-table-container details.wx-station[open], #weather-search:focus, #map-station > *')]"
+            hx-trigger="every 300s"
             hx-swap="outerHTML"
             class="box weather" {
             div class="weather-head" {

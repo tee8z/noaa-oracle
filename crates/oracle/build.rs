@@ -1,146 +1,233 @@
 //! Bundles the UI assets that live beside the maud templates.
 //!
-//! Every `.css` and `.js` file under `src/templates` is concatenated and
-//! minified into Cargo's `OUT_DIR`, along with the files in
-//! `src/templates/static`. The generated `assets.rs` gives each file a
-//! content-hashed URL and embeds its bytes, so the binary serves its own UI
-//! and nothing is written to the source tree.
+//! Styles and scripts sit next to the template that uses them. This script
+//! minifies them (lightningcss for styles, oxc for scripts) into a few
+//! bundles in Cargo's `OUT_DIR`, next to copies of the files in
+//! `src/templates/static`, and generates `assets.rs`. That file embeds each
+//! asset, plain and gzipped, with `include_bytes!` under a URL containing a
+//! hash of its content. Nothing is written to the source tree.
 
 use std::{
     env,
     error::Error,
-    fs, io,
+    fmt::Write as _,
+    fs,
+    io::{self, Write as _},
     path::{Path, PathBuf},
 };
 
-use better_minify_js::{Session, TopLevelMode, minify};
+use flate2::{Compression, write::GzEncoder};
 use lightningcss::stylesheet::{MinifyOptions, ParserOptions, PrinterOptions, StyleSheet};
+use oxc::{
+    allocator::Allocator,
+    codegen::{Codegen, CodegenOptions},
+    minifier::{Minifier, MinifierOptions},
+    parser::Parser,
+    span::SourceType,
+};
 use sha2::{Digest, Sha256};
-use walkdir::WalkDir;
+
+/// The script that runs in `<head>`, before the page paints.
+const HEAD_SCRIPT: &str = "layouts/head.js";
+/// Scripts that only the raw data page loads.
+const RAW_DATA_DIR: &str = "pages/raw_data";
+
+struct Asset {
+    /// Rust constant naming the asset in `assets.rs`.
+    constant: &'static str,
+    /// File stem of the public URL, before the hash.
+    stem: &'static str,
+    extension: &'static str,
+    content_type: &'static str,
+    bytes: Vec<u8>,
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
+    println!("cargo::rerun-if-changed=build.rs");
     let manifest = env::var_os("CARGO_MANIFEST_DIR").ok_or("CARGO_MANIFEST_DIR is missing")?;
     let output = env::var_os("OUT_DIR").ok_or("OUT_DIR is missing")?;
     let templates = Path::new(&manifest).join("src/templates");
     let static_dir = templates.join("static");
     let output = Path::new(&output);
 
-    println!("cargo::rerun-if-changed=build.rs");
-
-    let mut css_files = Vec::new();
-    let mut js_files = Vec::new();
-    let mut static_files = Vec::new();
-    for entry in WalkDir::new(&templates).sort_by_file_name() {
-        let entry = entry?;
-        let path = entry.path();
-        if entry.file_type().is_dir() {
-            // Cargo notices added files only in directories it watches.
-            println!("cargo::rerun-if-changed={}", path.display());
-            continue;
-        }
-        if path.starts_with(&static_dir) {
-            static_files.push(path.to_path_buf());
-        } else {
-            match path.extension().and_then(|extension| extension.to_str()) {
-                Some("css") => css_files.push(path.to_path_buf()),
-                Some("js") => js_files.push(path.to_path_buf()),
-                _ => continue,
-            }
-        }
-        println!("cargo::rerun-if-changed={}", path.display());
+    let mut files = Vec::new();
+    collect(&templates, &mut files)?;
+    files.sort();
+    for file in &files {
+        println!("cargo::rerun-if-changed={}", file.display());
     }
-    // Base styles come first so component styles can refine them.
-    let base_styles = templates.join("styles.css");
-    css_files.sort_by_key(|path| (path != &base_styles, path.clone()));
 
-    let css = minify_css(&concatenate(&css_files, "\n")?)?;
-    // Newlines end trailing line comments; semicolons separate the scripts.
-    let js = minify_javascript(&concatenate(&js_files, "\n;\n")?)?;
+    let head = templates.join(HEAD_SCRIPT);
+    let raw_data = templates.join(RAW_DATA_DIR);
+    let scripts = |wanted: &dyn Fn(&Path) -> bool| -> Vec<PathBuf> {
+        files
+            .iter()
+            .filter(|file| has_extension(file, "js") && !file.starts_with(&static_dir))
+            .filter(|file| wanted(file))
+            .cloned()
+            .collect()
+    };
+    let head_scripts = scripts(&|file| file == head);
+    if head_scripts.is_empty() {
+        return Err(format!("{} is missing", head.display()).into());
+    }
+
+    let assets = [
+        Asset {
+            constant: "SITE_CSS",
+            stem: "site",
+            extension: "css",
+            content_type: "text/css; charset=utf-8",
+            bytes: stylesheet(&templates.join("styles.css"), &static_dir, &files)?,
+        },
+        Asset {
+            constant: "HEAD_JS",
+            stem: "head",
+            extension: "js",
+            content_type: "text/javascript; charset=utf-8",
+            bytes: minify_scripts(&head_scripts)?,
+        },
+        Asset {
+            constant: "SITE_JS",
+            stem: "site",
+            extension: "js",
+            content_type: "text/javascript; charset=utf-8",
+            bytes: minify_scripts(&scripts(&|file| {
+                file != head && !file.starts_with(&raw_data)
+            }))?,
+        },
+        Asset {
+            constant: "RAW_DATA_JS",
+            stem: "raw-data",
+            extension: "js",
+            content_type: "text/javascript; charset=utf-8",
+            bytes: minify_scripts(&scripts(&|file| file.starts_with(&raw_data)))?,
+        },
+        // Vendored as published: htmx.org 1.9.10, dist/htmx.min.js.
+        Asset {
+            constant: "HTMX_JS",
+            stem: "htmx",
+            extension: "js",
+            content_type: "text/javascript; charset=utf-8",
+            bytes: fs::read(static_dir.join("htmx-1.9.10.min.js"))?,
+        },
+        Asset {
+            constant: "USA_MAP_SVG",
+            stem: "usa-map",
+            extension: "svg",
+            content_type: "image/svg+xml",
+            bytes: fs::read(static_dir.join("usa-map.svg"))?,
+        },
+    ];
 
     let mut generated =
-        String::from("// Generated by build.rs; edit the files in src/templates instead.\n");
-    generated.push_str(&asset(output, "CSS", "site.css", css.as_bytes())?);
-    generated.push_str(&asset(output, "JS", "site.js", &js)?);
-    for path in &static_files {
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| format!("{} has no UTF-8 file name", path.display()))?;
-        let constant = name
-            .rsplit_once('.')
-            .map_or(name, |(stem, _)| stem)
-            .replace(|character: char| !character.is_ascii_alphanumeric(), "_")
-            .to_ascii_uppercase();
-        generated.push_str(&asset(output, &constant, name, &fs::read(path)?)?);
+        String::from("// Generated by build.rs; edit the files under src/templates instead.\n");
+    for asset in &assets {
+        let file = format!("{}.{}", asset.stem, asset.extension);
+        fs::write(output.join(&file), &asset.bytes)?;
+        fs::write(output.join(format!("{file}.gz")), gzip(&asset.bytes)?)?;
+        let digest = hex::encode(Sha256::digest(&asset.bytes));
+        let url = format!("/assets/{}.{}.{}", asset.stem, &digest[..16], asset.extension);
+        writeln!(
+            generated,
+            "pub const {constant}: Asset = Asset {{ url: {url:?}, content_type: {content_type:?}, \
+             bytes: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{file}\")), \
+             gzip: include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{file}.gz\")) }};",
+            constant = asset.constant,
+            content_type = asset.content_type,
+        )?;
     }
+    let constants: Vec<_> = assets.iter().map(|asset| asset.constant).collect();
+    writeln!(
+        generated,
+        "pub const ALL: &[Asset] = &[{}];",
+        constants.join(", ")
+    )?;
     fs::write(output.join("assets.rs"), generated)?;
     Ok(())
 }
 
-fn concatenate(files: &[PathBuf], separator: &str) -> io::Result<String> {
-    let mut combined = String::new();
-    for path in files {
-        let source = fs::read_to_string(path).map_err(|error| {
-            io::Error::new(error.kind(), format!("read {}: {error}", path.display()))
-        })?;
-        combined.push_str(&source);
-        combined.push_str(separator);
+/// Every file below `directory`. Directories are watched too, so an added
+/// or removed file triggers a rebuild.
+fn collect(directory: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
+    println!("cargo::rerun-if-changed={}", directory.display());
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect(&path, files)?;
+        } else {
+            files.push(path);
+        }
     }
-    Ok(combined)
+    Ok(())
 }
 
-fn minify_css(css: &str) -> Result<String, Box<dyn Error>> {
-    let mut stylesheet = StyleSheet::parse(
-        css,
+fn has_extension(path: &Path, extension: &str) -> bool {
+    path.extension().is_some_and(|found| found == extension)
+}
+
+/// Minifies each script on its own and joins them. Each is parsed as a
+/// classic script, so its top-level names stay global and are not renamed.
+/// A script the parser rejects fails the build.
+fn minify_scripts(files: &[PathBuf]) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut bundle = String::new();
+    for file in files {
+        let source = fs::read_to_string(file)?;
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, &source, SourceType::script()).parse();
+        if let Some(error) = parsed.diagnostics.errors().next() {
+            return Err(format!("{}: {error}", file.display()).into());
+        }
+        let mut program = parsed.program;
+        let minified = Minifier::new(MinifierOptions::default()).minify(&allocator, &mut program);
+        let code = Codegen::new()
+            .with_options(CodegenOptions::minify())
+            .with_scoping(minified.scoping)
+            .build(&program)
+            .code;
+        bundle.push_str(&code);
+        // Semicolons keep one script's last statement apart from the next.
+        bundle.push_str(";\n");
+    }
+    Ok(bundle.into_bytes())
+}
+
+/// Base styles first, then every component's styles, minified as one sheet.
+fn stylesheet(
+    base: &Path,
+    static_dir: &Path,
+    files: &[PathBuf],
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut css = fs::read_to_string(base)?;
+    for file in files {
+        if has_extension(file, "css") && file != base && !file.starts_with(static_dir) {
+            css.push('\n');
+            css.push_str(&fs::read_to_string(file)?);
+        }
+    }
+    let mut sheet = StyleSheet::parse(
+        &css,
         ParserOptions {
             filename: "src/templates (combined CSS)".into(),
             ..ParserOptions::default()
         },
     )
     .map_err(|error| io::Error::other(format!("parse CSS: {error}")))?;
-    stylesheet
+    sheet
         .minify(MinifyOptions::default())
         .map_err(|error| io::Error::other(format!("minify CSS: {error}")))?;
-    Ok(stylesheet
+    let printed = sheet
         .to_css(PrinterOptions {
             minify: true,
             ..PrinterOptions::default()
-        })?
-        .code)
+        })
+        .map_err(|error| io::Error::other(format!("print CSS: {error}")))?;
+    Ok(printed.code.into_bytes())
 }
 
-fn minify_javascript(source: &str) -> Result<Vec<u8>, Box<dyn Error>> {
-    let minified = std::panic::catch_unwind(|| {
-        let session = Session::new();
-        let mut minified = Vec::new();
-        // Pages load one classic deferred script, so keep global-script semantics.
-        minify(
-            &session,
-            TopLevelMode::Global,
-            source.as_bytes(),
-            &mut minified,
-        )
-        .map(|_| minified)
-        .map_err(|error| format!("{error:?}"))
-    });
-    let reason = match minified {
-        Ok(Ok(minified)) => return Ok(minified),
-        Ok(Err(error)) => error,
-        Err(_) => "the minifier panicked".to_owned(),
-    };
-    // A minifier bug must not change what ships, so ship the source as written.
-    println!("cargo::warning=serving site.js unminified: {reason}");
-    Ok(source.as_bytes().to_vec())
-}
-
-/// Writes one asset to `OUT_DIR` and returns the constants that embed it.
-fn asset(output: &Path, constant: &str, name: &str, bytes: &[u8]) -> io::Result<String> {
-    fs::write(output.join(name), bytes)?;
-    let digest = hex::encode(Sha256::digest(bytes));
-    let (stem, extension) = name.rsplit_once('.').unwrap_or((name, ""));
-    let url = format!("/assets/{stem}.{}.{extension}", &digest[..16]);
-    Ok(format!(
-        "pub const {constant}_URL: &str = {url:?};\n\
-         pub const {constant}_BYTES: &[u8] = include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{name}\"));\n"
-    ))
+fn gzip(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+    encoder.write_all(bytes)?;
+    encoder.finish()
 }

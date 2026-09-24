@@ -24,22 +24,34 @@ and/or `name.js`.
 
 `build.rs` runs at compile time and writes only to Cargo's `OUT_DIR`:
 
-1. Collects every `.css` file below `templates/` (`styles.css` first) and
-   minifies them with lightningcss into one stylesheet.
-2. Collects every `.js` file and minifies them with better-minify-js into one
-   classic script, so top-level names are shared across files.
-3. Copies `static/` files as they are.
-4. Generates `assets.rs` with a content-hashed URL and the bytes of each file.
+1. Minifies every `.css` file below `templates/` (`styles.css` first) with
+   lightningcss into one stylesheet, `site.css`.
+2. Minifies each `.js` file with oxc as a classic script, so top-level names
+   stay global, and joins them into bundles: `layouts/head.js` alone runs in
+   `<head>` before the page paints; `pages/raw_data/` scripts load only on
+   the raw data page; everything else is `site.js`. A script that does not
+   parse fails the build.
+3. Takes `static/` files as they are: htmx 1.9.10 as published
+   (`dist/htmx.min.js`) and the map.
+4. Generates `assets.rs` with a content-hashed URL, the bytes and a gzipped
+   copy of each file.
 
-The binary embeds the files (`include_bytes!`) and `assets.rs` serves them at
-`/assets/<name>.<hash>.<ext>` with a one-year immutable cache header. A
-changed file gets a new URL, so nothing needs to be installed next to the
-binary. Templates link to them through the constants:
+The binary embeds the files (`include_bytes!`) and serves them at
+`/assets/<name>.<hash>.<ext>` with a one-year immutable cache header, gzipped
+when the browser accepts it. A changed file gets a new URL, so nothing needs
+to be installed next to the binary. Templates link to them through the
+constants:
 
 ```rust
-link rel="stylesheet" href=(assets::CSS_URL);
-script defer src=(assets::JS_URL) {}
+link rel="stylesheet" href=(assets::SITE_CSS.url);
+script defer src=(assets::SITE_JS.url) {}
 ```
 
-Large browser libraries (DuckDB-WASM on the raw data page) are imported
-lazily by the script that needs them rather than on every page.
+## Scripts and the Content-Security-Policy
+
+Pages send `script-src 'self'`, so every script is a file served from
+`/assets/`: no inline `<script>`, no `onclick=` attributes and no `hx-on`.
+htmx is configured (`HTMX_CONFIG` in the layout) not to evaluate code, which
+also rules out trigger filters such as `every 30s [cond]`; put that logic in
+a script listening for `htmx:confirm` instead. The raw data page's policy
+also allows DuckDB-WASM from jsdelivr.

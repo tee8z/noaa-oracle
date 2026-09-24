@@ -4,7 +4,8 @@ use crate::templates::layouts::CurrentPage;
 
 /// The three pages, as tabs that fit a phone screen. htmx swaps only the
 /// main content; the response re-sends the tabs out of band so the current
-/// page stays marked.
+/// page stays marked. The raw data page loads in full, because it needs its
+/// own script and a Content-Security-Policy that allows DuckDB-WASM.
 pub fn tabs(current: CurrentPage, out_of_band: bool) -> Markup {
     html! {
         nav id="site-tabs" class="tabs site-tabs" aria-label="Pages"
@@ -20,12 +21,13 @@ pub fn tabs(current: CurrentPage, out_of_band: bool) -> Markup {
 
 fn tab(current: CurrentPage, page: CurrentPage, href: &str, label: &str, icon: Markup) -> Markup {
     let active = current == page;
+    let swap = page != CurrentPage::RawData;
     html! {
         li class=[active.then_some("is-active")] {
             a href=(href)
-              hx-get=(href)
-              hx-target="#main-content"
-              hx-push-url="true"
+              hx-get=[swap.then_some(href)]
+              hx-target=[swap.then_some("#main-content")]
+              hx-push-url=[swap.then_some("true")]
               aria-current=[active.then_some("page")] {
                 span class="icon is-small" aria-hidden="true" { (icon) }
                 span { (label) }
