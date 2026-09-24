@@ -109,7 +109,16 @@ pub struct AppState {
     stations: tokio::sync::Mutex<Option<(std::time::Instant, Arc<Vec<Station>>)>>,
     background: Background,
     etl_slot: Arc<Semaphore>,
+    /// This process, as a lease holder. Unique per start.
+    instance: String,
 }
+
+/// Processing scores entries and signs attestations. During a blue/green
+/// deploy two oracles share one database, and only this lease's holder runs it.
+const ETL_LEASE: &str = "etl";
+/// Longer than the processing interval, so the holder keeps the lease between
+/// passes; a stopped holder's passes move to another process after this.
+const ETL_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum EtlRejected {
@@ -156,6 +165,7 @@ impl AppState {
             stations: tokio::sync::Mutex::new(None),
             background,
             etl_slot: Arc::new(Semaphore::new(1)),
+            instance: format!("oracle-{}", uuid::Uuid::now_v7()),
         }
     }
 
@@ -227,8 +237,42 @@ impl AppState {
         let state = self.clone();
         self.background.tasks.spawn(async move {
             let _permit = permit;
+            match state
+                .database
+                .take_lease(ETL_LEASE, &state.instance, ETL_LEASE_TTL)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    info!("another oracle process runs processing; skipped {etl_process_id}");
+                    return;
+                }
+                Err(e) => {
+                    warn!("cannot take the processing lease; skipped {etl_process_id}: {e}");
+                    return;
+                }
+            }
             info!("starting etl process: {}", etl_process_id);
-            match state.oracle.etl_data(etl_process_id).await {
+            // Keep the lease for as long as the pass runs.
+            let renewal = async {
+                loop {
+                    tokio::time::sleep(ETL_LEASE_TTL / 3).await;
+                    match state
+                        .database
+                        .take_lease(ETL_LEASE, &state.instance, ETL_LEASE_TTL)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => warn!("another oracle process took the processing lease"),
+                        Err(e) => warn!("cannot renew the processing lease: {e}"),
+                    }
+                }
+            };
+            let result = tokio::select! {
+                result = state.oracle.etl_data(etl_process_id) => result,
+                () = renewal => unreachable!("lease renewal never ends"),
+            };
+            match result {
                 Ok(0) => info!("completed etl process: {etl_process_id}"),
                 Ok(failed) => warn!("etl process {etl_process_id}: {failed} events failed"),
                 Err(e) => error!("failed etl process: {etl_process_id} {e:#}"),
@@ -559,6 +603,7 @@ impl ApplicationRuntime {
         };
         spawn_cache_warmer(&state);
         spawn_etl_schedule(&state, configuration.etl_interval);
+        spawn_lease_release(&state);
         runtime.http = Some(spawn_http(
             listener,
             app(state),
@@ -667,6 +712,25 @@ fn spawn_cache_warmer(state: &Arc<AppState>) {
                     warm_forecast_cache(&state).await;
                 }
             }
+        }
+    });
+}
+
+/// On shutdown, hands processing over to another oracle process at once. The
+/// lease is released only after a running pass finishes, so two passes never
+/// overlap.
+fn spawn_lease_release(state: &Arc<AppState>) {
+    let state = state.clone();
+    let stopping = state.background.stopping.clone();
+    state.background.tasks.clone().spawn(async move {
+        stopping.cancelled().await;
+        let _idle = state.etl_slot.acquire().await;
+        if let Err(e) = state
+            .database
+            .release_lease(ETL_LEASE, &state.instance)
+            .await
+        {
+            warn!("cannot release the processing lease: {e}");
         }
     });
 }
