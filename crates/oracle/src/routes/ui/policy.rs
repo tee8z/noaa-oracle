@@ -1,8 +1,11 @@
 //! The Content-Security-Policy for the UI's pages.
 //!
 //! Scripts load only from this site, as files: no inline scripts, `on…`
-//! attributes or `eval`. htmx is configured to match (see the layout's
-//! `HTMX_CONFIG`). The API and its docs are not covered.
+//! attributes or `eval`. htmx 4 has no setting that stops it evaluating
+//! `hx-on` or running scripts in swapped HTML, so this policy is what stops
+//! them. Pages also require Trusted Types: only the `htmx` policy
+//! (`layouts/head.js`) may turn strings into HTML. The API and its docs are
+//! not covered.
 
 use axum::{
     extract::Request,
@@ -12,11 +15,18 @@ use axum::{
 };
 
 pub const PAGE_POLICY: &str = "script-src 'self'; object-src 'none'; base-uri 'none'; \
-     frame-ancestors 'none'; form-action 'self'";
+     frame-ancestors 'none'; form-action 'self'; \
+     require-trusted-types-for 'script'; trusted-types htmx";
 
-/// The raw data page also runs DuckDB-WASM from jsdelivr: its module, the
-/// worker it starts from a `blob:` URL, and WebAssembly.
-pub const RAW_DATA_POLICY: &str = "script-src 'self' https://cdn.jsdelivr.net 'wasm-unsafe-eval'; \
+/// The raw data page also runs DuckDB-WASM from jsdelivr: the module and the
+/// three modules it imports, the worker it starts from a `blob:` URL (which
+/// loads DuckDB's worker script), and WebAssembly. DuckDB creates its worker
+/// from a string, so this page does not require Trusted Types.
+pub const RAW_DATA_POLICY: &str = "script-src 'self' 'wasm-unsafe-eval' \
+     https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/ \
+     https://cdn.jsdelivr.net/npm/apache-arrow@17.0.0/+esm \
+     https://cdn.jsdelivr.net/npm/flatbuffers@24.3.25/+esm \
+     https://cdn.jsdelivr.net/npm/tslib@2.6.3/+esm; \
      worker-src blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; \
      form-action 'self'";
 

@@ -12,6 +12,7 @@ use crate::{
     AppState,
     templates::pages::event_detail::{
         event_detail_fragment, event_detail_page, event_not_found_fragment, event_not_found_page,
+        event_unavailable_fragment, event_unavailable_page,
     },
 };
 
@@ -43,7 +44,15 @@ pub async fn event_detail_handler(
         }
         Err(error) => {
             log::error!("event page {event_id}: {error:#}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            let html = match super::htmx::render(&headers) {
+                Render::Page => event_unavailable_page(event_id),
+                _ => event_unavailable_fragment(event_id),
+            };
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                page_or_fragment(html.into_string()),
+            )
+                .into_response()
         }
     }
 }

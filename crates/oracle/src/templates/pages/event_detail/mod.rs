@@ -58,10 +58,39 @@ pub fn event_not_found_fragment(event_id: Uuid) -> Markup {
 }
 
 fn event_not_found_content(event_id: Uuid) -> Markup {
+    event_problem(
+        "Event not found",
+        html! { "No event has the ID " code { (event_id) } "." },
+    )
+}
+
+const UNAVAILABLE: PageConfig<'static> = PageConfig {
+    title: "Event unavailable - 4cast Truth Oracle",
+    current_page: CurrentPage::Events,
+};
+
+/// The event could not be read. htmx 4 swaps error replies too, so this
+/// replaces the page's content instead of leaving it blank.
+pub fn event_unavailable_page(event_id: Uuid) -> Markup {
+    base(&UNAVAILABLE, event_unavailable_content(event_id))
+}
+
+pub fn event_unavailable_fragment(event_id: Uuid) -> Markup {
+    page_fragment(&UNAVAILABLE, event_unavailable_content(event_id))
+}
+
+fn event_unavailable_content(event_id: Uuid) -> Markup {
+    event_problem(
+        "Event unavailable",
+        html! { "Event " code { (event_id) } " could not be read. Try again in a moment." },
+    )
+}
+
+fn event_problem(heading: &str, message: Markup) -> Markup {
     html! {
         section class="box" {
-            h2 class="title is-5" { "Event not found" }
-            p { "No event has the ID " code { (event_id) } "." }
+            h2 class="title is-5" { (heading) }
+            p { (message) }
             a href="/events" class="button is-small mt-3"
               hx-get="/events" hx-target="#main-content" hx-push-url="true" {
                 "All events"

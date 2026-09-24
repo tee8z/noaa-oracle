@@ -1,10 +1,13 @@
 // The weather section refreshes itself every five minutes. Skip a refresh
 // while the reader has a station open or is typing a search, so it doesn't
 // close what they are reading.
-document.addEventListener("htmx:confirm", function (event) {
+function weatherBusy(section) {
+  return section.querySelector("details.wx-station[open], #weather-search:focus, #map-station > *");
+}
+
+document.addEventListener("htmx:config:request", function (event) {
   var section = event.target;
-  if (section.id !== "weather-table-container") return;
-  if (section.querySelector("details.wx-station[open], #weather-search:focus, #map-station > *")) {
+  if (section.id === "weather-table-container" && weatherBusy(section)) {
     event.preventDefault();
   }
 });
@@ -20,18 +23,15 @@ document.addEventListener("keydown", function (event) {
 
 // An interactive request takes precedence over an automatic section refresh.
 // Requests for individual station details still run independently.
-document.addEventListener("htmx:beforeRequest", function (event) {
+document.addEventListener("htmx:before:request", function (event) {
   var source = event.target;
   var section = source.closest && source.closest("#weather-table-container");
   if (section && source !== section) htmx.trigger(section, "htmx:abort");
 });
 
 // The reader may start typing or open a station after a refresh was sent.
-document.addEventListener("htmx:beforeSwap", function (event) {
-  var source = event.detail.requestConfig.elt;
-  if (source.id !== "weather-table-container") return;
+document.addEventListener("htmx:before:swap", function (event) {
+  if (event.detail.ctx.sourceElement.id !== "weather-table-container") return;
   var section = document.getElementById("weather-table-container");
-  if (section && section.querySelector("details.wx-station[open], #weather-search:focus, #map-station > *")) {
-    event.detail.shouldSwap = false;
-  }
+  if (section && weatherBusy(section)) event.preventDefault();
 });

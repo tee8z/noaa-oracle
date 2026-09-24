@@ -522,6 +522,5 @@ document.addEventListener("click", function (event) {
   runQuery(null);
 });
 
-// Initialize when DOM is ready and on page navigation (HTMX)
+// The page always loads as a whole document (see raw_data.rs).
 document.addEventListener("DOMContentLoaded", initRawDataPage);
-document.addEventListener("htmx:afterSettle", initRawDataPage);

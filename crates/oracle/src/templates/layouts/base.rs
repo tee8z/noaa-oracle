@@ -69,12 +69,15 @@ pub fn page_fragment(config: &PageConfig, content: Markup) -> Markup {
     }
 }
 
-/// htmx settings that suit the Content-Security-Policy: no `eval` (so no
-/// `hx-on`, `js:` values or trigger filters), no scripts run from swapped
-/// HTML, requests only to this site, no inline indicator styles, and a full
-/// load when a page is missing from htmx's history cache, so each page gets
-/// its own policy and scripts.
-pub const HTMX_CONFIG: &str = r#"{"allowEval":false,"allowScriptTags":false,"selfRequestsOnly":true,"includeIndicatorStyles":false,"refreshOnHistoryMiss":true}"#;
+/// htmx 4 settings. htmx 4 has no switch for `eval` or for scripts in
+/// swapped HTML; the Content-Security-Policy (`policy.rs`) blocks both, and
+/// the markup uses neither `hx-on` nor `js:` values. Here: requests only to
+/// this site (the default, stated), a 10 s limit instead of 60 s, loading
+/// styles from our stylesheet rather than an injected one, and only our
+/// Trusted Types extension (`head.js`). History needs no setting: htmx 4
+/// keeps no copies in localStorage, and going back re-requests the page
+/// with `HX-History-Restore-Request`.
+pub const HTMX_CONFIG: &str = r#"{"mode":"same-origin","defaultTimeout":10000,"includeIndicatorCSS":false,"extensions":"trusted-types"}"#;
 
 fn github_icon() -> Markup {
     html! {

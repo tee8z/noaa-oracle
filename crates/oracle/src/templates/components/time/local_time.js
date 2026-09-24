@@ -26,6 +26,6 @@
         " " + zone(end);
     });
   };
-  document.addEventListener("DOMContentLoaded", function () { localize(document); });
-  document.addEventListener("htmx:load", function (event) { localize(event.target); });
+  // htmx processes the page, then each piece of HTML it swaps in.
+  document.addEventListener("htmx:after:process", function (event) { localize(event.target); });
 })();

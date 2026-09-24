@@ -31,8 +31,8 @@ and/or `name.js`.
    `<head>` before the page paints; `pages/raw_data/` scripts load only on
    the raw data page; everything else is `site.js`. A script that does not
    parse fails the build.
-3. Takes `static/` files as they are: htmx 1.9.10 as published
-   (`dist/htmx.min.js`) and the map.
+3. Takes the map in `static/` and htmx 4.0.0 as published
+   (`crates/oracle/vendor/htmx/4.0.0/`, with its checksum) as they are.
 4. Generates `assets.rs` with a content-hashed URL, the bytes and a gzipped
    copy of each file.
 
@@ -51,7 +51,21 @@ script defer src=(assets::SITE_JS.url) {}
 
 Pages send `script-src 'self'`, so every script is a file served from
 `/assets/`: no inline `<script>`, no `onclick=` attributes and no `hx-on`.
-htmx is configured (`HTMX_CONFIG` in the layout) not to evaluate code, which
-also rules out trigger filters such as `every 30s [cond]`; put that logic in
-a script listening for `htmx:confirm` instead. The raw data page's policy
-also allows DuckDB-WASM from jsdelivr.
+htmx 4 cannot be told not to evaluate code: it compiles `hx-on`, `js:` values
+and trigger filters such as `every 30s [cond]` with `new Function`, and
+re-creates `<script>` tags in swapped HTML. The policy blocks all of that, so
+put such logic in a script file that listens for htmx events
+(`htmx:config:request`, `htmx:before:swap`, …) instead.
+
+Pages also require Trusted Types. `layouts/head.js` gives htmx the only
+policy, `htmx`, which turns response text into HTML and refuses scripts.
+Scripts set text with `textContent` and build elements with
+`createElement`, never `innerHTML`.
+
+htmx 4 attributes are not inherited: put `hx-target`, `hx-swap` and the rest
+on the element that makes the request. htmx names the target in `HX-Target`
+as `tag#id`; `routes/ui/htmx.rs` reads the id.
+
+The raw data page's policy also allows DuckDB-WASM and the three modules it
+imports from jsdelivr, by exact path. That page always loads as a whole
+document.

@@ -108,6 +108,7 @@
             (builtins.match ".*config/.*" path != null) ||
             (builtins.match ".*migrations/.*" path != null) ||
             (builtins.match ".*templates/.*" path != null) ||
+            (builtins.match ".*/vendor/.*" path != null) ||
             (builtins.match ".*testdata/.*" path != null) ||
             (builtins.match ".*\.toml$" path != null);
         };

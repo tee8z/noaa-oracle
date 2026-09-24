@@ -292,12 +292,15 @@ async fn event_pages_return_only_their_content_to_htmx() {
 
         let request = Request::get(&path)
             .header("hx-request", "true")
-            .header("hx-target", "main-content")
+            .header("hx-target", "main#main-content")
             .body(Body::empty())
             .unwrap();
         let response = test_app.app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()[header::VARY], "HX-Request, HX-Target");
+        assert_eq!(
+            response.headers()[header::VARY],
+            "HX-Request, HX-Target, HX-History-Restore-Request"
+        );
         let fragment = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let fragment = String::from_utf8(fragment.to_vec()).unwrap();
         assert!(!fragment.contains("<html"), "{path}");
@@ -313,6 +316,7 @@ async fn event_pages_return_only_their_content_to_htmx() {
             .send(
                 Request::get(&path)
                     .header("hx-request", "true")
+                    .header("hx-target", "body")
                     .header("hx-history-restore-request", "true")
                     .body(Body::empty())
                     .unwrap(),
@@ -337,20 +341,40 @@ async fn event_filters_render_the_matching_part() {
             .body(Body::empty())
             .unwrap()
     };
-    let (_, body) = test_app.send(part("events", "/events?status=live")).await;
+    let (_, body) = test_app
+        .send(part("section#events", "/events?status=live"))
+        .await;
     let section = String::from_utf8(body.to_vec()).unwrap();
     assert!(section.starts_with("<section id=\"events\""), "{section}");
     assert!(section.contains(short_id));
     assert!(section.contains("hx-get=\"/events?status=live\""));
 
     let (_, body) = test_app
-        .send(part("events-list", "/events?status=signed"))
+        .send(part("div#events-list", "/events?status=signed"))
         .await;
     let list = String::from_utf8(body.to_vec()).unwrap();
     assert!(list.starts_with("<div id=\"events-list\""), "{list}");
     assert!(!list.contains(short_id));
     assert!(list.contains("No events match these filters."));
     assert!(!list.contains("status-filter"));
+}
+
+/// The raw data page needs its own policy and script, so htmx never swaps
+/// it into another page: going back to it reloads it.
+#[tokio::test]
+async fn htmx_reloads_the_raw_data_page_instead_of_swapping_it() {
+    let test_app = app().await;
+    let request = Request::get("/raw")
+        .header("hx-request", "true")
+        .header("hx-target", "body")
+        .header("hx-history-restore-request", "true")
+        .body(Body::empty())
+        .unwrap();
+    let response = test_app.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["hx-refresh"], "true");
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(body.is_empty());
 }
 
 /// Attributes named `on…`, which run inline script.
@@ -382,7 +406,10 @@ async fn pages_allow_only_their_own_script_files() {
         (
             "/raw".to_string(),
             StatusCode::OK,
-            Some("https://cdn.jsdelivr.net 'wasm-unsafe-eval'; worker-src blob:"),
+            Some(
+                "'wasm-unsafe-eval' https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/ \
+                 https://cdn.jsdelivr.net/npm/apache-arrow@17.0.0/+esm",
+            ),
         ),
     ] {
         let response = test_app
@@ -407,8 +434,19 @@ async fn pages_allow_only_their_own_script_files() {
         assert!(!policy.contains("unsafe-inline"), "{path}: {policy}");
         assert!(!policy.contains("'unsafe-eval'"), "{path}: {policy}");
         match extra {
-            Some(sources) => assert!(policy.contains(sources), "{path}: {policy}"),
-            None => assert!(!policy.contains("jsdelivr"), "{path}: {policy}"),
+            Some(sources) => {
+                assert!(policy.contains(sources), "{path}: {policy}");
+                // Only the exact modules, not the whole CDN.
+                assert!(!policy.contains("jsdelivr.net "), "{path}: {policy}");
+                assert!(!policy.contains("jsdelivr.net;"), "{path}: {policy}");
+            }
+            None => {
+                assert!(!policy.contains("jsdelivr"), "{path}: {policy}");
+                assert!(
+                    policy.contains("require-trusted-types-for 'script'; trusted-types htmx"),
+                    "{path}: {policy}"
+                );
+            }
         }
 
         let html = to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -424,8 +462,12 @@ async fn pages_allow_only_their_own_script_files() {
         }
         assert_eq!(inline_handlers(&html), Vec::<&str>::new(), "{path}");
         assert!(!html.contains("hx-on"), "{path}");
-        assert!(html.contains("allowEval&quot;:false"), "{path}");
-        assert!(html.contains("selfRequestsOnly&quot;:true"), "{path}");
+        // htmx 4 has no switch for eval; it may only call this site.
+        assert!(
+            html.contains("&quot;mode&quot;:&quot;same-origin&quot;"),
+            "{path}"
+        );
+        assert!(html.contains("&quot;defaultTimeout&quot;:10000"), "{path}");
         // Only the raw data page loads its DuckDB script.
         assert_eq!(html.contains("/assets/raw-data."), path == "/raw", "{path}");
     }

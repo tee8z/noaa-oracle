@@ -778,7 +778,7 @@ async fn station_search_returns_only_the_list_to_htmx() {
         .send(
             Request::get(path)
                 .header("hx-request", "true")
-                .header("hx-target", "weather-list")
+                .header("hx-target", "div#weather-list")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -794,7 +794,7 @@ async fn station_search_returns_only_the_list_to_htmx() {
         .oneshot(
             Request::get(path)
                 .header("hx-request", "true")
-                .header("hx-target", "weather-list")
+                .header("hx-target", "div#weather-list")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -804,14 +804,17 @@ async fn station_search_returns_only_the_list_to_htmx() {
         response.headers()["hx-replace-url"],
         "/?stations=KORD&view=list&q=chicago"
     );
-    assert_eq!(response.headers()[header::VARY], "HX-Request, HX-Target");
+    assert_eq!(
+        response.headers()[header::VARY],
+        "HX-Request, HX-Target, HX-History-Restore-Request"
+    );
 
     // Without a match the list says so.
     let (_, body) = app
         .send(
             Request::get("/fragments/weather?stations=KORD&view=list&q=boston")
                 .header("hx-request", "true")
-                .header("hx-target", "weather-list")
+                .header("hx-target", "div#weather-list")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -824,7 +827,7 @@ async fn station_search_returns_only_the_list_to_htmx() {
         .send(
             Request::get("/fragments/weather?stations=KORD&view=list")
                 .header("hx-request", "true")
-                .header("hx-target", "weather-table-container")
+                .header("hx-target", "section#weather-table-container")
                 .body(Body::empty())
                 .unwrap(),
         )

@@ -23,7 +23,7 @@ function load() {
     },
   };
   vm.runInNewContext(fs.readFileSync(script, "utf8"), { document, htmx });
-  return { listeners, triggered };
+  return { listeners, triggered, document };
 }
 
 function confirmEvent(target) {
@@ -41,16 +41,16 @@ test("the five-minute refresh waits while a station is open or the search has fo
   const tab = { id: "", querySelector: () => ({}) };
 
   const skipped = confirmEvent(busy);
-  listeners["htmx:confirm"](skipped);
+  listeners["htmx:config:request"](skipped);
   assert.equal(skipped.prevented, true);
 
   const refreshed = confirmEvent(idle);
-  listeners["htmx:confirm"](refreshed);
+  listeners["htmx:config:request"](refreshed);
   assert.equal(refreshed.prevented, false);
 
   // Tabs and links inside the section still work.
   const clicked = confirmEvent(tab);
-  listeners["htmx:confirm"](clicked);
+  listeners["htmx:config:request"](clicked);
   assert.equal(clicked.prevented, false);
 });
 
@@ -75,12 +75,14 @@ test("interaction wins over an automatic refresh already in flight", () => {
   const { listeners, document, triggered } = load();
   const section = { id: "weather-table-container", querySelector: () => ({}) };
   document.getElementById = () => section;
-  listeners["htmx:beforeRequest"]({ target: { closest: () => section } });
+  listeners["htmx:before:request"]({ target: { closest: () => section } });
   assert.deepEqual(triggered, [[section, "htmx:abort"]]);
-  const detail = { requestConfig: { elt: section }, shouldSwap: true };
-  listeners["htmx:beforeSwap"]({ detail });
-  assert.equal(detail.shouldSwap, false);
-  const search = { requestConfig: { elt: { id: "weather-search" } }, shouldSwap: true };
-  listeners["htmx:beforeSwap"]({ detail: search });
-  assert.equal(search.shouldSwap, true);
+  const refresh = confirmEvent(section);
+  refresh.detail = { ctx: { sourceElement: section } };
+  listeners["htmx:before:swap"](refresh);
+  assert.equal(refresh.prevented, true);
+  const search = confirmEvent({ id: "weather-search" });
+  search.detail = { ctx: { sourceElement: { id: "weather-search" } } };
+  listeners["htmx:before:swap"](search);
+  assert.equal(search.prevented, false);
 });

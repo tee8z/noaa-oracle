@@ -3,9 +3,10 @@
 //! Styles and scripts sit next to the template that uses them. This script
 //! minifies them (lightningcss for styles, oxc for scripts) into a few
 //! bundles in Cargo's `OUT_DIR`, next to copies of the files in
-//! `src/templates/static`, and generates `assets.rs`. That file embeds each
-//! asset, plain and gzipped, with `include_bytes!` under a URL containing a
-//! hash of its content. Nothing is written to the source tree.
+//! `src/templates/static` and of the vendored htmx, and generates
+//! `assets.rs`. That file embeds each asset, plain and gzipped, with
+//! `include_bytes!` under a URL containing a hash of its content. Nothing is
+//! written to the source tree.
 
 use std::{
     env,
@@ -31,6 +32,8 @@ use sha2::{Digest, Sha256};
 const HEAD_SCRIPT: &str = "layouts/head.js";
 /// Scripts that only the raw data page loads.
 const RAW_DATA_DIR: &str = "pages/raw_data";
+/// htmx as published on npm (see the README beside it).
+const HTMX: &str = "vendor/htmx/4.0.0/htmx.min.js";
 
 struct Asset {
     /// Rust constant naming the asset in `assets.rs`.
@@ -48,6 +51,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let output = env::var_os("OUT_DIR").ok_or("OUT_DIR is missing")?;
     let templates = Path::new(&manifest).join("src/templates");
     let static_dir = templates.join("static");
+    let htmx = Path::new(&manifest).join(HTMX);
+    println!("cargo::rerun-if-changed={}", htmx.display());
     let output = Path::new(&output);
 
     let mut files = Vec::new();
@@ -103,13 +108,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             content_type: "text/javascript; charset=utf-8",
             bytes: minify_scripts(&scripts(&|file| file.starts_with(&raw_data)))?,
         },
-        // Vendored as published: htmx.org 1.9.10, dist/htmx.min.js.
         Asset {
             constant: "HTMX_JS",
             stem: "htmx",
             extension: "js",
             content_type: "text/javascript; charset=utf-8",
-            bytes: fs::read(static_dir.join("htmx-1.9.10.min.js"))?,
+            bytes: fs::read(&htmx)?,
         },
         Asset {
             constant: "USA_MAP_SVG",

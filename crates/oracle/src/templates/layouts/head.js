@@ -12,3 +12,26 @@
   }
   document.documentElement.setAttribute("data-theme", theme);
 })();
+
+// Pages require Trusted Types (policy.rs): only the "htmx" policy may turn a
+// string into HTML, and htmx parses every response it swaps through it. The
+// policy has no createScript, so a <script> in a swapped response throws
+// instead of running. htmx fires this event before it first reads the page,
+// so no response is parsed without the policy.
+document.addEventListener(
+  "htmx:before:process",
+  function () {
+    if (!window.trustedTypes) return;
+    var policy = trustedTypes.createPolicy("htmx", {
+      createHTML: function (html) {
+        return html;
+      },
+    });
+    htmx.registerExtension("trusted-types", {
+      init: function (api) {
+        api.initSecurity(policy);
+      },
+    });
+  },
+  { once: true },
+);

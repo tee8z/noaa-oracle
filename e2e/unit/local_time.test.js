@@ -20,7 +20,8 @@ function run(elements) {
     },
   };
   vm.runInNewContext(fs.readFileSync(script, "utf8"), { document, Date, isNaN });
-  listeners.DOMContentLoaded();
+  // htmx processes the whole page first.
+  listeners["htmx:after:process"]({ target: document });
   return listeners;
 }
 
@@ -57,9 +58,9 @@ test("htmx swaps are localized too, and only once", () => {
   const target = {
     querySelectorAll: (selector) => (selector === "time.local-time[datetime]" ? [time] : []),
   };
-  listeners["htmx:load"]({ target });
+  listeners["htmx:after:process"]({ target });
   const first = time.textContent;
-  listeners["htmx:load"]({ target });
+  listeners["htmx:after:process"]({ target });
   assert.equal(time.textContent, first);
   assert.equal(time.title, "x");
 });

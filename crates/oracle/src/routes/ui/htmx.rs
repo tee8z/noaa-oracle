@@ -17,19 +17,31 @@ pub(super) enum Render {
     Part(String),
 }
 
-/// A history restore replaces the whole body, so it gets the full page like
-/// a normal load.
+/// Whether htmx sent this request.
+pub(super) fn is_htmx(headers: &HeaderMap) -> bool {
+    headers.contains_key("hx-request")
+}
+
+/// Going back or forward, htmx 4 re-requests the page and replaces the
+/// whole body with it.
+pub(super) fn is_history_restore(headers: &HeaderMap) -> bool {
+    headers.contains_key("hx-history-restore-request")
+}
+
+/// A history restore gets the full page like a normal load. htmx 4 names the
+/// target `tag#id` (`div#events-list`); a target without an id gets the
+/// page's content.
 pub(super) fn render(headers: &HeaderMap) -> Render {
-    if !headers.contains_key("hx-request") || headers.contains_key("hx-history-restore-request") {
+    if !is_htmx(headers) || is_history_restore(headers) {
         return Render::Page;
     }
-    match headers
+    let target = headers
         .get("hx-target")
         .and_then(|target| target.to_str().ok())
-    {
-        Some(target) if !target.is_empty() && target != "main-content" => {
-            Render::Part(target.to_string())
-        }
+        .and_then(|target| target.split_once('#'))
+        .map(|(_, id)| id);
+    match target {
+        Some(id) if !id.is_empty() && id != "main-content" => Render::Part(id.to_string()),
         _ => Render::Content,
     }
 }
@@ -40,7 +52,7 @@ pub(super) fn page_or_fragment(html: String) -> Response {
     let mut response = Html(html).into_response();
     response.headers_mut().insert(
         header::VARY,
-        HeaderValue::from_static("HX-Request, HX-Target"),
+        HeaderValue::from_static("HX-Request, HX-Target, HX-History-Restore-Request"),
     );
     response
 }
@@ -74,21 +86,26 @@ mod tests {
         assert_eq!(
             render(&headers(&[
                 ("hx-request", "true"),
-                ("hx-target", "main-content")
+                ("hx-target", "main#main-content")
             ])),
             Render::Content
         );
         assert_eq!(
             render(&headers(&[
                 ("hx-request", "true"),
-                ("hx-target", "events-list")
+                ("hx-target", "div#events-list")
             ])),
             Render::Part("events-list".into())
+        );
+        // A target without an id.
+        assert_eq!(
+            render(&headers(&[("hx-request", "true"), ("hx-target", "div")])),
+            Render::Content
         );
         assert_eq!(
             render(&headers(&[
                 ("hx-request", "true"),
-                ("hx-target", "events-list"),
+                ("hx-target", "body"),
                 ("hx-history-restore-request", "true")
             ])),
             Render::Page

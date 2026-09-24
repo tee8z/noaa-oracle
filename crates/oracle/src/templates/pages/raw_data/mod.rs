@@ -1,7 +1,7 @@
 use maud::{Markup, html};
 use time::{Duration, OffsetDateTime, Time, macros::format_description};
 
-use crate::templates::layouts::{CurrentPage, PageConfig, base, page_fragment};
+use crate::templates::layouts::{CurrentPage, PageConfig, base};
 
 const CONFIG: PageConfig<'static> = PageConfig {
     title: "4cast Truth Oracle - Raw Data",
@@ -24,10 +24,6 @@ const EXAMPLES: [(&str, &str); 4] = [
 
 pub fn raw_data_page(now: OffsetDateTime) -> Markup {
     base(&CONFIG, raw_data_content(now))
-}
-
-pub fn raw_data_fragment(now: OffsetDateTime) -> Markup {
-    page_fragment(&CONFIG, raw_data_content(now))
 }
 
 /// Yesterday, midnight to midnight UTC, as `datetime-local` values.
