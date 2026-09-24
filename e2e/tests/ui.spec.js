@@ -104,6 +104,41 @@ test.describe("Raw Data Page", () => {
   });
 });
 
+test.describe("Raw Data Page with DuckDB", () => {
+  test("loads files, queries them and exports CSV with its header", async ({ page }) => {
+    test.setTimeout(120000);
+    const errors = collectErrors(page);
+    await page.goto("/raw");
+    // DuckDB-WASM loads from jsdelivr under the page's narrow policy.
+    await expect(page.locator("#raw-data-status")).toHaveText(/^Ready/, { timeout: 60000 });
+    await page.fill("#start", "2026-01-17T00:00");
+    await page.fill("#end", "2026-01-18T00:00");
+    await page.click("#submit");
+    await expect(page.locator("#raw-data-status")).toHaveText(/^Loaded \d+ files/, { timeout: 60000 });
+    await expect(page.locator("#observations-status")).toContainText("fields");
+
+    await page.getByRole("button", { name: "Station list" }).click();
+    await expect(page.locator("#queryResult tbody tr").first()).toBeVisible();
+
+    // Empty text keeps its column; numbers stay numbers.
+    await page.fill(
+      "#customQuery",
+      "SELECT 'a' AS first, '' AS empty, NULL AS nothing, 'c' AS last, -5 AS negative, '=1' AS formula",
+    );
+    await page.click("#runQuery");
+    await expect(page.locator("#queryResult thead th")).toHaveText([
+      "first", "empty", "nothing", "last", "negative", "formula",
+    ]);
+    await expect(page.locator("#queryResult tbody tr").first().locator("td")).toHaveText([
+      "a", "", "", "c", "-5", "=1",
+    ]);
+    const [download] = await Promise.all([page.waitForEvent("download"), page.click("#downloadCsv")]);
+    const csv = require("fs").readFileSync(await download.path(), "utf8");
+    expect(csv).toBe("first,empty,nothing,last,negative,formula\na,,,c,-5,'=1");
+    expect(errors()).toHaveLength(0);
+  });
+});
+
 test.describe("Events Page", () => {
   test("loads without errors, with filters", async ({ page }) => {
     const errors = collectErrors(page);
@@ -117,23 +152,175 @@ test.describe("Events Page", () => {
   });
 });
 
+// One site header, one main area and one marked tab, and nothing wider
+// than the screen, after every htmx swap.
+async function expectOneLayout(page) {
+  await expect(page.locator(".site-header")).toHaveCount(1);
+  await expect(page.locator("#main-content")).toHaveCount(1);
+  await expect(page.locator(".site-tabs li.is-active")).toHaveCount(1);
+  const width = await page.evaluate(() => document.documentElement.scrollWidth);
+  expect(width).toBeLessThanOrEqual(page.viewportSize().width);
+}
+
+for (const viewport of [
+  { width: 1280, height: 900 },
+  { width: 360, height: 800 },
+]) {
+  test.describe(`Navigation at ${viewport.width}px`, () => {
+    test.use({ viewport, timezoneId: "America/New_York" });
+
+    test("search, map details and tabs keep one layout, and history works", async ({ page }) => {
+      const errors = collectErrors(page);
+      await page.goto(dashboard("&view=list"));
+      await page.locator("#weather-list details.wx-station").first().waitFor();
+      await expectOneLayout(page);
+
+      // The search replaces only the list, so the box keeps focus.
+      const stations = page.locator("details.wx-station");
+      const initialCount = await stations.count();
+      const stationId = (await page.locator(".wx-name strong").first().textContent()).trim();
+      const search = page.locator("#weather-search");
+      await search.fill(stationId);
+      await expect(stations).toHaveCount(1);
+      await expect(search).toBeFocused();
+      await expect(page).toHaveURL(new RegExp(`q=${stationId}`));
+      await stations.first().locator("summary").click();
+      await expect(stations.first().locator(".forecast-detail")).toHaveCount(1);
+      await search.fill("no such station anywhere");
+      await expect(page.locator("#weather-list")).toContainText("No station in this list matches");
+      await search.fill("");
+      await expect(stations).toHaveCount(initialCount);
+      await expectOneLayout(page);
+
+      // Pins are links: Enter opens one, and a second replaces the first.
+      await page.getByRole("link", { name: "Map", exact: true }).click();
+      const pins = page.locator(".station-markers .pin");
+      await pins.first().focus();
+      await page.keyboard.press("Enter");
+      const detail = page.locator("#map-station .station-detail");
+      await expect(detail.locator(".forecast-detail")).toHaveCount(1);
+      const second = (await pins.nth(1).getAttribute("hx-get")).split("/").pop();
+      await pins.nth(1).focus();
+      await page.keyboard.press("Enter");
+      await expect(detail.locator(".station-detail-head h3")).toHaveText(second);
+      await expect(page.locator("#map-station")).toHaveCount(1);
+      const bounds = await detail.boundingBox();
+      expect(bounds.x).toBeGreaterThanOrEqual(-1);
+      expect(bounds.x + bounds.width).toBeLessThanOrEqual(viewport.width + 1);
+      await expectOneLayout(page);
+
+      // The raw data page always loads whole; the others swap in.
+      for (const destination of ["/raw", "/events", "/raw", "/events"]) {
+        await page.locator(`.site-tabs a[href='${destination}']`).click();
+        await expect(page).toHaveURL((url) => url.pathname === destination);
+        await expect(page.locator(`.site-tabs li.is-active a[href='${destination}']`)).toHaveCount(1);
+        await expectOneLayout(page);
+      }
+      // Back from a swapped page to the raw data page reloads it, so it
+      // gets its own policy and script again.
+      await page.goBack();
+      await expect(page.locator(".site-tabs li.is-active a[href='/raw']")).toHaveCount(1);
+      await expect(page.locator("#raw-data-status")).not.toHaveText("Loading DuckDB…", { timeout: 60000 });
+      await expectOneLayout(page);
+      await page.goForward();
+      await expect(page.locator(".site-tabs li.is-active a[href='/events']")).toHaveCount(1);
+      await expectOneLayout(page);
+      expect(errors()).toHaveLength(0);
+    });
+  });
+}
+
 test.describe("HTMX Navigation", () => {
-  test("tabs swap the content and keep the current tab marked", async ({ page }) => {
+  test("going back restores the page htmx swapped away from", async ({ page }) => {
+    const errors = collectErrors(page);
     await page.goto(dashboard());
-
-    await page.click('.site-tabs a[href="/raw"]');
-    await expect(page).toHaveURL(/\/raw$/);
-    await expect(page.locator(".site-header")).toHaveCount(1);
-    await expect(page.locator('.site-tabs li.is-active a[href="/raw"]')).toHaveCount(1);
-
     await page.click('.site-tabs a[href="/events"]');
     await expect(page).toHaveURL(/\/events$/);
-    await expect(page.locator('.site-tabs li.is-active a[href="/events"]')).toHaveCount(1);
-    await expect(page.locator(".site-tabs li.is-active")).toHaveCount(1);
-
-    await page.click('.site-tabs a[href="/"]');
+    await expect(page).toHaveTitle(/Events/);
+    await page.goBack();
     await expect(page.getByRole("heading", { name: "Current weather" })).toBeVisible();
-    await expect(page.locator(".site-header")).toHaveCount(1);
+    await expect(page).toHaveTitle(/Dashboard/);
+    await expectOneLayout(page);
+    expect(errors()).toHaveLength(0);
+  });
+
+  test("the weather refresh keeps running, and keeps the open station", async ({ page }) => {
+    await page.goto(dashboard("&view=map"));
+    await page.locator(".station-markers .pin").first().click();
+    await expect(page.locator("#map-station .station-detail")).toHaveCount(1);
+    // Run the five-minute refresh now.
+    await page.evaluate(async () => {
+      const section = document.getElementById("weather-table-container");
+      section.dataset.before = "refresh";
+      await htmx.ajax("GET", section.getAttribute("hx-get"), {
+        source: section,
+        target: section,
+        swap: "outerHTML",
+      });
+    });
+    await expect(page.locator("#weather-table-container[data-before]")).toHaveCount(0);
+    await expect(page.locator("#weather-table-container")).toHaveCount(1);
+    await expect(page.locator("#map-station .station-detail")).toHaveCount(1);
+  });
+
+  test("a station request that gets no reply says so and can be retried", async ({ page }) => {
+    await page.goto(dashboard("&view=map"));
+    await page.route("**/fragments/station/**", (route) => route.abort("failed"));
+    await page.locator(".station-markers .pin").first().click();
+    const panel = page.locator("#map-station");
+    await expect(panel.locator(".load-error")).toContainText("Couldn't load this station");
+    await expect(page.locator("#map-station-loading")).toBeHidden();
+    await page.unroute("**/fragments/station/**");
+    await panel.getByRole("button", { name: "Try again" }).click();
+    await expect(panel.locator(".station-detail .forecast-detail")).toHaveCount(1);
+  });
+});
+
+test.describe("Content-Security-Policy", () => {
+  test("scripts and hx-on in a swapped response do not run", async ({ page, browserName }) => {
+    const response = await page.goto(dashboard("&view=map"));
+    const policy = response.headers()["content-security-policy"];
+    expect(policy).toContain("script-src 'self';");
+    expect(policy).toContain("require-trusted-types-for 'script'; trusted-types htmx");
+    expect(policy).not.toContain("unsafe-eval");
+    expect(policy).not.toContain("unsafe-inline");
+    const station = "**/fragments/station/**";
+    const answer = (body) => (route) =>
+      route.fulfill({ status: 200, contentType: "text/html; charset=utf-8", body });
+
+    // A <script> in the reply: Trusted Types refuse it (the "htmx" policy
+    // has no createScript), and without them the policy blocks inline code.
+    await page.route(station, answer('<p id="injected-script">x</p><script>window.ranScript = 1</script>'));
+    await page.locator(".station-markers .pin").first().click();
+    await page.waitForTimeout(500);
+    expect(await page.evaluate(() => window.ranScript)).toBeUndefined();
+
+    // hx-on and an inline handler are swapped in but never run.
+    await page.unroute(station);
+    await page.route(
+      station,
+      answer(
+        '<button id="injected-hx-on" hx-on:click="window.ranHxOn = 1">x</button>' +
+          '<img id="injected-img" src="/missing.png" onerror="window.ranHandler = 1">',
+      ),
+    );
+    await page.locator(".station-markers .pin").nth(1).click();
+    await page.locator("#injected-hx-on").click();
+    await page.waitForTimeout(500);
+    expect(await page.evaluate(() => [window.ranHxOn, window.ranHandler])).toEqual([undefined, undefined]);
+
+    if (browserName === "chromium") {
+      // Only the htmx policy may create HTML from a string.
+      const sink = await page.evaluate(() => {
+        try {
+          document.body.insertAdjacentHTML("beforeend", "<b>x</b>");
+          return "allowed";
+        } catch (error) {
+          return error.name;
+        }
+      });
+      expect(sink).toBe("TypeError");
+    }
   });
 });
 

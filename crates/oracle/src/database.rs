@@ -418,13 +418,13 @@ impl Database {
         let now = now.unix_timestamp();
         let row = sqlx::query(
             "WITH e AS (
-                 SELECT attestation, start_observation_date AS start,
+                 SELECT attestation, start_observation_date AS start_,
                         end_observation_date AS end_, (? OR NOT test) AS counted, test
                  FROM (SELECT *, end_observation_date - start_observation_date < ? AS test
                        FROM events))
              SELECT
-                 COALESCE(SUM(counted AND attestation IS NULL AND ? < start), 0) AS live,
-                 COALESCE(SUM(counted AND attestation IS NULL AND start <= ? AND ? < end_), 0)
+                 COALESCE(SUM(counted AND attestation IS NULL AND ? < start_), 0) AS live,
+                 COALESCE(SUM(counted AND attestation IS NULL AND start_ <= ? AND ? < end_), 0)
                      AS running,
                  COALESCE(SUM(counted AND attestation IS NULL AND end_ <= ?), 0) AS completed,
                  COALESCE(SUM(counted AND attestation IS NOT NULL), 0) AS signed,

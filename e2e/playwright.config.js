@@ -17,7 +17,12 @@ module.exports = defineConfig({
     // Disable HTTP/2 to avoid connection issues
     ignoreHTTPSErrors: true,
   },
+  // Chromium enforces the pages' Trusted Types; Firefox checks the rest.
   projects: [
+    {
+      name: "chromium",
+      use: { ...devices["Desktop Chrome"] },
+    },
     {
       name: "firefox",
       use: { ...devices["Desktop Firefox"] },

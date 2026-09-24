@@ -296,7 +296,7 @@ jobs:
         working-directory: e2e
         run: |
           npm ci
-          npx playwright install firefox --with-deps
+          npx playwright install chromium firefox --with-deps
 
       - name: Build runtime libraries
         id: runtime-libs
