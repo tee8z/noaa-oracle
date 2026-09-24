@@ -96,6 +96,13 @@ pub(super) fn weather_map(weather: &[WeatherDisplay], context: &WeatherContext) 
     if weather.is_empty() {
         return no_data();
     }
+    let placed: Vec<_> = weather
+        .iter()
+        .filter_map(|station| {
+            lat_lon_to_svg(station.latitude, station.longitude)
+                .map(|(x, y)| (station, format!("{x:.1}"), format!("{y:.1}")))
+        })
+        .collect();
     let off_map: Vec<_> = weather
         .iter()
         .filter(|w| lat_lon_to_svg(w.latitude, w.longitude).is_none())
@@ -106,23 +113,31 @@ pub(super) fn weather_map(weather: &[WeatherDisplay], context: &WeatherContext) 
                 img src=(assets::USA_MAP_SVG.url) alt="" class="usa-map";
                 svg class="station-markers" viewBox="0 0 599.96 327.28" preserveAspectRatio="none"
                     role="group" aria-label="Stations by latest temperature" {
-                    @for station in weather {
-                        @if let Some((x, y)) = lat_lon_to_svg(station.latitude, station.longitude) {
-                            // A link, so it takes focus and opens with Enter
-                            // without a script; without htmx it opens the list.
-                            a class={ "pin " (band(station.latest_temp)) }
-                              href=(list_url(&station.station_id))
-                              aria-label=(summary(station, context).replace('\n', ", "))
-                              hx-get=(station_url(&station.station_id))
-                              hx-target="#map-station"
-                              hx-swap="innerHTML"
-                              hx-sync="#map-station:replace"
-                              hx-indicator="#map-station-loading" {
-                                title { (summary(station, context)) }
-                                // A wider invisible circle is easier to hit.
-                                circle class="pin-target" cx=(format!("{x:.1}")) cy=(format!("{y:.1}")) r="9" {}
-                                circle class="pin-dot" cx=(format!("{x:.1}")) cy=(format!("{y:.1}")) r="4.5" {}
-                            }
+                    // Wider invisible circles are easier to hit. They sit
+                    // under every dot, so a neighbour's never covers a dot.
+                    g aria-hidden="true" {
+                        @for (station, x, y) in &placed {
+                            circle class="pin-target" cx=(x) cy=(y) r="9"
+                                hx-get=(station_url(&station.station_id))
+                                hx-target="#map-station"
+                                hx-swap="innerHTML"
+                                hx-sync="#map-station:replace"
+                                hx-indicator="#map-station-loading" {}
+                        }
+                    }
+                    @for (station, x, y) in &placed {
+                        // A link, so it takes focus and opens with Enter
+                        // without a script; without htmx it opens the list.
+                        a class={ "pin " (band(station.latest_temp)) }
+                          href=(list_url(&station.station_id))
+                          aria-label=(summary(station, context).replace('\n', ", "))
+                          hx-get=(station_url(&station.station_id))
+                          hx-target="#map-station"
+                          hx-swap="innerHTML"
+                          hx-sync="#map-station:replace"
+                          hx-indicator="#map-station-loading" {
+                            title { (summary(station, context)) }
+                            circle class="pin-dot" cx=(x) cy=(y) r="4.5" {}
                         }
                     }
                 }
@@ -172,6 +187,57 @@ mod tests {
         assert_eq!(band(Some(39.5)), "t-cool");
         assert_eq!(band(Some(74.0)), "t-mild");
         assert_eq!(band(Some(89.6)), "t-hot");
+    }
+
+    fn station(id: &str, latitude: f64, longitude: f64) -> WeatherDisplay {
+        WeatherDisplay {
+            station_id: id.into(),
+            station_name: String::new(),
+            state: String::new(),
+            iata_id: String::new(),
+            latest_temp: Some(50.0),
+            latest_temp_time: None,
+            observation_period: super::super::ObservationPeriod::Today,
+            temp_high: None,
+            temp_low: None,
+            wind_speed: None,
+            wind_direction: None,
+            humidity: None,
+            rain_amt: None,
+            snow_amt: None,
+            observed_start: String::new(),
+            observed_end: String::new(),
+            latitude,
+            longitude,
+            forecast_high: None,
+            forecast_low: None,
+        }
+    }
+
+    #[test]
+    fn no_hit_area_covers_a_pin() {
+        // Reagan National and Baltimore are close enough for one's hit area
+        // to reach the other's dot.
+        let weather = [
+            station("KDCA", 38.85, -77.03),
+            station("KBWI", 39.17, -76.68),
+        ];
+        let context = WeatherContext {
+            view: super::super::WeatherView::Map,
+            query: "",
+            selection_path: "/fragments/weather",
+            stations: &[],
+            now: time::OffsetDateTime::now_utc(),
+        };
+        let html = weather_map(&weather, &context).into_string();
+        let last_target = html.rfind("class=\"pin-target\"").unwrap();
+        let first_dot = html.find("class=\"pin-dot\"").unwrap();
+        assert!(last_target < first_dot, "{html}");
+        assert_eq!(html.matches("class=\"pin-target\"").count(), 2);
+        assert_eq!(
+            html.matches("hx-get=\"/fragments/station/KBWI\"").count(),
+            2
+        );
     }
 
     #[test]

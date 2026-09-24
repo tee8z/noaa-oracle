@@ -242,6 +242,7 @@
 
 .pin-target {
     fill: transparent;
+    cursor: pointer;
 }
 
 .pin-dot {

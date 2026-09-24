@@ -4,6 +4,11 @@ const { test, expect } = require("@playwright/test");
 const DAY = "start=2026-01-17T00%3A00%3A00Z&end=2026-01-18T00%3A00%3A00Z";
 const dashboard = (extra = "") => `/?${DAY}${extra}`;
 
+// Pins of stations with no close neighbour, so a click at a pin's centre
+// can't land on a neighbouring dot.
+const pin = (page, station = "KSLC") =>
+  page.locator(`.station-markers .pin[hx-get="/fragments/station/${station}"]`);
+
 function collectErrors(page) {
   const errors = [];
   page.on("console", (msg) => {
@@ -41,9 +46,23 @@ test.describe("Dashboard", () => {
     await expect(page.locator(".map-legend")).toContainText("90°F and above");
     await expect(pins.first().locator("title")).toContainText("Latest");
 
-    await pins.first().click();
+    // Every dot is on top where it is drawn: no neighbour's wider hit area
+    // covers it.
+    const covered = await page.evaluate(() =>
+      [...document.querySelectorAll(".station-markers .pin-dot")]
+        .map((dot) => dot.getBoundingClientRect())
+        .filter((box) => box.bottom <= innerHeight && box.right <= innerWidth)
+        .filter((box) => {
+          const hit = document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2);
+          return !hit || !hit.classList.contains("pin-dot");
+        }).length,
+    );
+    expect(covered).toBe(0);
+
+    await pin(page).click();
     const panel = page.locator("#map-station .station-detail");
     await expect(panel).toBeVisible({ timeout: 10000 });
+    await expect(panel.locator(".station-detail-head h3")).toHaveText("KSLC");
     await expect(panel.locator(".forecast-detail")).toHaveCount(1);
   });
 
@@ -246,7 +265,7 @@ test.describe("HTMX Navigation", () => {
 
   test("the weather refresh keeps running, and keeps the open station", async ({ page }) => {
     await page.goto(dashboard("&view=map"));
-    await page.locator(".station-markers .pin").first().click();
+    await pin(page).click();
     await expect(page.locator("#map-station .station-detail")).toHaveCount(1);
     // Run the five-minute refresh now.
     await page.evaluate(async () => {
@@ -266,7 +285,7 @@ test.describe("HTMX Navigation", () => {
   test("a station request that gets no reply says so and can be retried", async ({ page }) => {
     await page.goto(dashboard("&view=map"));
     await page.route("**/fragments/station/**", (route) => route.abort("failed"));
-    await page.locator(".station-markers .pin").first().click();
+    await pin(page).click();
     const panel = page.locator("#map-station");
     await expect(panel.locator(".load-error")).toContainText("Couldn't load this station");
     await expect(page.locator("#map-station-loading")).toBeHidden();
@@ -291,7 +310,7 @@ test.describe("Content-Security-Policy", () => {
     // A <script> in the reply: Trusted Types refuse it (the "htmx" policy
     // has no createScript), and without them the policy blocks inline code.
     await page.route(station, answer('<p id="injected-script">x</p><script>window.ranScript = 1</script>'));
-    await page.locator(".station-markers .pin").first().click();
+    await pin(page).click();
     await page.waitForTimeout(500);
     expect(await page.evaluate(() => window.ranScript)).toBeUndefined();
 
@@ -304,7 +323,7 @@ test.describe("Content-Security-Policy", () => {
           '<img id="injected-img" src="/missing.png" onerror="window.ranHandler = 1">',
       ),
     );
-    await page.locator(".station-markers .pin").nth(1).click();
+    await pin(page, "KSEA").click();
     await page.locator("#injected-hx-on").click();
     await page.waitForTimeout(500);
     expect(await page.evaluate(() => [window.ranHxOn, window.ranHandler])).toEqual([undefined, undefined]);
