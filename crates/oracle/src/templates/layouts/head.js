@@ -13,5 +13,11 @@
   document.documentElement.setAttribute("data-theme", theme);
 })();
 
-// Calendar days follow the reader's offset; scripts disabled fall back to UTC.
-document.cookie = "utc_offset=" + (-new Date().getTimezoneOffset()) + ";path=/;SameSite=Lax;max-age=86400";
+// Refresh the first dashboard after learning an offset that its request lacked.
+(function () {
+  var offset = String(-new Date().getTimezoneOffset());
+  var previous = document.cookie.split(";").map(function (cookie) { return cookie.trim(); })
+    .find(function (cookie) { return cookie.indexOf("utc_offset=") === 0; });
+  document.cookie = "utc_offset=" + offset + ";path=/;SameSite=Lax;max-age=86400";
+  if (previous !== "utc_offset=" + offset) document.documentElement.dataset.localDayChanged = "true";
+})();

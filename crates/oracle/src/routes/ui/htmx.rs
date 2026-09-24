@@ -40,7 +40,7 @@ pub(super) fn page_or_fragment(html: String) -> Response {
     let mut response = Html(html).into_response();
     response.headers_mut().insert(
         header::VARY,
-        HeaderValue::from_static("HX-Request, HX-Target"),
+        HeaderValue::from_static("HX-Request, HX-Target, HX-History-Restore-Request, Cookie"),
     );
     response
 }

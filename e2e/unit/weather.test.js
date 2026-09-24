@@ -12,18 +12,22 @@ const script = path.resolve(
 function load() {
   const listeners = {};
   const triggered = [];
+  const requested = [];
   const document = {
+    documentElement: { dataset: {} },
+    getElementById() { return null; },
     addEventListener(name, listener) {
       listeners[name] = listener;
     },
   };
   const htmx = {
+    ajax(method, url, options) { requested.push([method, url, options]); },
     trigger(element, name) {
       triggered.push([element, name]);
     },
   };
   vm.runInNewContext(fs.readFileSync(script, "utf8"), { document, htmx });
-  return { listeners, triggered };
+  return { listeners, triggered, requested, document };
 }
 
 function confirmEvent(target) {
@@ -69,4 +73,21 @@ test("Enter or Space on a map pin opens it like a click", () => {
   ]);
   listeners.keydown({ key: "Enter", target: { closest: () => null }, preventDefault() {} });
   assert.equal(triggered.length, 2);
+});
+
+test("a new browser offset refreshes weather once and keeps the selected view", () => {
+  const { listeners, document, requested } = load();
+  const section = { getAttribute: () => "/fragments/weather?view=list&stations=KORD" };
+  document.getElementById = () => section;
+  listeners.DOMContentLoaded();
+  assert.equal(requested.length, 0);
+  document.documentElement.dataset.localDayChanged = "true";
+  listeners.DOMContentLoaded();
+  assert.equal(requested.length, 1);
+  assert.equal(requested[0][0], "GET");
+  assert.equal(requested[0][1], "/fragments/weather?view=list&stations=KORD");
+  assert.equal(requested[0][2].target, section);
+  assert.equal(requested[0][2].swap, "outerHTML");
+  listeners.DOMContentLoaded();
+  assert.equal(requested.length, 1);
 });

@@ -297,7 +297,10 @@ async fn event_pages_return_only_their_content_to_htmx() {
             .unwrap();
         let response = test_app.app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()[header::VARY], "HX-Request, HX-Target");
+        assert_eq!(
+            response.headers()[header::VARY],
+            "HX-Request, HX-Target, HX-History-Restore-Request, Cookie"
+        );
         let fragment = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let fragment = String::from_utf8(fragment.to_vec()).unwrap();
         assert!(!fragment.contains("<html"), "{path}");

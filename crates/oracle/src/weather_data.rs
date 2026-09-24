@@ -2364,13 +2364,16 @@ mod tests {
                         25::BIGINT AS min_temp, 50::BIGINT AS max_temp, 'fahrenheit' AS temperature_unit_code",
             ),
         ]);
-        std::fs::copy(
-            FORECAST_FIXTURE,
-            directory
-                .path()
-                .join("2026-01-17/forecasts_2026-01-17T17:16:19.76658783Z.parquet"),
-        )
-        .unwrap();
+        // Keep the legacy-schema sample representative and small: the old
+        // all-stations query exceeds the production memory limit by design.
+        // Full real-data timing and equivalence live in the ignored benchmark.
+        let fixture = directory
+            .path()
+            .join("2026-01-17/forecasts_2026-01-17T17:16:19.76658783Z.parquet");
+        open_connection().unwrap().execute_batch(&format!(
+            "COPY (SELECT * FROM read_parquet('{}') WHERE station_id IN ('KORD', 'KSAW', 'KDEN')) TO '{}' (FORMAT PARQUET)",
+            FORECAST_FIXTURE.replace('\'', "''"), fixture.to_string_lossy().replace('\'', "''")
+        )).unwrap();
         directory
     }
 

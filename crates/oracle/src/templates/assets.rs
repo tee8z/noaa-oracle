@@ -41,7 +41,15 @@ pub async fn serve_asset(Path(file): Path<String>, headers: HeaderMap) -> Respon
         .flat_map(|value| value.split(','))
         .any(|coding| {
             let mut parts = coding.split(';').map(str::trim);
-            parts.next() == Some("gzip") && !parts.any(|parameter| parameter == "q=0")
+            parts
+                .next()
+                .is_some_and(|coding| coding.eq_ignore_ascii_case("gzip"))
+                && !parts.any(|parameter| {
+                    parameter
+                        .strip_prefix("q=")
+                        .and_then(|value| value.parse::<f32>().ok())
+                        .is_some_and(|quality| quality <= 0.0)
+                })
         });
     let mut response = if accepts_gzip {
         ([(header::CONTENT_ENCODING, "gzip")], asset.gzip).into_response()
@@ -123,8 +131,10 @@ mod tests {
                 .unwrap();
             assert_eq!(plain, asset.bytes, "{}", asset.url);
         }
-        let refused = request(SITE_JS.url, Some("gzip;q=0, identity")).await;
-        assert!(!refused.headers().contains_key(header::CONTENT_ENCODING));
+        for encoding in ["gzip;q=0, identity", "gzip;q=0.0, identity", "gzip;q=0.000"] {
+            let refused = request(SITE_JS.url, Some(encoding)).await;
+            assert!(!refused.headers().contains_key(header::CONTENT_ENCODING));
+        }
     }
 
     #[tokio::test]

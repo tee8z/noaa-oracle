@@ -894,7 +894,10 @@ async fn station_search_returns_only_the_list_to_htmx() {
         response.headers()["hx-replace-url"],
         "/?stations=KORD&view=list&q=chicago"
     );
-    assert_eq!(response.headers()[header::VARY], "HX-Request, HX-Target");
+    assert_eq!(
+        response.headers()[header::VARY],
+        "HX-Request, HX-Target, HX-History-Restore-Request, Cookie"
+    );
 
     // Without a match the list says so.
     let (_, body) = app

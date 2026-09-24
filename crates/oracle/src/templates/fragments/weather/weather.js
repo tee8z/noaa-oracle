@@ -17,3 +17,12 @@ document.addEventListener("keydown", function (event) {
   event.preventDefault();
   htmx.trigger(pin, "click");
 });
+
+// The initial document used UTC if it arrived without an offset cookie.
+// Fetch its weather once after head.js has supplied the reader's offset.
+document.addEventListener("DOMContentLoaded", function () {
+  if (!document.documentElement.dataset.localDayChanged) return;
+  delete document.documentElement.dataset.localDayChanged;
+  var section = document.getElementById("weather-table-container");
+  if (section) htmx.ajax("GET", section.getAttribute("hx-get"), { target: section, swap: "outerHTML" });
+});
