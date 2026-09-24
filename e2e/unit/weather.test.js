@@ -91,3 +91,26 @@ test("a new browser offset refreshes weather once and keeps the selected view", 
   listeners.DOMContentLoaded();
   assert.equal(requested.length, 1);
 });
+
+
+test("explicit UTC selections need no first-visit timezone refresh", () => {
+  const { listeners, document, requested } = load();
+  document.documentElement.dataset.localDayChanged = "true";
+  document.getElementById = () => ({ getAttribute: () => "/fragments/weather?view=list&start=2026-01-17T00%3A00%3A00Z" });
+  listeners.DOMContentLoaded();
+  assert.equal(requested.length, 0);
+});
+
+test("interaction wins over an automatic refresh already in flight", () => {
+  const { listeners, document, triggered } = load();
+  const section = { id: "weather-table-container", querySelector: () => ({}) };
+  document.getElementById = () => section;
+  listeners["htmx:beforeRequest"]({ target: { closest: () => section } });
+  assert.deepEqual(triggered, [[section, "htmx:abort"]]);
+  const detail = { requestConfig: { elt: section }, shouldSwap: true };
+  listeners["htmx:beforeSwap"]({ detail });
+  assert.equal(detail.shouldSwap, false);
+  const search = { requestConfig: { elt: { id: "weather-search" } }, shouldSwap: true };
+  listeners["htmx:beforeSwap"]({ detail: search });
+  assert.equal(search.shouldSwap, true);
+});

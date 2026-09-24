@@ -228,12 +228,39 @@ async fn build_forecast_html(
         temperature_unit: TemperatureUnit::Fahrenheit,
     };
 
-    let forecasts = state
-        .weather_db
-        .local_forecasts(&future_req, vec![station_id.to_string()], days.offset)
-        .await
-        .unwrap_or_default();
+    // Fetch both forecast windows and past observations together (last 7 days).
+    let past_start = today - time::Duration::days(7);
+    let past_req = ForecastRequest {
+        start: Some(past_start),
+        end: Some(today),
+        generated_start: Some(past_start - time::Duration::days(1)),
+        generated_end: Some(now),
+        station_ids: station_id.to_string(),
+        temperature_unit: TemperatureUnit::Fahrenheit,
+    };
 
+    let obs_req = ObservationRequest {
+        start: Some(past_start),
+        end: Some(today - time::Duration::nanoseconds(1)),
+        station_ids: station_id.to_string(),
+        temperature_unit: TemperatureUnit::Fahrenheit,
+    };
+
+    let (forecasts, past_forecasts, daily_obs) = tokio::join!(
+        state
+            .weather_db
+            .local_forecasts(&future_req, vec![station_id.to_string()], days.offset),
+        state
+            .weather_db
+            .local_forecasts(&past_req, vec![station_id.to_string()], days.offset),
+        state.weather_db.local_daily_observations(
+            &obs_req,
+            vec![station_id.to_string()],
+            days.offset
+        )
+    );
+
+    let forecasts = forecasts.unwrap_or_default();
     let today_key = today.date().to_string();
     let mut forecast_displays: Vec<ForecastDisplay> = forecasts
         .into_iter()
@@ -259,35 +286,6 @@ async fn build_forecast_html(
 
     // Sort by date chronologically
     forecast_displays.sort_by(|a, b| a.date.cmp(&b.date));
-
-    // Fetch past forecasts and daily observations in parallel (last 7 days)
-    let past_start = today - time::Duration::days(7);
-    let past_req = ForecastRequest {
-        start: Some(past_start),
-        end: Some(today),
-        generated_start: Some(past_start - time::Duration::days(1)),
-        generated_end: Some(now),
-        station_ids: station_id.to_string(),
-        temperature_unit: TemperatureUnit::Fahrenheit,
-    };
-
-    let obs_req = ObservationRequest {
-        start: Some(past_start),
-        end: Some(today - time::Duration::nanoseconds(1)),
-        station_ids: station_id.to_string(),
-        temperature_unit: TemperatureUnit::Fahrenheit,
-    };
-
-    let (past_forecasts, daily_obs) = tokio::join!(
-        state
-            .weather_db
-            .local_forecasts(&past_req, vec![station_id.to_string()], days.offset),
-        state.weather_db.local_daily_observations(
-            &obs_req,
-            vec![station_id.to_string()],
-            days.offset
-        )
-    );
 
     let past_forecasts = past_forecasts.unwrap_or_default();
     let daily_obs = daily_obs.unwrap_or_default();
@@ -353,8 +351,10 @@ pub async fn warm_forecast_cache(state: &Arc<AppState>) {
         })
         .collect();
 
+    // A station uses up to three query slots. Warm one at a time so HTTP
+    // requests do not wait behind dozens of background queries.
     stream::iter(futs)
-        .buffer_unordered(10)
+        .buffer_unordered(1)
         .collect::<Vec<()>>()
         .await;
 

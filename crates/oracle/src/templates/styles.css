@@ -62,7 +62,7 @@ body {
     color: var(--bulma-text);
 }
 
-/* The page tabs stay visible on phones; they scroll if they must. */
+/* Keep all page tabs visible, including narrow phone layouts. */
 .site-tabs {
     margin-bottom: 1rem !important;
 }
@@ -78,6 +78,13 @@ body {
 
     .site-actions .button:not(#theme-toggle) {
         display: none;
+    }
+}
+
+@media screen and (max-width: 400px) {
+    .site-tabs a {
+        padding: 0.5em 0.6em;
+        font-size: 0.875rem;
     }
 }
 

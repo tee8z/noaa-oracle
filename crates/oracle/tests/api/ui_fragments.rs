@@ -312,7 +312,7 @@ async fn start_only_weather_selection_keeps_its_bound_and_refresh_context() {
     let refresh = weather_refresh_url(&html);
     assert_eq!(
         refresh,
-        "/fragments/weather?stations=KORD&start=2024-08-12T00%3A00%3A00Z"
+        "/fragments/weather?stations=KORD&start=2024-08-12T00%3A00%3A00Z&view=map"
     );
     let (status, body) = app.get(&refresh).await;
     assert!(status.is_success());
@@ -506,7 +506,7 @@ async fn assert_dashboard_selection_survives_refresh(has_observations: bool) {
     let refresh = weather_refresh_url(&html);
     assert_eq!(
         refresh,
-        "/fragments/weather?stations=KORD%2CKBOS&start=2024-08-12T00%3A00%3A00Z&end=2024-08-14T00%3A00%3A00Z"
+        "/fragments/weather?stations=KORD%2CKBOS&start=2024-08-12T00%3A00%3A00Z&end=2024-08-14T00%3A00%3A00Z&view=map"
     );
     let (status, body) = app.get(&refresh).await;
     assert!(status.is_success());
@@ -518,7 +518,12 @@ async fn assert_dashboard_selection_survives_refresh(has_observations: bool) {
     );
 
     // A search offers requested stations without reports, keeping the selection.
-    let (status, body) = app.get(&format!("{refresh}&view=list&q=bos")).await;
+    let (status, body) = app
+        .get(&format!(
+            "{}&q=bos",
+            refresh.replace("view=map", "view=list")
+        ))
+        .await;
     assert!(status.is_success());
     let searched = String::from_utf8(body.to_vec()).unwrap();
     assert!(searched.contains(
@@ -847,7 +852,7 @@ async fn empty_weather_refresh_retains_requested_stations_and_selected_dates() {
     assert!(html.contains("No weather data available"));
     assert_eq!(
         weather_refresh_url(&html),
-        "/fragments/weather?stations=KORD%2CKBOS&start=2024-08-12T00%3A00%3A00Z&end=2024-08-13T00%3A00%3A00Z"
+        "/fragments/weather?stations=KORD%2CKBOS&start=2024-08-12T00%3A00%3A00Z&end=2024-08-13T00%3A00%3A00Z&view=map"
     );
 }
 
