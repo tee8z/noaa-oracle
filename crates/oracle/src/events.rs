@@ -518,6 +518,51 @@ impl EventFilter {
     }
 }
 
+/// Events whose observation window is shorter than this are test runs: the
+/// synthetic checks open a ten-minute window every hour. They come through
+/// the same coordinator, with the same key, as real competitions, so the
+/// window is the only thing that marks them.
+pub const TEST_WINDOW: Duration = Duration::hours(1);
+
+/// Whether an event with this observation window is a test run.
+pub fn is_test_window(start: OffsetDateTime, end: OffsetDateTime) -> bool {
+    end - start < TEST_WINDOW
+}
+
+/// One page of the events list. The database applies every filter before
+/// the limit, so old real events are never crowded out by newer test runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventListQuery {
+    pub status: Option<EventStatus>,
+    pub include_tests: bool,
+    /// Only events created before this one; ids grow with creation time.
+    pub before: Option<Uuid>,
+    pub limit: usize,
+}
+
+/// Events by status, counted with the same test setting as the list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EventCounts {
+    pub live: usize,
+    pub running: usize,
+    pub completed: usize,
+    pub signed: usize,
+    /// Test events, whether or not they are counted above.
+    pub tests: usize,
+}
+
+impl EventCounts {
+    pub fn of(&self, status: Option<EventStatus>) -> usize {
+        match status {
+            None => self.live + self.running + self.completed + self.signed,
+            Some(EventStatus::Live) => self.live,
+            Some(EventStatus::Running) => self.running,
+            Some(EventStatus::Completed) => self.completed,
+            Some(EventStatus::Signed) => self.signed,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub enum EventStatus {
     /// Observation window has not started; entries can be added

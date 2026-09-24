@@ -123,3 +123,10 @@ a.ev-row:focus-visible {
         font-size: 0.75rem;
     }
 }
+
+.ev-pages {
+    display: flex;
+    gap: 0.5rem;
+    justify-content: flex-end;
+    margin-top: 0.75rem;
+}

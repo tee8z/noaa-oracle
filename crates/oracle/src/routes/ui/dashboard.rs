@@ -11,9 +11,8 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use super::htmx::{Render, page_or_fragment};
 use crate::{
     AppState,
-    events::EventStatus,
     templates::{
-        fragments::{EventStats, WeatherContext, WeatherDisplay, WeatherView, weather_section},
+        fragments::{WeatherContext, WeatherDisplay, WeatherView, weather_section},
         pages::dashboard::{DashboardData, dashboard_fragment, dashboard_page},
     },
 };
@@ -122,25 +121,15 @@ async fn build_dashboard_data(
     let pubkey = state.oracle.public_key_base64();
     let npub = state.oracle.npub();
 
-    // Get event statistics
-    let events = state
-        .oracle
-        .list_events(crate::events::EventFilter::default())
-        .await
-        .unwrap_or_default();
-
-    let mut stats = EventStats::default();
-
-    for event in &events {
-        match event.status {
-            EventStatus::Live => stats.live_count += 1,
-            EventStatus::Running => stats.running_count += 1,
-            EventStatus::Completed => stats.completed_count += 1,
-            EventStatus::Signed => stats.signed_count += 1,
-        }
-    }
-
-    let (weather, default_airports) = get_latest_weather(state, station_ids, start, end).await;
+    // The cards link to the events list, which hides test events.
+    let (counts, (weather, default_airports)) = tokio::join!(
+        state.oracle.event_counts(false),
+        get_latest_weather(state, station_ids, start, end)
+    );
+    let counts = counts.unwrap_or_else(|error| {
+        log::error!("event counts: {error:#}");
+        Default::default()
+    });
     // The default airports refresh without naming them, which keeps the
     // address bar short; any other selection names its stations.
     let displayed_ids: Vec<String> = if default_airports {
@@ -158,7 +147,7 @@ async fn build_dashboard_data(
         DashboardData {
             pubkey,
             npub,
-            stats,
+            counts,
             weather,
         },
         selection_path,

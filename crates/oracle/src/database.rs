@@ -40,7 +40,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    events::{Entry, EventRecord, NewEvent, ValueOptions},
+    events::{
+        Entry, EventCounts, EventListQuery, EventRecord, EventStatus, NewEvent, TEST_WINDOW,
+        ValueOptions,
+    },
     scoring::Pick,
     signing::EventNonce,
     sources::Reading,
@@ -361,6 +364,90 @@ impl Database {
         rows.iter().map(event_from_row).collect()
     }
 
+    /// A page of the UI's events list, newest first. Test events and the
+    /// status are filtered here, before the limit.
+    pub async fn event_page(
+        &self,
+        query: &EventListQuery,
+        now: OffsetDateTime,
+    ) -> Result<Vec<EventRecord>, sqlx::Error> {
+        let now = now.unix_timestamp();
+        let mut conditions = vec![];
+        let mut binds = vec![];
+        if !query.include_tests {
+            conditions.push(NOT_A_TEST);
+            binds.push(TEST_WINDOW.whole_seconds());
+        }
+        if let Some(status) = query.status {
+            let (condition, now_binds) = status_condition(status);
+            conditions.push(condition);
+            binds.extend(std::iter::repeat_n(now, now_binds));
+        }
+        let before = query.before.map(|id| id.to_string());
+        if before.is_some() {
+            conditions.push("e.id < ?");
+        }
+        let filter = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conditions.join(" AND "))
+        };
+        // Only constant conditions are interpolated; values are bound.
+        let sql = format!("{EVENT_SELECT}{filter} GROUP BY e.id ORDER BY e.id DESC LIMIT ?");
+        let mut statement = sqlx::query(AssertSqlSafe(sql));
+        for value in binds {
+            statement = statement.bind(value);
+        }
+        if let Some(before) = before {
+            statement = statement.bind(before);
+        }
+        let rows = statement
+            .bind(i64::try_from(query.limit).unwrap_or(i64::MAX))
+            .fetch_all(&self.readers)
+            .await?;
+        rows.iter().map(event_from_row).collect()
+    }
+
+    /// Events by status, with or without test events, and the number of test
+    /// events either way.
+    pub async fn event_counts(
+        &self,
+        include_tests: bool,
+        now: OffsetDateTime,
+    ) -> Result<EventCounts, sqlx::Error> {
+        let now = now.unix_timestamp();
+        let row = sqlx::query(
+            "WITH e AS (
+                 SELECT attestation, start_observation_date AS start,
+                        end_observation_date AS end_, (? OR NOT test) AS counted, test
+                 FROM (SELECT *, end_observation_date - start_observation_date < ? AS test
+                       FROM events))
+             SELECT
+                 COALESCE(SUM(counted AND attestation IS NULL AND ? < start), 0) AS live,
+                 COALESCE(SUM(counted AND attestation IS NULL AND start <= ? AND ? < end_), 0)
+                     AS running,
+                 COALESCE(SUM(counted AND attestation IS NULL AND end_ <= ?), 0) AS completed,
+                 COALESCE(SUM(counted AND attestation IS NOT NULL), 0) AS signed,
+                 COALESCE(SUM(test), 0) AS tests
+             FROM e",
+        )
+        .bind(include_tests)
+        .bind(TEST_WINDOW.whole_seconds())
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .fetch_one(&self.readers)
+        .await?;
+        Ok(EventCounts {
+            live: count_column(&row, "live")?,
+            running: count_column(&row, "running")?,
+            completed: count_column(&row, "completed")?,
+            signed: count_column(&row, "signed")?,
+            tests: count_column(&row, "tests")?,
+        })
+    }
+
     /// Events without an attestation, oldest first.
     pub async fn unattested_events(&self) -> Result<Vec<EventRecord>, sqlx::Error> {
         // Only constant SQL is interpolated.
@@ -678,6 +765,24 @@ const EVENT_SELECT: &str = "SELECT e.id, e.source, e.signing_date, e.start_obser
         COUNT(ee.id) AS total_entries
      FROM events e
      LEFT JOIN events_entries ee ON ee.event_id = e.id";
+
+/// Events whose window is at least [`TEST_WINDOW`] long (bind its seconds).
+const NOT_A_TEST: &str = "e.end_observation_date - e.start_observation_date >= ?";
+
+/// The SQL form of [`EventRecord::status`], and how many times it binds the
+/// current time.
+fn status_condition(status: EventStatus) -> (&'static str, usize) {
+    match status {
+        EventStatus::Signed => ("e.attestation IS NOT NULL", 0),
+        EventStatus::Live => ("e.attestation IS NULL AND ? < e.start_observation_date", 1),
+        EventStatus::Running => (
+            "e.attestation IS NULL AND e.start_observation_date <= ? \
+             AND ? < e.end_observation_date",
+            2,
+        ),
+        EventStatus::Completed => ("e.attestation IS NULL AND e.end_observation_date <= ?", 1),
+    }
+}
 
 /// Column values for a new event, encoded before the command is queued so the
 /// writer only performs SQL.

@@ -1,17 +1,19 @@
 use maud::{Markup, html};
 
-use crate::templates::{
-    fragments::{
-        EventStats, WeatherContext, WeatherDisplay, event_stats, oracle_info, weather_section,
+use crate::{
+    events::EventCounts,
+    templates::{
+        fragments::{WeatherContext, WeatherDisplay, event_stats, oracle_info, weather_section},
+        layouts::{CurrentPage, PageConfig, base, page_fragment},
     },
-    layouts::{CurrentPage, PageConfig, base, page_fragment},
 };
 
 /// Dashboard page data
 pub struct DashboardData {
     pub pubkey: String,
     pub npub: String,
-    pub stats: EventStats,
+    /// Without test events, like the events list they link to.
+    pub counts: EventCounts,
     pub weather: Vec<WeatherDisplay>,
 }
 
@@ -32,7 +34,7 @@ pub fn dashboard_fragment(data: &DashboardData, weather: &WeatherContext) -> Mar
 fn dashboard_content(data: &DashboardData, weather: &WeatherContext) -> Markup {
     html! {
         (weather_section(&data.weather, weather))
-        (event_stats(&data.stats))
+        (event_stats(&data.counts))
         (oracle_info(&data.pubkey, &data.npub))
     }
 }

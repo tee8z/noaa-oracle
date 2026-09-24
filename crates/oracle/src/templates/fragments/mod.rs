@@ -4,7 +4,7 @@ mod forecast_detail;
 mod oracle_info;
 pub mod weather;
 
-pub use event_stats::{EventStats, event_stats};
+pub use event_stats::event_stats;
 pub use forecast_detail::{ForecastComparison, ForecastDisplay, forecast_detail, station_detail};
 pub use oracle_info::oracle_info;
 pub use weather::{

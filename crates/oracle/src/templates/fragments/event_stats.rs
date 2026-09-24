@@ -1,23 +1,17 @@
 use maud::{Markup, html};
 
-/// Event counts by status.
-#[derive(Default)]
-pub struct EventStats {
-    pub live_count: usize,
-    pub running_count: usize,
-    pub completed_count: usize,
-    pub signed_count: usize,
-}
+use crate::events::EventCounts;
 
-/// One line of counts; each opens the events list filtered to that status.
-pub fn event_stats(stats: &EventStats) -> Markup {
+/// One line of counts, without test events; each opens the events list
+/// filtered to that status, which hides test events too.
+pub fn event_stats(counts: &EventCounts) -> Markup {
     html! {
         section class="box event-stats" aria-label="Events by status" {
             @for (status, count, label, hint) in [
-                ("live", stats.live_count, "Live", "Accepting entries"),
-                ("running", stats.running_count, "Running", "Observing weather"),
-                ("completed", stats.completed_count, "Completed", "Awaiting signature"),
-                ("signed", stats.signed_count, "Signed", "Attested"),
+                ("live", counts.live, "Live", "Accepting entries"),
+                ("running", counts.running, "Running", "Observing weather"),
+                ("completed", counts.completed, "Completed", "Awaiting signature"),
+                ("signed", counts.signed, "Signed", "Attested"),
             ] {
                 a class="stat-card" href=(format!("/events?status={status}"))
                   hx-get=(format!("/events?status={status}"))

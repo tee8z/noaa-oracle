@@ -1,14 +1,17 @@
-//! The events list: status filters and a test-event toggle above one row
-//! per event. Rows open the event; the list refreshes itself.
+//! The events list: status filters and a test-event toggle above one page
+//! of rows. Rows open the event; the list refreshes itself.
 
 use maud::{Markup, html};
-use time::{Duration, OffsetDateTime};
+use time::OffsetDateTime;
+use uuid::Uuid;
 
-use crate::{events::EventStatus, templates::components::time as when};
+use crate::{
+    events::{EventCounts, EventStatus, is_test_window},
+    templates::components::time as when,
+};
 
-/// Windows shorter than this are test runs (synthetic checks run every
-/// hour with ten-minute windows).
-const TEST_WINDOW: Duration = Duration::hours(1);
+/// Rows on one page of the list.
+pub const PAGE_SIZE: usize = 50;
 
 /// Event view data for the list
 pub struct EventView {
@@ -25,7 +28,7 @@ pub struct EventView {
 
 impl EventView {
     pub fn is_test(&self) -> bool {
-        self.end_observation - self.start_observation < TEST_WINDOW
+        is_test_window(self.start_observation, self.end_observation)
     }
 }
 
@@ -34,13 +37,16 @@ impl EventView {
 pub struct EventFilters {
     pub status: Option<EventStatus>,
     pub show_tests: bool,
+    /// The page after this event; `None` is the newest page.
+    pub before: Option<Uuid>,
 }
 
 impl EventFilters {
-    pub fn parse(status: Option<&str>, tests: Option<&str>) -> Self {
+    pub fn parse(status: Option<&str>, tests: Option<&str>, before: Option<&str>) -> Self {
         Self {
             status: status.and_then(parse_status),
             show_tests: tests == Some("show"),
+            before: before.and_then(|id| Uuid::parse_str(id).ok()),
         }
     }
 
@@ -53,6 +59,9 @@ impl EventFilters {
         if self.show_tests {
             parameters.push("tests=show".into());
         }
+        if let Some(before) = self.before {
+            parameters.push(format!("before={before}"));
+        }
         if parameters.is_empty() {
             "/events".into()
         } else {
@@ -60,10 +69,20 @@ impl EventFilters {
         }
     }
 
-    fn shows(&self, event: &EventView) -> bool {
-        (self.show_tests || !event.is_test())
-            && self.status.is_none_or(|status| event.status == status)
+    fn page(self, before: Option<Uuid>) -> Self {
+        Self { before, ..self }
     }
+}
+
+/// One page of events, the counts for the filters, and whether older
+/// events follow.
+pub struct EventsPage<'a> {
+    pub events: &'a [EventView],
+    pub counts: EventCounts,
+    pub filters: EventFilters,
+    /// The last row's id when an older page exists.
+    pub older: Option<Uuid>,
+    pub now: OffsetDateTime,
 }
 
 const STATUSES: [EventStatus; 4] = [
@@ -101,19 +120,10 @@ pub fn status_tag(status: EventStatus) -> Markup {
     html! { span class={ "tag is-" (status_param(status)) } { (status_text(status)) } }
 }
 
-/// The filters and the list. Changing a filter replaces this section.
-pub fn events_section(events: &[EventView], filters: EventFilters, now: OffsetDateTime) -> Markup {
-    let candidates: Vec<_> = events
-        .iter()
-        .filter(|event| filters.show_tests || !event.is_test())
-        .collect();
-    let hidden_tests = events.iter().filter(|event| event.is_test()).count();
-    let count = |status: Option<EventStatus>| {
-        candidates
-            .iter()
-            .filter(|event| status.is_none_or(|status| event.status == status))
-            .count()
-    };
+/// The filters and the list. Changing a filter replaces this section and
+/// returns to the newest page.
+pub fn events_section(page: &EventsPage) -> Markup {
+    let filters = page.filters;
     html! {
         section id="events" class="box" {
             h2 class="title is-5" { "Oracle events" }
@@ -129,7 +139,7 @@ pub fn events_section(events: &[EventView], filters: EventFilters, now: OffsetDa
                                 checked[filters.status == status];
                             span {
                                 (status.map_or("All", status_text))
-                                " " span class="chip-count" { (count(status)) }
+                                " " span class="chip-count" { (page.counts.of(status)) }
                             }
                         }
                     }
@@ -139,26 +149,28 @@ pub fn events_section(events: &[EventView], filters: EventFilters, now: OffsetDa
                     " Show test events"
                     span class="muted" {
                         " (windows under an hour"
-                        @if !filters.show_tests && hidden_tests > 0 { ", " (hidden_tests) " hidden" }
+                        @if !filters.show_tests && page.counts.tests > 0 {
+                            ", " (page.counts.tests) " hidden"
+                        }
                         ")"
                     }
                 }
                 noscript { button type="submit" class="button is-small" { "Apply" } }
             }
-            (events_list(events, filters, now))
+            (events_list(page))
         }
     }
 }
 
-/// The rows alone, which refresh every 30 seconds.
-pub fn events_list(events: &[EventView], filters: EventFilters, now: OffsetDateTime) -> Markup {
-    let shown: Vec<_> = events.iter().filter(|event| filters.shows(event)).collect();
+/// The rows alone, which refresh every 30 seconds, and the page links.
+pub fn events_list(page: &EventsPage) -> Markup {
+    let filters = page.filters;
     html! {
         div id="events-list" class="ev-list"
             hx-get=(filters.url()) hx-trigger="every 30s" hx-swap="outerHTML" {
-            @if shown.is_empty() {
+            @if page.events.is_empty() {
                 div class="ev-empty" {
-                    @if events.is_empty() {
+                    @if page.counts.of(None) + page.counts.tests == 0 {
                         p class="is-size-5" { "No events found" }
                         p class="is-size-7" { "Events will appear here when created by coordinators." }
                     } @else {
@@ -175,11 +187,29 @@ pub fn events_list(events: &[EventView], filters: EventFilters, now: OffsetDateT
                     span class="ev-num" { "Entries" }
                     span class="ev-num" { "Paid places" }
                 }
-                @for event in shown {
-                    (event_row(event, now))
+                @for event in page.events {
+                    (event_row(event, page.now))
+                }
+            }
+            @if filters.before.is_some() || page.older.is_some() {
+                nav class="ev-pages" aria-label="Pages" {
+                    @if filters.before.is_some() {
+                        (page_link(filters.page(None), "Newest events"))
+                    }
+                    @if let Some(older) = page.older {
+                        (page_link(filters.page(Some(older)), "Older events"))
+                    }
                 }
             }
         }
+    }
+}
+
+fn page_link(filters: EventFilters, label: &str) -> Markup {
+    let url = filters.url();
+    html! {
+        a class="button is-small" href=(url) hx-get=(url) hx-target="#events-list"
+          hx-swap="outerHTML" hx-push-url="true" { (label) }
     }
 }
 
@@ -191,7 +221,10 @@ fn event_row(event: &EventView, now: OffsetDateTime) -> Markup {
             span class="ev-locations" {
                 @for location in &event.locations { span class="tag" { (location) } " " }
             }
-            span class="ev-status" { (status_tag(event.status)) }
+            span class="ev-status" {
+                (status_tag(event.status))
+                @if event.is_test() { " " span class="tag is-light" { "Test" } }
+            }
             span class="ev-window" data-label="Window" {
                 (when::window(event.start_observation, event.end_observation))
             }
@@ -205,7 +238,7 @@ fn event_row(event: &EventView, now: OffsetDateTime) -> Markup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use time::macros::datetime;
+    use time::{Duration, macros::datetime};
 
     fn event(id: &str, status: EventStatus, minutes: i64) -> EventView {
         let start = datetime!(2026-09-24 11:44 UTC);
@@ -222,37 +255,82 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_events_are_hidden_unless_asked_for() {
-        let events = [
-            event("aaaaaaaa-test", EventStatus::Signed, 10),
-            event("bbbbbbbb-real", EventStatus::Running, 18 * 60),
-        ];
-        let now = datetime!(2026-09-24 12:00 UTC);
-        let html = events_section(&events, EventFilters::default(), now).into_string();
-        assert!(!html.contains("aaaaaaaa"));
-        assert!(html.contains("bbbbbbbb"));
-        assert!(html.contains("1 hidden"));
-        let html = events_list(&events, EventFilters::parse(None, Some("show")), now).into_string();
-        assert!(html.contains("aaaaaaaa"));
+    fn page<'a>(events: &'a [EventView], filters: EventFilters) -> EventsPage<'a> {
+        EventsPage {
+            events,
+            counts: EventCounts {
+                running: 1,
+                tests: 1,
+                ..EventCounts::default()
+            },
+            filters,
+            older: None,
+            now: datetime!(2026-09-24 12:00 UTC),
+        }
     }
 
     #[test]
-    fn status_filter_keeps_only_that_status() {
-        let events = [
-            event("aaaaaaaa", EventStatus::Signed, 120),
-            event("bbbbbbbb", EventStatus::Running, 120),
-        ];
-        let filters = EventFilters::parse(Some("running"), None);
-        assert_eq!(filters.url(), "/events?status=running");
-        let html = events_list(&events, filters, datetime!(2026-09-24 12:00 UTC)).into_string();
-        assert!(!html.contains("aaaaaaaa"));
+    fn the_toggle_says_how_many_test_events_are_hidden() {
+        let events = [event("bbbbbbbb-real", EventStatus::Running, 18 * 60)];
+        let html = events_section(&page(&events, EventFilters::default())).into_string();
         assert!(html.contains("bbbbbbbb"));
+        assert!(html.contains("1 hidden"));
+        let shown = EventFilters::parse(None, Some("show"), None);
+        let html = events_section(&page(&events, shown)).into_string();
+        assert!(!html.contains("1 hidden"));
+    }
+
+    #[test]
+    fn test_events_are_tagged_when_shown() {
+        let events = [event("aaaaaaaa-test", EventStatus::Signed, 10)];
+        let shown = EventFilters::parse(None, Some("show"), None);
+        let html = events_list(&page(&events, shown)).into_string();
+        assert!(html.contains("aaaaaaaa"));
+        assert!(html.contains(">Test<"));
+    }
+
+    #[test]
+    fn filters_round_trip_through_the_url() {
+        let before = Uuid::from_u128(7);
+        let filters = EventFilters::parse(Some("running"), Some("show"), Some(&before.to_string()));
+        assert_eq!(
+            filters.url(),
+            format!("/events?status=running&tests=show&before={before}")
+        );
+        assert_eq!(
+            EventFilters::parse(Some("bogus"), Some("no"), Some("nope")),
+            EventFilters::default()
+        );
+    }
+
+    #[test]
+    fn pages_link_to_older_and_back_to_the_newest() {
+        let events = [event("bbbbbbbb", EventStatus::Running, 120)];
+        let older = Uuid::from_u128(9);
+        let first = EventsPage {
+            older: Some(older),
+            ..page(&events, EventFilters::parse(Some("running"), None, None))
+        };
+        let html = events_list(&first).into_string();
+        assert!(
+            html.contains(&format!("/events?status=running&amp;before={older}")),
+            "{html}"
+        );
+        assert!(!html.contains("Newest events"));
         assert!(html.contains("Paid places"));
         assert!(!html.contains("Winners"));
-        assert_eq!(
-            EventFilters::parse(Some("bogus"), Some("no")),
-            EventFilters::default()
+
+        let last = page(
+            &events,
+            EventFilters::parse(None, None, Some(&older.to_string())),
+        );
+        let html = events_list(&last).into_string();
+        assert!(html.contains("Newest events"));
+        assert!(!html.contains("Older events"));
+        // The refresh keeps the page.
+        assert!(
+            html.contains(&format!("hx-get=\"/events?before={older}\"")),
+            "{html}"
         );
     }
 }
