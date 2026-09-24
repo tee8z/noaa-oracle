@@ -8,7 +8,7 @@ use axum::{
     http::{Method, Request, StatusCode, header},
 };
 use nostr::key::Keys;
-use oracle::{Event, EventStatus, EventSummary, WeatherEntry};
+use oracle::{CreateEvent, Event, EventStatus, EventSummary, WeatherEntry};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use time::Duration;
@@ -247,6 +247,103 @@ async fn listing_is_newest_first_bounded_and_filterable() {
         completed
             .iter()
             .all(|event| event.status == EventStatus::Completed)
+    );
+}
+
+async fn created_with(test_app: &TestApp, unlisted: bool) -> Event {
+    let event = CreateEvent {
+        unlisted,
+        ..event_at(test_app.clock.now())
+    };
+    let (status, body) = test_app.create_event(&event).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    serde_json::from_slice(&body).unwrap()
+}
+
+async fn html(test_app: &TestApp, path: &str) -> String {
+    let (status, body) = test_app.get(path).await;
+    assert_eq!(status, StatusCode::OK, "{path}");
+    String::from_utf8(body.to_vec()).unwrap()
+}
+
+fn rows(html: &str) -> usize {
+    html.matches("<a class=\"ev-row\" href=").count()
+}
+
+/// Unlisted events stay off the events list and the counts, filtered
+/// before the page limit, until the reader asks for them. Their own page
+/// and the API still serve them.
+#[tokio::test]
+async fn unlisted_events_stay_off_the_list_and_counts_but_open_by_their_link() {
+    let mut weather = MockWeatherAccess::new();
+    weather
+        .expect_observation_data()
+        .returning(|_, _| Ok(vec![]));
+    weather
+        .expect_daily_observations()
+        .returning(|_, _| Ok(vec![]));
+    weather.expect_forecasts_data().returning(|_, _| Ok(vec![]));
+    weather.expect_stations().returning(|| Ok(vec![]));
+    let test_app = spawn_app(Arc::new(weather)).await;
+
+    // One listed event, then a full page (50 rows) of newer unlisted ones.
+    let listed = created_with(&test_app, false).await;
+    assert!(!listed.unlisted);
+    let mut unlisted = vec![];
+    for _ in 0..50 {
+        unlisted.push(created_with(&test_app, true).await);
+    }
+    assert!(unlisted.iter().all(|event| event.unlisted));
+    let newest = unlisted.last().unwrap().id.to_string();
+    let oldest_unlisted = unlisted[0].id;
+
+    // Listed only: the old listed event is on the first page, and the
+    // counts and the toggle agree with it.
+    let page = html(&test_app, "/events").await;
+    assert_eq!(rows(&page), 1);
+    assert!(page.contains(&listed.id.to_string()));
+    assert!(!page.contains(&newest));
+    assert!(page.contains("All <span class=\"chip-count\">1</span>"));
+    assert!(page.contains("Live <span class=\"chip-count\">1</span>"));
+    assert!(page.contains("Show unlisted"));
+    assert!(page.contains("(50 hidden)"));
+    assert!(!page.contains("Older events"));
+    let dashboard = html(&test_app, "/").await;
+    assert!(
+        dashboard.contains("<span class=\"stat-value stat-live\">1</span>"),
+        "{dashboard}"
+    );
+
+    // With the toggle: newest first, a page at a time, counted too.
+    let page = html(&test_app, "/events?unlisted=show").await;
+    assert_eq!(rows(&page), 50);
+    assert!(page.contains(&newest));
+    assert!(!page.contains(&listed.id.to_string()));
+    assert!(page.contains("All <span class=\"chip-count\">51</span>"));
+    assert!(!page.contains("hidden)"));
+    assert!(page.contains(">Unlisted<"));
+    let older = format!("/events?unlisted=show&before={oldest_unlisted}");
+    assert!(page.contains(&older.replace('&', "&amp;")), "{page}");
+    let page = html(&test_app, &older).await;
+    assert_eq!(rows(&page), 1);
+    assert!(page.contains(&listed.id.to_string()));
+    assert!(page.contains("Newest events"));
+
+    // Reachable by their link, on their page and over the API.
+    let page = html(&test_app, &format!("/events/{newest}")).await;
+    assert!(page.contains(&newest));
+    assert!(page.contains(">Unlisted<"));
+    let fetched: Event = test_app.get_json(&format!("/oracle/events/{newest}")).await;
+    assert!(fetched.unlisted);
+    let summaries: Vec<EventSummary> = test_app
+        .get_json(&format!("/oracle/events?event_ids={newest},{}", listed.id))
+        .await;
+    assert_eq!(
+        summaries
+            .iter()
+            .map(|event| (event.id, event.unlisted))
+            .collect::<Vec<_>>(),
+        vec![(unlisted[49].id, true), (listed.id, false)]
     );
 }
 

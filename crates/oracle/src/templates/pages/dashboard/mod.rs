@@ -12,7 +12,7 @@ use crate::{
 pub struct DashboardData {
     pub pubkey: String,
     pub npub: String,
-    /// Without test events, like the events list they link to.
+    /// Without unlisted events, like the events list they link to.
     pub counts: EventCounts,
     pub weather: Vec<WeatherDisplay>,
 }

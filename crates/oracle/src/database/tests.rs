@@ -473,96 +473,129 @@ async fn one_oracle_process_runs_processing_until_it_hands_over() {
     bounded(green_task).await.unwrap().unwrap();
 }
 
-/// An event with this window, relative to `now`.
+/// An event with this window, relative to `now`, listed or not.
 async fn add_window(
     database: &Database,
     now: OffsetDateTime,
     starts_in: TimeDuration,
     window: TimeDuration,
+    unlisted: bool,
 ) -> Uuid {
     let mut event = create_event_data(2);
     event.start_observation_date = now + starts_in;
     event.end_observation_date = event.start_observation_date + window;
     event.signing_date = event.end_observation_date + TimeDuration::minutes(5);
+    event.unlisted = unlisted;
     bounded(database.add_event(&event)).await.unwrap();
     event.id
 }
 
 #[tokio::test]
-async fn the_events_list_filters_test_events_and_status_before_its_limit() {
+async fn the_events_list_filters_unlisted_events_and_status_before_its_limit() {
     let (_directory, database, writer) = open(8).await;
     let (shutdown, task) = start(writer);
     let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
-    let day = TimeDuration::hours(24);
-    let ten_minutes = TimeDuration::minutes(10);
-    // Oldest first: a signed real event, a running one, then many test runs
-    // that would fill a limit applied after the query.
-    let signed = add_window(&database, now, -TimeDuration::hours(30), day).await;
+    let hours = TimeDuration::hours;
+    // Oldest first: a signed listed event, a running one, then unlisted
+    // events that would fill a limit applied after the query. Window
+    // length plays no part: a short listed event is listed.
+    let signed = add_window(&database, now, -hours(30), hours(24), false).await;
     assert!(
         bounded(database.record_attestation(signed, MaybeScalar::from_slice(&[7; 32]).unwrap()))
             .await
             .unwrap()
     );
-    let running = add_window(&database, now, -TimeDuration::hours(1), day).await;
-    let mut tests = vec![];
+    let running = add_window(&database, now, -TimeDuration::minutes(5), hours(24), false).await;
+    let mut unlisted = vec![];
     for _ in 0..5 {
-        tests.push(add_window(&database, now, -TimeDuration::hours(2), ten_minutes).await);
+        unlisted.push(add_window(&database, now, -hours(30), hours(24), true).await);
     }
-    let live_test = add_window(&database, now, TimeDuration::hours(1), ten_minutes).await;
+    let live_unlisted = add_window(&database, now, hours(1), hours(24), true).await;
+    let short = add_window(&database, now, hours(1), TimeDuration::minutes(10), false).await;
 
-    let page = |status, include_tests, before, limit| EventListQuery {
+    let page = |status, include_unlisted, before, limit| EventListQuery {
         status,
-        include_tests,
+        include_unlisted,
         before,
         limit,
     };
     let ids = |records: Vec<EventRecord>| records.into_iter().map(|r| r.id).collect::<Vec<_>>();
 
-    // Without tests, the two real events fit a limit of two.
-    let real = ids(database
-        .event_page(&page(None, false, None, 2), now)
+    // Without unlisted events, the three listed events fit a limit of three.
+    let listed = database
+        .event_page(&page(None, false, None, 3), now)
         .await
-        .unwrap());
-    assert_eq!(real, vec![running, signed]);
+        .unwrap();
+    assert!(listed.iter().all(|event| !event.unlisted));
+    assert_eq!(ids(listed), vec![short, running, signed]);
     let only_running = database
         .event_page(&page(Some(EventStatus::Running), false, None, 10), now)
         .await
         .unwrap();
     assert_eq!(ids(only_running), vec![running]);
-    let completed_tests = database
+    let completed_unlisted = database
         .event_page(&page(Some(EventStatus::Completed), true, None, 10), now)
         .await
         .unwrap();
-    assert_eq!(completed_tests.len(), tests.len());
+    assert_eq!(completed_unlisted.len(), unlisted.len());
+    assert!(completed_unlisted.iter().all(|event| event.unlisted));
 
-    // Paging with tests: newest first, then the page before the last id.
+    // Paging with unlisted events: newest first, then the page before the
+    // last id.
     let first = ids(database
         .event_page(&page(None, true, None, 4), now)
         .await
         .unwrap());
-    assert_eq!(first[0], live_test);
+    assert_eq!(first[..2], [short, live_unlisted]);
     let rest = ids(database
         .event_page(&page(None, true, first.last().copied(), 10), now)
         .await
         .unwrap());
-    assert_eq!(rest.len(), 4);
+    assert_eq!(rest.len(), 5);
     assert_eq!(rest.last(), Some(&signed));
 
-    // Counts match the lists, and say how many tests are hidden.
+    // Counts match the lists, and say how many unlisted events are hidden.
     let counts = database.event_counts(false, now).await.unwrap();
     assert_eq!(
         counts,
         EventCounts {
-            live: 0,
+            live: 1,
             running: 1,
             completed: 0,
             signed: 1,
-            tests: 6,
+            unlisted: 6,
         }
     );
-    let with_tests = database.event_counts(true, now).await.unwrap();
-    assert_eq!((with_tests.live, with_tests.completed), (1, 5));
-    assert_eq!(with_tests.of(None), 8);
+    let with_unlisted = database.event_counts(true, now).await.unwrap();
+    assert_eq!((with_unlisted.live, with_unlisted.completed), (2, 5));
+    assert_eq!(with_unlisted.of(None), 9);
+    assert_eq!(with_unlisted.unlisted, 6);
+    for include_unlisted in [false, true] {
+        let counts = database.event_counts(include_unlisted, now).await.unwrap();
+        for status in [
+            None,
+            Some(EventStatus::Live),
+            Some(EventStatus::Running),
+            Some(EventStatus::Completed),
+            Some(EventStatus::Signed),
+        ] {
+            let listed = database
+                .event_page(&page(status, include_unlisted, None, 100), now)
+                .await
+                .unwrap();
+            assert_eq!(
+                listed.len(),
+                counts.of(status),
+                "{status:?}, unlisted shown: {include_unlisted}"
+            );
+        }
+    }
+
+    // Unlisted events stay reachable by id.
+    let direct = database.get_event(live_unlisted).await.unwrap().unwrap();
+    assert!(direct.unlisted);
+    let by_id = database.list_events(&[live_unlisted], 10).await.unwrap();
+    assert_eq!(ids(by_id), vec![live_unlisted]);
 
     shutdown.cancel();
     bounded(task).await.unwrap().unwrap();

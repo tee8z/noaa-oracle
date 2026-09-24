@@ -41,8 +41,7 @@ use uuid::Uuid;
 
 use crate::{
     events::{
-        Entry, EventCounts, EventListQuery, EventRecord, EventStatus, NewEvent, TEST_WINDOW,
-        ValueOptions,
+        Entry, EventCounts, EventListQuery, EventRecord, EventStatus, NewEvent, ValueOptions,
     },
     scoring::Pick,
     signing::EventNonce,
@@ -365,8 +364,8 @@ impl Database {
         rows.iter().map(event_from_row).collect()
     }
 
-    /// A page of the UI's events list, newest first. Test events and the
-    /// status are filtered here, before the limit.
+    /// A page of the UI's events list, newest first. Unlisted events and
+    /// the status are filtered here, before the limit.
     pub async fn event_page(
         &self,
         query: &EventListQuery,
@@ -375,9 +374,8 @@ impl Database {
         let now = now.unix_timestamp();
         let mut conditions = vec![];
         let mut binds = vec![];
-        if !query.include_tests {
-            conditions.push(NOT_A_TEST);
-            binds.push(TEST_WINDOW.whole_seconds());
+        if !query.include_unlisted {
+            conditions.push(LISTED);
         }
         if let Some(status) = query.status {
             let (condition, now_binds) = status_condition(status);
@@ -409,31 +407,29 @@ impl Database {
         rows.iter().map(event_from_row).collect()
     }
 
-    /// Events by status, with or without test events, and the number of test
-    /// events either way.
+    /// Events by status, with or without unlisted events, and the number of
+    /// unlisted events either way.
     pub async fn event_counts(
         &self,
-        include_tests: bool,
+        include_unlisted: bool,
         now: OffsetDateTime,
     ) -> Result<EventCounts, sqlx::Error> {
         let now = now.unix_timestamp();
         let row = sqlx::query(
             "WITH e AS (
                  SELECT attestation, start_observation_date AS start_,
-                        end_observation_date AS end_, (? OR NOT test) AS counted, test
-                 FROM (SELECT *, end_observation_date - start_observation_date < ? AS test
-                       FROM events))
+                        end_observation_date AS end_, (? OR unlisted = 0) AS counted, unlisted
+                 FROM events)
              SELECT
                  COALESCE(SUM(counted AND attestation IS NULL AND ? < start_), 0) AS live,
                  COALESCE(SUM(counted AND attestation IS NULL AND start_ <= ? AND ? < end_), 0)
                      AS running,
                  COALESCE(SUM(counted AND attestation IS NULL AND end_ <= ?), 0) AS completed,
                  COALESCE(SUM(counted AND attestation IS NOT NULL), 0) AS signed,
-                 COALESCE(SUM(test), 0) AS tests
+                 COALESCE(SUM(unlisted), 0) AS unlisted
              FROM e",
         )
-        .bind(include_tests)
-        .bind(TEST_WINDOW.whole_seconds())
+        .bind(include_unlisted)
         .bind(now)
         .bind(now)
         .bind(now)
@@ -445,7 +441,7 @@ impl Database {
             running: count_column(&row, "running")?,
             completed: count_column(&row, "completed")?,
             signed: count_column(&row, "signed")?,
-            tests: count_column(&row, "tests")?,
+            unlisted: count_column(&row, "unlisted")?,
         })
     }
 
@@ -767,8 +763,8 @@ const EVENT_SELECT: &str = "SELECT e.id, e.source, e.signing_date, e.start_obser
      FROM events e
      LEFT JOIN events_entries ee ON ee.event_id = e.id";
 
-/// Events whose window is at least [`TEST_WINDOW`] long (bind its seconds).
-const NOT_A_TEST: &str = "e.end_observation_date - e.start_observation_date >= ?";
+/// Events on the public list: not created unlisted.
+const LISTED: &str = "e.unlisted = 0";
 
 /// The SQL form of [`EventRecord::status`], and how many times it binds the
 /// current time.

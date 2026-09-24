@@ -172,8 +172,8 @@ impl Oracle {
     }
 
     /// Events by status, counted like [`Self::event_page`] lists them.
-    pub async fn event_counts(&self, include_tests: bool) -> Result<EventCounts, Error> {
-        Ok(self.db.event_counts(include_tests, self.now()).await?)
+    pub async fn event_counts(&self, include_unlisted: bool) -> Result<EventCounts, Error> {
+        Ok(self.db.event_counts(include_unlisted, self.now()).await?)
     }
 
     pub async fn get_event(&self, id: Uuid) -> Result<Event, Error> {

@@ -1,12 +1,12 @@
-//! The events list: status filters and a test-event toggle above one page
-//! of rows. Rows open the event; the list refreshes itself.
+//! The events list: status filters and an unlisted-event toggle above one
+//! page of rows. Rows open the event; the list refreshes itself.
 
 use maud::{Markup, html};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    events::{EventCounts, EventStatus, is_test_window},
+    events::{EventCounts, EventStatus},
     templates::components::time as when,
 };
 
@@ -24,28 +24,23 @@ pub struct EventView {
     pub total_entries: i64,
     pub total_allowed_entries: i64,
     pub number_of_places_win: i64,
+    pub unlisted: bool,
 }
 
-impl EventView {
-    pub fn is_test(&self) -> bool {
-        is_test_window(self.start_observation, self.end_observation)
-    }
-}
-
-/// Which events to show. Test events are hidden unless asked for.
+/// Which events to show. Unlisted events are left out unless asked for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EventFilters {
     pub status: Option<EventStatus>,
-    pub show_tests: bool,
+    pub show_unlisted: bool,
     /// The page after this event; `None` is the newest page.
     pub before: Option<Uuid>,
 }
 
 impl EventFilters {
-    pub fn parse(status: Option<&str>, tests: Option<&str>, before: Option<&str>) -> Self {
+    pub fn parse(status: Option<&str>, unlisted: Option<&str>, before: Option<&str>) -> Self {
         Self {
             status: status.and_then(parse_status),
-            show_tests: tests == Some("show"),
+            show_unlisted: unlisted == Some("show"),
             before: before.and_then(|id| Uuid::parse_str(id).ok()),
         }
     }
@@ -56,8 +51,8 @@ impl EventFilters {
         if let Some(status) = self.status {
             parameters.push(format!("status={}", status_param(status)));
         }
-        if self.show_tests {
-            parameters.push("tests=show".into());
+        if self.show_unlisted {
+            parameters.push("unlisted=show".into());
         }
         if let Some(before) = self.before {
             parameters.push(format!("before={before}"));
@@ -144,15 +139,12 @@ pub fn events_section(page: &EventsPage) -> Markup {
                         }
                     }
                 }
-                label class="checkbox test-toggle" {
-                    input type="checkbox" name="tests" value="show" checked[filters.show_tests];
-                    " Show test events"
-                    span class="muted" {
-                        " (windows under an hour"
-                        @if !filters.show_tests && page.counts.tests > 0 {
-                            ", " (page.counts.tests) " hidden"
-                        }
-                        ")"
+                label class="checkbox unlisted-toggle" {
+                    input type="checkbox" name="unlisted" value="show"
+                        checked[filters.show_unlisted];
+                    " Show unlisted"
+                    @if !filters.show_unlisted && page.counts.unlisted > 0 {
+                        span class="muted" { " (" (page.counts.unlisted) " hidden)" }
                     }
                 }
                 noscript { button type="submit" class="button is-small" { "Apply" } }
@@ -170,7 +162,7 @@ pub fn events_list(page: &EventsPage) -> Markup {
             hx-get=(filters.url()) hx-trigger="every 30s" hx-swap="outerHTML" {
             @if page.events.is_empty() {
                 div class="ev-empty" {
-                    @if page.counts.of(None) + page.counts.tests == 0 {
+                    @if page.counts.of(None) + page.counts.unlisted == 0 {
                         p class="is-size-5" { "No events found" }
                         p class="is-size-7" { "Events will appear here when created by coordinators." }
                     } @else {
@@ -229,7 +221,7 @@ fn event_row(event: &EventView, now: OffsetDateTime) -> Markup {
             span class="ev-status" {
                 span class="is-sr-only" { "Status " }
                 (status_tag(event.status))
-                @if event.is_test() { " " span class="tag is-light" { "Test" } }
+                @if event.unlisted { " " span class="tag is-light" { "Unlisted" } }
             }
             span class="ev-window" {
                 span class="cell-label" { "Window: " }
@@ -256,18 +248,19 @@ mod tests {
     use super::*;
     use time::{Duration, macros::datetime};
 
-    fn event(id: &str, status: EventStatus, minutes: i64) -> EventView {
+    fn event(id: &str, status: EventStatus, unlisted: bool) -> EventView {
         let start = datetime!(2026-09-24 11:44 UTC);
         EventView {
             id: id.into(),
             locations: vec!["KDEN".into()],
             status,
             start_observation: start,
-            end_observation: start + Duration::minutes(minutes),
-            signing_date: start + Duration::minutes(minutes + 5),
+            end_observation: start + Duration::hours(18),
+            signing_date: start + Duration::hours(19),
             total_entries: 3,
             total_allowed_entries: 3,
             number_of_places_win: 1,
+            unlisted,
         }
     }
 
@@ -276,7 +269,7 @@ mod tests {
             events,
             counts: EventCounts {
                 running: 1,
-                tests: 1,
+                unlisted: 1,
                 ..EventCounts::default()
             },
             filters,
@@ -286,23 +279,25 @@ mod tests {
     }
 
     #[test]
-    fn the_toggle_says_how_many_test_events_are_hidden() {
-        let events = [event("bbbbbbbb-real", EventStatus::Running, 18 * 60)];
+    fn the_toggle_says_how_many_unlisted_events_are_hidden() {
+        let events = [event("bbbbbbbb-listed", EventStatus::Running, false)];
         let html = events_section(&page(&events, EventFilters::default())).into_string();
         assert!(html.contains("bbbbbbbb"));
-        assert!(html.contains("1 hidden"));
+        assert!(html.contains("Show unlisted"));
+        assert!(html.contains("(1 hidden)"));
+        assert!(!html.contains(">Unlisted<"));
         let shown = EventFilters::parse(None, Some("show"), None);
         let html = events_section(&page(&events, shown)).into_string();
-        assert!(!html.contains("1 hidden"));
+        assert!(!html.contains("hidden"));
     }
 
     #[test]
-    fn test_events_are_tagged_when_shown() {
-        let events = [event("aaaaaaaa-test", EventStatus::Signed, 10)];
+    fn unlisted_events_are_tagged_when_shown() {
+        let events = [event("aaaaaaaa-unlisted", EventStatus::Signed, true)];
         let shown = EventFilters::parse(None, Some("show"), None);
         let html = events_list(&page(&events, shown)).into_string();
         assert!(html.contains("aaaaaaaa"));
-        assert!(html.contains(">Test<"));
+        assert!(html.contains(">Unlisted<"));
     }
 
     #[test]
@@ -311,7 +306,7 @@ mod tests {
         let filters = EventFilters::parse(Some("running"), Some("show"), Some(&before.to_string()));
         assert_eq!(
             filters.url(),
-            format!("/events?status=running&tests=show&before={before}")
+            format!("/events?status=running&unlisted=show&before={before}")
         );
         assert_eq!(
             EventFilters::parse(Some("bogus"), Some("no"), Some("nope")),
@@ -321,7 +316,7 @@ mod tests {
 
     #[test]
     fn pages_link_to_older_and_back_to_the_newest() {
-        let events = [event("bbbbbbbb", EventStatus::Running, 120)];
+        let events = [event("bbbbbbbb", EventStatus::Running, false)];
         let older = Uuid::from_u128(9);
         let first = EventsPage {
             older: Some(older),

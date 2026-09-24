@@ -164,9 +164,12 @@ test.describe("Events Page", () => {
     await page.goto("/events");
     await expect(page.locator(".site-header")).toHaveCount(1);
     await expect(page.locator(".status-filter")).toBeVisible();
-    await expect(page.getByText("Show test events")).toBeVisible();
+    await expect(page.getByText("Show unlisted")).toBeVisible();
     await page.locator(".status-chip", { hasText: "Signed" }).click();
     await expect(page).toHaveURL(/status=signed/);
+    await page.getByLabel("Show unlisted").check();
+    await expect(page).toHaveURL(/status=signed&unlisted=show/);
+    await expect(page.getByLabel("Show unlisted")).toBeChecked();
     expect(errors()).toHaveLength(0);
   });
 });

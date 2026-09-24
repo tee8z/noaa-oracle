@@ -114,7 +114,7 @@ async fn build_dashboard_data(
     let pubkey = state.oracle.public_key_base64();
     let npub = state.oracle.npub();
 
-    // The cards link to the events list, which hides test events.
+    // The cards link to the events list, which leaves out unlisted events.
     let (counts, (weather, default_airports)) = tokio::join!(
         state.oracle.event_counts(false),
         get_latest_weather(state, station_ids, start, end)

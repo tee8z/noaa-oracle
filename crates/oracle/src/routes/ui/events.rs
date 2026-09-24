@@ -24,8 +24,8 @@ use crate::{
 pub struct EventsQuery {
     /// `live`, `running`, `completed` or `signed`; empty for all.
     pub status: Option<String>,
-    /// `show` to include test events.
-    pub tests: Option<String>,
+    /// `show` to include unlisted events.
+    pub unlisted: Option<String>,
     /// Event id: show the page of events created before it.
     pub before: Option<String>,
 }
@@ -40,19 +40,19 @@ pub async fn events_handler(
 ) -> Response {
     let filters = EventFilters::parse(
         query.status.as_deref(),
-        query.tests.as_deref(),
+        query.unlisted.as_deref(),
         query.before.as_deref(),
     );
     let list = EventListQuery {
         status: filters.status,
-        include_tests: filters.show_tests,
+        include_unlisted: filters.show_unlisted,
         before: filters.before,
         // One more than a page says whether an older page exists.
         limit: PAGE_SIZE + 1,
     };
     let (events, counts) = tokio::join!(
         state.oracle.event_page(&list),
-        state.oracle.event_counts(filters.show_tests)
+        state.oracle.event_counts(filters.show_unlisted)
     );
     let mut events = events.unwrap_or_else(|error| {
         log::error!("events page: {error:#}");
@@ -96,5 +96,6 @@ fn view(event: EventSummary) -> EventView {
         total_entries: event.total_entries,
         total_allowed_entries: event.total_allowed_entries,
         number_of_places_win: event.number_of_places_win,
+        unlisted: event.unlisted,
     }
 }

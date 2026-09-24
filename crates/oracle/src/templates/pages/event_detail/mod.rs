@@ -129,6 +129,11 @@ pub fn event_detail_content(event: &Event, now: OffsetDateTime) -> Markup {
             }
             h2 class="title is-4 mb-0" { "Event " code { (truncate_id(&event.id.to_string())) } }
             (status_tag(event.status))
+            @if event.unlisted {
+                span class="tag is-light" title="Not on the events list; reachable by its link" {
+                    "Unlisted"
+                }
+            }
         }
 
         div class="event-grid" {
