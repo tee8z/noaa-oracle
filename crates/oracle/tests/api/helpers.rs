@@ -79,7 +79,10 @@ impl Drop for WriterGuard {
 static INIT_LOGGER: Once = Once::new();
 fn init_logger() {
     INIT_LOGGER.call_once(|| {
-        let _ = setup_logger().level(LevelFilter::Debug).apply();
+        let (logger, guard) = setup_logger();
+        let _ = logger.level(LevelFilter::Debug).apply();
+        // Tests share one logger for the whole run.
+        std::mem::forget(guard);
     });
 }
 

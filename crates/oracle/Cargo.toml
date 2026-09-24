@@ -59,6 +59,7 @@ zeroize = "1.8"
 # Logging
 log = { workspace = true, features = ["serde"] }
 fern.workspace = true
+tracing-appender = "0.2"
 
 # Time
 time.workspace = true
