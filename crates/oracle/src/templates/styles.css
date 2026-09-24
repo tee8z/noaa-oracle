@@ -831,6 +831,7 @@ textarea.schema-content:focus {
     min-width: 0;
     max-height: calc(100vh - 2rem);
     overflow-y: auto;
+    overscroll-behavior: contain;
 }
 
 .popup-header {
@@ -988,10 +989,28 @@ textarea.schema-content:focus {
     color: var(--bulma-text-weak);
 }
 
-.popup-loading {
-    text-align: center;
-    padding: 0.5rem;
+.popup-loading,
+.popup-error {
+    padding: 0.35rem 0;
+    margin-bottom: 0.5rem;
+    font-size: 0.8125rem;
     color: var(--bulma-text-weak);
+}
+
+.popup-loading .loader {
+    display: inline-block;
+    vertical-align: middle;
+    margin-right: 0.35rem;
+}
+
+.popup-error {
+    color: var(--bulma-danger-text, #c0392b);
+}
+
+.popup-error .popup-retry {
+    height: auto;
+    padding: 0 0.25rem;
+    font-size: 0.8125rem;
 }
 
 /* ================================
@@ -1074,6 +1093,21 @@ textarea.schema-content:focus {
     .station-popup {
         padding: 0.625rem;
         font-size: 0.75rem;
+    }
+
+    /* The map is too short on phones to hold the popup: use a bottom sheet. */
+    .station-popup.is-sheet {
+        position: fixed;
+        top: auto;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        width: 100%;
+        max-height: 70vh;
+        z-index: 50;
+        padding: 0.875rem 0.875rem calc(0.875rem + env(safe-area-inset-bottom));
+        border-radius: 12px 12px 0 0;
+        box-shadow: 0 -6px 20px rgba(0, 0, 0, 0.25);
     }
 
     .popup-details {

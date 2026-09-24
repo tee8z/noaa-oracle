@@ -2,6 +2,7 @@
 
 // Current station for popup
 let currentPopupStation = null;
+let currentPopupMarker = null;
 
 // Switch between map and table views
 window.switchWeatherView = function (view) {
@@ -46,6 +47,7 @@ window.showStationPopup = function (marker) {
 
   // Store current station for forecast link
   currentPopupStation = stationId;
+  currentPopupMarker = marker;
 
   // Populate popup header
   popup.querySelector(".popup-station-id").textContent = stationId;
@@ -60,50 +62,82 @@ window.showStationPopup = function (marker) {
   const nameText = [stationName, state].filter(Boolean).join(", ");
   popup.querySelector(".popup-name").textContent = nameText;
 
+  popup.style.display = "block";
+  loadStationPopup(stationId, marker, popup);
+};
+
+function loadStationPopup(stationId, marker, popup) {
   // Clear the previous station while the comparison loads.
   const forecastGrid = popup.querySelector(".popup-forecast-grid");
-  const loadingEl = popup.querySelector(".popup-loading");
   if (forecastGrid) {
     forecastGrid.querySelectorAll("[data-field]").forEach((el) => {
       el.textContent = "—";
     });
   }
-  if (loadingEl) loadingEl.style.display = "block";
-  popup.style.display = "block";
-
+  setPopupError(popup, null);
   positionStationPopup(marker, popup);
 
   // Reposition after rendering because comparison labels can wrap on phones.
   fetchStationForecast(stationId, popup).then(() => {
     if (currentPopupStation === stationId) positionStationPopup(marker, popup);
   });
-};
+}
 
+function setPopupError(popup, message) {
+  const errorEl = popup.querySelector(".popup-error");
+  if (!errorEl) return;
+  const text = errorEl.querySelector(".popup-error-text");
+  if (text) text.textContent = message || "";
+  errorEl.style.display = message ? "block" : "none";
+}
+
+// Phones show the popup as a sheet at the bottom of the screen; wider
+// screens place it next to the marker, always inside the map.
 function positionStationPopup(marker, popup) {
-  const mapRect = document.querySelector(".map-wrapper").getBoundingClientRect();
+  const narrow = typeof window.matchMedia === "function" &&
+    window.matchMedia("(max-width: 768px)").matches;
+  popup.classList?.toggle("is-sheet", narrow);
+  if (narrow) {
+    popup.style.transform = "";
+    popup.style.left = "";
+    popup.style.top = "";
+    popup.style.maxHeight = "";
+    return;
+  }
+
+  const map = document.querySelector(".map-wrapper").getBoundingClientRect();
   const markerRect = marker.getBoundingClientRect();
+  const margin = 8;
+  popup.style.maxHeight = `${Math.max(map.height - 2 * margin, 160)}px`;
   const { width, height } = popup.getBoundingClientRect();
-  const viewport = document.documentElement;
-  const margin = 10;
 
-  // The popup can extend beyond a narrow map, but stays within the viewport.
-  const center = markerRect.left + markerRect.width / 2;
+  const center = markerRect.left + markerRect.width / 2 - map.left;
   const left = Math.max(
-    margin + width / 2,
-    Math.min(center, viewport.clientWidth - width / 2 - margin),
-  );
-  const above = markerRect.top - height - margin;
-  const preferredTop = above >= margin
-    ? above
-    : markerRect.top + markerRect.height + margin;
-  const top = Math.max(
     margin,
-    Math.min(preferredTop, viewport.clientHeight - height - margin),
+    Math.min(center - width / 2, map.width - width - margin),
   );
+  const markerTop = markerRect.top - map.top;
+  const markerBottom = markerTop + markerRect.height;
+  let top = markerTop - height - margin;
+  if (top < margin) top = markerBottom + margin;
+  if (top + height > map.height - margin) {
+    top = Math.max(margin, map.height - height - margin);
+  }
 
-  popup.style.transform = "translateX(-50%)";
-  popup.style.left = `${left - mapRect.left}px`;
-  popup.style.top = `${top - mapRect.top}px`;
+  popup.style.transform = "none";
+  popup.style.left = `${left}px`;
+  popup.style.top = `${top}px`;
+}
+
+// Recently loaded stations reopen without waiting on the network.
+const POPUP_CACHE_MS = 5 * 60 * 1000;
+const POPUP_TIMEOUT_MS = 20 * 1000;
+const popupCache = new Map();
+
+async function fetchPopupJson(url, signal) {
+  const response = await fetch(url, signal ? { signal } : undefined);
+  if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+  return response.json();
 }
 
 // Fetch forecast data for popup
@@ -112,6 +146,7 @@ async function fetchStationForecast(stationId, popup) {
 
   if (loadingEl) loadingEl.style.display = "block";
 
+  let timer = null;
   try {
     // The APIs aggregate UTC calendar days. Include all of yesterday, even
     // when the popup is opened late in the day or across a local DST change.
@@ -136,17 +171,28 @@ async function fetchStationForecast(stationId, popup) {
     const startDate = formatDateParam(yesterday);
     const endDate = formatDateParam(dayAfterTomorrow);
 
-    const [forecastRes, obsRes] = await Promise.all([
-      fetch(
-        `/stations/forecasts?station_ids=${stationId}&start=${encodeURIComponent(startDate)}&end=${encodeURIComponent(endDate)}`,
-      ),
-      fetch(
-        `/stations/daily-observations?station_ids=${stationId}&start=${encodeURIComponent(startDate)}&end=${encodeURIComponent(endDate)}`,
-      ),
-    ]);
-
-    const forecasts = forecastRes.ok ? await forecastRes.json() : [];
-    const observations = obsRes.ok ? await obsRes.json() : [];
+    const cacheKey = `${stationId}|${startDate}`;
+    const cached = popupCache.get(cacheKey);
+    let forecasts;
+    let observations;
+    if (cached && Date.now() - cached.at < POPUP_CACHE_MS) {
+      ({ forecasts, observations } = cached);
+    } else {
+      // A request that never answers must not leave the popup loading forever.
+      const controller = typeof AbortController === "function"
+        ? new AbortController()
+        : null;
+      if (controller && typeof setTimeout === "function") {
+        timer = setTimeout(() => controller.abort(), POPUP_TIMEOUT_MS);
+      }
+      const station = encodeURIComponent(stationId);
+      const range = `start=${encodeURIComponent(startDate)}&end=${encodeURIComponent(endDate)}`;
+      [forecasts, observations] = await Promise.all([
+        fetchPopupJson(`/stations/forecasts?station_ids=${station}&${range}`, controller?.signal),
+        fetchPopupJson(`/stations/daily-observations?station_ids=${station}&${range}`, controller?.signal),
+      ]);
+      popupCache.set(cacheKey, { at: Date.now(), forecasts, observations });
+    }
     if (currentPopupStation !== stationId) return;
 
     // API dates can include a midnight timestamp. Match calendar dates without
@@ -242,12 +288,15 @@ async function fetchStationForecast(stationId, popup) {
     populateDay("tomorrow", null, tomorrowForecast);
   } catch (err) {
     if (currentPopupStation !== stationId) return;
-    console.error("Error fetching forecast:", err);
-    // Show error state
-    popup.querySelectorAll("[data-field]").forEach((el) => {
-      el.textContent = "?";
-    });
+    console.warn("Error fetching station data:", err);
+    setPopupError(
+      popup,
+      err && err.name === "AbortError"
+        ? "The station data took too long to load."
+        : "The station data could not be loaded.",
+    );
   } finally {
+    if (timer !== null) clearTimeout(timer);
     if (loadingEl && currentPopupStation === stationId) {
       loadingEl.style.display = "none";
     }
@@ -261,6 +310,7 @@ window.hideStationPopup = function () {
     popup.style.display = "none";
   }
   currentPopupStation = null;
+  currentPopupMarker = null;
 };
 
 // Load forecast from popup
@@ -295,6 +345,11 @@ window.loadForecastFromPopup = function () {
 document.addEventListener("click", function (e) {
   const popup = document.getElementById("station-popup");
   if (!popup) return;
+
+  if (e.target.closest?.(".popup-retry") && currentPopupStation) {
+    loadStationPopup(currentPopupStation, currentPopupMarker, popup);
+    return;
+  }
 
   // Check if click is on a marker or inside popup
   if (e.target.classList.contains("station-marker")) return;

@@ -131,6 +131,17 @@ pub fn weather_map(weather_data: &[WeatherDisplay]) -> Markup {
                     }
                     div class="popup-name" {}
 
+                    // Load state sits above the grid so it is seen without scrolling.
+                    div class="popup-loading" role="status" style="display: none;" {
+                        span class="loader" {}
+                        " Loading station data…"
+                    }
+                    div class="popup-error" role="alert" style="display: none;" {
+                        span class="popup-error-text" {}
+                        " "
+                        button type="button" class="button is-small is-text popup-retry" { "Try again" }
+                    }
+
                     // 3-day compact forecast grid
                     div class="popup-forecast-grid" {
                         // Header row
@@ -292,12 +303,6 @@ pub fn weather_map(weather_data: &[WeatherDisplay]) -> Markup {
                     }
 
                     p class="popup-data-note" { "Days use UTC · — = unavailable" }
-
-                    // Loading indicator
-                    div class="popup-loading" style="display: none;" {
-                        span class="icon is-small" { i class="fas fa-spinner fa-spin" {} }
-                        " Loading..."
-                    }
                 }
             }
         }

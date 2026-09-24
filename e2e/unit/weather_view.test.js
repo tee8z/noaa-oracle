@@ -21,7 +21,7 @@ class FixedDate extends Date {
   }
 }
 
-async function openStationPopup(script, forecasts, observations) {
+async function openStationPopup(script, forecasts, observations, status = 200) {
   const fields = new Map();
   for (const day of ["yesterday", "today", "tomorrow"]) {
     for (const metric of ["temp", "wind", "chance", "rain", "snow", "humidity"]) {
@@ -32,8 +32,14 @@ async function openStationPopup(script, forecasts, observations) {
     }
   }
   const loading = { style: { display: "none" } };
+  const errorText = { textContent: "" };
+  const error = {
+    style: { display: "none" },
+    querySelector: (selector) => (selector === ".popup-error-text" ? errorText : null),
+  };
   const elements = new Map([
     [".popup-loading", loading],
+    [".popup-error", error],
     [".popup-station-id", { textContent: "" }],
     [".popup-iata", { textContent: "", style: {} }],
     [".popup-name", { textContent: "" }],
@@ -80,7 +86,7 @@ async function openStationPopup(script, forecasts, observations) {
       const data = endpoint.pathname === "/stations/forecasts" ? forecasts
         : endpoint.pathname === "/stations/daily-observations" ? observations
         : assert.fail(`Unexpected popup request: ${endpoint.pathname}`);
-      return { ok: true, json: async () => data };
+      return { ok: status === 200, status, json: async () => data };
     },
   });
   vm.runInContext(fs.readFileSync(script, "utf8"), context, { filename: script });
@@ -92,7 +98,9 @@ async function openStationPopup(script, forecasts, observations) {
   assert.equal(elements.get(".popup-station-id").textContent, "KJFK");
   assert.equal(requests.length, 2);
   assert.deepEqual(errors, []);
-  return (field) => fields.get(field)?.textContent;
+  const field = (name) => fields.get(name)?.textContent;
+  field.error = () => (error.style.display === "block" ? errorText.textContent : null);
+  return field;
 }
 
 function weatherRequests(script, refreshPath, location) {
@@ -303,5 +311,12 @@ for (const script of targets) {
       assert.equal(field(`${day}-temp-obs`), day === "tomorrow" ? undefined : "—");
       assert.equal(field(`${day}-temp-fcst`), "—");
     }
+    assert.equal(field.error(), null);
+  });
+
+  test(`${path.basename(script)}: failed API requests stop loading and say so`, async () => {
+    const field = await openStationPopup(script, [], [], 503);
+    assert.equal(field.error(), "The station data could not be loaded.");
+    assert.equal(field("today-temp-obs"), "—");
   });
 }
