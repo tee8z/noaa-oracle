@@ -11,7 +11,6 @@
     --delta-off: #8a5a00;
     --delta-far: #b91c1c;
     --pin-ring: #ffffff;
-    --pin-middle: #d9d7d0;
     --key: #6b21a8;
 }
 
@@ -24,8 +23,8 @@
     --delta-close: #4ade80;
     --delta-off: #facc15;
     --delta-far: #f87171;
-    --pin-ring: #1a1a19;
-    --pin-middle: #8f8d86;
+    /* A light ring keeps dark pins visible on the dark map. */
+    --pin-ring: #e7e5e4;
     --key: #d8b4fe;
 }
 

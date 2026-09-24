@@ -250,11 +250,13 @@
     stroke: var(--bulma-text-strong);
 }
 
-/* Diverging bands; no report is an open ring, not a colour. */
+/* Diverging bands; no report is an open ring, not a colour. Every fill
+   is at least 3:1 against the light map (#f1f1f1): 7.1, 4.0, 3.6, 3.7 and
+   6.4. On the dark map the light ring gives each pin 14:1. */
 .t-cold { --pin: #1d4f99; }
-.t-cool { --pin: #4f93dd; }
-.t-mild { --pin: var(--pin-middle); }
-.t-warm { --pin: #e5704f; }
+.t-cool { --pin: #3a78c2; }
+.t-mild { --pin: #827d70; }
+.t-warm { --pin: #cc5a2e; }
 .t-hot { --pin: #a8231c; }
 .t-none { --pin: transparent; }
 
