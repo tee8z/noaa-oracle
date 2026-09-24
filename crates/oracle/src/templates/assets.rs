@@ -53,7 +53,10 @@ pub async fn serve_asset(Path(file): Path<String>, headers: HeaderMap) -> Respon
         header::CONTENT_TYPE,
         HeaderValue::from_static(asset.content_type),
     );
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(CACHE_POLICY));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(CACHE_POLICY),
+    );
     headers.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,

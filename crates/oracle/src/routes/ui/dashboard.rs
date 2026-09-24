@@ -88,8 +88,9 @@ pub async fn dashboard_handler(
             .map(str::to_string)
             .collect::<Vec<_>>()
     });
+    let days = super::local_day::reader_offset(&headers);
     let (data, selection_path) =
-        build_dashboard_data(&state, station_ids.as_deref(), start, end).await;
+        build_dashboard_data(&state, station_ids.as_deref(), start, end, days).await;
     let stations = state.stations().await.unwrap_or_default();
     let view = chosen_view(query.view.as_deref(), &headers);
     let context = WeatherContext {
@@ -117,6 +118,7 @@ async fn build_dashboard_data(
     station_ids: Option<&[String]>,
     start: Option<OffsetDateTime>,
     end: Option<OffsetDateTime>,
+    days: time::UtcOffset,
 ) -> (DashboardData, String) {
     // Get oracle identity
     let pubkey = state.oracle.public_key_base64();
@@ -140,7 +142,8 @@ async fn build_dashboard_data(
         }
     }
 
-    let (weather, default_airports) = get_latest_weather(state, station_ids, start, end).await;
+    let (weather, default_airports) =
+        get_latest_weather(state, station_ids, start, end, days).await;
     // The default airports refresh without naming them, which keeps the
     // address bar short; any other selection names its stations.
     let displayed_ids: Vec<String> = if default_airports {
@@ -270,9 +273,10 @@ async fn get_latest_weather(
     station_ids: Option<&[String]>,
     start: Option<OffsetDateTime>,
     end: Option<OffsetDateTime>,
+    days: time::UtcOffset,
 ) -> (Vec<WeatherDisplay>, bool) {
     if let Some(station_ids) = station_ids {
-        let weather_data = super::weather::load_weather(state, station_ids, start, end).await;
+        let weather_data = super::weather::load_weather(state, station_ids, start, end, days).await;
         return (weather_data, false);
     }
     // Query only the default airports: a forecast query over every station
@@ -281,12 +285,12 @@ async fn get_latest_weather(
         .iter()
         .map(|station| station.to_string())
         .collect();
-    let weather_data = super::weather::load_weather(state, &airports, start, end).await;
+    let weather_data = super::weather::load_weather(state, &airports, start, end, days).await;
     if !weather_data.is_empty() {
         return (weather_data, true);
     }
     // Data without any default airport: show the first stations reporting.
-    let mut weather_data = super::weather::load_weather(state, &[], start, end).await;
+    let mut weather_data = super::weather::load_weather(state, &[], start, end, days).await;
     weather_data.sort_by(|a, b| a.station_id.cmp(&b.station_id));
     weather_data.truncate(20);
     (weather_data, false)

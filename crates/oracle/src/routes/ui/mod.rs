@@ -3,6 +3,7 @@ mod event_detail;
 mod events;
 mod fragments;
 mod htmx;
+mod local_day;
 pub mod policy;
 mod raw_data;
 mod weather;

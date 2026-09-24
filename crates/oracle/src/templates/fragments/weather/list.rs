@@ -42,7 +42,15 @@ fn matches(query: &str, id: &str, iata: &str, name: &str, state: &str) -> bool {
 pub fn weather_list(weather: &[WeatherDisplay], context: &WeatherContext) -> Markup {
     let shown: Vec<_> = weather
         .iter()
-        .filter(|w| matches(context.query, &w.station_id, &w.iata_id, &w.station_name, &w.state))
+        .filter(|w| {
+            matches(
+                context.query,
+                &w.station_id,
+                &w.iata_id,
+                &w.station_name,
+                &w.state,
+            )
+        })
         .collect();
     let others: Vec<_> = if context.query.trim().len() < 2 {
         vec![]
@@ -51,7 +59,15 @@ pub fn weather_list(weather: &[WeatherDisplay], context: &WeatherContext) -> Mar
             .stations
             .iter()
             .filter(|station| !weather.iter().any(|w| w.station_id == station.station_id))
-            .filter(|s| matches(context.query, &s.station_id, &s.iata_id, &s.station_name, &s.state))
+            .filter(|s| {
+                matches(
+                    context.query,
+                    &s.station_id,
+                    &s.iata_id,
+                    &s.station_name,
+                    &s.state,
+                )
+            })
             .take(OTHER_MATCHES)
             .collect()
     };
@@ -125,7 +141,10 @@ fn station_row(weather: &WeatherDisplay, context: &WeatherContext) -> Markup {
     let settled = weather.observation_period.settled(context.now);
     let forecast_high = weather.forecast_high.map(|t| t as f64);
     let forecast_low = weather.forecast_low.map(|t| t as f64);
-    let observed = match (when::parse(&weather.observed_start), when::parse(&weather.observed_end)) {
+    let observed = match (
+        when::parse(&weather.observed_start),
+        when::parse(&weather.observed_end),
+    ) {
         (Some(start), Some(end)) => format!("Observed {}", when::window_text(start, end)),
         _ => "No observations in this period".into(),
     };

@@ -127,7 +127,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         fs::write(output.join(&file), &asset.bytes)?;
         fs::write(output.join(format!("{file}.gz")), gzip(&asset.bytes)?)?;
         let digest = hex::encode(Sha256::digest(&asset.bytes));
-        let url = format!("/assets/{}.{}.{}", asset.stem, &digest[..16], asset.extension);
+        let url = format!(
+            "/assets/{}.{}.{}",
+            asset.stem,
+            &digest[..16],
+            asset.extension
+        );
         writeln!(
             generated,
             "pub const {constant}: Asset = Asset {{ url: {url:?}, content_type: {content_type:?}, \

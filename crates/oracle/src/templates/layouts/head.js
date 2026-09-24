@@ -12,3 +12,6 @@
   }
   document.documentElement.setAttribute("data-theme", theme);
 })();
+
+// Calendar days follow the reader's offset; scripts disabled fall back to UTC.
+document.cookie = "utc_offset=" + (-new Date().getTimezoneOffset()) + ";path=/;SameSite=Lax;max-age=86400";

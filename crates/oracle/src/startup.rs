@@ -43,7 +43,10 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -66,6 +69,9 @@ const FORECAST_CACHE_REFRESH: Duration = Duration::from_secs(30 * 60);
 /// Forecast fragments kept in memory. Only known stations are cached, so
 /// this bounds memory even if the station list grows unexpectedly.
 const MAX_CACHED_FORECASTS: usize = 4_096;
+/// How often derived forecast files are checked for, besides after each
+/// upload: catches files added by another oracle process.
+const PREPARE_FILES_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 type TaskResult = Result<Result<()>, JoinError>;
 
@@ -105,12 +111,24 @@ pub struct AppState {
     pub oracle: Arc<Oracle>,
     pub database: Database,
     forecast_cache: Mutex<HashMap<String, String>>,
-    /// Station list and when it was read; it only changes with new uploads.
-    stations: tokio::sync::Mutex<Option<(std::time::Instant, Arc<Vec<Station>>)>>,
+    stations: Arc<StationList>,
     background: Background,
     etl_slot: Arc<Semaphore>,
     /// This process, as a lease holder. Unique per start.
     instance: String,
+    /// Wakes the task that prepares new data files for queries.
+    files_added: tokio::sync::Notify,
+}
+
+/// The station list and when it was read. It only changes when new files
+/// add a station, and reading it scans a month of observation files, so
+/// pages get the list last read while a refresh runs in the background.
+#[derive(Default)]
+struct StationList {
+    current: tokio::sync::Mutex<Option<(std::time::Instant, Arc<Vec<Station>>)>>,
+    /// New files arrived since the list was read.
+    stale: AtomicBool,
+    refreshing: AtomicBool,
 }
 
 /// Processing scores entries and signs attestations. During a blue/green
@@ -159,11 +177,17 @@ impl AppState {
             oracle,
             database,
             forecast_cache: Mutex::new(HashMap::new()),
-            stations: tokio::sync::Mutex::new(None),
+            stations: Arc::default(),
             background,
             etl_slot: Arc::new(Semaphore::new(1)),
             instance: format!("oracle-{}", uuid::Uuid::now_v7()),
+            files_added: tokio::sync::Notify::new(),
         }
+    }
+
+    /// A data file was published: prepare it for queries.
+    pub fn file_added(&self) {
+        self.files_added.notify_one();
     }
 
     pub fn cached_forecast(&self, station_id: &str) -> Option<String> {
@@ -185,29 +209,57 @@ impl AppState {
         }
     }
 
-    /// Drops cached forecasts and the station list after new data arrives.
+    /// Drops cached forecasts and marks the station list for a refresh after
+    /// new data arrives.
     pub fn clear_forecast_cache(&self) {
         self.forecast_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
-        if let Ok(mut stations) = self.stations.try_lock() {
-            *stations = None;
-        }
+        self.stations.stale.store(true, Ordering::Release);
     }
 
-    /// Every station in the observation files, read at most once per
-    /// [`FORECAST_CACHE_REFRESH`] instead of on every page load.
+    /// Every station in the observation files. Only the first call waits
+    /// for the files to be read; later calls get the list last read, and
+    /// start a background refresh when new files arrived or the list is
+    /// older than [`FORECAST_CACHE_REFRESH`].
     pub async fn stations(&self) -> Result<Arc<Vec<Station>>, weather_data::Error> {
-        let mut cached = self.stations.lock().await;
-        if let Some((read_at, stations)) = cached.as_ref()
-            && read_at.elapsed() < FORECAST_CACHE_REFRESH
-        {
+        let mut current = self.stations.current.lock().await;
+        if let Some((read_at, stations)) = current.as_ref() {
+            if read_at.elapsed() >= FORECAST_CACHE_REFRESH
+                || self.stations.stale.load(Ordering::Acquire)
+            {
+                self.refresh_stations();
+            }
             return Ok(stations.clone());
         }
+        self.stations.stale.store(false, Ordering::Release);
         let stations = Arc::new(self.weather_db.stations().await?);
-        *cached = Some((std::time::Instant::now(), stations.clone()));
+        *current = Some((std::time::Instant::now(), stations.clone()));
         Ok(stations)
+    }
+
+    /// Rereads the station list in the background, once at a time.
+    fn refresh_stations(&self) {
+        if self.stations.refreshing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let list = self.stations.clone();
+        let weather_db = self.weather_db.clone();
+        self.background.tasks.spawn(async move {
+            list.stale.store(false, Ordering::Release);
+            match weather_db.stations().await {
+                Ok(stations) => {
+                    *list.current.lock().await =
+                        Some((std::time::Instant::now(), Arc::new(stations)));
+                }
+                Err(error) => {
+                    list.stale.store(true, Ordering::Release);
+                    warn!("cannot refresh the station list: {error}");
+                }
+            }
+            list.refreshing.store(false, Ordering::Release);
+        });
     }
 
     /// Whether `station_id` appears in the observation files.
@@ -346,7 +398,10 @@ async fn build_app_state(
     let local_file_access: Arc<dyn FileData> = Arc::new(FileAccess::new(
         configuration.weather_dir.to_string_lossy().into_owned(),
     ));
-    let weather_db: Arc<dyn WeatherData> = Arc::new(WeatherAccess::new(local_file_access));
+    let weather_db: Arc<dyn WeatherData> = Arc::new(WeatherAccess::with_derived_forecasts(
+        local_file_access,
+        &configuration.weather_dir.join("derived"),
+    ));
     let sources = Sources::new(Arc::new(NoaaWeather::new(weather_db.clone())), []);
     let oracle = Oracle::new(
         database.clone(),
@@ -545,6 +600,7 @@ impl ApplicationRuntime {
                 return first_failure(result.map(|_| ()), cleanup).map(|()| None);
             }
         };
+        spawn_file_preparation(&state);
         spawn_cache_warmer(&state);
         spawn_etl_schedule(&state, configuration.etl_interval);
         spawn_lease_release(&state);
@@ -643,6 +699,9 @@ fn spawn_cache_warmer(state: &Arc<AppState>) {
     let state = state.clone();
     let stopping = state.background.stopping.clone();
     state.background.tasks.clone().spawn(async move {
+        if let Err(error) = state.stations().await {
+            warn!("cannot read the station list: {error}");
+        }
         warm_forecast_cache(&state).await;
         let mut interval = tokio::time::interval(FORECAST_CACHE_REFRESH);
         interval.tick().await; // the first tick completes immediately
@@ -654,6 +713,27 @@ fn spawn_cache_warmer(state: &Arc<AppState>) {
                     state.clear_forecast_cache();
                     warm_forecast_cache(&state).await;
                 }
+            }
+        }
+    });
+}
+
+/// Makes derived copies of new forecast files: at start, after each
+/// upload, and every [`PREPARE_FILES_INTERVAL`]. Stops between files on
+/// shutdown.
+fn spawn_file_preparation(state: &Arc<AppState>) {
+    let state = state.clone();
+    let stopping = state.background.stopping.clone();
+    state.background.tasks.clone().spawn(async move {
+        loop {
+            if let Err(error) = state.weather_db.prepare_files(&stopping).await {
+                warn!("cannot prepare weather files for queries: {error}");
+            }
+            tokio::select! {
+                biased;
+                () = stopping.cancelled() => break,
+                () = state.files_added.notified() => {}
+                () = tokio::time::sleep(PREPARE_FILES_INTERVAL) => {}
             }
         }
     });

@@ -58,7 +58,7 @@ pub fn forecast_detail(
                 section class="past-performance" {
                     h4 class="title is-6" { "Past week: forecast vs observed" }
                     p class="forecast-note" {
-                        "By UTC day. Each forecast was issued the day before. Differences are observed − forecast; + means it came in higher."
+                        "Latest available forecasts by your calendar day (UTC if unavailable). Differences are observed − forecast; + means it came in higher."
                     }
                     div class="table-container" {
                         table class="table is-narrow is-fullwidth past-table" {

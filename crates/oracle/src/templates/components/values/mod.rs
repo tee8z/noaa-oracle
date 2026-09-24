@@ -32,7 +32,12 @@ pub enum Settled {
 
 /// Observed − forecast, beside the observed value: positive means it came
 /// in higher than forecast.
-pub fn difference(observed: Option<f64>, forecast: Option<f64>, unit: &str, settled: Settled) -> Markup {
+pub fn difference(
+    observed: Option<f64>,
+    forecast: Option<f64>,
+    unit: &str,
+    settled: Settled,
+) -> Markup {
     let (Some(observed), Some(forecast)) = (observed, forecast) else {
         return missing();
     };
@@ -120,9 +125,15 @@ mod tests {
     #[test]
     fn differences_are_observed_minus_forecast() {
         let warmer = difference(Some(75.0), Some(70.0), "°F", Settled::Final).into_string();
-        assert!(warmer.contains("+5°F") && warmer.contains("is-off"), "{warmer}");
+        assert!(
+            warmer.contains("+5°F") && warmer.contains("is-off"),
+            "{warmer}"
+        );
         let cooler = difference(Some(75.0), Some(83.0), "°F", Settled::Final).into_string();
-        assert!(cooler.contains("-8°F") && cooler.contains("is-far"), "{cooler}");
+        assert!(
+            cooler.contains("-8°F") && cooler.contains("is-far"),
+            "{cooler}"
+        );
         // Halves round like scoring before comparing.
         let half = difference(Some(54.5), Some(55.0), "°F", Settled::Final).into_string();
         assert!(half.contains("+0°F"), "{half}");
@@ -138,10 +149,17 @@ mod tests {
 
     #[test]
     fn zero_precipitation_is_dimmed() {
-        assert!(precipitation(Some(0.0), "rain", 2).into_string().contains("is-zero"));
+        assert!(
+            precipitation(Some(0.0), "rain", 2)
+                .into_string()
+                .contains("is-zero")
+        );
         let rain = precipitation(Some(0.25), "rain", 2).into_string();
         // maud escapes the inch mark in text.
-        assert!(rain.contains("0.25&quot;") && !rain.contains("is-zero"), "{rain}");
+        assert!(
+            rain.contains("0.25&quot;") && !rain.contains("is-zero"),
+            "{rain}"
+        );
         assert!(precipitation(None, "rain", 2).into_string().contains("—"));
     }
 }

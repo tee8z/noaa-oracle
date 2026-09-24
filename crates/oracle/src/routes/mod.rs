@@ -18,7 +18,6 @@ pub use stations::{
     get_stations, observations,
 };
 pub use ui::{
-    dashboard_handler, event_detail_handler, event_stats_handler, events_handler,
-    forecast_handler, oracle_info_handler, raw_data_handler, station_handler, warm_forecast_cache,
-    weather_handler,
+    dashboard_handler, event_detail_handler, event_stats_handler, events_handler, forecast_handler,
+    oracle_info_handler, raw_data_handler, station_handler, warm_forecast_cache, weather_handler,
 };

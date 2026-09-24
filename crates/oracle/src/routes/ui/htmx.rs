@@ -23,7 +23,10 @@ pub(super) fn render(headers: &HeaderMap) -> Render {
     if !headers.contains_key("hx-request") || headers.contains_key("hx-history-restore-request") {
         return Render::Page;
     }
-    match headers.get("hx-target").and_then(|target| target.to_str().ok()) {
+    match headers
+        .get("hx-target")
+        .and_then(|target| target.to_str().ok())
+    {
         Some(target) if !target.is_empty() && target != "main-content" => {
             Render::Part(target.to_string())
         }
@@ -69,11 +72,17 @@ mod tests {
         assert_eq!(render(&headers(&[])), Render::Page);
         assert_eq!(render(&headers(&[("hx-request", "true")])), Render::Content);
         assert_eq!(
-            render(&headers(&[("hx-request", "true"), ("hx-target", "main-content")])),
+            render(&headers(&[
+                ("hx-request", "true"),
+                ("hx-target", "main-content")
+            ])),
             Render::Content
         );
         assert_eq!(
-            render(&headers(&[("hx-request", "true"), ("hx-target", "events-list")])),
+            render(&headers(&[
+                ("hx-request", "true"),
+                ("hx-target", "events-list")
+            ])),
             Render::Part("events-list".into())
         );
         assert_eq!(

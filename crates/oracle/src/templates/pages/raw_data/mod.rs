@@ -10,9 +10,15 @@ const CONFIG: PageConfig<'static> = PageConfig {
 
 /// Example queries, run by DuckDB in the browser against the loaded files.
 const EXAMPLES: [(&str, &str); 4] = [
-    ("Daily observations", include_str!("queries/daily_observations.sql")),
+    (
+        "Daily observations",
+        include_str!("queries/daily_observations.sql"),
+    ),
     ("Daily forecast", include_str!("queries/daily_forecast.sql")),
-    ("Forecast vs observed", include_str!("queries/forecast_vs_observed.sql")),
+    (
+        "Forecast vs observed",
+        include_str!("queries/forecast_vs_observed.sql"),
+    ),
     ("Station list", include_str!("queries/stations.sql")),
 ];
 
@@ -29,7 +35,9 @@ fn yesterday(now: OffsetDateTime) -> (String, String) {
     let today = now.replace_time(Time::MIDNIGHT);
     let format = format_description!("[year]-[month]-[day]T[hour]:[minute]");
     (
-        (today - Duration::days(1)).format(format).unwrap_or_default(),
+        (today - Duration::days(1))
+            .format(format)
+            .unwrap_or_default(),
         today.format(format).unwrap_or_default(),
     )
 }

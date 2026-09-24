@@ -25,7 +25,7 @@ pub enum ObservationPeriod {
 impl ObservationPeriod {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Today => "Today so far (UTC)",
+            Self::Today => "Today so far",
             Self::Selected { .. } => "Selected period (UTC)",
         }
     }
@@ -306,12 +306,12 @@ mod tests {
             context.fragment_url(WeatherView::List),
             "/fragments/weather?stations=KSTL%2CKORD&view=list&q=St.%20Louis%20%26%20co"
         );
-        assert_eq!(
-            context.page_url(WeatherView::Map),
-            "/?stations=KSTL%2CKORD"
-        );
+        assert_eq!(context.page_url(WeatherView::Map), "/?stations=KSTL%2CKORD");
         assert_eq!(page_url("/fragments/weather"), "/");
-        assert_eq!(with_parameters("/fragments/weather", &[("view", "list")]), "/fragments/weather?view=list");
+        assert_eq!(
+            with_parameters("/fragments/weather", &[("view", "list")]),
+            "/fragments/weather?view=list"
+        );
     }
 
     #[test]

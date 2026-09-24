@@ -5,8 +5,7 @@
 
 use maud::{Markup, html};
 use time::{
-    Duration, OffsetDateTime, UtcOffset,
-    format_description::well_known::Rfc3339,
+    Duration, OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339,
     macros::format_description,
 };
 
@@ -57,7 +56,7 @@ pub fn date(time: OffsetDateTime) -> String {
 }
 
 /// "Thu, Sep 24" for a `YYYY-MM-DD` calendar day (or a timestamp starting
-/// with one). Forecast days are UTC days, so no time zone applies.
+/// with one). The server has already selected the calendar day, so no conversion applies.
 pub fn calendar_day(day: &str) -> String {
     let date = day.split([' ', 'T']).next().unwrap_or(day);
     time::Date::parse(date, format_description!("[year]-[month]-[day]"))
@@ -96,7 +95,10 @@ pub fn window(start: OffsetDateTime, end: OffsetDateTime) -> Markup {
 }
 
 pub fn window_text(start: OffsetDateTime, end: OffsetDateTime) -> String {
-    let (start, end) = (start.to_offset(UtcOffset::UTC), end.to_offset(UtcOffset::UTC));
+    let (start, end) = (
+        start.to_offset(UtcOffset::UTC),
+        end.to_offset(UtcOffset::UTC),
+    );
     let clock = format_description!("[hour]:[minute]");
     let day_clock = format_description!("[month repr:short] [day padding:none], [hour]:[minute]");
     let (Ok(first), Ok(last_clock), Ok(last)) = (

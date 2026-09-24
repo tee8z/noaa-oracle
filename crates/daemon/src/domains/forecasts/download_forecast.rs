@@ -514,7 +514,11 @@ impl TryFrom<Dwml> for HashMap<String, Vec<WeatherForecast>> {
             if let Some(weather_forecast) = weather.get(&location.location_key)
                 && let Some(station_id) = &location.station_id
             {
-                weather_by_station.insert(station_id.clone(), weather_forecast.clone());
+                let mut forecasts = weather_forecast.clone();
+                for forecast in &mut forecasts {
+                    forecast.station_id = station_id.clone();
+                }
+                weather_by_station.insert(station_id.clone(), forecasts);
             }
         });
 
@@ -780,7 +784,6 @@ impl ForecastService {
         output_path: &str,
     ) -> Result<ForecastReport, Error> {
         let batches = split_cityweather(city_weather.clone(), STATIONS_PER_REQUEST);
-        let stations = &StationLookup::new(city_weather, &self.logger);
         let file = File::create(output_path)
             .map_err(|e| anyhow!("failed to create parquet file: {}", e))?;
         let props = WriterProperties::builder().build();
@@ -797,7 +800,10 @@ impl ForecastService {
         let mut results = stream::iter(batches)
             .map(|batch| async move {
                 let url = get_url(&batch)?;
-                self.fetch_batch(&url, stations).await
+                // Only this batch's stations: shared points may appear in other
+                // batches, but each station must be written and counted once.
+                let stations = StationLookup::new(&batch, &self.logger);
+                self.fetch_batch(&url, &stations).await
             })
             .buffer_unordered(CONCURRENT_REQUESTS);
         while let Some(result) = results.next().await {
@@ -903,18 +909,17 @@ impl ForecastService {
     }
 }
 
-/// Maps NDFD point coordinates (2 decimal places) to station ids. When two
-/// stations round to the same point the lowest id wins, so the result does
-/// not depend on hash order; ambiguous points are logged once.
+/// Maps NDFD point coordinates (2 decimal places) to all requested station
+/// ids. Every station sharing a grid point receives that point's forecast.
 struct StationLookup {
-    by_point: HashMap<(String, String), String>,
+    by_point: HashMap<(String, String), Vec<String>>,
 }
 
 impl StationLookup {
     fn new(city_weather: &CityWeather, logger: &Logger) -> Self {
         let mut stations: Vec<&WeatherStation> = city_weather.city_data.values().collect();
         stations.sort_by(|a, b| a.station_id.cmp(&b.station_id));
-        let mut by_point: HashMap<(String, String), String> = HashMap::new();
+        let mut by_point: HashMap<(String, String), Vec<String>> = HashMap::new();
         let mut ambiguous = 0;
         for station in stations {
             let (Some(latitude), Some(longitude)) =
@@ -923,32 +928,48 @@ impl StationLookup {
                 continue;
             };
             match by_point.entry((latitude, longitude)) {
-                std::collections::hash_map::Entry::Occupied(_) => ambiguous += 1,
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    ambiguous += 1;
+                    entry.get_mut().push(station.station_id.clone());
+                }
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(station.station_id.clone());
+                    entry.insert(vec![station.station_id.clone()]);
                 }
             }
         }
         if ambiguous > 0 {
             info!(
                 logger,
-                "{} stations share a forecast grid point with a lower station id and get no forecast",
-                ambiguous
+                "{} stations share another station's forecast grid point", ambiguous
             );
         }
         Self { by_point }
     }
 
     fn assign(&self, mut converted_xml: Dwml) -> Dwml {
-        for location in &mut converted_xml.data.location {
-            location.station_id = self
-                .by_point
-                .get(&(
+        converted_xml.data.location = converted_xml
+            .data
+            .location
+            .into_iter()
+            .flat_map(|location| {
+                match self.by_point.get(&(
                     location.point.latitude.clone(),
                     location.point.longitude.clone(),
-                ))
-                .cloned();
-        }
+                )) {
+                    Some(stations) => stations
+                        .iter()
+                        .map(|station_id| {
+                            let mut assigned = location.clone();
+                            assigned.station_id = Some(station_id.clone());
+                            assigned
+                        })
+                        .collect::<Vec<_>>(),
+                    // Keep unknown points so their parameter blocks still parse;
+                    // conversion omits them from the station output.
+                    None => vec![location],
+                }
+            })
+            .collect();
         converted_xml
     }
 }
@@ -971,4 +992,50 @@ fn get_url(city_weather: &CityWeather) -> Result<String, Error> {
         begin.format(&format)?,
         (begin + Duration::weeks(1)).format(&format)?,
     ))
+}
+
+#[cfg(test)]
+mod shared_point_tests {
+    use super::*;
+
+    #[test]
+    fn every_station_at_a_shared_point_receives_its_own_forecast_rows() {
+        let city_weather = CityWeather {
+            city_data: ["KAAA", "KORD"]
+                .into_iter()
+                .map(|id| {
+                    (
+                        id.to_string(),
+                        WeatherStation {
+                            station_id: id.into(),
+                            station_name: id.into(),
+                            state: "IL".into(),
+                            iata_id: String::new(),
+                            elevation_m: None,
+                            latitude: "41.98".into(),
+                            longitude: "-87.90".into(),
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let logger = Logger::root(slog::Discard, slog::o!());
+        let lookup = StationLookup::new(&city_weather, &logger);
+        let raw: Dwml = crate::parse_xml(include_str!("testdata/dwml.xml")).unwrap();
+        let weather: HashMap<String, Vec<WeatherForecast>> = lookup.assign(raw).try_into().unwrap();
+        assert_eq!(weather.len(), 2);
+        assert!(!weather["KAAA"].is_empty());
+        assert_eq!(weather["KAAA"].len(), weather["KORD"].len());
+        for (left, right) in weather["KAAA"].iter().zip(&weather["KORD"]) {
+            assert_eq!(left.station_id, "KAAA");
+            assert_eq!(right.station_id, "KORD");
+            assert_eq!(left.begin_time, right.begin_time);
+            assert_eq!(left.end_time, right.end_time);
+            assert_eq!(left.max_temp, right.max_temp);
+            assert_eq!(
+                left.liquid_precipitation_amt,
+                right.liquid_precipitation_amt
+            );
+        }
+    }
 }

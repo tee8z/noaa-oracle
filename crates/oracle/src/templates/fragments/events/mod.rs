@@ -61,7 +61,8 @@ impl EventFilters {
     }
 
     fn shows(&self, event: &EventView) -> bool {
-        (self.show_tests || !event.is_test()) && self.status.is_none_or(|status| event.status == status)
+        (self.show_tests || !event.is_test())
+            && self.status.is_none_or(|status| event.status == status)
     }
 }
 
@@ -249,6 +250,9 @@ mod tests {
         assert!(html.contains("bbbbbbbb"));
         assert!(html.contains("Paid places"));
         assert!(!html.contains("Winners"));
-        assert_eq!(EventFilters::parse(Some("bogus"), Some("no")), EventFilters::default());
+        assert_eq!(
+            EventFilters::parse(Some("bogus"), Some("no")),
+            EventFilters::default()
+        );
     }
 }

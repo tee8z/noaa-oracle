@@ -12,7 +12,10 @@ use crate::templates::{
 
 fn config(event: &Event) -> (String, CurrentPage) {
     (
-        format!("Event {} - 4cast Truth Oracle", truncate_id(&event.id.to_string())),
+        format!(
+            "Event {} - 4cast Truth Oracle",
+            truncate_id(&event.id.to_string())
+        ),
         CurrentPage::Events,
     )
 }
@@ -20,13 +23,25 @@ fn config(event: &Event) -> (String, CurrentPage) {
 /// Event detail page - shows full information about a single event
 pub fn event_detail_page(event: &Event, now: OffsetDateTime) -> Markup {
     let (title, current_page) = config(event);
-    base(&PageConfig { title: &title, current_page }, event_detail_content(event, now))
+    base(
+        &PageConfig {
+            title: &title,
+            current_page,
+        },
+        event_detail_content(event, now),
+    )
 }
 
 /// What htmx swaps in when an event row is opened.
 pub fn event_detail_fragment(event: &Event, now: OffsetDateTime) -> Markup {
     let (title, current_page) = config(event);
-    page_fragment(&PageConfig { title: &title, current_page }, event_detail_content(event, now))
+    page_fragment(
+        &PageConfig {
+            title: &title,
+            current_page,
+        },
+        event_detail_content(event, now),
+    )
 }
 
 const NOT_FOUND: PageConfig<'static> = PageConfig {
@@ -157,7 +172,11 @@ fn duration(span: time::Duration) -> String {
     } else if span < time::Duration::hours(48) {
         let hours = span.whole_hours();
         let minutes = span.whole_minutes() % 60;
-        if minutes == 0 { format!("{hours} h") } else { format!("{hours} h {minutes} min") }
+        if minutes == 0 {
+            format!("{hours} h")
+        } else {
+            format!("{hours} h {minutes} min")
+        }
     } else {
         format!("{} days", span.whole_days())
     }
@@ -193,7 +212,12 @@ fn weather_comparison_table(weather: &[Weather]) -> Markup {
     }
 }
 
-fn observed_and_forecast(observed: Option<f64>, forecast: Option<f64>, unit: &str, class: &str) -> Markup {
+fn observed_and_forecast(
+    observed: Option<f64>,
+    forecast: Option<f64>,
+    unit: &str,
+    class: &str,
+) -> Markup {
     let show = |value: Option<f64>| match value {
         Some(value) => html! { span class={ "val " (class) } { (format!("{value:.0}{unit}")) } },
         None => values::missing(),
@@ -222,13 +246,29 @@ fn refund_reason(nothing_observed: bool, window: time::Duration) -> String {
 }
 
 fn entries_table(event: &Event, num_winners: usize, signed: bool) -> Markup {
-    let nothing_observed = event.readings.iter().all(|reading| reading.observed.is_none())
-        && event.weather.iter().all(|weather| weather.observed.is_none());
+    let nothing_observed = event
+        .readings
+        .iter()
+        .all(|reading| reading.observed.is_none())
+        && event
+            .weather
+            .iter()
+            .all(|weather| weather.observed.is_none());
     let window = event.end_observation_date - event.start_observation_date;
-    entries_list(&event.entries, num_winners, signed, &refund_reason(nothing_observed, window))
+    entries_list(
+        &event.entries,
+        num_winners,
+        signed,
+        &refund_reason(nothing_observed, window),
+    )
 }
 
-fn entries_list(entries: &[WeatherEntry], num_winners: usize, signed: bool, refunded: &str) -> Markup {
+fn entries_list(
+    entries: &[WeatherEntry],
+    num_winners: usize,
+    signed: bool,
+    refunded: &str,
+) -> Markup {
     // API entries stay in id order because outcome indices depend on it.
     // Sort references for display only. Stored scores also preserve the
     // ranking of historical events signed with the older score formula.
@@ -294,9 +334,6 @@ fn truncate_id(id: &str) -> String {
         id.to_string()
     }
 }
-
-
-
 
 fn back_icon() -> Markup {
     html! {
@@ -397,7 +434,9 @@ mod tests {
         let short = time::Duration::minutes(10);
         let reason = refund_reason(true, short);
         assert!(reason.starts_with("All entries refunded"));
-        assert!(reason.contains("no hourly station report fell inside the 10 min observation window"));
+        assert!(
+            reason.contains("no hourly station report fell inside the 10 min observation window")
+        );
         assert_eq!(
             refund_reason(false, time::Duration::hours(18)),
             "All entries refunded: no entry scored any points."

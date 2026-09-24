@@ -343,7 +343,9 @@ async fn event_filters_render_the_matching_part() {
     assert!(section.contains(short_id));
     assert!(section.contains("hx-get=\"/events?status=live\""));
 
-    let (_, body) = test_app.send(part("events-list", "/events?status=signed")).await;
+    let (_, body) = test_app
+        .send(part("events-list", "/events?status=signed"))
+        .await;
     let list = String::from_utf8(body.to_vec()).unwrap();
     assert!(list.starts_with("<div id=\"events-list\""), "{list}");
     assert!(!list.contains(short_id));
@@ -372,7 +374,11 @@ async fn pages_allow_only_their_own_script_files() {
     for (path, status, extra) in [
         ("/events".to_string(), StatusCode::OK, None),
         (format!("/events/{}", event.id), StatusCode::OK, None),
-        (format!("/events/{}", Uuid::nil()), StatusCode::NOT_FOUND, None),
+        (
+            format!("/events/{}", Uuid::nil()),
+            StatusCode::NOT_FOUND,
+            None,
+        ),
         (
             "/raw".to_string(),
             StatusCode::OK,
@@ -410,7 +416,10 @@ async fn pages_allow_only_their_own_script_files() {
         assert!(html.starts_with("<!DOCTYPE html>"), "{path}");
         for script in html.split("<script").skip(1) {
             let (attributes, rest) = script.split_once('>').unwrap();
-            assert!(attributes.contains(" src=\"/assets/"), "{path}: <script{attributes}>");
+            assert!(
+                attributes.contains(" src=\"/assets/"),
+                "{path}: <script{attributes}>"
+            );
             assert!(rest.starts_with("</script>"), "{path}: inline script");
         }
         assert_eq!(inline_handlers(&html), Vec::<&str>::new(), "{path}");
@@ -418,11 +427,7 @@ async fn pages_allow_only_their_own_script_files() {
         assert!(html.contains("allowEval&quot;:false"), "{path}");
         assert!(html.contains("selfRequestsOnly&quot;:true"), "{path}");
         // Only the raw data page loads its DuckDB script.
-        assert_eq!(
-            html.contains("/assets/raw-data."),
-            path == "/raw",
-            "{path}"
-        );
+        assert_eq!(html.contains("/assets/raw-data."), path == "/raw", "{path}");
     }
     assert_eq!(inline_handlers(r#"<a onclick="x()">once</a>"#), ["onclick"]);
     assert!(inline_handlers(r#"<p hx-trigger="toggle once">on = off</p>"#).is_empty());
