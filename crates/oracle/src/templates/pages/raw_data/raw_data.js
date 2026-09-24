@@ -109,36 +109,24 @@ async function submitDownloadRequest(event, autoRunQuery = false) {
   }
 }
 
-function fetchFileNames() {
-  // Get values from datetime-local inputs (format: YYYY-MM-DDTHH:MM)
-  const startTimeRaw = document.getElementById("start").value;
-  const endTimeRaw = document.getElementById("end").value;
-
-  // Convert to RFC3339 format with seconds and Z suffix for API
-  const startTime = startTimeRaw ? `${startTimeRaw}:00Z` : "";
-  const endTime = endTimeRaw ? `${endTimeRaw}:00Z` : "";
-
-  const forecasts = document.getElementById("forecasts").checked;
-  const observations = document.getElementById("observations").checked;
-  return new Promise((resolve, reject) => {
-    let url = `/files?start=${startTime}&end=${endTime}&observations=${observations}&forecasts=${forecasts}`;
-    console.log(`Requesting: ${url}`);
-    fetch(url)
-      .then((response) => {
-        if (!response.ok) {
-          throw new Error(`HTTP error! Status: ${response.status}`);
-        }
-        return response.json();
-      })
-      .then((data) => {
-        console.log(data);
-        resolve(data.file_names);
-      })
-      .catch((error) => {
-        console.error("Error fetching file names:", error);
-        reject(error);
-      });
+async function fetchFileNames() {
+  // datetime-local values (YYYY-MM-DDTHH:MM) are UTC here; the API takes
+  // RFC 3339.
+  const utc = (id) => {
+    const value = document.getElementById(id).value;
+    return value ? `${value}:00Z` : "";
+  };
+  const query = new URLSearchParams({
+    start: utc("start"),
+    end: utc("end"),
+    observations: document.getElementById("observations").checked,
+    forecasts: document.getElementById("forecasts").checked,
   });
+  const response = await fetch(`/files?${query}`);
+  if (!response.ok) {
+    throw new Error(`HTTP error! Status: ${response.status}`);
+  }
+  return (await response.json()).file_names;
 }
 
 async function loadFiles(fileNames) {
@@ -198,27 +186,15 @@ async function runQuery(event) {
 }
 
 function loadSchema(tableName, queryResult) {
-  console.log(queryResult);
   const schemaTextarea = document.getElementById(`${tableName}-schema`);
   if (!schemaTextarea) return;
 
   const fields = {};
-  for (const feild_index in queryResult.schema.fields) {
-    const field = queryResult.schema.fields[feild_index];
-    const column = queryResult.batches[0].data.children[feild_index];
-    fields[field.name] = {};
-    fields[field.name]["type"] = getType(column.values);
-    fields[field.name]["nullable"] = field.nullable;
+  for (const field of queryResult.schema.fields) {
+    fields[field.name] = { type: String(field.type), nullable: field.nullable };
   }
-  const table_schema = {
-    table_name: tableName,
-    fields: fields,
-  };
-  schemaTextarea.value = JSON.stringify(table_schema, null, 2);
-
-  // Update status to show field count
-  const fieldCount = Object.keys(fields).length;
-  updateSchemaStatus(tableName, "loaded", fieldCount);
+  schemaTextarea.value = JSON.stringify({ table_name: tableName, fields }, null, 2);
+  updateSchemaStatus(tableName, "loaded", queryResult.schema.fields.length);
 }
 
 // Schema UI helper functions
@@ -269,59 +245,57 @@ function updateSchemaStatus(tableName, status, fieldCount = 0) {
   }
 }
 
+// The last query's column names, types and raw values, for the CSV.
+let lastResult = null;
+
 function loadTable(tableName, queryResult) {
   deleteErr();
   deleteTable(tableName);
   const tableParentDiv = document.getElementById(`${tableName}-container`);
   if (!tableParentDiv) return;
 
+  const fields = queryResult.schema.fields;
+  const types = fields.map((field) => String(field.type));
+  const columns = fields.map((_, index) => queryResult.getChildAt(index));
+  const rows = [];
+  for (let row = 0; row < queryResult.numRows; row++) {
+    rows.push(columns.map((column) => column.get(row)));
+  }
+  lastResult = { names: fields.map((field) => field.name), types, rows };
+
   const table = document.createElement("table");
   table.classList.add("table", "is-striped", "is-narrow", "is-bordered");
   table.id = tableName;
-
-  const headerRow = table.createTHead().insertRow(0);
-  for (const [index, column] of Object.entries(queryResult.schema.fields)) {
-    const headerCell = headerRow.insertCell(index);
-    headerCell.textContent = column.name;
+  const headerRow = table.createTHead().insertRow();
+  for (const name of lastResult.names) {
+    const header = document.createElement("th");
+    header.textContent = name;
+    headerRow.appendChild(header);
   }
-
-  for (const batch_index in queryResult.batches) {
-    const row_count = queryResult.batches[batch_index].data.length;
-    let data_grid = [];
-
-    for (const column_index in queryResult.batches[batch_index].data.children) {
-      const column =
-        queryResult.batches[batch_index].data.children[column_index];
-      let values = column.values;
-      const array_type = getArrayType(values);
-
-      if (array_type == "BigInt64Array") {
-        values = formatInts(values);
-      }
-      if (array_type == "Uint8Array") {
-        const offSets = column.valueOffsets;
-        values = convertUintArrayToStrings(values, offSets);
-      }
-      data_grid.push(values);
-    }
-
-    for (let row_index = 0; row_index < row_count; row_index++) {
-      const newRow = table.insertRow();
-      for (const column_index in queryResult.batches[batch_index].data
-        .children) {
-        const cell = newRow.insertCell(column_index);
-        cell.textContent = data_grid[column_index][row_index];
-      }
-    }
-
-    tableParentDiv.appendChild(table);
+  const body = table.createTBody();
+  for (const values of rows) {
+    const tableRow = body.insertRow();
+    values.forEach((value, index) => {
+      tableRow.insertCell().textContent = cellText(value, types[index]);
+    });
   }
+  tableParentDiv.appendChild(table);
 
   // Enable download button when table is loaded
   const downloadButton = document.getElementById("downloadCsv");
   if (downloadButton) {
     downloadButton.disabled = false;
   }
+}
+
+// A value as text: nulls empty, times in ISO 8601 UTC, large integers exact.
+function cellText(value, type) {
+  if (value === null || value === undefined) return "";
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === "number" && /^(Timestamp|Date)/.test(type)) {
+    return new Date(value).toISOString();
+  }
+  return String(value);
 }
 
 function displayQueryErr(err) {
@@ -345,50 +319,8 @@ function deleteErr() {
   }
 }
 
-function getArrayType(arr) {
-  if (arr instanceof Uint8Array) return "Uint8Array";
-  if (arr instanceof Float64Array) return "Float64Array";
-  if (arr instanceof BigInt64Array) return "BigInt64Array";
-  return "Unknown";
-}
-
-function getType(arr) {
-  if (arr instanceof Uint8Array) return "Text";
-  if (arr instanceof Float64Array) return "Float64";
-  if (arr instanceof BigInt64Array) return "BigInt64";
-  return "Unknown";
-}
-
-function convertUintArrayToStrings(uint8Array, valueOffsets) {
-  const textDecoder = new TextDecoder("utf-8");
-  const decodedStrings = [];
-
-  for (let i = 0; i < valueOffsets.length; i++) {
-    const start = i === 0 ? 0 : valueOffsets[i - 1];
-    const end = valueOffsets[i];
-    const stringBytes = uint8Array.subarray(start, end);
-    const decodedString = textDecoder.decode(stringBytes);
-    if (decodedString.length != 0) {
-      decodedStrings.push(decodedString);
-    }
-  }
-  return decodedStrings;
-}
-
-function formatInts(intArray) {
-  const maxSafeInteger = BigInt(Number.MAX_SAFE_INTEGER);
-  let formattedVals = [];
-  for (let i = 0; i < intArray.length; i++) {
-    if (intArray[i] > maxSafeInteger || intArray[i] < -maxSafeInteger) {
-      formattedVals[i] = "NaN";
-    } else {
-      formattedVals[i] = `${intArray[i]}`;
-    }
-  }
-  return formattedVals;
-}
-
 function clearQuerys(event) {
+  lastResult = null;
   deleteTable("queryResult");
   deleteErr();
   // Disable download button when clearing
@@ -399,36 +331,15 @@ function clearQuerys(event) {
 }
 
 function downloadCsv() {
-  const table = document.getElementById("queryResult");
-  if (!table) return;
-
-  let csv = [];
-
-  // Get headers
-  const headers = [];
-  const headerRow = table.querySelector("thead tr");
-  if (headerRow) {
-    headerRow.querySelectorAll("th").forEach((th) => {
-      headers.push(escapeCsvValue(th.textContent));
-    });
-    csv.push(headers.join(","));
+  if (!lastResult) return;
+  const { names, types, rows } = lastResult;
+  const csv = [names.map((name) => escapeCsvValue(name)).join(",")];
+  for (const values of rows) {
+    csv.push(values.map((value, index) => csvCell(value, types[index])).join(","));
   }
 
-  // Get data rows
-  const rows = table.querySelectorAll("tbody tr, tr:not(:first-child)");
-  rows.forEach((row) => {
-    const rowData = [];
-    row.querySelectorAll("td").forEach((td) => {
-      rowData.push(escapeCsvValue(td.textContent));
-    });
-    if (rowData.length > 0) {
-      csv.push(rowData.join(","));
-    }
-  });
-
   // Create and download file
-  const csvContent = csv.join("\n");
-  const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+  const blob = new Blob([csv.join("\n")], { type: "text/csv;charset=utf-8;" });
   const link = document.createElement("a");
   const url = URL.createObjectURL(blob);
 
@@ -444,14 +355,19 @@ function downloadCsv() {
   URL.revokeObjectURL(url);
 }
 
-function escapeCsvValue(value) {
-  if (value === null || value === undefined) {
-    return "";
-  }
+function csvCell(value, type) {
+  return typeof value === "string"
+    ? escapeCsvValue(value)
+    : escapeCsvValue(cellText(value, type), false);
+}
+
+// `text` marks values that were text in the result (and the column names).
+function escapeCsvValue(value, text = true) {
   let str = String(value);
   // Text starting with a formula character would run as a formula when the
-  // CSV is opened in a spreadsheet; prefix it so it stays text.
-  if (typeof value === "string" && /^[=+\-@\t\r]/.test(str)) {
+  // CSV is opened in a spreadsheet; prefix it so it stays text. Numbers,
+  // negative ones included, are left alone.
+  if (text && /^[=+\-@\t\r]/.test(str)) {
     str = "'" + str;
   }
   // Escape quotes and wrap in quotes if contains comma, quote, or newline
