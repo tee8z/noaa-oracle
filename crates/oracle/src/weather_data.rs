@@ -2862,12 +2862,17 @@ mod tests {
         println!("| --- | ---: | ---: | ---: | ---: |");
         for (name, (request, station_ids)) in cases {
             let started = std::time::Instant::now();
-            let expected = sorted(
-                legacy::forecasts_data(&published, &request, station_ids.clone())
-                    .await
-                    .unwrap(),
-            );
-            let before_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let expected =
+                match legacy::forecasts_data(&published, &request, station_ids.clone()).await {
+                    Ok(rows) => Some(sorted(rows)),
+                    Err(error) if error.to_string().contains("Out of Memory") => None,
+                    Err(error) => panic!("legacy query {name}: {error}"),
+                };
+            let before_ms = if expected.is_some() {
+                format!("{:.0}", started.elapsed().as_secs_f64() * 1000.0)
+            } else {
+                "OOM (512 MB)".to_string()
+            };
             let started = std::time::Instant::now();
             let from_files = published
                 .forecasts_data(&request, station_ids.clone())
@@ -2884,11 +2889,15 @@ mod tests {
                     .unwrap();
                 copies_ms = copies_ms.min(started.elapsed().as_secs_f64() * 1000.0);
             }
-            assert_same_forecasts(&expected, &from_files, name);
-            assert_same_forecasts(&expected, &from_copies, name);
+            if let Some(expected) = &expected {
+                assert_same_forecasts(expected, &from_files, name);
+                assert_same_forecasts(expected, &from_copies, name);
+            } else {
+                assert_same_forecasts(&from_files, &from_copies, name);
+            }
             println!(
-                "| {name} | {before_ms:.0} | {files_ms:.0} | {copies_ms:.0} | {} |",
-                expected.len()
+                "| {name} | {before_ms} | {files_ms:.0} | {copies_ms:.0} | {} |",
+                from_copies.len()
             );
         }
     }

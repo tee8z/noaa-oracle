@@ -8,7 +8,7 @@ use axum::{
 use futures::stream::{self, StreamExt};
 use log::info;
 use serde::Deserialize;
-use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use super::htmx::{Render, page_or_fragment, with_url};
 use crate::{
@@ -108,7 +108,7 @@ pub async fn weather_handler(
         .end
         .as_deref()
         .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok());
-    let days = super::local_day::reader_offset(&headers);
+    let days = super::local_day::reader_day(&headers, OffsetDateTime::now_utc());
     let (weather, stations) = tokio::join!(
         super::weather::load_weather(&state, &station_ids, start, end, days),
         state.stations()
@@ -186,7 +186,7 @@ pub async fn forecast_handler(
     if validate_station_id(&station_id).is_err() {
         return (StatusCode::BAD_REQUEST, "invalid station id").into_response();
     }
-    let days = super::local_day::reader_offset(&headers);
+    let days = super::local_day::reader_day(&headers, OffsetDateTime::now_utc());
     let key = forecast_cache_key(&station_id, days);
     if let Some(cached) = state.cached_forecast(&key) {
         return Html(cached).into_response();
@@ -199,25 +199,25 @@ pub async fn forecast_handler(
 }
 
 /// Forecast fragments differ by calendar and must expire at local midnight.
-fn forecast_cache_key(station_id: &str, days: UtcOffset) -> String {
+fn forecast_cache_key(station_id: &str, days: super::local_day::ReaderDay) -> String {
     format!(
         "{station_id}@{}@{}",
-        days.whole_minutes(),
-        OffsetDateTime::now_utc().to_offset(days).date()
+        days.offset.whole_minutes(),
+        days.start.date()
     )
 }
 
 /// Build the forecast detail HTML for a station (used by handler and cache warming)
-pub async fn build_forecast_html(
+async fn build_forecast_html(
     state: &Arc<AppState>,
     station_id: &str,
-    days: UtcOffset,
+    days: super::local_day::ReaderDay,
 ) -> String {
     let now = OffsetDateTime::now_utc();
 
     // Forecasts and comparison observations use complete calendar days at
     // `days` from UTC.
-    let today = super::local_day::start_of_today(now, days);
+    let today = days.start;
     let future_end = today + time::Duration::days(7);
     let future_req = ForecastRequest {
         start: Some(today),
@@ -230,7 +230,7 @@ pub async fn build_forecast_html(
 
     let forecasts = state
         .weather_db
-        .local_forecasts(&future_req, vec![station_id.to_string()], days)
+        .local_forecasts(&future_req, vec![station_id.to_string()], days.offset)
         .await
         .unwrap_or_default();
 
@@ -281,10 +281,12 @@ pub async fn build_forecast_html(
     let (past_forecasts, daily_obs) = tokio::join!(
         state
             .weather_db
-            .local_forecasts(&past_req, vec![station_id.to_string()], days),
-        state
-            .weather_db
-            .local_daily_observations(&obs_req, vec![station_id.to_string()], days)
+            .local_forecasts(&past_req, vec![station_id.to_string()], days.offset),
+        state.weather_db.local_daily_observations(
+            &obs_req,
+            vec![station_id.to_string()],
+            days.offset
+        )
     );
 
     let past_forecasts = past_forecasts.unwrap_or_default();
@@ -343,8 +345,10 @@ pub async fn warm_forecast_cache(state: &Arc<AppState>) {
             let state = state.clone();
             let station_id = station_id.to_string();
             async move {
-                let html = build_forecast_html(&state, &station_id, UtcOffset::UTC).await;
-                state.cache_forecast(forecast_cache_key(&station_id, UtcOffset::UTC), html);
+                let day =
+                    super::local_day::reader_day(&HeaderMap::new(), OffsetDateTime::now_utc());
+                let html = build_forecast_html(&state, &station_id, day).await;
+                state.cache_forecast(forecast_cache_key(&station_id, day), html);
             }
         })
         .collect();

@@ -88,7 +88,7 @@ pub async fn dashboard_handler(
             .map(str::to_string)
             .collect::<Vec<_>>()
     });
-    let days = super::local_day::reader_offset(&headers);
+    let days = super::local_day::reader_day(&headers, OffsetDateTime::now_utc());
     let (data, selection_path) =
         build_dashboard_data(&state, station_ids.as_deref(), start, end, days).await;
     let stations = state.stations().await.unwrap_or_default();
@@ -118,7 +118,7 @@ async fn build_dashboard_data(
     station_ids: Option<&[String]>,
     start: Option<OffsetDateTime>,
     end: Option<OffsetDateTime>,
-    days: time::UtcOffset,
+    days: super::local_day::ReaderDay,
 ) -> (DashboardData, String) {
     // Get oracle identity
     let pubkey = state.oracle.public_key_base64();
@@ -273,7 +273,7 @@ async fn get_latest_weather(
     station_ids: Option<&[String]>,
     start: Option<OffsetDateTime>,
     end: Option<OffsetDateTime>,
-    days: time::UtcOffset,
+    days: super::local_day::ReaderDay,
 ) -> (Vec<WeatherDisplay>, bool) {
     if let Some(station_ids) = station_ids {
         let weather_data = super::weather::load_weather(state, station_ids, start, end, days).await;

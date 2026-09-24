@@ -56,13 +56,19 @@ pub(super) async fn load_weather(
     station_ids: &[String],
     start: Option<OffsetDateTime>,
     end: Option<OffsetDateTime>,
-    days: UtcOffset,
+    day: super::local_day::ReaderDay,
 ) -> Vec<WeatherDisplay> {
     let now = OffsetDateTime::now_utc();
     let selected = start.is_some() || end.is_some();
-    let days = if selected { UtcOffset::UTC } else { days };
+    let days = if selected { UtcOffset::UTC } else { day.offset };
     let start = start
-        .unwrap_or_else(|| super::local_day::start_of_today(now, days))
+        .unwrap_or_else(|| {
+            if selected {
+                now.replace_time(Time::MIDNIGHT)
+            } else {
+                day.start
+            }
+        })
         .to_offset(UtcOffset::UTC);
     let end = end.unwrap_or(now).to_offset(UtcOffset::UTC);
     let day_start = start.to_offset(days).replace_time(Time::MIDNIGHT);

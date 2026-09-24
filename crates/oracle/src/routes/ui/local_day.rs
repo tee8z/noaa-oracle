@@ -1,5 +1,6 @@
 //! The reader's "today". A one-line script in the page head stores the
-//! browser's UTC offset, in minutes east of UTC, in the `utc_offset` cookie.
+//! browser midnight and its UTC offset in the `local_midnight` and
+//! `utc_offset` cookies. History and future days use that fixed offset.
 //! Pages then take today to be the reader's calendar day: observations from
 //! their local midnight, and forecasts grouped by their local dates. Without
 //! the cookie (a first visit, or scripts turned off) days are UTC days.
@@ -25,6 +26,32 @@ pub fn reader_offset(headers: &HeaderMap) -> UtcOffset {
         .filter(|minutes| (-MAX_OFFSET_MINUTES..=MAX_OFFSET_MINUTES).contains(minutes))
         .and_then(|minutes| UtcOffset::from_whole_seconds(minutes * 60).ok())
         .unwrap_or(UtcOffset::UTC)
+}
+
+/// A browser calendar day's midnight and its offset. Days without browser
+/// context use UTC. Forecast history retains this fixed offset.
+#[derive(Clone, Copy)]
+pub(super) struct ReaderDay {
+    pub offset: UtcOffset,
+    pub start: OffsetDateTime,
+}
+
+pub(super) fn reader_day(headers: &HeaderMap, now: OffsetDateTime) -> ReaderDay {
+    let offset = reader_offset(headers);
+    let start = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|cookies| cookies.split(';'))
+        .filter_map(|cookie| cookie.trim().split_once('='))
+        .find(|(name, _)| *name == "local_midnight")
+        .and_then(|(_, value)| value.parse::<i64>().ok())
+        .and_then(|seconds| OffsetDateTime::from_unix_timestamp(seconds).ok())
+        .filter(|start| *start <= now && now - *start < time::Duration::hours(26))
+        .map(|start| start.to_offset(offset))
+        .filter(|start| start.time() == Time::MIDNIGHT)
+        .unwrap_or_else(|| start_of_today(now, offset));
+    ReaderDay { offset, start }
 }
 
 /// The midnight that started the reader's current day.
@@ -68,6 +95,26 @@ mod tests {
             );
         }
         assert_eq!(reader_offset(&HeaderMap::new()), UtcOffset::UTC);
+    }
+
+    #[test]
+    fn browser_midnight_anchors_the_day_across_a_dst_offset_change() {
+        // Fall-back evening is still November 1, despite having passed 24 hours
+        // since local midnight. The browser also sends midnight's EDT offset.
+        let now = datetime!(2026-11-02 04:30 UTC);
+        let midnight = datetime!(2026-11-01 04:00 UTC);
+        let headers = with_cookie(&format!(
+            "utc_offset=-240; local_midnight={}",
+            midnight.unix_timestamp()
+        ));
+        assert_eq!(reader_day(&headers, now).start, midnight);
+        for invalid in ["0", "999999999999999999", "not-a-time"] {
+            let headers = with_cookie(&format!("utc_offset=-240; local_midnight={invalid}"));
+            assert_eq!(
+                reader_day(&headers, now).start,
+                start_of_today(now, offset!(-4))
+            );
+        }
     }
 
     #[test]
