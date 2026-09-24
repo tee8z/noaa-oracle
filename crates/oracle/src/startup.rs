@@ -17,9 +17,11 @@ use crate::{
         event_detail_handler, event_stats_handler, events_handler, files, forecast_handler,
         forecasts, get_event, get_event_entry, get_npub, get_pubkey, get_stations, healthy,
         list_events, list_sources, observations, oracle_info_handler, raw_data_handler, ready,
-        station_handler, update_data, upload, warm_forecast_cache, weather_handler,
+        station_handler, ui::policy::content_security_policy, update_data, upload,
+        warm_forecast_cache, weather_handler,
     },
     sources::{NoaaWeather, Sources},
+    templates::assets::serve_asset,
     weather_data::{self, Station, WeatherAccess, WeatherData},
 };
 use anyhow::{Context, Result, anyhow};
@@ -384,18 +386,22 @@ pub fn app(app_state: Arc<AppState>) -> Router {
         .allow_headers([ACCEPT, CONTENT_TYPE])
         .allow_origin(Any);
 
-    Router::new()
-        // UI routes
+    // Pages and the fragments htmx swaps into them.
+    let ui = Router::new()
         .route("/", get(dashboard_handler))
         .route("/events", get(events_handler))
         .route("/events/{event_id}", get(event_detail_handler))
         .route("/raw", get(raw_data_handler))
-        // HTMX fragment routes
         .route("/fragments/oracle-info", get(oracle_info_handler))
         .route("/fragments/event-stats", get(event_stats_handler))
         .route("/fragments/weather", get(weather_handler))
         .route("/fragments/forecast/{station_id}", get(forecast_handler))
         .route("/fragments/station/{station_id}", get(station_handler))
+        .layer(middleware::from_fn(content_security_policy));
+
+    Router::new()
+        .merge(ui)
+        .route("/assets/{file}", get(serve_asset))
         // Probes
         .route("/health", get(ready))
         .route("/ready", get(ready))
@@ -423,7 +429,6 @@ pub fn app(app_state: Arc<AppState>) -> Router {
             get(get_event_entry),
         )
         .with_state(app_state)
-        .merge(crate::templates::assets::router())
         .layer(middleware::from_fn(log_request))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .merge(Scalar::with_url("/docs", api_docs))

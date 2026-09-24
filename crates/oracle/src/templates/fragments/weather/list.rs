@@ -4,10 +4,7 @@
 use maud::{Markup, html};
 
 use super::{ObservationPeriod, WeatherContext, WeatherDisplay, by_region, place, with_parameters};
-use crate::templates::components::{
-    time as when,
-    values::{self, Settled},
-};
+use crate::templates::components::{time as when, values};
 
 /// At most this many stations outside the list are offered for a search.
 const OTHER_MATCHES: usize = 8;

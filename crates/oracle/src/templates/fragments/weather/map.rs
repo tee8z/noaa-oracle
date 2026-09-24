@@ -1,6 +1,6 @@
 //! Stations on a map of the lower 48, coloured by their latest temperature.
-//! Hovering a pin shows its values; clicking loads the station's forecast
-//! and history below the map.
+//! Hovering a pin shows its values; clicking it, or Enter or Space on it
+//! (`weather.js`), loads the station's forecast and history below the map.
 
 use maud::{Markup, html};
 
@@ -98,7 +98,7 @@ pub(super) fn weather_map(weather: &[WeatherDisplay], context: &WeatherContext) 
     html! {
         div class="wx-map" {
             div class="map-wrapper" {
-                img src=(assets::USA_MAP_URL) alt="" class="usa-map";
+                img src=(assets::USA_MAP_SVG.url) alt="" class="usa-map";
                 svg class="station-markers" viewBox="0 0 599.96 327.28" preserveAspectRatio="none"
                     role="group" aria-label="Stations by latest temperature" {
                     @for station in weather {
@@ -108,7 +108,6 @@ pub(super) fn weather_map(weather: &[WeatherDisplay], context: &WeatherContext) 
                               aria-label=(summary(station, context).replace('\n', ", "))
                               hx-get=(station_url(&station.station_id))
                               hx-target="#map-station"
-                              hx-trigger="click, keyup[key=='Enter']"
                               hx-indicator="#map-station-loading" {
                                 title { (summary(station, context)) }
                                 // A wider invisible circle is easier to hit.

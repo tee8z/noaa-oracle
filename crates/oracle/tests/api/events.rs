@@ -352,3 +352,83 @@ async fn event_filters_render_the_matching_part() {
     assert!(list.contains("No events match these filters."));
     assert!(!list.contains("status-filter"));
 }
+
+/// Attributes named `on…`, which run inline script.
+fn inline_handlers(html: &str) -> Vec<&str> {
+    html.match_indices(" on")
+        .filter_map(|(at, _)| {
+            let name = &html[at + 1..];
+            let end = name.find(|c: char| !c.is_ascii_lowercase())?;
+            (end > 2 && name[end..].starts_with('=')).then_some(&name[..end])
+        })
+        .collect()
+}
+
+/// Pages send a Content-Security-Policy that allows only this site's script
+/// files, and contain nothing it would block: every script is a file, no
+/// element has an inline handler, and htmx is told not to evaluate code.
+#[tokio::test]
+async fn pages_allow_only_their_own_script_files() {
+    let test_app = app().await;
+    let event = created(&test_app).await;
+    for (path, status, extra) in [
+        ("/events".to_string(), StatusCode::OK, None),
+        (format!("/events/{}", event.id), StatusCode::OK, None),
+        (
+            format!("/events/{}", Uuid::nil()),
+            StatusCode::NOT_FOUND,
+            None,
+        ),
+        (
+            "/raw".to_string(),
+            StatusCode::OK,
+            Some("https://cdn.jsdelivr.net 'wasm-unsafe-eval'; worker-src blob:"),
+        ),
+    ] {
+        let response = test_app
+            .app
+            .clone()
+            .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{path}");
+        let policy = response.headers()[header::CONTENT_SECURITY_POLICY]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(policy.starts_with("script-src 'self'"), "{path}: {policy}");
+        for directive in [
+            "object-src 'none'",
+            "base-uri 'none'",
+            "frame-ancestors 'none'",
+        ] {
+            assert!(policy.contains(directive), "{path}: {policy}");
+        }
+        assert!(!policy.contains("unsafe-inline"), "{path}: {policy}");
+        assert!(!policy.contains("'unsafe-eval'"), "{path}: {policy}");
+        match extra {
+            Some(sources) => assert!(policy.contains(sources), "{path}: {policy}"),
+            None => assert!(!policy.contains("jsdelivr"), "{path}: {policy}"),
+        }
+
+        let html = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(html.to_vec()).unwrap();
+        assert!(html.starts_with("<!DOCTYPE html>"), "{path}");
+        for script in html.split("<script").skip(1) {
+            let (attributes, rest) = script.split_once('>').unwrap();
+            assert!(
+                attributes.contains(" src=\"/assets/"),
+                "{path}: <script{attributes}>"
+            );
+            assert!(rest.starts_with("</script>"), "{path}: inline script");
+        }
+        assert_eq!(inline_handlers(&html), Vec::<&str>::new(), "{path}");
+        assert!(!html.contains("hx-on"), "{path}");
+        assert!(html.contains("allowEval&quot;:false"), "{path}");
+        assert!(html.contains("selfRequestsOnly&quot;:true"), "{path}");
+        // Only the raw data page loads its DuckDB script.
+        assert_eq!(html.contains("/assets/raw-data."), path == "/raw", "{path}");
+    }
+    assert_eq!(inline_handlers(r#"<a onclick="x()">once</a>"#), ["onclick"]);
+    assert!(inline_handlers(r#"<p hx-trigger="toggle once">on = off</p>"#).is_empty());
+}

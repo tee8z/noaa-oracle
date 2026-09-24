@@ -58,8 +58,8 @@ pub fn date(time: OffsetDateTime) -> String {
 /// "Thu, Sep 24" for a `YYYY-MM-DD` calendar day (or a timestamp starting
 /// with one). Forecast days are UTC days, so no time zone applies.
 pub fn calendar_day(day: &str) -> String {
-    let day = day.split([' ', 'T']).next().unwrap_or(day);
-    time::Date::parse(day, format_description!("[year]-[month]-[day]"))
+    let date = day.split([' ', 'T']).next().unwrap_or(day);
+    time::Date::parse(date, format_description!("[year]-[month]-[day]"))
         .ok()
         .and_then(|date| {
             date.format(format_description!(

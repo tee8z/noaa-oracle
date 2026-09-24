@@ -171,7 +171,6 @@ pub(super) async fn load_weather(
                 iata_id: station
                     .map(|station| station.iata_id.clone())
                     .unwrap_or_default(),
-                elevation_m: station.and_then(|station| station.elevation_m),
                 latest_temp: latest.latest_temp,
                 latest_temp_time: latest.latest_temp_time.clone(),
                 observation_period: period.clone(),
