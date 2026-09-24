@@ -2,22 +2,31 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
 };
 use uuid::Uuid;
 
-use crate::{AppState, templates::event_detail_page};
+use super::htmx::{page_or_fragment, wants_fragment};
+use crate::{
+    AppState,
+    templates::{event_detail_page, pages::event_detail::event_detail_content},
+};
 
-/// Handler for the event detail page (GET /events/{id})
+/// Handler for the event detail page (GET /events/{id}).
+/// Returns the full page for normal requests and only the content for htmx,
+/// which swaps it into the page's existing layout.
 pub async fn event_detail_handler(
+    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Path(event_id): Path<Uuid>,
 ) -> Response {
     match state.oracle.get_event(event_id).await {
-        Ok(event) => {
-            Html(event_detail_page(&state.remote_url, &event).into_string()).into_response()
-        }
+        Ok(event) => page_or_fragment(if wants_fragment(&headers) {
+            event_detail_content(&event).into_string()
+        } else {
+            event_detail_page(&state.remote_url, &event).into_string()
+        }),
         Err(crate::oracle::Error::EventNotFound(_)) => (
             StatusCode::NOT_FOUND,
             Html(not_found_page(&event_id.to_string())),

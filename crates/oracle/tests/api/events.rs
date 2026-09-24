@@ -3,12 +3,16 @@
 //! routes apply them with the right status codes.
 
 use crate::helpers::{MockWeatherAccess, TestApp, event_at, signed, spawn_app};
-use axum::http::{Method, StatusCode};
+use axum::{
+    body::{Body, to_bytes},
+    http::{Method, Request, StatusCode, header},
+};
 use nostr::key::Keys;
 use oracle::{Event, EventStatus, EventSummary, WeatherEntry};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use time::Duration;
+use tower::ServiceExt;
 use uuid::Uuid;
 
 async fn app() -> TestApp {
@@ -273,4 +277,43 @@ async fn oracle_identity_is_public() {
     assert!(npub["key"].as_str().unwrap().starts_with("npub1"));
     let pubkey: Value = test_app.get_json("/oracle/pubkey").await;
     assert_eq!(pubkey["key"], test_app.oracle.public_key_base64());
+}
+
+#[tokio::test]
+async fn event_pages_return_only_their_content_to_htmx() {
+    let test_app = app().await;
+    let event = created(&test_app).await;
+    for path in [format!("/events/{}", event.id), "/events".to_string()] {
+        let (status, page) = test_app.get(&path).await;
+        assert_eq!(status, StatusCode::OK);
+        let page = String::from_utf8(page.to_vec()).unwrap();
+        assert!(page.starts_with("<!DOCTYPE html>"), "{path}");
+        assert_eq!(page.matches("4cast Truth Oracle</h1>").count(), 1);
+
+        let request = Request::get(&path)
+            .header("hx-request", "true")
+            .body(Body::empty())
+            .unwrap();
+        let response = test_app.app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::VARY], "HX-Request");
+        let fragment = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let fragment = String::from_utf8(fragment.to_vec()).unwrap();
+        assert!(!fragment.contains("<html"), "{path}");
+        assert!(!fragment.contains("4cast Truth Oracle</h1>"), "{path}");
+        assert!(!fragment.contains("navbar"), "{path}");
+        assert!(fragment.contains(&event.id.to_string()[..8]), "{path}");
+
+        // htmx restores history by replacing the body, so it needs the page.
+        let (_, restored) = test_app
+            .send(
+                Request::get(&path)
+                    .header("hx-request", "true")
+                    .header("hx-history-restore-request", "true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert!(restored.starts_with(b"<!DOCTYPE html>"), "{path}");
+    }
 }

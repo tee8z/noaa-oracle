@@ -3,11 +3,12 @@ use std::sync::Arc;
 use axum::{
     extract::{Query, State},
     http::HeaderMap,
-    response::Html,
+    response::Response,
 };
 use serde::Deserialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+use super::htmx::{page_or_fragment, wants_fragment};
 use crate::{
     AppState,
     events::EventStatus,
@@ -34,7 +35,7 @@ pub async fn dashboard_handler(
     headers: HeaderMap,
     Query(query): Query<DashboardQuery>,
     State(state): State<Arc<AppState>>,
-) -> Html<String> {
+) -> Response {
     // Parse optional time range from query params
     let start = query
         .start
@@ -55,14 +56,11 @@ pub async fn dashboard_handler(
     });
     let data = build_dashboard_data(&state, station_ids.as_deref(), start, end).await;
 
-    // Check if this is an HTMX request
-    if headers.contains_key("hx-request") {
-        // Return only the content for HTMX partial updates
-        Html(dashboard_content(&data).into_string())
+    page_or_fragment(if wants_fragment(&headers) {
+        dashboard_content(&data).into_string()
     } else {
-        // Return full page for normal browser requests
-        Html(dashboard_page(&state.remote_url, &data).into_string())
-    }
+        dashboard_page(&state.remote_url, &data).into_string()
+    })
 }
 
 async fn build_dashboard_data(
