@@ -225,6 +225,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: noaa-oracle-binaries
+          path: target/debug
 
       - name: Make binaries executable
         run: chmod +x target/debug/oracle target/debug/daemon
@@ -268,6 +269,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: noaa-oracle-binaries
+          path: target/debug
 
       - name: Make binaries executable
         run: chmod +x target/debug/oracle target/debug/daemon
