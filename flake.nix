@@ -136,6 +136,8 @@
           buildInputs = buildDeps ++ [ pkgs.stdenv.cc.cc.lib ];
           nativeBuildInputs = buildDeps;
           cargoExtraArgs = "--bin oracle";
+          # CI runs the test suite; the release packages only build.
+          doCheck = false;
 
           # Copy static files right after cargo build, before they get cleaned up
           postBuild = ''
@@ -194,6 +196,7 @@
           buildInputs = commonDeps;
           nativeBuildInputs = buildDeps;
           cargoExtraArgs = "--bin daemon";
+          doCheck = false;
         } // commonEnv);
 
         # Docker images
