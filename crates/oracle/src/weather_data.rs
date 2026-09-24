@@ -2916,6 +2916,168 @@ mod tests {
         );
     }
 
+    /// The previous query, the current query over the published files, and
+    /// the current query over copies and folds, on a copy of real data:
+    ///
+    /// ```text
+    /// ORACLE_PERF_DATA=~/weather cargo test -p oracle --lib real_forecasts -- --ignored --nocapture
+    /// ```
+    ///
+    /// Requests are those the pages and the coordinator make, as of the
+    /// newest file. Local days have no previous query; they compare the
+    /// published files with the copies and folds.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs ORACLE_PERF_DATA"]
+    async fn real_forecasts_match_the_previous_query() {
+        let directory = std::env::var("ORACLE_PERF_DATA")
+            .expect("ORACLE_PERF_DATA must name a weather directory");
+        let file_access = Arc::new(crate::file_access::FileAccess::new(directory.clone()));
+        let published = WeatherAccess::new(file_access.clone());
+        let prepared = WeatherAccess::with_derived_forecasts(
+            file_access,
+            &Path::new(&directory).join("derived"),
+        );
+        let started = std::time::Instant::now();
+        prepared
+            .prepare_files(&CancellationToken::new())
+            .await
+            .unwrap();
+        println!(
+            "\ncopies and folds ready in {:.1}s",
+            started.elapsed().as_secs_f64()
+        );
+        let now = OffsetDateTime::now_utc();
+        let today = now.replace_time(time::Time::MIDNIGHT);
+        let airports: Vec<String> = "KATL,KLAX,KORD,KDFW,KDEN,KJFK,KSFO,KSEA,KLAS,KMCO,KEWR,KMIA,KPHX,KIAH,KBOS,KMSP,KFLL,KDTW,KPHL,KLGA,KBWI,KSLC,KDCA,KSAN,KTPA,KPDX,KSTL,KHNL,KBNA,KAUS,KMCI,KRDU,KMKE,KSMF,KCLT,KPIT,KSAT,KOAK,KCLE,KSJC,KIND,KCVG,KCMH,KJAN,KRSW,KABQ,KANC,KOMA,KBUF,KPBI,KBDL,KPVD,KBTV,KPWM,KMHT,KBOI,KBIL,KFSD,KFAR,KGEG,KICT,KLIT,KLEX,KBHM,KMEM,KJAX,KCHS,KRIC,KORF,KCRW,KPNS,KMOB,KSHV,KMSY,KTUL,KELP,KTUS,KCOS,KGRR,KDSM,KMSN,KDLH,KBZN,KGJT,KRAP,KFCA,KCYS,KJAR,KSGF,KFSM"
+            .split(',')
+            .map(String::from)
+            .collect();
+        let three: Vec<String> = ["KPWM", "KBTV", "KBED"].map(String::from).to_vec();
+        let one = vec!["KORD".to_owned()];
+        let request = |start: OffsetDateTime,
+                       end: OffsetDateTime,
+                       generated: Option<(OffsetDateTime, OffsetDateTime)>,
+                       station_ids: &[String]| {
+            (
+                ForecastRequest {
+                    start: Some(start),
+                    end: Some(end),
+                    generated_start: generated.map(|(start, _)| start),
+                    generated_end: generated.map(|(_, end)| end),
+                    station_ids: station_ids.join(","),
+                    temperature_unit: TemperatureUnit::Fahrenheit,
+                },
+                station_ids.to_vec(),
+            )
+        };
+        let before = |time: OffsetDateTime| time - Duration::nanoseconds(1);
+        let finished = today - Duration::hours(21);
+        let new_york = Calendar::from_zone_name("America/New_York").unwrap();
+        let local_day = new_york.start_of_day(now);
+        let cases = [
+            (
+                "dashboard: 90 airports, today from yesterday's issues",
+                request(
+                    today,
+                    today + Duration::days(1),
+                    Some((today - Duration::days(1), before(today))),
+                    &airports,
+                ),
+            ),
+            (
+                "map popup: next 7 days",
+                request(today, today + Duration::days(7), None, &one),
+            ),
+            (
+                "map popup: last 7 days",
+                request(
+                    today - Duration::days(7),
+                    today,
+                    Some((today - Duration::days(8), now)),
+                    &one,
+                ),
+            ),
+            (
+                "API: entry form, 3 stations, next 2 days",
+                request(now, now + Duration::days(2), None, &three),
+            ),
+            (
+                "API: leaderboard, 3 stations, finished window",
+                request(finished, finished + Duration::days(1), None, &three),
+            ),
+            (
+                "scoring: 3 stations, issues before the window",
+                request(
+                    finished,
+                    finished + Duration::days(1),
+                    Some((finished - Duration::days(7), before(finished))),
+                    &three,
+                ),
+            ),
+            (
+                "admin page: 90 airports, next 2 days",
+                request(now, now + Duration::days(2), None, &airports),
+            ),
+        ];
+        println!(
+            "\n| Query | Previous (ms) | Current, files (ms) | Current, copies and folds (ms) | Rows |"
+        );
+        println!("| --- | ---: | ---: | ---: | ---: |");
+        let timed = |started: std::time::Instant| started.elapsed().as_secs_f64() * 1000.0;
+        for (name, (request, station_ids)) in cases {
+            let started = std::time::Instant::now();
+            let expected = sorted(
+                legacy::forecasts_data(&published, &request, station_ids.clone())
+                    .await
+                    .unwrap_or_else(|error| panic!("previous query, {name}: {error}")),
+            );
+            let legacy_ms = timed(started);
+            assert!(!expected.is_empty(), "{name}: no forecasts in the data");
+            let started = std::time::Instant::now();
+            let from_files = published
+                .forecasts_data(&request, station_ids.clone())
+                .await
+                .unwrap();
+            let files_ms = timed(started);
+            let started = std::time::Instant::now();
+            let from_prepared = prepared
+                .forecasts_data(&request, station_ids.clone())
+                .await
+                .unwrap();
+            let prepared_ms = timed(started);
+            assert_same_forecasts(&expected, &from_files, name);
+            assert_same_forecasts(&expected, &from_prepared, name);
+            println!(
+                "| {name} | {legacy_ms:.0} | {files_ms:.0} | {prepared_ms:.0} | {} |",
+                expected.len()
+            );
+        }
+        let (request, station_ids) = request(
+            local_day,
+            local_day + Duration::days(1),
+            Some((local_day - Duration::days(1), before(local_day))),
+            &airports,
+        );
+        let started = std::time::Instant::now();
+        let from_files = published
+            .calendar_forecasts(&request, station_ids.clone(), new_york)
+            .await
+            .unwrap();
+        let files_ms = timed(started);
+        let started = std::time::Instant::now();
+        let from_prepared = prepared
+            .calendar_forecasts(&request, station_ids, new_york)
+            .await
+            .unwrap();
+        let prepared_ms = timed(started);
+        assert!(!from_files.is_empty());
+        assert_same_forecasts(&from_files, &from_prepared, "New York dashboard");
+        println!(
+            "| dashboard: 90 airports, New York day (no previous query) | - | {files_ms:.0} | {prepared_ms:.0} | {} |",
+            from_files.len()
+        );
+    }
+
     #[test]
     fn temperature_units_accept_the_daemon_spelling() {
         assert!((convert(0.0, "celcius", &TemperatureUnit::Fahrenheit) - 32.0).abs() < 1e-9);
