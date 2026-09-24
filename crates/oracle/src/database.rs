@@ -259,8 +259,8 @@ impl Database {
                         number_of_values_per_entry, signing_date,
                         start_observation_date, end_observation_date,
                         nonce_salt, nonce_point, event_announcement,
-                        locations, metrics, coordinator_pubkey
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        locations, metrics, coordinator_pubkey, unlisted
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(row.id)
                 .bind(row.source)
@@ -276,6 +276,7 @@ impl Database {
                 .bind(row.locations)
                 .bind(row.metrics)
                 .bind(row.coordinator_pubkey)
+                .bind(row.unlisted)
                 .execute(connection)
                 .await?;
                 Ok(())
@@ -761,7 +762,7 @@ pub struct EntryScore {
 const EVENT_SELECT: &str = "SELECT e.id, e.source, e.signing_date, e.start_observation_date,
         e.end_observation_date, e.locations, e.metrics, e.total_allowed_entries,
         e.number_of_places_win, e.number_of_values_per_entry, e.nonce_salt,
-        e.nonce_point, e.coordinator_pubkey, e.attestation,
+        e.nonce_point, e.coordinator_pubkey, e.attestation, e.unlisted,
         COUNT(ee.id) AS total_entries
      FROM events e
      LEFT JOIN events_entries ee ON ee.event_id = e.id";
@@ -801,6 +802,7 @@ struct EventInsert {
     locations: String,
     metrics: String,
     coordinator_pubkey: String,
+    unlisted: bool,
 }
 
 impl EventInsert {
@@ -825,6 +827,7 @@ impl EventInsert {
             locations: serde_json::to_string(&event.locations).map_err(encode_error)?,
             metrics: serde_json::to_string(&event.metrics).map_err(encode_error)?,
             coordinator_pubkey: event.coordinator_pubkey.clone(),
+            unlisted: event.unlisted,
         })
     }
 }
@@ -864,6 +867,7 @@ fn event_from_row(row: &SqliteRow) -> Result<EventRecord, sqlx::Error> {
                 MaybeScalar::from_slice(&bytes).map_err(|error| decode_error("attestation", error))
             })
             .transpose()?,
+        unlisted: row.try_get("unlisted")?,
     })
 }
 

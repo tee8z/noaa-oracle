@@ -85,6 +85,8 @@ async fn coordinator_event_lifecycle_uses_stable_wire_shapes() {
         raw["scoring_fields"],
         json!(["temp_high", "temp_low", "wind_speed"])
     );
+    // A client that doesn't know about `unlisted` creates listed events.
+    assert_eq!(raw["unlisted"], false);
     let created: CoordinatorEvent = serde_json::from_value(raw).unwrap();
     assert_eq!(created.id, event_id);
     assert!(created.attestation.is_none());

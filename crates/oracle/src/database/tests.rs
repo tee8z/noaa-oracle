@@ -51,6 +51,7 @@ fn create_event_data(entries: usize) -> NewEvent {
             expiry: Some(1),
         },
         coordinator_pubkey: "npub1coordinator".into(),
+        unlisted: false,
     }
 }
 

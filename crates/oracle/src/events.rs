@@ -76,6 +76,11 @@ pub struct CreateEvent {
     /// source's defaults (`temp_high`, `temp_low`, `wind_speed` for NOAA).
     #[serde(default, alias = "metrics", skip_serializing_if = "Option::is_none")]
     pub scoring_fields: Option<Vec<String>>,
+    /// Keep the event off the oracle's events list and dashboard counts
+    /// unless the reader asks to see unlisted events. It stays reachable by
+    /// its id, on its own page and over the API. Defaults to `false`.
+    #[serde(default)]
+    pub unlisted: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -164,6 +169,7 @@ pub struct NewEvent {
     pub event_announcement: EventLockingConditions,
     /// The coordinator's npub.
     pub coordinator_pubkey: String,
+    pub unlisted: bool,
 }
 
 impl NewEvent {
@@ -270,6 +276,7 @@ impl NewEvent {
                 locking_points,
             },
             coordinator_pubkey,
+            unlisted: event.unlisted,
         })
     }
 }
@@ -291,6 +298,7 @@ pub struct EventRecord {
     pub coordinator_pubkey: String,
     pub attestation: Option<MaybeScalar>,
     pub total_entries: usize,
+    pub unlisted: bool,
 }
 
 impl EventRecord {
@@ -346,6 +354,7 @@ impl EventRecord {
             scoring_fields: self.metrics,
             source: self.source,
             locations: self.locations,
+            unlisted: self.unlisted,
         }
     }
 
@@ -367,6 +376,7 @@ impl EventRecord {
             scoring_fields: self.metrics,
             source: self.source,
             locations: self.locations,
+            unlisted: self.unlisted,
         }
     }
 }
@@ -623,6 +633,9 @@ pub struct EventSummary {
     /// Public nonce point `R` the attestation is made with
     #[schema(value_type = String)]
     pub nonce_point: Point,
+    /// Left off the oracle's events list unless asked for
+    #[serde(default)]
+    pub unlisted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
@@ -664,6 +677,9 @@ pub struct Event {
     pub coordinator_pubkey: String,
     /// Metric ids the event scores
     pub scoring_fields: Vec<String>,
+    /// Left off the oracle's events list unless asked for
+    #[serde(default)]
+    pub unlisted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -1031,6 +1047,7 @@ mod tests {
             number_of_places_win: places,
             source: None,
             scoring_fields: None,
+            unlisted: false,
         }
     }
 
@@ -1060,6 +1077,7 @@ mod tests {
             coordinator_pubkey: new.coordinator_pubkey,
             attestation: None,
             total_entries: 0,
+            unlisted: new.unlisted,
         }
     }
 
@@ -1349,6 +1367,17 @@ mod tests {
             .collect();
         assert_eq!(picks.len(), 3);
         assert_eq!(WeatherChoices::from_picks(&picks), choices);
+    }
+
+    #[test]
+    fn events_are_listed_unless_created_unlisted() {
+        let mut body = serde_json::to_value(event(3, 1)).unwrap();
+        body.as_object_mut().unwrap().remove("unlisted");
+        let old_client: CreateEvent = serde_json::from_value(body.clone()).unwrap();
+        assert!(!record(build(old_client).unwrap()).unlisted);
+        body["unlisted"] = true.into();
+        let unlisted: CreateEvent = serde_json::from_value(body).unwrap();
+        assert!(record(build(unlisted).unwrap()).unlisted);
     }
 
     #[test]

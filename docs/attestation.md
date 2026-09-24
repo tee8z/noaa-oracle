@@ -88,12 +88,16 @@ the existing 10:1 liquid-to-snow estimate rather than a direct snowfall measurem
   "signing_date": "2030-01-02T03:00:00Z",
   "total_allowed_entries": 10,
   "number_of_places_win": 3,
-  "number_of_values_per_entry": 4
+  "number_of_values_per_entry": 4,
+  "unlisted": false
 }
 ```
 
 `source` defaults to the default source and `scoring_fields` (alias
 `metrics`) to the source's defaults; `targets` is accepted for `locations`.
+`unlisted` (default `false`) keeps the event off the oracle's events page
+and dashboard counts unless the reader chooses "Show unlisted"; its page,
+`/events/{id}`, and the API still serve it, and responses carry the flag.
 Limits: 2–25 entries, 1–5 places and fewer places than entries, at most
 20,000 outcomes, 1–50 distinct targets, start < end ≤ signing date.
 

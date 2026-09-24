@@ -59,6 +59,7 @@ fn event_data() -> NewEvent {
             expiry: Some(1),
         },
         coordinator_pubkey: "npub1coordinator".into(),
+        unlisted: false,
     }
 }
 

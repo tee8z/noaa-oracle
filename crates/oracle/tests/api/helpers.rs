@@ -267,6 +267,7 @@ pub fn event_at(now: OffsetDateTime) -> CreateEvent {
         total_allowed_entries: 3,
         number_of_places_win: 1,
         scoring_fields: None,
+        unlisted: false,
     }
 }
 
