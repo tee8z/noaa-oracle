@@ -154,6 +154,10 @@ fn encode(value: &str) -> String {
     encoded
 }
 
+/// `hx-sync` for requests the reader starts in the section: they share its
+/// queue and replace a refresh in flight.
+pub(super) const INTERACTIVE: &str = "closest #weather-table-container:replace";
+
 /// The weather section. It refreshes itself every five minutes, but not
 /// while the reader has a station open or is typing a search (`weather.js`).
 pub fn weather_section(weather: &[WeatherDisplay], context: &WeatherContext) -> Markup {
@@ -161,11 +165,14 @@ pub fn weather_section(weather: &[WeatherDisplay], context: &WeatherContext) -> 
     // the whole section, rather than restoring the query from its initial HTML.
     let refresh = with_parameters(context.selection_path, &[("view", context.view.as_str())]);
     html! {
+        // A refresh gives way to a request the reader started (their
+        // requests replace it, and it is dropped while one runs).
         section id="weather-table-container"
             hx-get=(refresh)
             hx-include=[(context.view == WeatherView::List).then_some("#weather-search")]
             hx-trigger="every 300s"
             hx-swap="outerHTML"
+            hx-sync="this:drop"
             class="box weather" {
             div class="weather-head" {
                 h2 class="title is-5" { "Current weather" }
@@ -195,6 +202,7 @@ fn view_tabs(context: &WeatherContext) -> Markup {
                           hx-get=(context.fragment_url(view))
                           hx-target="#weather-table-container"
                           hx-swap="outerHTML"
+                          hx-sync=(INTERACTIVE)
                           hx-push-url=(context.page_url(view))
                           aria-current=[(context.view == view).then_some("true")] {
                             (label)

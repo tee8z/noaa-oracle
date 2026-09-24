@@ -13,23 +13,6 @@ document.addEventListener("htmx:config:request", function (event) {
   }
 });
 
-// Map pins are SVG groups that act as buttons: Enter or Space opens one.
-document.addEventListener("keydown", function (event) {
-  if (event.key !== "Enter" && event.key !== " ") return;
-  var pin = event.target.closest && event.target.closest(".pin[hx-get]");
-  if (!pin) return;
-  event.preventDefault();
-  htmx.trigger(pin, "click");
-});
-
-// An interactive request takes precedence over an automatic section refresh.
-// Requests for individual station details still run independently.
-document.addEventListener("htmx:before:request", function (event) {
-  var source = event.target;
-  var section = source.closest && source.closest("#weather-table-container");
-  if (section && source !== section) htmx.trigger(section, "htmx:abort");
-});
-
 // The reader may start typing or open a station after a refresh was sent.
 document.addEventListener("htmx:before:swap", function (event) {
   if (event.detail.ctx.sourceElement.id !== "weather-table-container") return;

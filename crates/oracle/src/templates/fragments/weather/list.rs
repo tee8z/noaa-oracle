@@ -3,7 +3,10 @@
 
 use maud::{Markup, html};
 
-use super::{ObservationPeriod, WeatherContext, WeatherDisplay, by_region, place, with_parameters};
+use super::{
+    INTERACTIVE, ObservationPeriod, WeatherContext, WeatherDisplay, by_region, place,
+    with_parameters,
+};
 use crate::templates::components::{time as when, values};
 
 /// At most this many stations outside the list are offered for a search.
@@ -17,7 +20,7 @@ pub(super) fn search_form(context: &WeatherContext) -> Markup {
         form class="weather-search" role="search"
             hx-get=(action)
             hx-target="#weather-list"
-            hx-sync="this:replace"
+            hx-sync=(INTERACTIVE)
             hx-swap="outerHTML"
             hx-trigger="input changed delay:200ms from:#weather-search, search from:#weather-search, submit"
             hx-indicator="#weather-search-loading" {
@@ -115,7 +118,8 @@ pub fn weather_list(weather: &[WeatherDisplay], context: &WeatherContext) -> Mar
                                 a href=(super::page_url(&with_parameters(context.selection_path, &[("add_station", &station.station_id), ("view", "list")])))
                                   hx-get=(with_parameters(context.selection_path, &[("add_station", &station.station_id), ("view", "list")]))
                                   hx-target="#weather-table-container"
-                                  hx-swap="outerHTML" {
+                                  hx-swap="outerHTML"
+                                  hx-sync=(INTERACTIVE) {
                                     "Add " strong { (station.station_id) } " "
                                     (station.station_name)
                                     @if !station.state.is_empty() { ", " (station.state) }

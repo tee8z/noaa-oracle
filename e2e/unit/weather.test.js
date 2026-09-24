@@ -11,19 +11,13 @@ const script = path.resolve(
 
 function load() {
   const listeners = {};
-  const triggered = [];
   const document = {
     addEventListener(name, listener) {
       listeners[name] = listener;
     },
   };
-  const htmx = {
-    trigger(element, name) {
-      triggered.push([element, name]);
-    },
-  };
-  vm.runInNewContext(fs.readFileSync(script, "utf8"), { document, htmx });
-  return { listeners, triggered, document };
+  vm.runInNewContext(fs.readFileSync(script, "utf8"), { document });
+  return { listeners, document };
 }
 
 function confirmEvent(target) {
@@ -54,29 +48,10 @@ test("the five-minute refresh waits while a station is open or the search has fo
   assert.equal(clicked.prevented, false);
 });
 
-test("Enter or Space on a map pin opens it like a click", () => {
-  const { listeners, triggered } = load();
-  const pin = {};
-  const target = { closest: (selector) => (selector === ".pin[hx-get]" ? pin : null) };
-  for (const key of ["Enter", " ", "a"]) {
-    let prevented = false;
-    listeners.keydown({ key, target, preventDefault: () => (prevented = true) });
-    assert.equal(prevented, key !== "a", key);
-  }
-  assert.deepEqual(triggered, [
-    [pin, "click"],
-    [pin, "click"],
-  ]);
-  listeners.keydown({ key: "Enter", target: { closest: () => null }, preventDefault() {} });
-  assert.equal(triggered.length, 2);
-});
-
-test("interaction wins over an automatic refresh already in flight", () => {
-  const { listeners, document, triggered } = load();
+test("a refresh that returns while the reader is busy is not swapped in", () => {
+  const { listeners, document } = load();
   const section = { id: "weather-table-container", querySelector: () => ({}) };
   document.getElementById = () => section;
-  listeners["htmx:before:request"]({ target: { closest: () => section } });
-  assert.deepEqual(triggered, [[section, "htmx:abort"]]);
   const refresh = confirmEvent(section);
   refresh.detail = { ctx: { sourceElement: section } };
   listeners["htmx:before:swap"](refresh);

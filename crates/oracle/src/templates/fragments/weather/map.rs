@@ -1,6 +1,6 @@
 //! Stations on a map of the lower 48, coloured by their latest temperature.
-//! Hovering a pin shows its values; clicking it, or Enter or Space on it
-//! (`weather.js`), loads the station's forecast and history below the map.
+//! Hovering a pin shows its values; clicking it, or Enter on it, loads the
+//! station's forecast and history below the map.
 
 use maud::{Markup, html};
 
@@ -87,6 +87,11 @@ fn station_url(station_id: &str) -> String {
     format!("/fragments/station/{station_id}")
 }
 
+/// The list, searched for this station.
+fn list_url(station_id: &str) -> String {
+    format!("/?view=list&q={station_id}")
+}
+
 pub(super) fn weather_map(weather: &[WeatherDisplay], context: &WeatherContext) -> Markup {
     if weather.is_empty() {
         return no_data();
@@ -103,13 +108,15 @@ pub(super) fn weather_map(weather: &[WeatherDisplay], context: &WeatherContext) 
                     role="group" aria-label="Stations by latest temperature" {
                     @for station in weather {
                         @if let Some((x, y)) = lat_lon_to_svg(station.latitude, station.longitude) {
-                            g class={ "pin " (band(station.latest_temp)) }
-                              tabindex="0" role="button"
+                            // A link, so it takes focus and opens with Enter
+                            // without a script; without htmx it opens the list.
+                            a class={ "pin " (band(station.latest_temp)) }
+                              href=(list_url(&station.station_id))
                               aria-label=(summary(station, context).replace('\n', ", "))
                               hx-get=(station_url(&station.station_id))
                               hx-target="#map-station"
-                          hx-swap="innerHTML"
-                          hx-sync="#map-station:replace"
+                              hx-swap="innerHTML"
+                              hx-sync="#map-station:replace"
                               hx-indicator="#map-station-loading" {
                                 title { (summary(station, context)) }
                                 // A wider invisible circle is easier to hit.
@@ -131,7 +138,7 @@ pub(super) fn weather_map(weather: &[WeatherDisplay], context: &WeatherContext) 
                     "Not on the map: "
                     @for (index, station) in off_map.iter().enumerate() {
                         @if index > 0 { ", " }
-                        a href=(format!("/?view=list&q={}", station.station_id))
+                        a href=(list_url(&station.station_id))
                           hx-get=(station_url(&station.station_id))
                           hx-target="#map-station"
                           hx-swap="innerHTML"
