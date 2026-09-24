@@ -1,3 +1,4 @@
+use dlctix::secp::MaybeScalar;
 use maud::{Markup, html};
 use std::cmp::Reverse;
 use time::OffsetDateTime;
@@ -99,12 +100,20 @@ fn event_problem(heading: &str, message: Markup) -> Markup {
     }
 }
 
-/// The attestation is a scalar; show it as hex, like the API does.
-fn attestation_hex(event: &Event) -> Option<String> {
-    let attestation = event.attestation.as_ref()?;
-    serde_json::to_value(attestation)
+/// The attestation, a scalar, as hex like the API sends it; "Pending"
+/// until the event is signed. A signed event whose value can't be written
+/// out still reads "Signed", never "Pending".
+fn attestation_value(attestation: Option<&MaybeScalar>) -> Markup {
+    let Some(attestation) = attestation else {
+        return html! { span class="tag is-warning is-light" { "Pending" } };
+    };
+    let hex = serde_json::to_value(attestation)
         .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
+        .and_then(|value| value.as_str().map(str::to_owned));
+    match hex {
+        Some(hex) => html! { code class="key" { (hex) } },
+        None => html! { span class="tag is-signed" { "Signed" } },
+    }
 }
 
 pub fn event_detail_content(event: &Event, now: OffsetDateTime) -> Markup {
@@ -167,13 +176,7 @@ pub fn event_detail_content(event: &Event, now: OffsetDateTime) -> Markup {
                     dt { "Outcomes" } dd { (event.event_announcement.locking_points.len()) }
                     dt { "Nonce point" } dd { code class="key" { (event.nonce_point.to_string()) } }
                     dt { "Attestation" }
-                    dd {
-                        @if let Some(attestation) = attestation_hex(event) {
-                            code class="key" { (attestation) }
-                        } @else {
-                            span class="tag is-warning is-light" { "Pending" }
-                        }
-                    }
+                    dd { (attestation_value(event.attestation.as_ref())) }
                 }
             }
         }
@@ -499,6 +502,15 @@ mod tests {
         let ended = weather_comparison_table(&weather, values::Settled::Final).into_string();
         assert!(ended.contains("is-far"), "{ended}");
         assert!(!ended.contains("is-provisional"));
+    }
+
+    #[test]
+    fn a_signed_event_shows_its_attestation_as_hex() {
+        let attestation = MaybeScalar::from_slice(&[7; 32]).unwrap();
+        let html = attestation_value(Some(&attestation)).into_string();
+        assert!(html.contains(&"07".repeat(32)), "{html}");
+        assert!(!html.contains("Pending"), "{html}");
+        assert!(attestation_value(None).into_string().contains("Pending"));
     }
 
     #[test]
