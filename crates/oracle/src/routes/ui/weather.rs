@@ -119,14 +119,20 @@ pub(super) async fn load_weather(
                     .weather_db
                     .forecasts_data(&forecast_request, station_ids.to_vec())
                     .await
-                    .unwrap_or_default()
+                    .unwrap_or_else(|error| {
+                        log::error!("failed to read forecasts for the weather table: {error:#}");
+                        vec![]
+                    })
             } else {
                 vec![]
             }
         },
         state.stations(),
     );
-    let observations = observations.unwrap_or_default();
+    let observations = observations.unwrap_or_else(|error| {
+        log::error!("failed to read observations for the weather table: {error:#}");
+        vec![]
+    });
     let stations = stations.unwrap_or_else(|error| {
         log::error!("failed to read stations: {error:#}");
         Default::default()

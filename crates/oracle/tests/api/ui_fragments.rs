@@ -511,14 +511,15 @@ async fn forecast_fragment_handles_no_data() {
 async fn dashboard_handles_no_weather_data() {
     let mut weather_data = MockWeatherAccess::new();
 
+    // The default airports first, then every station as a fallback.
     weather_data
         .expect_observation_data()
-        .times(2)
+        .times(4)
         .returning(|_, _| Ok(vec![]));
 
     weather_data
         .expect_forecasts_data()
-        .times(1)
+        .times(2)
         .returning(|_, _| Ok(vec![]));
 
     weather_data
@@ -549,6 +550,52 @@ async fn dashboard_handles_no_weather_data() {
 
     // Should show a message about no data
     assert!(html.contains("No weather data available"));
+}
+
+/// The default dashboard names its stations: a forecast query over every
+/// station exceeds the per-query memory limit and left forecasts empty.
+#[tokio::test]
+async fn dashboard_queries_forecasts_for_default_airports() {
+    let mut weather_data = MockWeatherAccess::new();
+
+    weather_data
+        .expect_observation_data()
+        .withf(|_, stations| stations.iter().any(|station| station == "KORD"))
+        .times(2)
+        .returning(|_, _| Ok(mock_observation_data()));
+
+    weather_data
+        .expect_forecasts_data()
+        .withf(|_, stations| stations.iter().any(|station| station == "KORD"))
+        .times(1)
+        .returning(|_, _| Ok(vec![]));
+
+    weather_data
+        .expect_stations()
+        .times(1)
+        .returning(|| Ok(vec![]));
+
+    let test_app = spawn_app(Arc::new(weather_data)).await;
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/")
+        .header(header::ACCEPT, "text/html")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = test_app
+        .app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("Failed to execute request.");
+
+    assert!(response.status().is_success());
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains("KORD"));
 }
 
 fn mock_observation_data() -> Vec<Observation> {

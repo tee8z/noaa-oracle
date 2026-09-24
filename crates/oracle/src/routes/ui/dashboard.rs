@@ -238,24 +238,27 @@ async fn get_latest_weather(
     start: Option<OffsetDateTime>,
     end: Option<OffsetDateTime>,
 ) -> Vec<WeatherDisplay> {
-    let mut weather_data =
-        super::weather::load_weather(state, station_ids.unwrap_or_default(), start, end).await;
-    if station_ids.is_some() {
+    if let Some(station_ids) = station_ids {
+        let mut weather_data = super::weather::load_weather(state, station_ids, start, end).await;
         weather_data.sort_by(|a, b| a.station_id.cmp(&b.station_id));
         return weather_data;
     }
-    if weather_data
+    // Query only the default airports: a forecast query over every station
+    // exceeds the per-query memory limit, which left the forecast column empty.
+    let airports: Vec<String> = DEFAULT_MAJOR_AIRPORTS
         .iter()
-        .any(|weather| DEFAULT_MAJOR_AIRPORTS.contains(&weather.station_id.as_str()))
-    {
-        weather_data
-            .retain(|weather| DEFAULT_MAJOR_AIRPORTS.contains(&weather.station_id.as_str()));
+        .map(|station| station.to_string())
+        .collect();
+    let mut weather_data = super::weather::load_weather(state, &airports, start, end).await;
+    if !weather_data.is_empty() {
         weather_data.sort_by(|a, b| {
             get_region(b.longitude)
                 .cmp(&get_region(a.longitude))
                 .then_with(|| b.latitude.total_cmp(&a.latitude))
         });
     } else {
+        // Data without any default airport: show the first stations reporting.
+        weather_data = super::weather::load_weather(state, &[], start, end).await;
         weather_data.sort_by(|a, b| a.station_id.cmp(&b.station_id));
         weather_data.truncate(20);
     }
