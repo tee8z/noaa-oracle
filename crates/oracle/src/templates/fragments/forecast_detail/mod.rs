@@ -55,100 +55,135 @@ pub fn forecast_detail(
         div class="forecast-detail" {
             h3 class="is-sr-only" { "Forecasts and observations for " (station_id) }
             @if !comparisons.is_empty() {
-                section class="past-performance" {
-                    h4 class="title is-6" { "Past week: forecast vs observed" }
-                    p class="forecast-note" {
-                        "By UTC day. Each forecast was issued the day before. Differences are observed − forecast; + means it came in higher."
-                    }
-                    div class="table-container" {
-                        table class="table is-narrow is-fullwidth past-table" {
-                            thead {
-                                tr {
-                                    th { "Day" }
-                                    th { "High" }
-                                    th { "Low" }
-                                    th { "Max wind" }
-                                    th title="Forecast range; observed is estimated from temperature and dew point" { "Humidity" }
-                                    th { "Rain" }
-                                    th title="Observed snow is estimated from liquid precipitation at 10:1" { "Snow" }
-                                }
-                            }
-                            tbody {
-                                @for comp in comparisons.iter().take(7) {
-                                    tr {
-                                        th scope="row" { (when::calendar_day(&comp.date)) }
-                                        td {
-                                            (pair(values::temperature(comp.actual_high, "temp-high"),
-                                                  values::temperature(Some(comp.forecast_high as f64), "temp-high"),
-                                                  comp.actual_high.map(|_| values::difference(comp.actual_high, Some(comp.forecast_high as f64), "°F", Settled::Final))))
-                                        }
-                                        td {
-                                            (pair(values::temperature(comp.actual_low, "temp-low"),
-                                                  values::temperature(Some(comp.forecast_low as f64), "temp-low"),
-                                                  comp.actual_low.map(|_| values::difference(comp.actual_low, Some(comp.forecast_low as f64), "°F", Settled::Final))))
-                                        }
-                                        td {
-                                            (pair(values::wind(comp.actual_wind, None),
-                                                  values::wind(comp.forecast_wind, None),
-                                                  comp.actual_wind.zip(comp.forecast_wind).map(|(observed, forecast)| values::difference(Some(observed as f64), Some(forecast as f64), " kt", Settled::Final))))
-                                        }
-                                        td {
-                                            (pair(values::percent(comp.actual_humidity),
-                                                  humidity_range(comp.forecast_humidity_min, comp.forecast_humidity_max),
-                                                  None))
-                                        }
-                                        td {
-                                            (pair(values::precipitation(comp.actual_rain, "rain", 2),
-                                                  values::precipitation(comp.forecast_rain, "rain", 2),
-                                                  None))
-                                        }
-                                        td {
-                                            (pair(values::precipitation(comp.actual_snow, "snow", 1),
-                                                  values::precipitation(comp.forecast_snow, "snow", 1),
-                                                  None))
-                                        }
-                                    }
-                                }
-                            }
+                (past_week(comparisons))
+            }
+            (coming_days(forecasts))
+        }
+    }
+}
+
+fn past_week(comparisons: &[ForecastComparison]) -> Markup {
+    html! {
+        section class="past-performance" {
+            h4 class="title is-6" { "Past week: forecast vs observed" }
+            p class="forecast-note" {
+                "By UTC day. Each forecast was issued the day before. Differences are observed − forecast; + means it came in higher."
+            }
+            div class="table-container" {
+                table class="table is-narrow is-fullwidth past-table" {
+                    thead {
+                        tr {
+                            th { "Day" }
+                            th { "High" }
+                            th { "Low" }
+                            th { "Max wind" }
+                            th title="Forecast range; observed is estimated from temperature and dew point" { "Humidity" }
+                            th { "Rain" }
+                            th title="Observed snow is estimated from liquid precipitation at 10:1" { "Snow" }
                         }
                     }
-                    p class="forecast-note" { "Each cell: observed, then " span class="fcst" { "forecast" } "." }
+                    tbody {
+                        @for comparison in comparisons.iter().take(7) {
+                            (past_day(comparison))
+                        }
+                    }
                 }
             }
+            p class="forecast-note" { "Each cell: observed, then " span class="fcst" { "forecast" } "." }
+        }
+    }
+}
 
-            section class="upcoming-forecast" {
-                h4 class="title is-6" { "Coming days" }
-                @if forecasts.is_empty() {
-                    p class="muted" { "No forecast data available." }
-                } @else {
-                    ol class="forecast-days" {
-                        @for forecast in forecasts.iter().take(7) {
-                            li class="forecast-day" {
-                                p class="forecast-date" { (when::calendar_day(&forecast.date)) }
-                                p {
-                                    (values::temperature(Some(forecast.temp_high as f64), "temp-high"))
-                                    " / "
-                                    (values::temperature(Some(forecast.temp_low as f64), "temp-low"))
-                                }
-                                @if forecast.wind_speed.is_some() {
-                                    p { (values::wind(forecast.wind_speed, forecast.wind_direction)) }
-                                }
-                                @if let (Some(min), Some(max)) = (forecast.humidity_min, forecast.humidity_max) {
-                                    p class="muted" { (min) "–" (max) "% RH" }
-                                }
-                                @if let Some(chance) = forecast.precip_chance {
-                                    p { span class=(if chance > 0 { "val rain" } else { "val is-zero" }) { (chance) "% chance" } }
-                                }
-                                @if forecast.rain_amt.is_some() {
-                                    p { (values::precipitation(forecast.rain_amt, "rain", 2)) " rain" }
-                                }
-                                @if forecast.snow_amt.is_some() {
-                                    p { (values::precipitation(forecast.snow_amt, "snow", 1)) " snow" }
-                                }
-                            }
-                        }
+/// One past day. Past days are over, so their differences are final.
+fn past_day(day: &ForecastComparison) -> Markup {
+    let (forecast_high, forecast_low) = (day.forecast_high as f64, day.forecast_low as f64);
+    let degrees = |observed: Option<f64>, forecast: f64| {
+        observed.map(|_| values::difference(observed, Some(forecast), "°F", Settled::Final))
+    };
+    let wind = day
+        .actual_wind
+        .zip(day.forecast_wind)
+        .map(|(observed, forecast)| {
+            values::difference(
+                Some(observed as f64),
+                Some(forecast as f64),
+                " kt",
+                Settled::Final,
+            )
+        });
+    html! {
+        tr {
+            th scope="row" { (when::calendar_day(&day.date)) }
+            td {
+                (pair(values::temperature(day.actual_high, "temp-high"),
+                      values::temperature(Some(forecast_high), "temp-high"),
+                      degrees(day.actual_high, forecast_high)))
+            }
+            td {
+                (pair(values::temperature(day.actual_low, "temp-low"),
+                      values::temperature(Some(forecast_low), "temp-low"),
+                      degrees(day.actual_low, forecast_low)))
+            }
+            td { (pair(values::wind(day.actual_wind, None), values::wind(day.forecast_wind, None), wind)) }
+            td {
+                (pair(values::percent(day.actual_humidity),
+                      humidity_range(day.forecast_humidity_min, day.forecast_humidity_max),
+                      None))
+            }
+            td {
+                (pair(values::precipitation(day.actual_rain, "rain", 2),
+                      values::precipitation(day.forecast_rain, "rain", 2),
+                      None))
+            }
+            td {
+                (pair(values::precipitation(day.actual_snow, "snow", 1),
+                      values::precipitation(day.forecast_snow, "snow", 1),
+                      None))
+            }
+        }
+    }
+}
+
+fn coming_days(forecasts: &[ForecastDisplay]) -> Markup {
+    html! {
+        section class="upcoming-forecast" {
+            h4 class="title is-6" { "Coming days" }
+            @if forecasts.is_empty() {
+                p class="muted" { "No forecast data available." }
+            } @else {
+                ol class="forecast-days" {
+                    @for forecast in forecasts.iter().take(7) {
+                        (coming_day(forecast))
                     }
                 }
+            }
+        }
+    }
+}
+
+fn coming_day(forecast: &ForecastDisplay) -> Markup {
+    html! {
+        li class="forecast-day" {
+            p class="forecast-date" { (when::calendar_day(&forecast.date)) }
+            p {
+                (values::temperature(Some(forecast.temp_high as f64), "temp-high"))
+                " / "
+                (values::temperature(Some(forecast.temp_low as f64), "temp-low"))
+            }
+            @if forecast.wind_speed.is_some() {
+                p { (values::wind(forecast.wind_speed, forecast.wind_direction)) }
+            }
+            @if let (Some(min), Some(max)) = (forecast.humidity_min, forecast.humidity_max) {
+                p class="muted" { (min) "–" (max) "% RH" }
+            }
+            @if let Some(chance) = forecast.precip_chance {
+                p { span class=(if chance > 0 { "val rain" } else { "val is-zero" }) { (chance) "% chance" } }
+            }
+            @if forecast.rain_amt.is_some() {
+                p { (values::precipitation(forecast.rain_amt, "rain", 2)) " rain" }
+            }
+            @if forecast.snow_amt.is_some() {
+                p { (values::precipitation(forecast.snow_amt, "snow", 1)) " snow" }
             }
         }
     }
