@@ -181,7 +181,7 @@ pub fn event_detail_content(event: &Event, now: OffsetDateTime) -> Markup {
         @if !event.weather.is_empty() {
             section class="box" {
                 h3 class="title is-6" { "Weather" }
-                (weather_comparison_table(&event.weather))
+                (weather_comparison_table(&event.weather, settled(event, now)))
             }
         }
 
@@ -211,8 +211,18 @@ fn duration(span: time::Duration) -> String {
     }
 }
 
+/// Differences stay provisional until the observation window closes: until
+/// then the observed high and low can still move.
+fn settled(event: &Event, now: OffsetDateTime) -> values::Settled {
+    if now < event.end_observation_date {
+        values::Settled::SoFar
+    } else {
+        values::Settled::Final
+    }
+}
+
 /// Forecast baseline against what was observed during the window.
-fn weather_comparison_table(weather: &[Weather]) -> Markup {
+fn weather_comparison_table(weather: &[Weather], settled: values::Settled) -> Markup {
     html! {
         div class="table-container" {
             table class="table is-fullwidth is-narrow event-weather" {
@@ -229,15 +239,20 @@ fn weather_comparison_table(weather: &[Weather]) -> Markup {
                         @let observed = w.observed.as_ref();
                         tr {
                             th scope="row" { (w.station_id) }
-                            td { (observed_and_forecast(observed.map(|o| o.temp_high as f64), Some(w.forecasted.temp_high as f64), "°F", "temp-high")) }
-                            td { (observed_and_forecast(observed.map(|o| o.temp_low as f64), Some(w.forecasted.temp_low as f64), "°F", "temp-low")) }
-                            td { (observed_and_forecast(observed.and_then(|o| o.wind_speed).map(|v| v as f64), w.forecasted.wind_speed.map(|v| v as f64), " kt", "")) }
+                            td { (observed_and_forecast(observed.map(|o| o.temp_high as f64), Some(w.forecasted.temp_high as f64), "°F", "temp-high", settled)) }
+                            td { (observed_and_forecast(observed.map(|o| o.temp_low as f64), Some(w.forecasted.temp_low as f64), "°F", "temp-low", settled)) }
+                            td { (observed_and_forecast(observed.and_then(|o| o.wind_speed).map(|v| v as f64), w.forecasted.wind_speed.map(|v| v as f64), " kt", "", settled)) }
                         }
                     }
                 }
             }
         }
-        p class="is-size-7 muted" { "Each cell: observed and observed − forecast, then " span class="fcst" { "forecast" } ". — means no report in the window." }
+        p class="is-size-7 muted" {
+            "Each cell: observed and observed − forecast, then " span class="fcst" { "forecast" } ". — means no report in the window."
+            @if settled == values::Settled::SoFar {
+                " The window is still open, so differences stay grey."
+            }
+        }
     }
 }
 
@@ -246,6 +261,7 @@ fn observed_and_forecast(
     forecast: Option<f64>,
     unit: &str,
     class: &str,
+    settled: values::Settled,
 ) -> Markup {
     let show = |value: Option<f64>| match value {
         Some(value) => html! { span class={ "val " (class) } { (format!("{value:.0}{unit}")) } },
@@ -255,7 +271,7 @@ fn observed_and_forecast(
         span class="obs" {
             (show(observed))
             @if observed.is_some() && forecast.is_some() {
-                " " (values::difference(observed, forecast, unit, values::Settled::Final))
+                " " (values::difference(observed, forecast, unit, settled))
             }
         }
         span class="fcst" { (show(forecast)) }
@@ -377,6 +393,7 @@ fn back_icon() -> Markup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::{Forecasted, Observed};
     use uuid::Uuid;
 
     fn entry(id: u128, score: Option<i64>, base_score: Option<i64>) -> WeatherEntry {
@@ -456,6 +473,32 @@ mod tests {
             assert!(!html.contains("is-paid"));
             assert!(!html.contains("#1"));
         }
+    }
+
+    #[test]
+    fn running_events_show_provisional_differences() {
+        let weather = [Weather {
+            station_id: "KDEN".into(),
+            observed: Some(Observed {
+                date: time::macros::datetime!(2026-09-24 00:00 UTC),
+                temp_low: 40,
+                temp_high: 52,
+                wind_speed: None,
+            }),
+            forecasted: Forecasted {
+                date: time::macros::datetime!(2026-09-24 00:00 UTC),
+                temp_low: 45,
+                temp_high: 70,
+                wind_speed: None,
+            },
+        }];
+        let running = weather_comparison_table(&weather, values::Settled::SoFar).into_string();
+        assert!(running.contains("is-provisional"), "{running}");
+        assert!(!running.contains("is-far"), "{running}");
+        assert!(running.contains("still open"));
+        let ended = weather_comparison_table(&weather, values::Settled::Final).into_string();
+        assert!(ended.contains("is-far"), "{ended}");
+        assert!(!ended.contains("is-provisional"));
     }
 
     #[test]

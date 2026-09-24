@@ -53,7 +53,7 @@ pub fn difference(
     let title = match settled {
         Settled::Final => format!("Observed − forecast: {difference:+.0} {unit}"),
         Settled::SoFar => format!(
-            "Observed so far − forecast: {difference:+.0} {unit}. The day is not over, so this can still change."
+            "Observed so far − forecast: {difference:+.0} {unit}. The period isn't over, so this can still change."
         ),
     };
     html! {
