@@ -13,10 +13,9 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use super::htmx::{Render, page_or_fragment, with_url};
 use crate::{
     AppState, ForecastRequest, ObservationRequest, TemperatureUnit,
-    events::EventStatus,
     templates::fragments::{
-        EventStats, ForecastComparison, ForecastDisplay, WeatherContext, event_stats,
-        forecast_detail, oracle_info, station_detail, weather_list, weather_section,
+        ForecastComparison, ForecastDisplay, WeatherContext, forecast_detail, station_detail,
+        weather_list, weather_section,
     },
     weather_data::validate_station_id,
 };
@@ -43,34 +42,6 @@ pub struct WeatherQuery {
     pub view: Option<String>,
     /// Station search in the list.
     pub q: Option<String>,
-}
-
-/// Handler for oracle info fragment (GET /fragments/oracle-info)
-pub async fn oracle_info_handler(State(state): State<Arc<AppState>>) -> Html<String> {
-    let pubkey = state.oracle.public_key_base64();
-    let npub = state.oracle.npub();
-    Html(oracle_info(&pubkey, &npub).into_string())
-}
-
-/// Handler for event stats fragment (GET /fragments/event-stats)
-pub async fn event_stats_handler(State(state): State<Arc<AppState>>) -> Html<String> {
-    let events = state
-        .oracle
-        .list_events(crate::events::EventFilter::default())
-        .await
-        .unwrap_or_default();
-
-    let mut stats = EventStats::default();
-    for event in &events {
-        match event.status {
-            EventStatus::Live => stats.live_count += 1,
-            EventStatus::Running => stats.running_count += 1,
-            EventStatus::Completed => stats.completed_count += 1,
-            EventStatus::Signed => stats.signed_count += 1,
-        }
-    }
-
-    Html(event_stats(&stats).into_string())
 }
 
 /// Handler for the weather section (GET /fragments/weather): the Map/List

@@ -14,11 +14,11 @@ use crate::{
     oracle::{Oracle, system_clock},
     routes::{
         add_event_entries, create_event, daily_observations, dashboard_handler, download,
-        event_detail_handler, event_stats_handler, events_handler, files, forecast_handler,
-        forecasts, get_event, get_event_entry, get_npub, get_pubkey, get_stations, healthy,
-        list_events, list_sources, observations, oracle_info_handler, raw_data_handler, ready,
-        station_handler, ui::policy::content_security_policy, update_data, upload,
-        warm_forecast_cache, weather_handler,
+        event_detail_handler, events_handler, files, forecast_handler, forecasts, get_event,
+        get_event_entry, get_npub, get_pubkey, get_stations, healthy, list_events, list_sources,
+        observations, raw_data_handler, ready, station_handler,
+        ui::policy::content_security_policy, update_data, upload, warm_forecast_cache,
+        weather_handler,
     },
     sources::{NoaaWeather, Sources},
     templates::assets::serve_asset,
@@ -392,8 +392,6 @@ pub fn app(app_state: Arc<AppState>) -> Router {
         .route("/events", get(events_handler))
         .route("/events/{event_id}", get(event_detail_handler))
         .route("/raw", get(raw_data_handler))
-        .route("/fragments/oracle-info", get(oracle_info_handler))
-        .route("/fragments/event-stats", get(event_stats_handler))
         .route("/fragments/weather", get(weather_handler))
         .route("/fragments/forecast/{station_id}", get(forecast_handler))
         .route("/fragments/station/{station_id}", get(station_handler))
