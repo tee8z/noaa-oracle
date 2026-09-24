@@ -1,5 +1,5 @@
--- Forecast vs Observed: compares forecast accuracy by joining
--- daily forecast aggregates with daily observation aggregates
+-- Forecast vs observed: joins daily forecast aggregates with daily
+-- observation aggregates
 WITH deduped_forecasts AS (
     SELECT DISTINCT ON (station_id, begin_time, end_time)
         station_id, begin_time, end_time, min_temp, max_temp, generated_at
@@ -28,8 +28,9 @@ SELECT
     f.station_id, f.date,
     f.temp_high AS forecast_high, f.temp_low AS forecast_low,
     o.temp_high AS observed_high, o.temp_low AS observed_low,
-    f.temp_high - o.temp_high AS high_error,
-    f.temp_low - o.temp_low AS low_error
+    -- Observed − forecast, as everywhere on the site: + means it came in higher.
+    o.temp_high - f.temp_high AS high_difference,
+    o.temp_low - f.temp_low AS low_difference
 FROM daily_fcst f
 JOIN daily_obs o ON f.station_id = o.station_id AND f.date = o.date
 ORDER BY f.station_id, f.date

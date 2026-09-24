@@ -160,4 +160,12 @@ mod tests {
         assert_eq!(html.matches("type=\"checkbox\" checked").count(), 2);
         assert!(html.contains("data-query=\"-- Daily observations"));
     }
+
+    #[test]
+    fn the_example_comparison_is_observed_minus_forecast() {
+        let (_, query) = EXAMPLES[2];
+        assert!(query.contains("o.temp_high - f.temp_high AS high_difference"));
+        assert!(query.contains("o.temp_low - f.temp_low AS low_difference"));
+        assert!(!query.contains("f.temp_high - o.temp_high"));
+    }
 }
