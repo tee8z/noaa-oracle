@@ -31,7 +31,7 @@ pub fn event_stats(stats: &EventStats) -> Markup {
                 // Running events
                 div class="column is-half-mobile is-one-quarter-tablet" {
                     div class="stat-card" {
-                        div class="stat-value has-text-warning-dark" {
+                        div class="stat-value stat-running" {
                             (stats.running_count)
                         }
                         div class="stat-label" { "Running" }
