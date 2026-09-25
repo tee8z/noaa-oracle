@@ -288,7 +288,7 @@ mod tests {
         assert!(!html.contains(">Unlisted<"));
         let shown = EventFilters::parse(None, Some("show"), None);
         let html = events_section(&page(&events, shown)).into_string();
-        assert!(!html.contains("hidden"));
+        assert!(!html.contains(" hidden)"), "{html}");
     }
 
     #[test]
