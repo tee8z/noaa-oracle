@@ -118,7 +118,6 @@ pub async fn spawn_app_at(weather_db: Arc<dyn WeatherData>, origin: &str) -> Tes
     let weather_dir = directory.path().join("weather_data");
     let state = Arc::new(AppState::new(AppParts {
         remote_url: origin.into(),
-        static_dir: PathBuf::from("./static"),
         weather_dir: weather_dir.clone(),
         auth: AuthPolicy::new(
             origin,
@@ -268,6 +267,7 @@ pub fn event_at(now: OffsetDateTime) -> CreateEvent {
         total_allowed_entries: 3,
         number_of_places_win: 1,
         scoring_fields: None,
+        unlisted: false,
     }
 }
 

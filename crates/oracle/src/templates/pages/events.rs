@@ -1,24 +1,19 @@
-use maud::{Markup, html};
+use maud::Markup;
 
 use crate::templates::{
-    fragments::{EventView, events_table},
-    layouts::{CurrentPage, PageConfig, base},
+    fragments::events::{EventsPage, events_section},
+    layouts::{CurrentPage, PageConfig, base, page_fragment},
 };
 
-/// Events page - shows list of all oracle events
-pub fn events_page(api_base: &str, events: &[EventView]) -> Markup {
-    let config = PageConfig {
-        title: "4cast Truth Oracle - Events",
-        api_base,
-        current_page: CurrentPage::Events,
-    };
+const CONFIG: PageConfig<'static> = PageConfig {
+    title: "4cast Truth Oracle - Events",
+    current_page: CurrentPage::Events,
+};
 
-    base(&config, events_content(events))
+pub fn events_page(page: &EventsPage) -> Markup {
+    base(&CONFIG, events_section(page))
 }
 
-/// Events content - can be used for full page or HTMX partial
-pub fn events_content(events: &[EventView]) -> Markup {
-    html! {
-        (events_table(events))
-    }
+pub fn events_fragment(page: &EventsPage) -> Markup {
+    page_fragment(&CONFIG, events_section(page))
 }

@@ -26,7 +26,7 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Test station popup rendering
+      - name: Test UI scripts
         run: node --test e2e/unit/*.test.js
 
   # Format check (no Nix needed, fast)
@@ -114,35 +114,13 @@ jobs:
         env:
           RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
 
-      - name: Verify static files were built
-        run: |
-          # build.rs now outputs directly to crates/oracle/static/
-          echo "Checking static files..."
-          ls -la crates/oracle/static/
-          if [ ! -f "crates/oracle/static/app.min.js" ]; then
-            echo "Error: app.min.js not found"
-            exit 1
-          fi
-          echo "Static files verified"
-
-      - name: Setup Node.js for bundle regression tests
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Test generated station popup bundle
-        run: node --test e2e/unit/*.test.js
-        env:
-          ORACLE_UI_BUNDLE: crates/oracle/static/app.min.js
-
-      - name: Upload binaries and static files for e2e tests
+      - name: Upload binaries for e2e tests
         uses: actions/upload-artifact@v4
         with:
           name: noaa-oracle-binaries
           path: |
             target/debug/oracle
             target/debug/daemon
-            crates/oracle/static/
           retention-days: 1
 
   # Clippy linting (needs Nix for DuckDB)
@@ -243,10 +221,11 @@ jobs:
           use-gha-cache: false
           use-flakehub: false
 
-      - name: Download pre-built binaries and static files
+      - name: Download pre-built binaries
         uses: actions/download-artifact@v4
         with:
           name: noaa-oracle-binaries
+          path: target/debug
 
       - name: Make binaries executable
         run: chmod +x target/debug/oracle target/debug/daemon
@@ -286,23 +265,14 @@ jobs:
           use-gha-cache: false
           use-flakehub: false
 
-      - name: Download pre-built binaries and static files
+      - name: Download pre-built binaries
         uses: actions/download-artifact@v4
         with:
           name: noaa-oracle-binaries
+          path: target/debug
 
       - name: Make binaries executable
         run: chmod +x target/debug/oracle target/debug/daemon
-
-      - name: Verify static files
-        run: |
-          echo "Checking downloaded static files..."
-          ls -la crates/oracle/static/ || echo "Static files directory missing!"
-          if [ ! -f "crates/oracle/static/app.min.js" ]; then
-            echo "Error: app.min.js not found in static files"
-            exit 1
-          fi
-          echo "Static files verified successfully"
 
       - name: Setup test environment
         run: |
@@ -326,7 +296,7 @@ jobs:
         working-directory: e2e
         run: |
           npm ci
-          npx playwright install firefox --with-deps
+          npx playwright install chromium firefox --with-deps
 
       - name: Build runtime libraries
         id: runtime-libs
@@ -346,7 +316,6 @@ jobs:
       - name: Start oracle server
         run: |
           export NOAA_ORACLE_DATA_DIR="${{ github.workspace }}/e2e/fixtures/weather_data"
-          export NOAA_ORACLE_UI_DIR="${{ github.workspace }}/crates/oracle/static"
           export NOAA_ORACLE_HOST="0.0.0.0"
           export RUST_LOG=info
           # Set library path for DuckDB and libstdc++

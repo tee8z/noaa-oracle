@@ -1,0 +1,249 @@
+//! Stations on a map of the lower 48, coloured by their latest temperature.
+//! Hovering a pin shows its values; clicking it, or Enter on it, loads the
+//! station's forecast and history below the map.
+
+use maud::{Markup, html};
+
+use super::{WeatherContext, WeatherDisplay, list::no_data, place};
+use crate::templates::{
+    assets,
+    components::{time as when, values::whole_degrees},
+};
+
+/// Diverging bands, cold blue through a neutral middle to hot red.
+const BANDS: [(&str, &str); 5] = [
+    ("t-cold", "Below 40°F"),
+    ("t-cool", "40–59°F"),
+    ("t-mild", "60–74°F"),
+    ("t-warm", "75–89°F"),
+    ("t-hot", "90°F and above"),
+];
+
+fn band(temperature: Option<f64>) -> &'static str {
+    match temperature.map(whole_degrees) {
+        None => "t-none",
+        Some(t) if t < 40.0 => "t-cold",
+        Some(t) if t < 60.0 => "t-cool",
+        Some(t) if t < 75.0 => "t-mild",
+        Some(t) if t < 90.0 => "t-warm",
+        Some(_) => "t-hot",
+    }
+}
+
+/// Mercator projection for latitude: ln(tan(π/4 + lat·π/360))
+fn mercator_lat(lat: f64) -> f64 {
+    (std::f64::consts::PI / 4.0 + lat * std::f64::consts::PI / 360.0)
+        .tan()
+        .ln()
+}
+
+/// Latitude and longitude to coordinates on the 599.96×327.28 USA map
+/// (achord/svg-map-usa), Mercator between the continental US bounds.
+/// Stations outside the lower 48 are not on the map.
+fn lat_lon_to_svg(lat: f64, lon: f64) -> Option<(f64, f64)> {
+    const SVG_WIDTH: f64 = 599.96;
+    const SVG_HEIGHT: f64 = 327.28;
+    const NORTH: f64 = 49.3931;
+    const SOUTH: f64 = 24.545874;
+    const EAST: f64 = -66.95;
+    const WEST: f64 = -124.75;
+
+    if !(SOUTH..=NORTH).contains(&lat) || !(WEST..=EAST).contains(&lon) {
+        return None;
+    }
+    let top = mercator_lat(NORTH);
+    let bottom = mercator_lat(SOUTH);
+    let y = (top - mercator_lat(lat)) / (top - bottom) * SVG_HEIGHT;
+    let x = (lon - WEST) / (EAST - WEST) * SVG_WIDTH;
+    Some((x.clamp(0.0, SVG_WIDTH), y.clamp(0.0, SVG_HEIGHT)))
+}
+
+/// What a pin says on hover.
+fn summary(weather: &WeatherDisplay, context: &WeatherContext) -> String {
+    let degrees = |value: Option<f64>| {
+        value.map_or("—".to_string(), |t| format!("{:.0}°F", whole_degrees(t)))
+    };
+    let mut text = format!("{} {}", weather.station_id, place(weather));
+    text.push_str(&format!("\nLatest {}", degrees(weather.latest_temp)));
+    if let Some(time) = weather.latest_temp_time.as_deref().and_then(when::parse) {
+        text.push_str(&format!(", {}", when::ago(time, context.now)));
+    }
+    text.push_str(&format!(
+        "\nHigh {} · Low {}",
+        degrees(weather.temp_high),
+        degrees(weather.temp_low)
+    ));
+    if weather.forecast_high.is_some() || weather.forecast_low.is_some() {
+        text.push_str(&format!(
+            "\nForecast {} / {}",
+            degrees(weather.forecast_high.map(|t| t as f64)),
+            degrees(weather.forecast_low.map(|t| t as f64))
+        ));
+    }
+    text
+}
+
+fn station_url(station_id: &str) -> String {
+    format!("/fragments/station/{station_id}")
+}
+
+/// The list, searched for this station.
+fn list_url(station_id: &str) -> String {
+    format!("/?view=list&q={station_id}")
+}
+
+pub(super) fn weather_map(weather: &[WeatherDisplay], context: &WeatherContext) -> Markup {
+    if weather.is_empty() {
+        return no_data();
+    }
+    let placed: Vec<_> = weather
+        .iter()
+        .filter_map(|station| {
+            lat_lon_to_svg(station.latitude, station.longitude)
+                .map(|(x, y)| (station, format!("{x:.1}"), format!("{y:.1}")))
+        })
+        .collect();
+    let off_map: Vec<_> = weather
+        .iter()
+        .filter(|w| lat_lon_to_svg(w.latitude, w.longitude).is_none())
+        .collect();
+    html! {
+        div class="wx-map" {
+            div class="map-wrapper" {
+                img src=(assets::USA_MAP_SVG.url) alt="" class="usa-map";
+                svg class="station-markers" viewBox="0 0 599.96 327.28" preserveAspectRatio="none"
+                    role="group" aria-label="Stations by latest temperature" {
+                    // Wider invisible circles are easier to hit. They sit
+                    // under every dot, so a neighbour's never covers a dot.
+                    g aria-hidden="true" {
+                        @for (station, x, y) in &placed {
+                            circle class="pin-target" cx=(x) cy=(y) r="9"
+                                hx-get=(station_url(&station.station_id))
+                                hx-target="#map-station"
+                                hx-swap="innerHTML"
+                                hx-sync="#map-station:replace"
+                                hx-indicator="#map-station-loading" {}
+                        }
+                    }
+                    @for (station, x, y) in &placed {
+                        // A link, so it takes focus and opens with Enter
+                        // without a script; without htmx it opens the list.
+                        a class={ "pin " (band(station.latest_temp)) }
+                          href=(list_url(&station.station_id))
+                          aria-label=(summary(station, context).replace('\n', ", "))
+                          hx-get=(station_url(&station.station_id))
+                          hx-target="#map-station"
+                          hx-swap="innerHTML"
+                          hx-sync="#map-station:replace"
+                          hx-indicator="#map-station-loading" {
+                            title { (summary(station, context)) }
+                            circle class="pin-dot" cx=(x) cy=(y) r="4.5" {}
+                        }
+                    }
+                }
+            }
+            ul class="map-legend" aria-label="Latest temperature" {
+                @for (class, label) in BANDS {
+                    li { span class={ "swatch " (class) } {} (label) }
+                }
+                li { span class="swatch t-none" {} "No report" }
+            }
+            @if !off_map.is_empty() {
+                p class="map-off" {
+                    "Not on the map: "
+                    @for (index, station) in off_map.iter().enumerate() {
+                        @if index > 0 { ", " }
+                        a href=(list_url(&station.station_id))
+                          hx-get=(station_url(&station.station_id))
+                          hx-target="#map-station"
+                          hx-swap="innerHTML"
+                          hx-sync="#map-station:replace"
+                          hx-indicator="#map-station-loading"
+                          title=(summary(station, context)) {
+                            (station.station_id)
+                        }
+                    }
+                }
+            }
+            p id="map-station-loading" class="htmx-indicator map-loading" role="status" {
+                span class="loader" {} " Loading station…"
+            }
+            // The five-minute refresh replaces the map but keeps the open
+            // station.
+            div id="map-station" aria-live="polite" hx-preserve
+                data-load-error="Couldn't load this station's forecast and history." {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pins_are_coloured_by_whole_degrees() {
+        assert_eq!(band(None), "t-none");
+        assert_eq!(band(Some(39.4)), "t-cold");
+        assert_eq!(band(Some(39.5)), "t-cool");
+        assert_eq!(band(Some(74.0)), "t-mild");
+        assert_eq!(band(Some(89.6)), "t-hot");
+    }
+
+    fn station(id: &str, latitude: f64, longitude: f64) -> WeatherDisplay {
+        WeatherDisplay {
+            station_id: id.into(),
+            station_name: String::new(),
+            state: String::new(),
+            iata_id: String::new(),
+            latest_temp: Some(50.0),
+            latest_temp_time: None,
+            observation_period: super::super::ObservationPeriod::Today,
+            temp_high: None,
+            temp_low: None,
+            wind_speed: None,
+            wind_direction: None,
+            humidity: None,
+            rain_amt: None,
+            snow_amt: None,
+            observed_start: String::new(),
+            observed_end: String::new(),
+            latitude,
+            longitude,
+            forecast_high: None,
+            forecast_low: None,
+        }
+    }
+
+    #[test]
+    fn no_hit_area_covers_a_pin() {
+        // Reagan National and Baltimore are close enough for one's hit area
+        // to reach the other's dot.
+        let weather = [
+            station("KDCA", 38.85, -77.03),
+            station("KBWI", 39.17, -76.68),
+        ];
+        let context = WeatherContext {
+            view: super::super::WeatherView::Map,
+            query: "",
+            selection_path: "/fragments/weather",
+            stations: &[],
+            now: time::OffsetDateTime::now_utc(),
+        };
+        let html = weather_map(&weather, &context).into_string();
+        let last_target = html.rfind("class=\"pin-target\"").unwrap();
+        let first_dot = html.find("class=\"pin-dot\"").unwrap();
+        assert!(last_target < first_dot, "{html}");
+        assert_eq!(html.matches("class=\"pin-target\"").count(), 2);
+        assert_eq!(
+            html.matches("hx-get=\"/fragments/station/KBWI\"").count(),
+            2
+        );
+    }
+
+    #[test]
+    fn only_the_lower_48_are_on_the_map() {
+        assert!(lat_lon_to_svg(41.97, -87.9).is_some());
+        assert!(lat_lon_to_svg(61.17, -150.0).is_none());
+        assert!(lat_lon_to_svg(21.3, -157.9).is_none());
+    }
+}

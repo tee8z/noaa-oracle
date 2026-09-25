@@ -1,0 +1,139 @@
+.event-filters {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 1.25rem;
+    margin-bottom: 0.75rem;
+}
+
+.status-filter {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    border: 0;
+    padding: 0;
+    margin: 0;
+}
+
+.status-chip input {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+}
+
+.status-chip span {
+    display: inline-block;
+    padding: 0.2rem 0.7rem;
+    border: 1px solid var(--bulma-border);
+    border-radius: 999px;
+    font-size: 0.8rem;
+    cursor: pointer;
+}
+
+.status-chip input:checked + span {
+    background: var(--bulma-link);
+    border-color: var(--bulma-link);
+    color: #fff;
+}
+
+.status-chip input:focus-visible + span {
+    outline: 2px solid var(--bulma-link);
+    outline-offset: 2px;
+}
+
+.chip-count {
+    opacity: 0.75;
+}
+
+.unlisted-toggle {
+    font-size: 0.85rem;
+}
+
+.ev-list {
+    font-size: 0.85rem;
+}
+
+.ev-row {
+    display: grid;
+    grid-template-columns: 6rem minmax(8rem, 1.3fr) 6rem minmax(13rem, 2fr) 6.5rem 4.5rem 5rem;
+    gap: 0 0.75rem;
+    align-items: center;
+    padding: 0.5rem;
+    border-bottom: 1px solid var(--bulma-border-weak);
+    color: inherit;
+}
+
+a.ev-row:hover,
+a.ev-row:focus-visible {
+    background: var(--bulma-scheme-main-bis);
+}
+
+.ev-header {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--bulma-scheme-main);
+    border-bottom: 1px solid var(--bulma-border);
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--muted);
+}
+
+.ev-num {
+    text-align: right;
+}
+
+.ev-window {
+    white-space: nowrap;
+}
+
+.ev-empty {
+    padding: 2rem 0;
+    text-align: center;
+    color: var(--muted);
+}
+
+@media screen and (max-width: 768px) {
+    .ev-header {
+        display: none;
+    }
+
+    .ev-row {
+        grid-template-columns: 1fr auto;
+        grid-template-areas:
+            "id status"
+            "locations locations"
+            "window window"
+            "signing signing"
+            "entries places";
+        gap: 0.3rem;
+    }
+
+    .ev-id { grid-area: id; }
+    .ev-status { grid-area: status; }
+    .ev-locations { grid-area: locations; }
+    .ev-window { grid-area: window; white-space: normal; }
+    .ev-signing { grid-area: signing; }
+    .ev-row > .ev-num:nth-last-child(2) { grid-area: entries; text-align: left; }
+    .ev-row > .ev-num:last-child { grid-area: places; }
+
+    .ev-row .cell-label {
+        position: static;
+        width: auto;
+        height: auto;
+        margin: 0;
+        overflow: visible;
+        clip: auto;
+        white-space: normal;
+        color: var(--muted);
+        font-size: 0.75rem;
+    }
+
+}
+
+.ev-pages {
+    display: flex;
+    gap: 0.5rem;
+    justify-content: flex-end;
+    margin-top: 0.75rem;
+}

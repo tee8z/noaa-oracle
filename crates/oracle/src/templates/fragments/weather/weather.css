@@ -1,0 +1,317 @@
+/* Current weather: header, map and list. */
+.weather-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+}
+
+.weather-head .title {
+    margin-bottom: 0;
+}
+
+.weather-views {
+    margin-bottom: 0 !important;
+}
+
+.weather-period {
+    font-size: 0.8rem;
+    color: var(--muted);
+    margin-bottom: 0.75rem;
+}
+
+.weather-period strong {
+    color: inherit;
+}
+
+.weather-search {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    max-width: 24rem;
+    margin-bottom: 0.75rem;
+}
+
+/* ---------- List ---------- */
+.wx-list {
+    font-size: 0.875rem;
+}
+
+.wx-row {
+    display: grid;
+    grid-template-columns: minmax(12rem, 2.4fr) 1.3fr 1fr 1fr 1.1fr 0.8fr 0.7fr 0.6fr 0.6fr;
+    gap: 0 0.75rem;
+    align-items: baseline;
+    padding: 0.45rem 0.5rem;
+}
+
+.wx-row > span:not(.wx-name) {
+    text-align: right;
+}
+
+.wx-header {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: var(--bulma-scheme-main);
+    border-bottom: 1px solid var(--bulma-border);
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--muted);
+}
+
+.wx-region > summary {
+    cursor: pointer;
+    padding: 0.5rem;
+    font-weight: 600;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    border-bottom: 1px solid var(--bulma-border);
+}
+
+.wx-count {
+    margin-left: 0.5rem;
+    font-weight: 400;
+}
+
+.wx-count::before { content: "("; }
+.wx-count::after { content: ")"; }
+
+.wx-station {
+    border-bottom: 1px solid var(--bulma-border-weak);
+}
+
+.wx-station > summary {
+    cursor: pointer;
+    list-style: none;
+}
+
+.wx-station > summary::-webkit-details-marker {
+    display: none;
+}
+
+.wx-station > summary:hover,
+.wx-station[open] > summary {
+    background: var(--bulma-scheme-main-bis);
+}
+
+.wx-station > summary:focus-visible {
+    outline: 2px solid var(--bulma-link);
+    outline-offset: -2px;
+}
+
+.wx-name strong::before {
+    content: "▸";
+    display: inline-block;
+    width: 1em;
+    color: var(--muted);
+    transition: transform 0.15s ease;
+}
+
+.wx-station[open] .wx-name strong::before {
+    transform: rotate(90deg);
+}
+
+.wx-place {
+    display: block;
+    padding-left: 1em;
+    font-size: 0.75rem;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.wx-when {
+    display: block;
+    font-size: 0.7rem;
+    color: var(--muted);
+}
+
+.wx-forecast {
+    padding: 0.5rem 0.5rem 1rem;
+}
+
+.wx-loading,
+.map-loading {
+    color: var(--muted);
+    font-size: 0.8rem;
+}
+
+.wx-empty {
+    padding: 1.5rem 0.5rem;
+    text-align: center;
+    color: var(--muted);
+}
+
+.wx-others {
+    padding: 0.75rem 0.5rem;
+    font-size: 0.8rem;
+}
+
+.wx-others ul {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem 1rem;
+    margin-top: 0.25rem;
+}
+
+/* Phones: each station becomes a small card with labelled values. */
+@media screen and (max-width: 768px) {
+    .wx-header {
+        display: none;
+    }
+
+    .wx-row {
+        grid-template-columns: repeat(3, 1fr);
+        grid-template-areas:
+            "name name latest"
+            "high low fcst"
+            "wind humidity rain";
+        gap: 0.35rem 0.5rem;
+        padding: 0.6rem 0.25rem;
+    }
+
+    .wx-row > span:not(.wx-name) {
+        text-align: left;
+    }
+
+    .wx-row .wx-latest { text-align: right; grid-area: latest; }
+    .wx-name { grid-area: name; min-width: 0; }
+    .wx-high { grid-area: high; }
+    .wx-low { grid-area: low; }
+    .wx-fcst { grid-area: fcst; }
+    .wx-wind { grid-area: wind; }
+    .wx-humidity { grid-area: humidity; }
+    .wx-rain { grid-area: rain; }
+
+    /* Snow is shown on phones only when some fell. */
+    .wx-snow:has(.is-zero, .is-missing) {
+        display: none;
+    }
+
+    .wx-row .cell-label {
+        position: static;
+        width: auto;
+        height: auto;
+        margin: 0;
+        overflow: visible;
+        clip: auto;
+        white-space: normal;
+        display: block;
+        font-size: 0.65rem;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--muted);
+    }
+}
+
+/* ---------- Map ---------- */
+.map-wrapper {
+    position: relative;
+    width: 100%;
+}
+
+.usa-map {
+    display: block;
+    width: 100%;
+    height: auto;
+    opacity: 0.55;
+}
+
+[data-theme="dark"] .usa-map {
+    filter: invert(1) brightness(0.8);
+    opacity: 0.35;
+}
+
+.station-markers {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+}
+
+.pin {
+    cursor: pointer;
+    outline: none;
+}
+
+.pin-target {
+    fill: transparent;
+    cursor: pointer;
+}
+
+.pin-dot {
+    stroke: var(--pin-ring);
+    stroke-width: 1.2;
+    transition: r 0.1s ease;
+}
+
+.pin:hover .pin-dot,
+.pin:focus-visible .pin-dot {
+    r: 7;
+    stroke: var(--bulma-text-strong);
+}
+
+/* Diverging bands; no report is an open ring, not a colour. Every fill
+   is at least 3:1 against the light map (#f1f1f1): 7.1, 4.0, 3.6, 3.7 and
+   6.4. On the dark map the light ring gives each pin 14:1. */
+.t-cold { --pin: #1d4f99; }
+.t-cool { --pin: #3a78c2; }
+.t-mild { --pin: #827d70; }
+.t-warm { --pin: #cc5a2e; }
+.t-hot { --pin: #a8231c; }
+.t-none { --pin: transparent; }
+
+.pin-dot,
+.swatch {
+    fill: var(--pin);
+    background: var(--pin);
+}
+
+.t-none .pin-dot {
+    stroke: var(--muted);
+    stroke-dasharray: 2 1.5;
+}
+
+.map-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem 1rem;
+    margin: 0.5rem 0;
+    font-size: 0.75rem;
+    color: var(--muted);
+}
+
+.map-legend li {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+}
+
+.swatch {
+    display: inline-block;
+    width: 0.8rem;
+    height: 0.8rem;
+    border-radius: 50%;
+    border: 1px solid var(--pin-ring);
+}
+
+.swatch.t-none {
+    border: 1px dashed var(--muted);
+}
+
+.map-off {
+    font-size: 0.8rem;
+    color: var(--muted);
+}
+
+#map-station:not(:empty) {
+    margin-top: 0.75rem;
+    border-top: 1px solid var(--bulma-border);
+    padding-top: 0.75rem;
+}

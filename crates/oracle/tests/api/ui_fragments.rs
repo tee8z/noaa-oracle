@@ -32,7 +32,7 @@ async fn dashboard_returns_current_day_observations() {
 
     let request = Request::builder()
         .method(Method::GET)
-        .uri("/")
+        .uri("/?view=list")
         .header(header::ACCEPT, "text/html")
         .body(Body::empty())
         .unwrap();
@@ -45,15 +45,29 @@ async fn dashboard_returns_current_day_observations() {
         .expect("Failed to execute request.");
 
     assert!(response.status().is_success());
+    // The chosen view is remembered for the next visit.
+    assert_eq!(
+        response.headers()[header::SET_COOKIE],
+        "weather_view=list; Path=/; Max-Age=31536000; SameSite=Lax"
+    );
+    let policy = response.headers()[header::CONTENT_SECURITY_POLICY]
+        .to_str()
+        .unwrap();
+    assert!(policy.starts_with("script-src 'self';"), "{policy}");
 
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let html = String::from_utf8(body.to_vec()).unwrap();
+    // Trigger filters are JavaScript, which htmx may not evaluate here.
+    for trigger in html.split("hx-trigger=\"").skip(1) {
+        let trigger = trigger.split_once('"').unwrap().0;
+        assert!(!trigger.contains('['), "{trigger}");
+    }
 
     // Verify the response contains weather data
-    assert!(html.contains("Current Weather"));
+    assert!(html.contains("Current weather"));
     // Should contain our mock station
     assert!(html.contains("KORD"));
-    assert!(html.contains("Latest observed"));
+    assert!(html.contains("Latest"));
     assert!(html.contains("63°F"));
     assert!(html.contains("2024-08-12T23:53:00Z"));
     assert!(html.contains("Today so far (UTC)"));
@@ -143,28 +157,30 @@ async fn selected_utc_day_uses_its_previous_day_forecast_and_preserves_refresh_c
     // The selected calendar day is expressed with an offset. Both the
     // query and refresh must preserve its UTC day, not the supplied offset.
     let (status, body) = app
-        .get("/fragments/weather?stations=KORD&start=2024-08-12T02:00:00%2B02:00&end=2024-08-13T02:00:00%2B02:00")
+        .get("/fragments/weather?stations=KORD&start=2024-08-12T02:00:00%2B02:00&end=2024-08-13T02:00:00%2B02:00&view=list")
         .await;
     assert!(status.is_success());
     let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(html.contains("Selected period (UTC)"));
+    assert!(html.contains("Selected period"));
     assert!(html.contains("81°F"));
     assert!(html.contains("62°F"));
-    assert!(html.contains("+6°F"));
-    assert!(html.contains("+7°F"));
+    // Observed − forecast: 75 − 81 and 55 − 62.
+    assert!(html.contains("-6°F"));
+    assert!(html.contains("-7°F"));
     assert!(!html.contains("98°F"));
     assert!(!html.contains("42°F"));
 
     let refresh = weather_refresh_url(&html);
     assert_eq!(
         refresh,
-        "/fragments/weather?stations=KORD&start=2024-08-12T00%3A00%3A00Z&end=2024-08-13T00%3A00%3A00Z"
+        "/fragments/weather?stations=KORD&start=2024-08-12T00%3A00%3A00Z&end=2024-08-13T00%3A00%3A00Z&view=list"
     );
     let (status, body) = app.get(&refresh).await;
     assert!(status.is_success());
     let refreshed = String::from_utf8(body.to_vec()).unwrap();
     assert!(refreshed.contains("81°F"));
-    assert!(refreshed.contains("Selected period (UTC)"));
+    assert!(refreshed.contains("-6°F"));
+    assert!(refreshed.contains("Selected period"));
     assert_eq!(weather_refresh_url(&refreshed), refresh);
 }
 
@@ -196,17 +212,17 @@ async fn start_only_weather_selection_keeps_its_bound_and_refresh_context() {
         .await;
     assert!(status.is_success());
     let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(html.contains("Selected period (UTC)"));
+    assert!(html.contains("Selected period"));
     assert!(!html.contains("Today so far (UTC)"));
     let refresh = weather_refresh_url(&html);
     assert_eq!(
         refresh,
-        "/fragments/weather?stations=KORD&start=2024-08-12T00%3A00%3A00Z"
+        "/fragments/weather?stations=KORD&start=2024-08-12T00%3A00%3A00Z&view=map"
     );
     let (status, body) = app.get(&refresh).await;
     assert!(status.is_success());
     let refreshed = String::from_utf8(body.to_vec()).unwrap();
-    assert!(refreshed.contains("Selected period (UTC)"));
+    assert!(refreshed.contains("Selected period"));
     assert_eq!(weather_refresh_url(&refreshed), refresh);
     let after = OffsetDateTime::now_utc();
     let ends = requested_ends.lock().unwrap();
@@ -238,19 +254,19 @@ async fn multi_day_selection_does_not_compare_against_a_single_day_forecast() {
     let app = spawn_app(Arc::new(weather)).await;
 
     let (status, body) = app
-        .get("/fragments/weather?stations=KORD&start=2024-08-12T00:00:00Z&end=2024-08-14T00:00:00Z")
+        .get("/fragments/weather?stations=KORD&start=2024-08-12T00:00:00Z&end=2024-08-14T00:00:00Z&view=list")
         .await;
     assert!(status.is_success());
     let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(html.contains("Selected period (UTC)"));
+    assert!(html.contains("Selected period"));
     assert!(html.contains("75°F"));
     assert!(html.contains("55°F"));
     assert!(!html.contains("+0°F"));
     let forecast_cell = html
-        .split_once("weather-forecast-cell\">")
+        .split_once("class=\"wx-fcst\"><span class=\"cell-label\">Forecast </span>")
         .unwrap()
         .1
-        .split_once("</td>")
+        .split_once("</span></span>")
         .unwrap()
         .0;
     assert!(!forecast_cell.contains("°F"));
@@ -299,12 +315,12 @@ async fn latest_report_remains_visible_before_the_first_observation_of_today() {
         .returning(|| Ok(mock_stations()));
     let app = spawn_app(Arc::new(weather)).await;
 
-    let (status, body) = app.get("/fragments/weather?stations=KORD").await;
+    let (status, body) = app.get("/fragments/weather?stations=KORD&view=list").await;
     assert!(status.is_success());
     let html = String::from_utf8(body.to_vec()).unwrap();
     assert!(html.contains("KORD"));
     assert!(html.contains("63°F"));
-    assert!(html.contains("Latest observed"));
+    assert!(html.contains("Latest"));
     assert!(html.contains("Today so far (UTC)"));
     assert!(html.contains("23:59:59.999999999Z"));
     assert!(!html.contains("75°F"));
@@ -312,16 +328,16 @@ async fn latest_report_remains_visible_before_the_first_observation_of_today() {
     assert!(!html.contains("10 kt"));
     assert!(!html.contains("No weather data available"));
     let row = html
-        .split_once("weather-row\"")
+        .split_once("class=\"wx-row\"")
         .unwrap()
         .1
-        .split_once("</tr>")
+        .split_once("</summary>")
         .unwrap()
         .0;
     assert!(row.matches(">—</span>").count() >= 7);
     assert_eq!(
         weather_refresh_url(&html),
-        "/fragments/weather?stations=KORD"
+        "/fragments/weather?stations=KORD&view=list"
     );
 }
 
@@ -360,7 +376,7 @@ async fn assert_dashboard_selection_survives_refresh(has_observations: bool) {
                 && request.station_ids == "KORD,KBOS"
                 && stations == &["KORD", "KBOS"]
         })
-        .times(2)
+        .times(3)
         .returning(move |_, _| {
             Ok(if has_observations {
                 mock_observation_data()
@@ -392,12 +408,10 @@ async fn assert_dashboard_selection_survives_refresh(has_observations: bool) {
         html.contains("No weather data available"),
         !has_observations
     );
-    // Available stations remain selectable even when no requested reports exist.
-    assert!(html.contains("hx-get=\"/fragments/weather?add_station=KBOS\""));
     let refresh = weather_refresh_url(&html);
     assert_eq!(
         refresh,
-        "/fragments/weather?stations=KORD%2CKBOS&start=2024-08-12T00%3A00%3A00Z&end=2024-08-14T00%3A00%3A00Z"
+        "/fragments/weather?stations=KORD%2CKBOS&start=2024-08-12T00%3A00%3A00Z&end=2024-08-14T00%3A00%3A00Z&view=map"
     );
     let (status, body) = app.get(&refresh).await;
     assert!(status.is_success());
@@ -407,6 +421,19 @@ async fn assert_dashboard_selection_survives_refresh(has_observations: bool) {
         refreshed.contains("No weather data available"),
         !has_observations
     );
+
+    // A search offers requested stations without reports, keeping the selection.
+    let (status, body) = app
+        .get(&format!(
+            "{}&q=bos",
+            refresh.replace("view=map", "view=list")
+        ))
+        .await;
+    assert!(status.is_success());
+    let searched = String::from_utf8(body.to_vec()).unwrap();
+    assert!(searched.contains(
+        "hx-get=\"/fragments/weather?stations=KORD%2CKBOS&amp;start=2024-08-12T00%3A00%3A00Z&amp;end=2024-08-14T00%3A00%3A00Z&amp;add_station=KBOS&amp;view=list\""
+    ));
 }
 
 /// Test that the forecast fragment endpoint returns forecast data
@@ -506,26 +533,85 @@ async fn forecast_fragment_handles_no_data() {
     assert!(html.contains("No forecast data available"));
 }
 
+/// A failed forecast query is not shown, or cached, as "no data": the
+/// reader gets an error with a retry, and the next request queries again.
+#[tokio::test]
+async fn failed_forecast_queries_offer_a_retry_and_are_not_cached() {
+    let broken = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut weather = MockWeatherAccess::new();
+    let failing = broken.clone();
+    weather.expect_forecasts_data().returning(move |_, _| {
+        if failing.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(oracle::weather_data::Error::InvalidStationId(
+                "broken".into(),
+            ))
+        } else {
+            Ok(mock_forecast_data())
+        }
+    });
+    weather
+        .expect_daily_observations()
+        .returning(|_, _| Ok(vec![]));
+    weather.expect_stations().returning(|| Ok(mock_stations()));
+    let app = spawn_app(Arc::new(weather)).await;
+
+    let (status, body) = app.get("/fragments/forecast/KORD").await;
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains("Try again"), "{html}");
+    assert!(
+        html.contains("hx-get=\"/fragments/forecast/KORD\""),
+        "{html}"
+    );
+    assert!(
+        html.contains("hx-target=\"closest .wx-forecast\""),
+        "{html}"
+    );
+    assert!(!html.contains("No forecast data available"), "{html}");
+
+    let (status, body) = app.get("/fragments/station/KORD").await;
+    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains("Chicago O"), "{html}");
+    assert!(
+        html.contains("hx-get=\"/fragments/station/KORD\""),
+        "{html}"
+    );
+    assert!(html.contains("hx-target=\"#map-station\""), "{html}");
+
+    broken.store(false, std::sync::atomic::Ordering::SeqCst);
+    let (status, body) = app.get("/fragments/forecast/KORD").await;
+    assert!(status.is_success());
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        html.contains("Forecasts and observations for KORD"),
+        "{html}"
+    );
+}
+
 /// Test that dashboard handles empty weather data gracefully
 #[tokio::test]
 async fn dashboard_handles_no_weather_data() {
     let mut weather_data = MockWeatherAccess::new();
 
-    // The default airports first, then every station as a fallback.
+    // The default airports first, then the first stations in the data;
+    // never an empty list, which would query every station.
     weather_data
         .expect_observation_data()
+        .withf(|_, stations| !stations.is_empty())
         .times(4)
         .returning(|_, _| Ok(vec![]));
 
     weather_data
         .expect_forecasts_data()
+        .withf(|_, stations| !stations.is_empty())
         .times(2)
         .returning(|_, _| Ok(vec![]));
 
     weather_data
         .expect_stations()
         .times(1)
-        .returning(|| Ok(vec![]));
+        .returning(|| Ok(mock_stations()));
 
     let test_app = spawn_app(Arc::new(weather_data)).await;
 
@@ -596,6 +682,36 @@ async fn dashboard_queries_forecasts_for_default_airports() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let html = String::from_utf8(body.to_vec()).unwrap();
     assert!(html.contains("KORD"));
+}
+
+/// `?stations=` with nothing usable shows the default airports; it must
+/// not query every station, which is what an empty list means to the data
+/// layer. Every weather call here names the airports.
+#[tokio::test]
+async fn an_empty_station_list_shows_the_default_airports() {
+    let mut weather = MockWeatherAccess::new();
+    weather
+        .expect_observation_data()
+        .withf(|_, stations| stations.len() > 1 && stations.iter().any(|id| id == "KORD"))
+        .returning(|_, _| Ok(mock_observation_data()));
+    weather
+        .expect_forecasts_data()
+        .withf(|_, stations| stations.len() > 1)
+        .returning(|_, _| Ok(vec![]));
+    weather.expect_stations().returning(|| Ok(vec![]));
+    let app = spawn_app(Arc::new(weather)).await;
+    for path in [
+        "/?stations=",
+        "/?stations=,%20,bad%27id",
+        "/fragments/weather?stations=",
+    ] {
+        let (status, body) = app.get(path).await;
+        assert!(status.is_success(), "{path}");
+        assert!(
+            String::from_utf8(body.to_vec()).unwrap().contains("KORD"),
+            "{path}"
+        );
+    }
 }
 
 fn mock_observation_data() -> Vec<Observation> {
@@ -730,6 +846,112 @@ async fn empty_weather_refresh_retains_requested_stations_and_selected_dates() {
     assert!(html.contains("No weather data available"));
     assert_eq!(
         weather_refresh_url(&html),
-        "/fragments/weather?stations=KORD%2CKBOS&start=2024-08-12T00%3A00%3A00Z&end=2024-08-13T00%3A00%3A00Z"
+        "/fragments/weather?stations=KORD%2CKBOS&start=2024-08-12T00%3A00%3A00Z&end=2024-08-13T00%3A00%3A00Z&view=map"
     );
+}
+
+/// A search replaces only the list, so the search box keeps focus, and puts
+/// the search in the address bar; a full load gets the whole page.
+#[tokio::test]
+async fn station_search_returns_only_the_list_to_htmx() {
+    let mut weather = MockWeatherAccess::new();
+    weather
+        .expect_observation_data()
+        .returning(|_, _| Ok(mock_observation_data()));
+    weather.expect_forecasts_data().returning(|_, _| Ok(vec![]));
+    weather.expect_stations().returning(|| Ok(mock_stations()));
+    let app = spawn_app(Arc::new(weather)).await;
+    let path = "/fragments/weather?stations=KORD&view=list&q=chicago";
+
+    let (_, response) = app
+        .send(
+            Request::get(path)
+                .header("hx-request", "true")
+                .header("hx-target", "div#weather-list")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    let list = String::from_utf8(response.to_vec()).unwrap();
+    assert!(list.starts_with("<div id=\"weather-list\""), "{list}");
+    assert!(list.contains("KORD"));
+    assert!(!list.contains("weather-search"));
+
+    let response = app
+        .app
+        .clone()
+        .oneshot(
+            Request::get(path)
+                .header("hx-request", "true")
+                .header("hx-target", "div#weather-list")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.headers()["hx-replace-url"],
+        "/?stations=KORD&view=list&q=chicago"
+    );
+    assert_eq!(
+        response.headers()[header::VARY],
+        "HX-Request, HX-Target, HX-History-Restore-Request"
+    );
+
+    // Without a match the list says so.
+    let (_, body) = app
+        .send(
+            Request::get("/fragments/weather?stations=KORD&view=list&q=boston")
+                .header("hx-request", "true")
+                .header("hx-target", "div#weather-list")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    let empty = String::from_utf8(body.to_vec()).unwrap();
+    assert!(empty.contains("No station in this list matches"));
+
+    // A tab click or refresh gets the whole section, and a page load the page.
+    let (_, body) = app
+        .send(
+            Request::get("/fragments/weather?stations=KORD&view=list")
+                .header("hx-request", "true")
+                .header("hx-target", "section#weather-table-container")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    let section = String::from_utf8(body.to_vec()).unwrap();
+    assert!(section.starts_with("<section id=\"weather-table-container\""));
+    assert!(section.contains("weather-search"));
+    let (_, body) = app.get("/?stations=KORD&view=list").await;
+    assert!(
+        String::from_utf8(body.to_vec())
+            .unwrap()
+            .starts_with("<!DOCTYPE html>")
+    );
+}
+
+/// Map pins open a panel with the station's name and forecast detail.
+#[tokio::test]
+async fn map_station_panel_names_the_station() {
+    let mut weather = MockWeatherAccess::new();
+    weather
+        .expect_forecasts_data()
+        .returning(|_, _| Ok(mock_forecast_data()));
+    weather
+        .expect_daily_observations()
+        .returning(|_, _| Ok(vec![]));
+    weather.expect_stations().returning(|| Ok(mock_stations()));
+    let app = spawn_app(Arc::new(weather)).await;
+    let (status, body) = app.get("/fragments/station/KORD").await;
+    assert!(status.is_success());
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        html.contains("Chicago O&#39;Hare, IL") || html.contains("Chicago O'Hare, IL"),
+        "{html}"
+    );
+    assert!(html.contains("Forecasts and observations for KORD"));
+    let (status, _) = app.get("/fragments/station/KORD%27x").await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
 }

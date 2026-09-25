@@ -1,143 +1,127 @@
 use maud::{Markup, html};
+use time::{Duration, OffsetDateTime, Time, macros::format_description};
 
 use crate::templates::layouts::{CurrentPage, PageConfig, base};
 
-/// Raw data page - wrapper for the existing DuckDB-WASM parquet analyzer
-pub fn raw_data_page(api_base: &str) -> Markup {
-    let config = PageConfig {
-        title: "4cast Truth Oracle - Raw Data",
-        api_base,
-        current_page: CurrentPage::RawData,
-    };
+const CONFIG: PageConfig<'static> = PageConfig {
+    title: "4cast Truth Oracle - Raw Data",
+    current_page: CurrentPage::RawData,
+};
 
-    base(&config, raw_data_content())
+/// Example queries, run by DuckDB in the browser against the loaded files.
+const EXAMPLES: [(&str, &str); 4] = [
+    (
+        "Daily observations",
+        include_str!("queries/daily_observations.sql"),
+    ),
+    ("Daily forecast", include_str!("queries/daily_forecast.sql")),
+    (
+        "Forecast vs observed",
+        include_str!("queries/forecast_vs_observed.sql"),
+    ),
+    ("Station list", include_str!("queries/stations.sql")),
+];
+
+pub fn raw_data_page(now: OffsetDateTime) -> Markup {
+    base(&CONFIG, raw_data_content(now))
 }
 
-/// Raw data content - the parquet file analyzer
-pub fn raw_data_content() -> Markup {
+/// Yesterday, midnight to midnight UTC, as `datetime-local` values.
+fn yesterday(now: OffsetDateTime) -> (String, String) {
+    let today = now.replace_time(Time::MIDNIGHT);
+    let format = format_description!("[year]-[month]-[day]T[hour]:[minute]");
+    (
+        (today - Duration::days(1))
+            .format(format)
+            .unwrap_or_default(),
+        today.format(format).unwrap_or_default(),
+    )
+}
+
+/// The parquet analyzer. The page's script loads DuckDB-WASM and queries
+/// the files in the browser; the server only lists and serves them.
+pub fn raw_data_content(now: OffsetDateTime) -> Markup {
+    let (start, end) = yesterday(now);
     html! {
-        div class="box" {
-            h2 class="title is-5 mb-4" { "NOAA Forecast and Observation Data Analyzer" }
-
-            // Date filters
-            div class="field is-grouped is-grouped-multiline" {
-                div class="control" {
-                    div class="field" {
-                        label class="label is-small" { "Start" }
-                        input id="start" class="input" type="datetime-local" autocomplete="on";
-                    }
-                }
-                div class="control" {
-                    div class="field" {
-                        label class="label is-small" { "End" }
-                        input id="end" class="input" type="datetime-local" autocomplete="on";
-                    }
-                }
-                div class="control" {
-                    div class="field" {
-                        label class="label is-small" { "\u{00A0}" } // Non-breaking space for alignment
-                        div class="field is-grouped" {
-                            label class="checkbox mr-4" {
-                                input id="observations" type="checkbox";
-                                " Observations"
-                            }
-                            label class="checkbox" {
-                                input id="forecasts" type="checkbox";
-                                " Forecasts"
-                            }
-                        }
-                    }
-                }
+        div id="raw-data" class="box raw-data" {
+            h2 class="title is-5" { "NOAA forecast and observation data" }
+            p class="muted is-size-7 mb-3" {
+                "Load the parquet files for a window, then query them with DuckDB in your browser. "
+                "Forecast files are several MB each; a full day is over 100 MB."
             }
 
-            div class="control mb-4" {
-                button id="submit" class="button is-primary" {
+            div class="raw-controls" {
+                div class="field" {
+                    label class="label is-small" for="start" { "Start (UTC)" }
+                    input id="start" class="input is-small" type="datetime-local" value=(start);
+                }
+                div class="field" {
+                    label class="label is-small" for="end" { "End (UTC)" }
+                    input id="end" class="input is-small" type="datetime-local" value=(end);
+                }
+                fieldset class="field raw-kinds" {
+                    legend class="label is-small" { "Files" }
+                    label class="checkbox" { input id="observations" type="checkbox" checked; " Observations" }
+                    label class="checkbox" { input id="forecasts" type="checkbox" checked; " Forecasts" }
+                }
+                button id="submit" class="button is-link is-small" data-needs-db disabled {
                     span class="icon" { (download_icon()) }
-                    span { "Download Files" }
+                    span { "Load files" }
                 }
             }
+            p id="raw-data-status" class="raw-status" role="status" { "Loading DuckDB…" }
 
-            // Schema display - resizable textareas with loading states
             div class="columns is-multiline mb-4" {
-                div class="column is-full-mobile is-half-desktop" {
-                    div class="schema-box" {
-                        div class="schema-header" {
-                            span class="schema-title" {
-                                " Forecasts Schema"
+                @for (table, title) in [("forecasts", "Forecasts schema"), ("observations", "Observations schema")] {
+                    div class="column is-full-mobile is-half-desktop" {
+                        div class="schema-box" {
+                            div class="schema-header" {
+                                span class="schema-title" { (title) }
+                                span id=(format!("{table}-status")) class="tag is-light is-small ml-2" { "Empty" }
                             }
-                            span id="forecasts-status" class="tag is-light is-small ml-2" { "Empty" }
-                        }
-                        div id="forecasts-loading" class="schema-loading" style="display: none;" {
-                            span class="loader mr-2" {}
-                            "Loading forecasts..."
-                        }
-                        textarea id="forecasts-schema" class="schema-content is-size-7" readonly placeholder="Schema will appear here after downloading files..." {}
-                    }
-                }
-                div class="column is-full-mobile is-half-desktop" {
-                    div class="schema-box" {
-                        div class="schema-header" {
-                            span class="schema-title" {
-                                " Observations Schema"
+                            div id=(format!("{table}-loading")) class="schema-loading" style="display: none;" {
+                                span class="loader mr-2" {}
+                                "Loading " (table) "…"
                             }
-                            span id="observations-status" class="tag is-light is-small ml-2" { "Empty" }
+                            textarea id=(format!("{table}-schema")) class="schema-content is-size-7" readonly
+                                placeholder="The schema appears here after the files load." {}
                         }
-                        div id="observations-loading" class="schema-loading" style="display: none;" {
-                            span class="loader mr-2" {}
-                            "Loading observations..."
-                        }
-                        textarea id="observations-schema" class="schema-content is-size-7" readonly placeholder="Schema will appear here after downloading files..." {}
                     }
                 }
             }
 
-            // Example queries
-            div class="field mb-4" {
-                label class="label is-small" { "Example Queries" }
-                div class="tags" {
-                    span class="tag is-link is-light is-clickable" onclick="loadExampleQuery('daily_observations')" { "Daily Observations" }
-                    span class="tag is-link is-light is-clickable" onclick="loadExampleQuery('daily_forecast')" { "Daily Forecast" }
-                    span class="tag is-link is-light is-clickable" onclick="loadExampleQuery('forecast_vs_observed')" { "Forecast vs Observed" }
-                    span class="tag is-link is-light is-clickable" onclick="loadExampleQuery('stations')" { "Station List" }
-                }
-            }
-
-            // Custom query
             div class="field" {
-                label class="label" { "Custom Query" }
-                div class="control" {
-                    textarea id="customQuery" class="textarea" rows="4"
-                             placeholder="SELECT * FROM observations ORDER BY station_id, generated_at DESC LIMIT 200" {}
+                p class="label is-small" { "Example queries" }
+                div class="buttons are-small" {
+                    @for (label, query) in EXAMPLES {
+                        button type="button" class="button" data-query=(query) { (label) }
+                    }
+                }
+            }
+
+            div class="field" {
+                label class="label is-small" for="customQuery" { "Query" }
+                textarea id="customQuery" class="textarea is-family-code is-size-7" rows="5" {
+                    "SELECT * FROM observations ORDER BY station_id, generated_at DESC LIMIT 200"
                 }
                 p class="help" {
-                    "Use DuckDB SQL syntax. "
-                    a href="https://duckdb.org/docs/sql/introduction" target="_blank" {
-                        "Query Documentation"
-                    }
+                    "DuckDB SQL. Tables: observations, forecasts. "
+                    a href="https://duckdb.org/docs/sql/introduction" { "Query documentation" }
                 }
             }
 
-            div class="field is-grouped mb-4" {
-                div class="control" {
-                    button id="runQuery" class="button is-info" {
-                        span class="icon" { (play_icon()) }
-                        span { "Run Query" }
-                    }
+            div class="buttons are-small" {
+                button id="runQuery" class="button is-link" data-needs-db disabled {
+                    span class="icon" { (play_icon()) }
+                    span { "Run query" }
                 }
-                div class="control" {
-                    button id="clearQuery" class="button is-light" {
-                        span { "Clear" }
-                    }
+                button id="downloadCsv" class="button is-link" disabled {
+                    span class="icon" { (download_icon()) }
+                    span { "Download CSV" }
                 }
-                div class="control" {
-                    button id="downloadCsv" class="button is-success" disabled {
-                        span class="icon" { (download_icon()) }
-                        span { "Download CSV" }
-                    }
-                }
+                button id="clearQuery" class="button" { "Clear" }
             }
 
-            // Query results
             div class="query-result-wrapper" id="queryResult-container" {}
         }
     }
@@ -160,5 +144,28 @@ fn play_icon() -> Markup {
             fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" {
             polygon points="5 3 19 12 5 21 5 3" {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+
+    #[test]
+    fn defaults_to_yesterday_utc_with_both_kinds_ticked() {
+        let html = raw_data_content(datetime!(2026-09-24 00:30 UTC)).into_string();
+        assert!(html.contains(r#"value="2026-09-23T00:00""#), "{html}");
+        assert!(html.contains(r#"value="2026-09-24T00:00""#));
+        assert_eq!(html.matches("type=\"checkbox\" checked").count(), 2);
+        assert!(html.contains("data-query=\"-- Daily observations"));
+    }
+
+    #[test]
+    fn the_example_comparison_is_observed_minus_forecast() {
+        let (_, query) = EXAMPLES[2];
+        assert!(query.contains("o.temp_high - f.temp_high AS high_difference"));
+        assert!(query.contains("o.temp_low - f.temp_low AS low_difference"));
+        assert!(!query.contains("f.temp_high - o.temp_high"));
     }
 }

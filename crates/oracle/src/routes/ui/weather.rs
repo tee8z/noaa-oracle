@@ -4,8 +4,43 @@ use time::{Duration, OffsetDateTime, Time, UtcOffset, format_description::well_k
 
 use crate::{
     AppState, ForecastRequest, ObservationRequest, TemperatureUnit,
-    templates::fragments::{ObservationPeriod, WeatherDisplay},
+    routes::stations::MAX_STATIONS,
+    templates::fragments::{ObservationPeriod, WeatherDisplay, weather::with_parameters},
+    weather_data::validate_station_id,
 };
+
+/// Stations shown when none are named: major airports covering every state.
+pub(super) const DEFAULT_MAJOR_AIRPORTS: &[&str] = &[
+    "KATL", "KLAX", "KORD", "KDFW", "KDEN", "KJFK", "KSFO", "KSEA", "KLAS", "KMCO", "KEWR", "KMIA",
+    "KPHX", "KIAH", "KBOS", "KMSP", "KFLL", "KDTW", "KPHL", "KLGA", "KBWI", "KSLC", "KDCA", "KSAN",
+    "KTPA", "KPDX", "KSTL", "KHNL", "KBNA", "KAUS", "KMCI", "KRDU", "KMKE", "KSMF", "KCLT", "KPIT",
+    "KSAT", "KOAK", "KCLE", "KSJC", "KIND", "KCVG", "KCMH", "KJAN", "KRSW", "KABQ", "KANC", "KOMA",
+    "KBUF", "KPBI", "KBDL", "KPVD", "KBTV", "KPWM", "KMHT", "KBOI", "KBIL", "KFSD", "KFAR", "KGEG",
+    "KICT", "KLIT", "KLEX", "KBHM", "KMEM", "KJAX", "KCHS", "KRIC", "KORF", "KCRW", "KPNS", "KMOB",
+    "KSHV", "KMSY", "KTUL", "KELP", "KTUS", "KCOS", "KGRR", "KDSM", "KMSN", "KDLH", "KBZN", "KGJT",
+    "KRAP", "KFCA", "KCYS", "KJAR", "KSGF", "KFSM",
+];
+
+pub(super) fn default_airports() -> Vec<String> {
+    DEFAULT_MAJOR_AIRPORTS
+        .iter()
+        .map(|station| station.to_string())
+        .collect()
+}
+
+/// The stations named in `?stations=`: valid ids, each once, at most
+/// [`MAX_STATIONS`]. `None` when none is usable, so `?stations=` shows the
+/// default airports instead of querying every station.
+pub(super) fn requested_stations(value: Option<&str>) -> Option<Vec<String>> {
+    let mut ids: Vec<String> = vec![];
+    for id in value?.split(',').map(str::trim) {
+        if validate_station_id(id).is_ok() && !ids.iter().any(|known| known == id) {
+            ids.push(id.to_string());
+        }
+    }
+    ids.truncate(MAX_STATIONS);
+    (!ids.is_empty()).then_some(ids)
+}
 
 /// Refresh the requested selection, including stations without observations.
 pub(super) fn refresh_path(
@@ -13,39 +48,28 @@ pub(super) fn refresh_path(
     start: Option<OffsetDateTime>,
     end: Option<OffsetDateTime>,
 ) -> String {
-    let mut parameters = Vec::new();
-    if !station_ids.is_empty() {
-        parameters.push(format!(
-            "stations={}",
-            encode_query_value(&station_ids.join(","))
-        ));
-    }
-    for (name, value) in [("start", start), ("end", end)] {
-        if let Some(value) = value {
-            let value = value
+    let stations = station_ids.join(",");
+    let time = |value: Option<OffsetDateTime>| {
+        value.map(|value| {
+            value
                 .to_offset(UtcOffset::UTC)
                 .format(&Rfc3339)
-                .unwrap_or_default();
-            parameters.push(format!("{}={}", name, encode_query_value(&value)));
-        }
-    }
-    if parameters.is_empty() {
-        "/fragments/weather".into()
-    } else {
-        format!("/fragments/weather?{}", parameters.join("&"))
-    }
-}
-
-fn encode_query_value(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    encoded
+                .unwrap_or_default()
+        })
+    };
+    let (start, end) = (time(start), time(end));
+    let parameters: Vec<(&str, &str)> = [
+        (
+            "stations",
+            (!stations.is_empty()).then_some(stations.as_str()),
+        ),
+        ("start", start.as_deref()),
+        ("end", end.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| Some((name, value?)))
+    .collect();
+    with_parameters("/fragments/weather", &parameters)
 }
 
 /// Use the same observation period and forecast vintage on initial load and refresh.
@@ -171,7 +195,6 @@ pub(super) async fn load_weather(
                 iata_id: station
                     .map(|station| station.iata_id.clone())
                     .unwrap_or_default(),
-                elevation_m: station.and_then(|station| station.elevation_m),
                 latest_temp: latest.latest_temp,
                 latest_temp_time: latest.latest_temp_time.clone(),
                 observation_period: period.clone(),
@@ -210,6 +233,25 @@ mod tests {
             refresh_path(&[], Some(start), Some(end)),
             "/fragments/weather?start=2026-09-20T00%3A00%3A00Z&end=2026-09-21T00%3A00%3A00Z"
         );
+    }
+
+    #[test]
+    fn only_usable_station_lists_replace_the_default_airports() {
+        assert_eq!(requested_stations(None), None);
+        assert_eq!(requested_stations(Some("")), None);
+        assert_eq!(requested_stations(Some(" , ,")), None);
+        assert_eq!(requested_stations(Some("bad'id")), None);
+        assert_eq!(
+            requested_stations(Some("KPWM, KBOS,KPWM,bad'id")),
+            Some(vec!["KPWM".to_string(), "KBOS".to_string()])
+        );
+        let many = ["KORD"; 3].join(",")
+            + ","
+            + &(0..200)
+                .map(|n| format!("K{n}"))
+                .collect::<Vec<_>>()
+                .join(",");
+        assert_eq!(requested_stations(Some(&many)).unwrap().len(), MAX_STATIONS);
     }
 
     #[test]

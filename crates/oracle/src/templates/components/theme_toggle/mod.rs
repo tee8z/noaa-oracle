@@ -1,15 +1,11 @@
 use maud::{Markup, html};
 
-/// Theme toggle button for dark/light mode
+/// Light/dark switch. CSS shows the icon for the current theme.
 pub fn theme_toggle() -> Markup {
     html! {
-        button #theme-toggle class="button is-small" title="Toggle dark/light mode" {
-            span #theme-icon-light class="icon" {
-                (sun_icon())
-            }
-            span #theme-icon-dark class="icon" style="display: none;" {
-                (moon_icon())
-            }
+        button #theme-toggle type="button" class="button is-small" title="Switch between light and dark" {
+            span #theme-icon-light class="icon" { (sun_icon()) }
+            span #theme-icon-dark class="icon" { (moon_icon()) }
         }
     }
 }

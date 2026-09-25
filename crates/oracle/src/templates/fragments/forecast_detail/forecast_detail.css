@@ -1,0 +1,66 @@
+.forecast-detail {
+    display: grid;
+    gap: 1rem;
+    font-size: 0.85rem;
+}
+
+.forecast-detail .title {
+    margin-bottom: 0.35rem;
+}
+
+.forecast-note {
+    font-size: 0.75rem;
+    color: var(--muted);
+    margin-bottom: 0.35rem;
+}
+
+.past-table {
+    font-size: 0.8rem;
+    background: transparent;
+}
+
+.past-table th[scope="row"] {
+    white-space: nowrap;
+    font-weight: 600;
+}
+
+.past-table .obs,
+.past-table .fcst {
+    display: block;
+    white-space: nowrap;
+}
+
+.fcst,
+.fcst .val {
+    color: var(--muted);
+    font-size: 0.75rem;
+}
+
+.forecast-days {
+    list-style: none;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(8.5rem, 1fr));
+    gap: 0.5rem;
+    margin: 0;
+}
+
+.forecast-day {
+    border: 1px solid var(--bulma-border-weak);
+    border-radius: 6px;
+    padding: 0.5rem;
+    text-align: center;
+    font-size: 0.8rem;
+}
+
+.forecast-date {
+    font-weight: 600;
+    margin-bottom: 0.2rem;
+}
+
+.station-detail-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.25rem 0.75rem;
+    margin-bottom: 0.5rem;
+}

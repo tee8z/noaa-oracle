@@ -1,24 +1,26 @@
-use std::sync::Arc;
-
-use axum::{extract::State, http::HeaderMap, response::Html};
-
-use crate::{
-    AppState,
-    templates::{pages::raw_data::raw_data_content, raw_data_page},
+use axum::{
+    http::{HeaderMap, HeaderName, HeaderValue, header},
+    response::{Html, IntoResponse, Response},
 };
+use time::OffsetDateTime;
 
-/// Handler for the raw data page (GET /raw)
-/// Returns full page for normal requests, content only for HTMX requests
-pub async fn raw_data_handler(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> Html<String> {
-    // Check if this is an HTMX request
-    if headers.contains_key("hx-request") {
-        // Return only the content for HTMX partial updates
-        Html(raw_data_content().into_string())
-    } else {
-        // Return full page for normal browser requests
-        Html(raw_data_page(&state.remote_url).into_string())
+use super::{htmx::is_htmx, policy::RAW_DATA_POLICY};
+use crate::templates::pages::raw_data::raw_data_page;
+
+/// Handler for the raw data page (GET /raw). Its policy lets the page's
+/// script run DuckDB-WASM, so it always loads as a whole document: the tab
+/// is a plain link, and when htmx asks for it (going back to it from a page
+/// opened by htmx) the reply tells htmx to reload instead.
+pub async fn raw_data_handler(headers: HeaderMap) -> Response {
+    if is_htmx(&headers) {
+        return ([(HeaderName::from_static("hx-refresh"), "true")], Html("")).into_response();
     }
+    let mut response = Html(raw_data_page(OffsetDateTime::now_utc()).into_string()).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(RAW_DATA_POLICY),
+    );
+    headers.insert(header::VARY, HeaderValue::from_static("HX-Request"));
+    response
 }

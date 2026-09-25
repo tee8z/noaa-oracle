@@ -76,13 +76,8 @@ data_dir = "./weather_data"
 event_db = "./event_data"
 
 # =============================================================================
-# Static Files & Keys
+# Keys
 # =============================================================================
-# Static files directory (CSS, JS assets built by build.rs)
-# For development: ./static (populated automatically during cargo build)
-# For Nix installs: set automatically to the package's share directory
-ui_dir = "./static"
-
 # Oracle signing key (secp256k1, PEM). Used for DLC attestations and as the
 # oracle's nostr identity - keep it secret. Generated with mode 0600 if it
 # doesn't exist; the oracle refuses to start if the file is readable by

@@ -14,27 +14,28 @@ use crate::{
     oracle::{Oracle, system_clock},
     routes::{
         add_event_entries, create_event, daily_observations, dashboard_handler, download,
-        event_detail_handler, event_stats_handler, events_cards_handler, events_handler,
-        events_rows_handler, files, forecast_handler, forecasts, get_event, get_event_entry,
-        get_npub, get_pubkey, get_stations, healthy, list_events, list_sources, observations,
-        oracle_info_handler, raw_data_handler, ready, update_data, upload, warm_forecast_cache,
+        event_detail_handler, events_handler, files, forecast_handler, forecasts, get_event,
+        get_event_entry, get_npub, get_pubkey, get_stations, healthy, list_events, list_sources,
+        observations, raw_data_handler, ready, station_handler,
+        ui::policy::content_security_policy, update_data, upload, warm_forecast_cache,
         weather_handler,
     },
     sources::{NoaaWeather, Sources},
+    templates::assets::serve_asset,
     weather_data::{self, Station, WeatherAccess, WeatherData},
 };
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Router,
     body::Body,
-    extract::{DefaultBodyLimit, Path, Request, State},
+    extract::{DefaultBodyLimit, Request},
     handler::Handler,
     http::{
-        Method, StatusCode,
-        header::{self, ACCEPT, CONTENT_TYPE},
+        Method,
+        header::{ACCEPT, CONTENT_TYPE},
     },
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::IntoResponse,
     routing::{get, post},
 };
 use log::{error, info, warn};
@@ -95,7 +96,6 @@ impl Background {
 
 /// Capabilities handlers receive. Handlers never see database connections.
 pub struct AppState {
-    pub static_dir: PathBuf,
     pub remote_url: String,
     /// Local directory uploads land in and DuckDB reads.
     pub weather_dir: PathBuf,
@@ -129,7 +129,6 @@ pub enum EtlRejected {
 /// Everything [`AppState`] is built from.
 pub struct AppParts {
     pub remote_url: String,
-    pub static_dir: PathBuf,
     pub weather_dir: PathBuf,
     pub auth: AuthPolicy,
     pub file_access: Arc<dyn FileData>,
@@ -143,7 +142,6 @@ impl AppState {
     pub fn new(parts: AppParts) -> Self {
         let AppParts {
             remote_url,
-            static_dir,
             weather_dir,
             auth,
             file_access,
@@ -153,7 +151,6 @@ impl AppState {
             background,
         } = parts;
         Self {
-            static_dir,
             remote_url,
             weather_dir,
             auth,
@@ -368,7 +365,6 @@ async fn build_app_state(
     }
     Ok(Arc::new(AppState::new(AppParts {
         remote_url: configuration.remote_url.clone(),
-        static_dir: configuration.static_dir.clone(),
         weather_dir: configuration.weather_dir.clone(),
         auth: AuthPolicy::new(
             &configuration.remote_url,
@@ -390,19 +386,20 @@ pub fn app(app_state: Arc<AppState>) -> Router {
         .allow_headers([ACCEPT, CONTENT_TYPE])
         .allow_origin(Any);
 
-    Router::new()
-        // UI routes
+    // Pages and the fragments htmx swaps into them.
+    let ui = Router::new()
         .route("/", get(dashboard_handler))
         .route("/events", get(events_handler))
         .route("/events/{event_id}", get(event_detail_handler))
         .route("/raw", get(raw_data_handler))
-        // HTMX fragment routes
-        .route("/fragments/oracle-info", get(oracle_info_handler))
-        .route("/fragments/event-stats", get(event_stats_handler))
         .route("/fragments/weather", get(weather_handler))
         .route("/fragments/forecast/{station_id}", get(forecast_handler))
-        .route("/fragments/events-rows", get(events_rows_handler))
-        .route("/fragments/events-cards", get(events_cards_handler))
+        .route("/fragments/station/{station_id}", get(station_handler))
+        .layer(middleware::from_fn(content_security_policy));
+
+    Router::new()
+        .merge(ui)
+        .route("/assets/{file}", get(serve_asset))
         // Probes
         .route("/health", get(ready))
         .route("/ready", get(ready))
@@ -429,8 +426,6 @@ pub fn app(app_state: Arc<AppState>) -> Router {
             "/oracle/events/{event_id}/entries/{entry_id}",
             get(get_event_entry),
         )
-        // Static files with explicit MIME types
-        .route("/static/{*path}", get(serve_static_file))
         .with_state(app_state)
         .layer(middleware::from_fn(log_request))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -457,59 +452,6 @@ async fn log_request(request: Request<Body>, next: Next) -> impl IntoResponse {
     );
 
     response
-}
-
-/// Serves static files with explicit MIME type mappings.
-/// This avoids relying on the system's MIME database which may be missing in containers.
-async fn serve_static_file(
-    State(state): State<Arc<AppState>>,
-    Path(path): Path<String>,
-) -> Response {
-    // Only plain file names below the static directory are served.
-    let relative = std::path::Path::new(&path);
-    if relative
-        .components()
-        .any(|component| !matches!(component, std::path::Component::Normal(_)))
-    {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-
-    let file_path = state.static_dir.join(relative);
-
-    let content = match tokio::fs::read(&file_path).await {
-        Ok(content) => content,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
-    };
-
-    let content_type = get_mime_type(&path);
-
-    ([(header::CONTENT_TYPE, content_type)], content).into_response()
-}
-
-/// Returns the appropriate MIME type for a file based on its extension.
-fn get_mime_type(path: &str) -> &'static str {
-    match path.rsplit('.').next() {
-        Some("js") | Some("mjs") => "application/javascript; charset=utf-8",
-        Some("css") => "text/css; charset=utf-8",
-        Some("html") | Some("htm") => "text/html; charset=utf-8",
-        Some("json") => "application/json; charset=utf-8",
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("svg") => "image/svg+xml",
-        Some("ico") => "image/x-icon",
-        Some("webp") => "image/webp",
-        Some("woff") => "font/woff",
-        Some("woff2") => "font/woff2",
-        Some("ttf") => "font/ttf",
-        Some("otf") => "font/otf",
-        Some("eot") => "application/vnd.ms-fontobject",
-        Some("txt") => "text/plain; charset=utf-8",
-        Some("xml") => "application/xml; charset=utf-8",
-        Some("wasm") => "application/wasm",
-        Some("map") => "application/json",
-        _ => "application/octet-stream",
-    }
 }
 
 /// Runs the oracle until a termination signal arrives or a supervised task
@@ -613,7 +555,6 @@ impl ApplicationRuntime {
         info!("  Docs:         http://{address}/docs");
         info!("  Weather data: {}", configuration.weather_dir.display());
         info!("  Event DB:     {}", configuration.event_dir.display());
-        info!("  Static:       {}", configuration.static_dir.display());
         Ok(Some(runtime))
     }
 

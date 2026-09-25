@@ -14,8 +14,9 @@ use uuid::Uuid;
 use crate::{
     database::{Database, EntryScore, WriteError},
     events::{
-        AddEventEntry, CreateEvent, EntryRejection, Event, EventFilter, EventRecord,
-        EventRejection, EventStatus, EventSummary, NewEvent, WeatherEntry, validate_entries,
+        AddEventEntry, CreateEvent, EntryRejection, Event, EventCounts, EventFilter,
+        EventListQuery, EventRecord, EventRejection, EventStatus, EventSummary, NewEvent,
+        WeatherEntry, validate_entries,
     },
     scoring::{self, NotUuidV7, Scored},
     signing::{AttestError, KeyError, SigningKey},
@@ -155,6 +156,24 @@ impl Oracle {
                 record.into_summary(now, &readings)
             })
             .collect())
+    }
+
+    /// One page of the UI's events list. Rows carry no weather readings;
+    /// the list does not show them.
+    pub async fn event_page(&self, query: &EventListQuery) -> Result<Vec<EventSummary>, Error> {
+        let now = self.now();
+        Ok(self
+            .db
+            .event_page(query, now)
+            .await?
+            .into_iter()
+            .map(|record| record.into_summary(now, &[]))
+            .collect())
+    }
+
+    /// Events by status, counted like [`Self::event_page`] lists them.
+    pub async fn event_counts(&self, include_unlisted: bool) -> Result<EventCounts, Error> {
+        Ok(self.db.event_counts(include_unlisted, self.now()).await?)
     }
 
     pub async fn get_event(&self, id: Uuid) -> Result<Event, Error> {

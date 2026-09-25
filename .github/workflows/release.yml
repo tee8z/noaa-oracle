@@ -151,11 +151,9 @@ jobs:
           mkdir -p "${PKG_NAME}/bin"
           mkdir -p "${PKG_NAME}/config"
 
-          # Copy the Nix-built binaries and the UI files the oracle serves from ui_dir
+          # Copy the Nix-built binaries; the oracle embeds its UI
           cp result/bin/oracle "${PKG_NAME}/bin/"
           cp result-daemon/bin/daemon "${PKG_NAME}/bin/"
-          mkdir -p "${PKG_NAME}/static"
-          cp -r result/share/noaa-oracle/static/. "${PKG_NAME}/static/"
 
           # Copy and rename config examples to usable defaults
           cp config/oracle.example.toml "${PKG_NAME}/config/oracle.toml"
@@ -242,7 +240,6 @@ jobs:
           Directories:
             - config/       Configuration files
             - bin/          Service binaries
-            - static/       Browser UI files served by the oracle
             - weather_data/ Downloaded parquet files (created on first run)
             - event_data/   DLC event database (created on first run)
 
@@ -264,12 +261,10 @@ jobs:
           mv "${PKG_NAME}.zip" release/
 
           # Cargo binaries tarball (for users who prefer dynamic linking).
-          # The oracle serves its UI from ui_dir (build.rs generates it; the
-          # Nix build installs a copy), so ship those files alongside.
-          mkdir -p cargo-pkg/bin cargo-pkg/static
+          # The oracle embeds its UI, so the binaries are all it needs.
+          mkdir -p cargo-pkg/bin
           cp target/release/oracle cargo-pkg/bin/
           cp target/release/daemon cargo-pkg/bin/
-          cp -r result/share/noaa-oracle/static/. cargo-pkg/static/
           tar czf "release/noaa-oracle-${VERSION}-x86_64-linux-cargo.tar.gz" -C cargo-pkg .
           rm -rf cargo-pkg
 
@@ -322,11 +317,9 @@ jobs:
           mkdir -p "${PKG_NAME}/bin"
           mkdir -p "${PKG_NAME}/config"
 
-          # Copy the Nix-built binaries and the UI files the oracle serves from ui_dir
+          # Copy the Nix-built binaries; the oracle embeds its UI
           cp result/bin/oracle "${PKG_NAME}/bin/"
           cp result-daemon/bin/daemon "${PKG_NAME}/bin/"
-          mkdir -p "${PKG_NAME}/static"
-          cp -r result/share/noaa-oracle/static/. "${PKG_NAME}/static/"
 
           # Copy and rename config examples to usable defaults
           cp config/oracle.example.toml "${PKG_NAME}/config/oracle.toml"
@@ -413,7 +406,6 @@ jobs:
           Directories:
             - config/       Configuration files
             - bin/          Service binaries
-            - static/       Browser UI files served by the oracle
             - weather_data/ Downloaded parquet files (created on first run)
             - event_data/   DLC event database (created on first run)
 
