@@ -15,8 +15,8 @@ use crate::{
     routes::{
         add_event_entries, create_event, daily_observations, dashboard_handler, download,
         event_detail_handler, events_handler, files, forecast_handler, forecasts, get_event,
-        get_event_entry, get_npub, get_pubkey, get_stations, healthy, list_events, list_sources,
-        observations, raw_data_handler, ready, station_handler,
+        get_event_entry, get_npub, get_pubkey, get_stations, health, healthy, list_events,
+        list_sources, observations, raw_data_handler, ready, station_handler,
         ui::policy::content_security_policy, update_data, upload, warm_forecast_cache,
         weather_handler,
     },
@@ -51,7 +51,7 @@ use std::{
 };
 use tokio::{
     net::TcpListener,
-    sync::Semaphore,
+    sync::{Semaphore, watch},
     task::{JoinError, JoinHandle},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -169,6 +169,21 @@ pub struct AppState {
     instance: String,
     /// Wakes the task that prepares new data files for queries.
     files_added: tokio::sync::Notify,
+    /// How far the first preparation of forecast files got.
+    preparation: watch::Sender<Preparation>,
+}
+
+/// The first pass that prepares recent forecast files for queries. Until
+/// it ends, queries read the published files: seconds per request and
+/// gigabytes of memory, so the cache warmer waits for it and readiness
+/// answers 503.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Preparation {
+    Running,
+    /// A pass failed and none has succeeded yet; the next one retries.
+    Failed,
+    /// A pass finished: copies and folds of every recent file exist.
+    Done,
 }
 
 /// Processing scores entries and signs attestations. During a blue/green
@@ -222,7 +237,32 @@ impl AppState {
             etl_slot: Arc::new(Semaphore::new(1)),
             instance: format!("oracle-{}", uuid::Uuid::now_v7()),
             files_added: tokio::sync::Notify::new(),
+            preparation: watch::Sender::new(Preparation::Running),
         }
+    }
+
+    /// Whether a preparation pass has made copies and folds of every recent
+    /// forecast file since this process started.
+    pub fn files_prepared(&self) -> bool {
+        *self.preparation.borrow() == Preparation::Done
+    }
+
+    /// Records the end of a preparation pass. Once done, it stays done.
+    fn preparation_ended(&self, succeeded: bool) {
+        self.preparation.send_if_modified(|stage| {
+            let next = match (*stage, succeeded) {
+                (Preparation::Done, _) | (_, true) => Preparation::Done,
+                (_, false) => Preparation::Failed,
+            };
+            std::mem::replace(stage, next) != next
+        });
+    }
+
+    /// Waits until the first preparation pass ended, successfully or not.
+    async fn first_preparation_ended(&self) {
+        let mut stage = self.preparation.subscribe();
+        // The sender lives as long as `self`, so this cannot fail.
+        let _ = stage.wait_for(|stage| *stage != Preparation::Running).await;
     }
 
     pub fn cached_forecast(&self, key: &str) -> Option<String> {
@@ -492,7 +532,7 @@ pub fn app(app_state: Arc<AppState>) -> Router {
         .merge(ui)
         .route("/assets/{file}", get(serve_asset))
         // Probes
-        .route("/health", get(ready))
+        .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/healthy", get(healthy))
         // API routes
@@ -733,20 +773,26 @@ impl Drop for ApplicationRuntime {
 /// [`weather_data::DerivedForecasts`] and [`weather_data::Folds`]): at
 /// start, after each upload, and every [`PREPARE_FILES_INTERVAL`]. Queries
 /// read the published files until then, with the same results. Stops
-/// between files on shutdown.
+/// between files on shutdown. The end of each pass is recorded for
+/// readiness and the cache warmer (see [`Preparation`]).
 fn spawn_file_preparation(state: &Arc<AppState>) {
     let state = state.clone();
     let stopping = state.background.stopping.clone();
     state.background.tasks.clone().spawn(async move {
         loop {
             let started = std::time::Instant::now();
-            match state.weather_db.prepare_files(&stopping).await {
+            let result = state.weather_db.prepare_files(&stopping).await;
+            match &result {
                 Ok(0) => {}
                 Ok(made) => info!(
                     "prepared {made} forecast files in {:.1}s",
                     started.elapsed().as_secs_f64()
                 ),
                 Err(error) => warn!("cannot prepare forecast files for queries: {error}"),
+            }
+            // A pass cut short by shutdown did not prepare every file.
+            if !stopping.is_cancelled() {
+                state.preparation_ended(result.is_ok());
             }
             tokio::select! {
                 biased;
@@ -758,10 +804,19 @@ fn spawn_file_preparation(state: &Arc<AppState>) {
     });
 }
 
+/// Warms the forecast cache once the first preparation pass has ended, then
+/// every [`FORECAST_CACHE_REFRESH`]. Warming from the published files
+/// before that would fill every query slot for minutes and take gigabytes
+/// of memory; from copies and folds it takes seconds.
 fn spawn_cache_warmer(state: &Arc<AppState>) {
     let state = state.clone();
     let stopping = state.background.stopping.clone();
     state.background.tasks.clone().spawn(async move {
+        tokio::select! {
+            biased;
+            () = stopping.cancelled() => return,
+            () = state.first_preparation_ended() => {}
+        }
         warm_forecast_cache(&state).await;
         let mut interval = tokio::time::interval(FORECAST_CACHE_REFRESH);
         interval.tick().await; // the first tick completes immediately

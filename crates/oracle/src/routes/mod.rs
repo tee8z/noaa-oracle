@@ -12,7 +12,7 @@ pub use events::{
     get_pubkey, list_events, list_sources, update_data,
 };
 pub use files::{Files, download, files, upload};
-pub use health::{healthy, ready};
+pub use health::{health, healthy, ready};
 pub use stations::{
     ForecastRequest, ObservationRequest, TemperatureUnit, daily_observations, forecasts,
     get_stations, observations,

@@ -102,7 +102,7 @@ coordinator_pubkeys = ["npub1..."]
 uploader_pubkeys = ["npub1..."]
 ```
 
-`GET /health` reports readiness (writer available and a database read succeeds) and turns 503 during shutdown; `GET /healthy` reports HTTP liveness only.
+`GET /health` reports health (writer available and a database read succeeds) and turns 503 during shutdown. `GET /ready` also waits for the first preparation of recent forecast files (their station-sorted copies and daily folds), which takes minutes on a first start without them; a blue/green deploy should switch traffic on it. `GET /healthy` reports HTTP liveness only.
 
 ### Security model
 
