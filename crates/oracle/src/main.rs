@@ -5,7 +5,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::load()?;
     let log_level = cli.log_level();
 
-    setup_logger()
+    // Held until main returns, so queued log lines are written at exit.
+    let (logger, _log_guard) = setup_logger();
+    logger
         .level(log_level)
         .level_for("duckdb", log_level)
         .level_for("oracle", log_level)

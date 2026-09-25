@@ -8,7 +8,8 @@ REST API, HTMX dashboard, and DLC attestation service. See the
 
 | Route | Purpose |
 | --- | --- |
-| `GET /health`, `GET /ready` | Readiness: writer accepts commands and SQLite answers a read; 503 while shutting down |
+| `GET /health` | Health: writer accepts commands and SQLite answers a read; 503 while shutting down |
+| `GET /ready` | Readiness to take traffic: `/health`, and the first preparation of recent forecast files (copies and folds) has finished; 503 until then |
 | `GET /healthy` | Liveness: HTTP only |
 | `GET /docs` | OpenAPI UI |
 | `GET /files`, `GET /file/{name}`, `POST /file/{name}` | List, download, and upload parquet files (`<observations|forecasts>_<rfc3339>.parquet`) |

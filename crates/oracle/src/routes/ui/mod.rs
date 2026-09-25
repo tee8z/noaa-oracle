@@ -4,6 +4,7 @@ mod events;
 mod forecast;
 mod fragments;
 mod htmx;
+pub mod local_day;
 pub mod policy;
 mod raw_data;
 mod weather;

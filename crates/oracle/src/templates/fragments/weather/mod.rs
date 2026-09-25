@@ -18,18 +18,25 @@ pub use list::weather_list;
 
 #[derive(Clone)]
 pub enum ObservationPeriod {
-    Today,
-    Selected { start: String, end: String },
+    /// The reader's day so far; `zone` names its days, such as `UTC` or
+    /// `New York time`.
+    Today {
+        zone: String,
+    },
+    Selected {
+        start: String,
+        end: String,
+    },
 }
 
 impl ObservationPeriod {
-    /// Today is a UTC day. A selection's times are shown in the reader's
-    /// time zone (`local_time.js`), with UTC on hover, so its label names
-    /// no zone.
-    pub fn label(&self) -> &'static str {
+    /// Today is the reader's day, named by its zone. A selection's times
+    /// are shown in the reader's time zone (`local_time.js`), with UTC on
+    /// hover, so its label names no zone.
+    pub fn label(&self) -> String {
         match self {
-            Self::Today => "Today so far (UTC)",
-            Self::Selected { .. } => "Selected period",
+            Self::Today { zone } => format!("Today so far ({zone})"),
+            Self::Selected { .. } => "Selected period".to_owned(),
         }
     }
 
@@ -238,7 +245,7 @@ fn period_note(period: &ObservationPeriod, now: OffsetDateTime) -> Markup {
             " · Δ = observed − forecast"
             @if period.settled(now) == Settled::SoFar {
                 span class="weather-provisional" {
-                    @if matches!(period, ObservationPeriod::Today) {
+                    @if matches!(period, ObservationPeriod::Today { .. }) {
                         " · The day isn't over, "
                     } @else {
                         " · This isn't a whole, finished UTC day, "
@@ -352,7 +359,8 @@ mod tests {
             &time::format_description::well_known::Rfc3339,
         )
         .unwrap();
-        assert_eq!(ObservationPeriod::Today.settled(now), Settled::SoFar);
+        let today = ObservationPeriod::Today { zone: "UTC".into() };
+        assert_eq!(today.settled(now), Settled::SoFar);
         let finished = ObservationPeriod::Selected {
             start: "2026-09-23T00:00:00Z".into(),
             end: "2026-09-24T00:00:00Z".into(),

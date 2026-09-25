@@ -1,9 +1,10 @@
 use std::{collections::HashMap, sync::Arc};
 
-use time::{Duration, OffsetDateTime, Time, UtcOffset, format_description::well_known::Rfc3339};
+use time::{Duration, OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 use crate::{
     AppState, ForecastRequest, ObservationRequest, TemperatureUnit,
+    calendar::Calendar,
     routes::stations::MAX_STATIONS,
     templates::fragments::{ObservationPeriod, WeatherDisplay, weather::with_parameters},
     weather_data::validate_station_id,
@@ -73,20 +74,30 @@ pub(super) fn refresh_path(
 }
 
 /// Use the same observation period and forecast vintage on initial load and refresh.
+/// Without a selected period, today is the reader's day in `calendar`
+/// (see [`super::local_day`]); a selected period keeps UTC days, as its
+/// address says.
 pub(super) async fn load_weather(
     state: &Arc<AppState>,
     station_ids: &[String],
     start: Option<OffsetDateTime>,
     end: Option<OffsetDateTime>,
+    calendar: Calendar,
 ) -> Vec<WeatherDisplay> {
     let now = OffsetDateTime::now_utc();
     let selected = start.is_some() || end.is_some();
+    let calendar = if selected { Calendar::Utc } else { calendar };
     let start = start
-        .unwrap_or_else(|| now.replace_time(Time::MIDNIGHT))
+        .unwrap_or_else(|| calendar.start_of_day(now))
         .to_offset(UtcOffset::UTC);
     let end = end.unwrap_or(now).to_offset(UtcOffset::UTC);
-    let day_start = start.replace_time(Time::MIDNIGHT);
-    let day_end = day_start.saturating_add(Duration::days(1));
+    let day = calendar.date_of(start);
+    let day_start = calendar.start_of(day);
+    // Days with a daylight-saving change last 23 or 25 hours.
+    let day_end = day
+        .next_day()
+        .map(|next| calendar.start_of(next))
+        .unwrap_or_else(|| day_start.saturating_add(Duration::days(1)));
     let single_day = start <= end && end <= day_end;
     let period = if selected {
         ObservationPeriod::Selected {
@@ -94,7 +105,9 @@ pub(super) async fn load_weather(
             end: end.format(&Rfc3339).unwrap_or_default(),
         }
     } else {
-        ObservationPeriod::Today
+        ObservationPeriod::Today {
+            zone: calendar.place(),
+        }
     };
     let request = ObservationRequest {
         start: Some(start),
@@ -141,7 +154,7 @@ pub(super) async fn load_weather(
             if single_day {
                 state
                     .weather_db
-                    .forecasts_data(&forecast_request, station_ids.to_vec())
+                    .calendar_forecasts(&forecast_request, station_ids.to_vec(), calendar)
                     .await
                     .unwrap_or_else(|error| {
                         log::error!("failed to read forecasts for the weather table: {error:#}");
@@ -165,7 +178,7 @@ pub(super) async fn load_weather(
         .iter()
         .map(|obs| (&obs.station_id, obs))
         .collect();
-    let date = day_start.date().to_string();
+    let date = day.to_string();
     let forecast_by_station: HashMap<_, _> = forecasts
         .iter()
         .filter(|forecast| forecast.date.get(..10) == Some(date.as_str()))

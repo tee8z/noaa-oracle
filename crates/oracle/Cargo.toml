@@ -59,9 +59,13 @@ zeroize = "1.8"
 # Logging
 log = { workspace = true, features = ["serde"] }
 fern.workspace = true
+tracing-appender = "0.2"
 
 # Time
 time.workspace = true
+# Readers' local days: IANA time zones and their daylight-saving rules.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.10"
 
 # API docs
 utoipa = { version = "5.5", features = ["axum_extras", "time", "uuid", "preserve_order", "preserve_path_order"] }

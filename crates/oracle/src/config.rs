@@ -11,11 +11,13 @@ use log::LevelFilter;
 use noaa_oracle_core::{ConfigSource, DEFAULT_ORACLE_PORT, find_config_file, load_config};
 use nostr::key::PublicKey;
 use std::{
+    io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     time::Duration,
 };
 use time::{OffsetDateTime, format_description::well_known::Iso8601};
+use tracing_appender::non_blocking::WorkerGuard;
 
 const DEFAULT_SHUTDOWN_TIMEOUT_SECONDS: u64 = 25;
 const DEFAULT_ETL_INTERVAL_SECONDS: u64 = 300;
@@ -272,7 +274,13 @@ fn parse_pubkeys(field: &'static str, values: &[String]) -> Result<Vec<PublicKey
         .collect()
 }
 
-pub fn setup_logger() -> Dispatch {
+/// Process logging. Lines go to stdout from a background thread, so a
+/// request never waits on stdout: a slow journald, a full pipe or a disk
+/// busy with other writes. If that thread falls 128,000 lines behind, new
+/// lines are dropped rather than waited for. Keep the guard until the
+/// process ends; dropping it writes out the lines still queued.
+pub fn setup_logger() -> (Dispatch, WorkerGuard) {
+    let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
     let colors = ColoredLevelConfig::new()
         .trace(Color::White)
         .debug(Color::Cyan)
@@ -280,7 +288,7 @@ pub fn setup_logger() -> Dispatch {
         .warn(Color::Yellow)
         .error(Color::Magenta);
 
-    fern::Dispatch::new()
+    let dispatch = fern::Dispatch::new()
         .format(move |out, message, record| {
             out.finish(format_args!(
                 "[{} {}] {}: {}",
@@ -292,7 +300,12 @@ pub fn setup_logger() -> Dispatch {
                 message
             ));
         })
-        .chain(std::io::stdout())
+        .chain(fern::Output::call(move |record| {
+            // One write per line, so a dropped line is never half written.
+            let line = format!("{}\n", record.args());
+            let _ = writer.clone().write_all(line.as_bytes());
+        }));
+    (dispatch, guard)
 }
 
 #[cfg(test)]

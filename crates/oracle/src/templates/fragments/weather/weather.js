@@ -19,3 +19,16 @@ document.addEventListener("htmx:before:swap", function (event) {
   var section = document.getElementById("weather-table-container");
   if (section && weatherBusy(section)) event.preventDefault();
 });
+
+// The page arrived without the reader's time zone (see head.js), so its
+// weather shows UTC days. Fetch it once more now that the cookie is set.
+// Explicit periods are UTC days either way.
+document.addEventListener("DOMContentLoaded", function () {
+  if (!document.documentElement.dataset.zoneChanged) return;
+  delete document.documentElement.dataset.zoneChanged;
+  var section = document.getElementById("weather-table-container");
+  var path = section && section.getAttribute("hx-get");
+  if (path && !/[?&](start|end)=/.test(path)) {
+    htmx.ajax("GET", path, { source: section, target: section, swap: "outerHTML" });
+  }
+});
