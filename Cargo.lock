@@ -1599,7 +1599,7 @@ dependencies = [
 
 [[package]]
 name = "daemon"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -3250,7 +3250,7 @@ dependencies = [
 
 [[package]]
 name = "noaa-oracle-core"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "log",
@@ -3375,7 +3375,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "oracle"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "anyhow",
  "async-trait",

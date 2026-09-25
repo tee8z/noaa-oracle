@@ -3,7 +3,7 @@ name: noaa-daemon
 description: NOAA weather data fetching daemon
 type: application
 version: 0.1.0
-appVersion: "2.2.0"
+appVersion: "2.3.0"
 
 home: https://github.com/tee8z/noaa-oracle
 sources:
