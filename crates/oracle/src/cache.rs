@@ -111,7 +111,7 @@ impl<K: Clone + Eq + Hash, V: Clone> Cache<K, V> {
             .filter(|(_, entry)| entry.used > since)
             .map(|(key, entry)| (entry.used, key.clone()))
             .collect();
-        keys.sort_by(|a, b| b.0.cmp(&a.0));
+        keys.sort_by_key(|(used, _)| std::cmp::Reverse(*used));
         keys.into_iter().map(|(_, key)| key).collect()
     }
 

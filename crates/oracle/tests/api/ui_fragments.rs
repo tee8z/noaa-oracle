@@ -123,7 +123,7 @@ async fn selected_utc_day_uses_its_previous_day_forecast_and_preserves_refresh_c
                 && request.station_ids == "KORD"
                 && stations == &["KORD"]
         })
-        .times(2)
+        .times(1)
         .returning(|_, _| Ok(mock_observation_data()));
     weather
         .expect_forecasts_data()
@@ -135,7 +135,7 @@ async fn selected_utc_day_uses_its_previous_day_forecast_and_preserves_refresh_c
                 && request.station_ids == "KORD"
                 && stations == &["KORD"]
         })
-        .times(2)
+        .times(1)
         .returning(|_, _| {
             let mut forecasts = mock_forecast_data();
             forecasts[0].date = "2024-08-12 00:00:00".into();
@@ -195,7 +195,7 @@ async fn start_only_weather_selection_keeps_its_bound_and_refresh_context() {
         .withf(move |request, stations| {
             request.start == Some(start) && request.station_ids == "KORD" && stations == &["KORD"]
         })
-        .times(2)
+        .times(1)
         .returning(move |request, _| {
             captured_ends.lock().unwrap().push(request.end.unwrap());
             Ok(mock_observation_data())
@@ -228,8 +228,8 @@ async fn start_only_weather_selection_keeps_its_bound_and_refresh_context() {
     let ends = requested_ends.lock().unwrap();
     assert_eq!(
         ends.len(),
-        2,
-        "selected windows do not fetch a second recent-report window"
+        1,
+        "the refresh is served from the cache, and a selected window fetches no recent-report window"
     );
     assert!(ends.iter().all(|end| *end >= before && *end <= after));
 }
@@ -376,7 +376,7 @@ async fn assert_dashboard_selection_survives_refresh(has_observations: bool) {
                 && request.station_ids == "KORD,KBOS"
                 && stations == &["KORD", "KBOS"]
         })
-        .times(3)
+        .times(1)
         .returning(move |_, _| {
             Ok(if has_observations {
                 mock_observation_data()
