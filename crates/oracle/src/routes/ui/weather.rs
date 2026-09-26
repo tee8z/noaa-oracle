@@ -1,9 +1,10 @@
 use std::{collections::HashMap, sync::Arc};
 
-use time::{Duration, OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
+use time::{Date, Duration, OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 use crate::{
     AppState, ForecastRequest, ObservationRequest, TemperatureUnit,
+    cache::Cached,
     calendar::Calendar,
     routes::stations::MAX_STATIONS,
     templates::fragments::{ObservationPeriod, WeatherDisplay, weather::with_parameters},
@@ -73,17 +74,109 @@ pub(super) fn refresh_path(
     with_parameters("/fragments/weather", &parameters)
 }
 
-/// Use the same observation period and forecast vintage on initial load and refresh.
-/// Without a selected period, today is the reader's day in `calendar`
-/// (see [`super::local_day`]); a selected period keeps UTC days, as its
-/// address says.
+/// What current weather shows: which stations, over which period, in which
+/// calendar's day. It changes only when new reports arrive, so it is
+/// cached by this key (see [`load_weather`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct WeatherKey {
+    stations: Vec<String>,
+    start: Option<OffsetDateTime>,
+    end: Option<OffsetDateTime>,
+    pub calendar: Calendar,
+    /// The day it covers: a reader's today changes at their midnight.
+    pub day: Date,
+}
+
+impl WeatherKey {
+    /// A selected period keeps UTC days, as its address says.
+    pub fn new(
+        station_ids: &[String],
+        start: Option<OffsetDateTime>,
+        end: Option<OffsetDateTime>,
+        calendar: Calendar,
+        now: OffsetDateTime,
+    ) -> Self {
+        let calendar = if start.is_some() || end.is_some() {
+            Calendar::Utc
+        } else {
+            calendar
+        };
+        Self {
+            stations: station_ids.to_vec(),
+            start,
+            end,
+            calendar,
+            day: calendar.date_of(start.unwrap_or(now)),
+        }
+    }
+
+    /// The same view as of `now`: without a selected period, a reader's
+    /// "today" moves on at their midnight. `None` for a selected period,
+    /// which the warmer leaves to readers.
+    pub fn as_of(&self, now: OffsetDateTime) -> Option<Self> {
+        (self.start.is_none() && self.end.is_none()).then(|| Self {
+            day: self.calendar.date_of(now),
+            ..self.clone()
+        })
+    }
+}
+
+/// Current weather for the stations and period, from the cache or built
+/// now. A stale copy is served while it is rebuilt in the background; only
+/// builds whose queries all succeeded are cached.
 pub(super) async fn load_weather(
     state: &Arc<AppState>,
     station_ids: &[String],
     start: Option<OffsetDateTime>,
     end: Option<OffsetDateTime>,
     calendar: Calendar,
-) -> Vec<WeatherDisplay> {
+) -> Arc<Vec<WeatherDisplay>> {
+    let key = WeatherKey::new(station_ids, start, end, calendar, OffsetDateTime::now_utc());
+    match state.cached_weather(&key) {
+        Cached::Fresh(weather) => weather,
+        Cached::Stale { value, refresh } => {
+            if refresh {
+                let task_state = state.clone();
+                state.spawn(async move { refresh_weather(&task_state, key).await });
+            }
+            value
+        }
+        Cached::Missing => {
+            let generation = state.data_generation();
+            let (weather, complete) = build_weather(state, station_ids, start, end, calendar).await;
+            let weather = Arc::new(weather);
+            if complete {
+                state.cache_weather(key, weather.clone(), generation);
+            }
+            weather
+        }
+    }
+}
+
+/// Rebuilds and caches the current weather for `key`; a failed query
+/// leaves the cached copy.
+pub(super) async fn refresh_weather(state: &Arc<AppState>, key: WeatherKey) {
+    let generation = state.data_generation();
+    let (weather, complete) =
+        build_weather(state, &key.stations, key.start, key.end, key.calendar).await;
+    if complete {
+        state.cache_weather(key, Arc::new(weather), generation);
+    } else {
+        state.weather_refresh_failed(&key);
+    }
+}
+
+/// Use the same observation period and forecast vintage on initial load and refresh.
+/// Without a selected period, today is the reader's day in `calendar`
+/// (see [`super::local_day`]); a selected period keeps UTC days, as its
+/// address says. Also says whether every query succeeded.
+async fn build_weather(
+    state: &Arc<AppState>,
+    station_ids: &[String],
+    start: Option<OffsetDateTime>,
+    end: Option<OffsetDateTime>,
+    calendar: Calendar,
+) -> (Vec<WeatherDisplay>, bool) {
     let now = OffsetDateTime::now_utc();
     let selected = start.is_some() || end.is_some();
     let calendar = if selected { Calendar::Utc } else { calendar };
@@ -141,11 +234,12 @@ pub(super) async fn load_weather(
             .observation_data(&request, station_ids.to_vec()),
         async {
             if !selected {
-                state
-                    .weather_db
-                    .observation_data(&recent_request, station_ids.to_vec())
-                    .await
-                    .ok()
+                Some(
+                    state
+                        .weather_db
+                        .observation_data(&recent_request, station_ids.to_vec())
+                        .await,
+                )
             } else {
                 None
             }
@@ -156,22 +250,34 @@ pub(super) async fn load_weather(
                     .weather_db
                     .calendar_forecasts(&forecast_request, station_ids.to_vec(), calendar)
                     .await
-                    .unwrap_or_else(|error| {
-                        log::error!("failed to read forecasts for the weather table: {error:#}");
-                        vec![]
-                    })
             } else {
-                vec![]
+                Ok(vec![])
             }
         },
         state.stations(),
     );
+    let mut complete = true;
     let observations = observations.unwrap_or_else(|error| {
         log::error!("failed to read observations for the weather table: {error:#}");
+        complete = false;
+        vec![]
+    });
+    let recent = recent.and_then(|recent| {
+        recent
+            .inspect_err(|error| {
+                log::error!("failed to read the latest reports for the weather table: {error:#}");
+                complete = false;
+            })
+            .ok()
+    });
+    let forecasts = forecasts.unwrap_or_else(|error| {
+        log::error!("failed to read forecasts for the weather table: {error:#}");
+        complete = false;
         vec![]
     });
     let stations = stations.unwrap_or_else(|error| {
         log::error!("failed to read stations: {error:#}");
+        complete = false;
         Default::default()
     });
     let period_by_station: HashMap<_, _> = observations
@@ -187,7 +293,7 @@ pub(super) async fn load_weather(
 
     // Keep the latest report visible across midnight, even before today's
     // first observation. Period summaries remain empty until today's data arrives.
-    recent
+    let weather = recent
         .as_deref()
         .unwrap_or(&observations)
         .iter()
@@ -226,7 +332,8 @@ pub(super) async fn load_weather(
                 forecast_low: forecast.map(|forecast| forecast.temp_low),
             }
         })
-        .collect()
+        .collect();
+    (weather, complete)
 }
 
 #[cfg(test)]

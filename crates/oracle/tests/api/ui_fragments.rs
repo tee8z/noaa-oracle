@@ -1059,3 +1059,33 @@ async fn forecast_details_vary_by_the_readers_calendar() {
         }
     }
 }
+
+/// Current weather changes only when new reports arrive: repeated requests
+/// for the same stations and day are answered from the cache, whether they
+/// ask for the map, the list or a search.
+#[tokio::test]
+async fn current_weather_is_built_once_per_selection_and_day() {
+    let mut weather = MockWeatherAccess::new();
+    // Today so far and the latest 24 hours, once each.
+    weather
+        .expect_observation_data()
+        .times(2)
+        .returning(|_, _| Ok(mock_observation_data()));
+    weather
+        .expect_forecasts_data()
+        .times(1)
+        .returning(|_, _| Ok(vec![]));
+    weather.expect_stations().returning(|| Ok(mock_stations()));
+    let app = spawn_app(Arc::new(weather)).await;
+    for path in [
+        "/fragments/weather?view=map",
+        "/fragments/weather?view=list",
+        "/fragments/weather?view=list&q=chicago",
+        "/?view=list",
+    ] {
+        let (status, body) = app.get(path).await;
+        assert!(status.is_success(), "{path}");
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("KORD"), "{path}: {html}");
+    }
+}

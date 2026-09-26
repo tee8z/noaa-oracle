@@ -14,7 +14,7 @@ pub struct DashboardData {
     pub npub: String,
     /// Without unlisted events, like the events list they link to.
     pub counts: EventCounts,
-    pub weather: Vec<WeatherDisplay>,
+    pub weather: std::sync::Arc<Vec<WeatherDisplay>>,
 }
 
 const CONFIG: PageConfig<'static> = PageConfig {

@@ -62,6 +62,7 @@ impl ObservationPeriod {
 }
 
 /// Weather data for display
+#[derive(Clone)]
 pub struct WeatherDisplay {
     pub station_id: String,
     pub station_name: String,

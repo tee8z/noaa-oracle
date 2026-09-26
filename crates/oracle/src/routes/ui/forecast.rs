@@ -14,6 +14,7 @@ use time::{Date, Duration, OffsetDateTime};
 
 use crate::{
     AppState, ForecastRequest, ObservationRequest, TemperatureUnit,
+    cache::Cached,
     calendar::Calendar,
     templates::fragments::{ForecastComparison, ForecastDisplay, forecast_detail},
     weather_data::{self, DailyObservation, Forecast},
@@ -23,8 +24,13 @@ use crate::{
 /// with a retry. htmx itself gives up after 10 s.
 const FORECAST_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 
-/// Stations the cache warmer builds at once.
-const WARM_CONCURRENCY: usize = 10;
+/// Values the cache warmer builds at once. Each runs up to three queries;
+/// readers' queries share the same slots.
+const WARM_CONCURRENCY: usize = 2;
+
+/// Calendars the default airports' forecast details are built in ahead of
+/// time: UTC and the newest readers' time zones.
+const WARM_CALENDARS: usize = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum ForecastError {
@@ -34,18 +40,37 @@ pub(super) enum ForecastError {
     TimedOut,
 }
 
-/// The station's forecast detail, from the cache or built now. Only
-/// successful builds for stations in the data are cached, so neither an
-/// error nor an arbitrary path fills the cache.
+/// The station's forecast detail, from the cache or built now. A stale
+/// copy is served while it is rebuilt in the background. Only successful
+/// builds for stations in the data are cached, so neither an error nor an
+/// arbitrary path fills the cache.
 pub(super) async fn forecast_html(
     state: &Arc<AppState>,
     station_id: &str,
     calendar: Calendar,
 ) -> Result<String, ForecastError> {
     let key = cache_key(station_id, calendar, OffsetDateTime::now_utc());
-    if let Some(cached) = state.cached_forecast(&key) {
-        return Ok(cached);
+    match state.cached_forecast(&key) {
+        Cached::Fresh(html) => return Ok(html),
+        Cached::Stale { value, refresh } => {
+            if refresh {
+                let (task_state, station_id) = (state.clone(), station_id.to_owned());
+                state.spawn(async move {
+                    let generation = task_state.data_generation();
+                    match build(&task_state, &station_id, calendar).await {
+                        Ok(html) => task_state.cache_forecast(key, html, generation),
+                        Err(error) => {
+                            error!("refreshing the forecast detail for {station_id}: {error}");
+                            task_state.forecast_refresh_failed(&key);
+                        }
+                    }
+                });
+            }
+            return Ok(value);
+        }
+        Cached::Missing => {}
     }
+    let generation = state.data_generation();
     let built =
         match tokio::time::timeout(FORECAST_TIMEOUT, build(state, station_id, calendar)).await {
             Ok(built) => built.map_err(ForecastError::from),
@@ -53,7 +78,7 @@ pub(super) async fn forecast_html(
         };
     let html = built.inspect_err(|error| error!("forecast detail for {station_id}: {error}"))?;
     if state.is_known_station(station_id).await {
-        state.cache_forecast(key, html.clone());
+        state.cache_forecast(key, html.clone(), generation);
     }
     Ok(html)
 }
@@ -64,23 +89,65 @@ fn cache_key(station_id: &str, calendar: Calendar, now: OffsetDateTime) -> Strin
     format!("{station_id}@{}@{}", calendar.name(), calendar.date_of(now))
 }
 
-/// Pre-warms the forecast cache for the default airports. Called at startup
-/// and every 30 minutes; a station whose query fails is left uncached.
-pub async fn warm_forecast_cache(state: &Arc<AppState>) {
+/// Builds the current weather readers asked for lately, and the default
+/// airports' forecast details, in UTC days and in the calendars of those
+/// readers. Called at startup, after new data and every 30 minutes;
+/// readers get the values built before until each is replaced. A value
+/// whose query fails keeps its old copy.
+pub async fn warm_caches(state: &Arc<AppState>) {
+    let started = std::time::Instant::now();
+    let generation = state.data_generation();
+    let mut calendars = vec![Calendar::Utc];
+    let recent = state.recent_weather();
+    for key in &recent {
+        if !calendars.contains(&key.calendar) && calendars.len() < WARM_CALENDARS {
+            calendars.push(key.calendar);
+        }
+    }
+    // The default airports in UTC days are what a first visit shows.
+    let default = super::weather::WeatherKey::new(
+        &super::weather::default_airports(),
+        None,
+        None,
+        Calendar::Utc,
+        OffsetDateTime::now_utc(),
+    );
+    // Recent views move on to today, so a reader's first visit after their
+    // midnight is ready too.
+    let now = OffsetDateTime::now_utc();
+    let mut weather = vec![];
+    for key in recent.iter().filter_map(|key| key.as_of(now)).chain([default]) {
+        if !weather.contains(&key) {
+            weather.push(key);
+        }
+    }
+    let rows = weather.len();
+    stream::iter(weather)
+        .for_each_concurrent(WARM_CONCURRENCY, |key| async move {
+            super::weather::refresh_weather(state, key).await;
+        })
+        .await;
     let airports = super::weather::default_airports();
-    info!("Warming forecast cache for {} stations...", airports.len());
-    stream::iter(airports)
-        .for_each_concurrent(WARM_CONCURRENCY, |station_id| async move {
-            match build(state, &station_id, Calendar::Utc).await {
+    let details = airports.len() * calendars.len();
+    let jobs: Vec<_> = calendars
+        .into_iter()
+        .flat_map(|calendar| airports.iter().map(move |station| (station.clone(), calendar)))
+        .collect();
+    stream::iter(jobs)
+        .for_each_concurrent(WARM_CONCURRENCY, |(station_id, calendar)| async move {
+            match build(state, &station_id, calendar).await {
                 Ok(html) => {
-                    let key = cache_key(&station_id, Calendar::Utc, OffsetDateTime::now_utc());
-                    state.cache_forecast(key, html)
+                    let key = cache_key(&station_id, calendar, OffsetDateTime::now_utc());
+                    state.cache_forecast(key, html, generation)
                 }
                 Err(error) => error!("warming the forecast detail for {station_id}: {error}"),
             }
         })
         .await;
-    info!("Forecast cache warming complete.");
+    info!(
+        "warmed {rows} weather views and {details} forecast details in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
 }
 
 async fn build(
