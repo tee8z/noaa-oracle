@@ -178,7 +178,7 @@ pub fn events_list(page: &EventsPage) -> Markup {
                     span { "Observation window" }
                     span { "Signing" }
                     span class="ev-num" { "Entries" }
-                    span class="ev-num" { "Paid places" }
+                    span class="ev-num" { "Winning places" }
                 }
                 @for event in page.events {
                     (event_row(event, page.now))
@@ -236,7 +236,7 @@ fn event_row(event: &EventView, now: OffsetDateTime) -> Markup {
                 (event.total_entries) " / " (event.total_allowed_entries)
             }
             span class="ev-num" {
-                span class="cell-label" { "Paid places: " }
+                span class="cell-label" { "Winning places: " }
                 (event.number_of_places_win)
             }
         }
@@ -328,7 +328,7 @@ mod tests {
             "{html}"
         );
         assert!(!html.contains("Newest events"));
-        assert!(html.contains("Paid places"));
+        assert!(html.contains("Winning places"));
         assert!(!html.contains("Winners"));
 
         let last = page(

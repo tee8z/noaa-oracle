@@ -177,7 +177,7 @@ pub fn event_detail_content(event: &Event, now: OffsetDateTime) -> Markup {
                 div class="entry-stats" {
                     div { span class="entry-stat" { (event.entries.len()) } span class="muted" { "Entries" } }
                     div { span class="entry-stat" { (event.total_allowed_entries) } span class="muted" { "Allowed" } }
-                    div { span class="entry-stat" { (event.number_of_places_win) } span class="muted" { "Paid places" } }
+                    div { span class="entry-stat" { (event.number_of_places_win) } span class="muted" { "Winning places" } }
                 }
             }
 
@@ -302,11 +302,10 @@ fn observed_and_forecast(
     }
 }
 
-/// Why every entry won, when nobody scored. The oracle then signs the
-/// outcome in which every entry wins, and the coordinator returns the pot
-/// to the entries in equal shares; it calls such a competition "Refunded".
-/// Stay in step with its wording.
-fn shared_reason(nothing_observed: bool, window: time::Duration) -> String {
+/// Why every entry ties, when nobody scored: the oracle then signs the
+/// outcome in which every entry wins. What that outcome pays is up to
+/// whoever built a contract on the event, so this says nothing about it.
+fn tie_reason(nothing_observed: bool, window: time::Duration) -> String {
     let why = if nothing_observed {
         format!(
             "No hourly station report fell inside the {} observation window, so no entry scored.",
@@ -315,9 +314,7 @@ fn shared_reason(nothing_observed: bool, window: time::Duration) -> String {
     } else {
         "No entry scored any points.".into()
     };
-    format!(
-        "{why} The oracle signed the outcome in which every entry wins, so the pot goes back to every entry in equal shares."
-    )
+    format!("{why} The oracle signed the outcome in which every entry ties.")
 }
 
 fn entries_table(event: &Event, num_winners: usize, signed: bool) -> Markup {
@@ -334,16 +331,11 @@ fn entries_table(event: &Event, num_winners: usize, signed: bool) -> Markup {
         &event.entries,
         num_winners,
         signed,
-        &shared_reason(nothing_observed, window),
+        &tie_reason(nothing_observed, window),
     )
 }
 
-fn entries_list(
-    entries: &[WeatherEntry],
-    num_winners: usize,
-    signed: bool,
-    shared: &str,
-) -> Markup {
+fn entries_list(entries: &[WeatherEntry], num_winners: usize, signed: bool, tied: &str) -> Markup {
     // API entries stay in id order because outcome indices depend on it.
     // Sort references for display only. Stored scores also preserve the
     // ranking of historical events signed with the older score formula.
@@ -357,7 +349,7 @@ fn entries_list(
             p class="entries-note" { "Scores pending." }
         } @else if no_points {
             p class="entries-note" {
-                @if signed { (shared) } @else { "No entry has scored yet." }
+                @if signed { (tied) } @else { "No entry has scored yet." }
             }
         }
         div class="table-container" {
@@ -375,11 +367,11 @@ fn entries_list(
                         tr class=[paid.then_some("is-paid")] {
                             td {
                                 @if no_points && signed {
-                                    span class="tag is-light" title="The pot goes back to every entry in equal shares" { "Refunded" }
+                                    span class="tag is-light" title="No entry scored, so every entry ties" { "Tied" }
                                 } @else if !show_ranks {
                                     span class="muted" { "—" }
                                 } @else if paid {
-                                    span class="tag is-success" title="Paid place" { (format!("#{}", idx + 1)) }
+                                    span class="tag is-success" title="Winning place" { (format!("#{}", idx + 1)) }
                                 } @else {
                                     span class="muted" { (format!("#{}", idx + 1)) }
                                 }
@@ -406,7 +398,7 @@ fn entries_list(
     }
 }
 
-/// An entry's points, as the coordinator shows them. Events scored before
+/// An entry's points. Events scored before
 /// points were stored show the stored score.
 fn points(entry: &WeatherEntry) -> Option<String> {
     match (entry.base_score, entry.score) {
@@ -467,7 +459,7 @@ mod tests {
             entry(2, Some(200_000), Some(20)),
         ];
         let original = entries.clone();
-        let html = entries_list(&entries, 1, true, "The pot is split equally.").into_string();
+        let html = entries_list(&entries, 1, true, "Every entry ties.").into_string();
         assert_eq!(
             displayed_ids(&html),
             vec![entries[2].id, entries[1].id, entries[0].id]
@@ -483,7 +475,7 @@ mod tests {
             entry(1, Some(190_001), Some(20)),
             entry(2, Some(200_000), Some(20)),
         ];
-        let html = entries_list(&entries, 1, true, "The pot is split equally.").into_string();
+        let html = entries_list(&entries, 1, true, "Every entry ties.").into_string();
         assert_eq!(displayed_ids(&html), vec![entries[1].id, entries[0].id]);
     }
 
@@ -509,10 +501,10 @@ mod tests {
                     entry(2, Some(10_000), Some(0)),
                 ],
                 true,
-                "The pot is split equally.",
+                "Every entry ties.",
             ),
         ] {
-            let html = entries_list(&entries, 1, signed, "The pot is split equally.").into_string();
+            let html = entries_list(&entries, 1, signed, "Every entry ties.").into_string();
             assert!(html.contains(message));
             assert!(!html.contains("entry-score paid"));
             assert!(!html.contains("is-paid"));
@@ -635,21 +627,20 @@ mod tests {
     }
 
     #[test]
-    fn when_nobody_scores_every_entry_shares_the_pot() {
+    fn when_nobody_scores_every_entry_ties() {
         let short = time::Duration::minutes(10);
-        let reason = shared_reason(true, short);
+        let reason = tie_reason(true, short);
         assert!(
             reason
                 .starts_with("No hourly station report fell inside the 10 min observation window")
         );
+        assert!(reason.contains("every entry ties"), "{reason}");
         assert!(
-            reason.contains("back to every entry in equal shares"),
+            !reason.contains("refund") && !reason.contains("pot"),
             "{reason}"
         );
-        assert!(!reason.contains("refund"), "{reason}");
         assert!(
-            shared_reason(false, time::Duration::hours(18))
-                .starts_with("No entry scored any points.")
+            tie_reason(false, time::Duration::hours(18)).starts_with("No entry scored any points.")
         );
         assert_eq!(duration(time::Duration::minutes(90)), "1 h 30 min");
 
@@ -657,8 +648,8 @@ mod tests {
             entry(1, Some(10_000), Some(0)),
             entry(2, Some(10_000), Some(0)),
         ];
-        let html = entries_list(&entries, 1, true, &shared_reason(true, short)).into_string();
-        assert_eq!(html.matches(">Refunded<").count(), 2, "{html}");
+        let html = entries_list(&entries, 1, true, &tie_reason(true, short)).into_string();
+        assert_eq!(html.matches(">Tied<").count(), 2, "{html}");
         assert!(!html.contains("pts"), "{html}");
         assert!(!html.contains("10000"), "{html}");
     }
