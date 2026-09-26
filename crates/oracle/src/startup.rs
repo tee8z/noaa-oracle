@@ -13,16 +13,15 @@ use crate::{
     database::Database,
     file_access::{FileAccess, FileData, S3FileAccess},
     oracle::{Oracle, system_clock},
+    routes::ui::WeatherKey,
     routes::{
         add_event_entries, create_event, daily_observations, dashboard_handler, download,
         event_detail_handler, events_handler, files, forecast_handler, forecasts, get_event,
         get_event_entry, get_npub, get_pubkey, get_stations, health, healthy, list_events,
         list_sources, observations, raw_data_handler, ready, station_handler,
-        ui::policy::content_security_policy, update_data, upload, warm_caches,
-        weather_handler,
+        ui::policy::content_security_policy, update_data, upload, warm_caches, weather_handler,
     },
     sources::{NoaaWeather, Sources},
-    routes::ui::WeatherKey,
     templates::{assets::serve_asset, fragments::WeatherDisplay},
     weather_data::{self, Station, WeatherAccess, WeatherData},
 };
@@ -280,7 +279,12 @@ impl AppState {
         lock(&self.weather_cache).get(key, generation)
     }
 
-    pub(crate) fn cache_weather(&self, key: WeatherKey, weather: Arc<Vec<WeatherDisplay>>, generation: u64) {
+    pub(crate) fn cache_weather(
+        &self,
+        key: WeatherKey,
+        weather: Arc<Vec<WeatherDisplay>>,
+        generation: u64,
+    ) {
         lock(&self.weather_cache).insert(key, weather, generation);
     }
 

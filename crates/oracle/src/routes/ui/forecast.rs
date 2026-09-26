@@ -116,7 +116,11 @@ pub async fn warm_caches(state: &Arc<AppState>) {
     // midnight is ready too.
     let now = OffsetDateTime::now_utc();
     let mut weather = vec![];
-    for key in recent.iter().filter_map(|key| key.as_of(now)).chain([default]) {
+    for key in recent
+        .iter()
+        .filter_map(|key| key.as_of(now))
+        .chain([default])
+    {
         if !weather.contains(&key) {
             weather.push(key);
         }
@@ -131,7 +135,11 @@ pub async fn warm_caches(state: &Arc<AppState>) {
     let details = airports.len() * calendars.len();
     let jobs: Vec<_> = calendars
         .into_iter()
-        .flat_map(|calendar| airports.iter().map(move |station| (station.clone(), calendar)))
+        .flat_map(|calendar| {
+            airports
+                .iter()
+                .map(move |station| (station.clone(), calendar))
+        })
         .collect();
     stream::iter(jobs)
         .for_each_concurrent(WARM_CONCURRENCY, |(station_id, calendar)| async move {

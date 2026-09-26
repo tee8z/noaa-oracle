@@ -16,7 +16,10 @@ pub enum Cached<V> {
     Fresh(V),
     /// Built from older data, or too long ago. `refresh` is true for the
     /// one caller that should rebuild it; others serve it as it is.
-    Stale { value: V, refresh: bool },
+    Stale {
+        value: V,
+        refresh: bool,
+    },
     Missing,
 }
 

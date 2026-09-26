@@ -1097,9 +1097,7 @@ async fn responses_are_gzipped_when_accepted() {
     weather
         .expect_observation_data()
         .returning(|_, _| Ok(mock_observation_data()));
-    weather
-        .expect_forecasts_data()
-        .returning(|_, _| Ok(vec![]));
+    weather.expect_forecasts_data().returning(|_, _| Ok(vec![]));
     weather.expect_stations().returning(|| Ok(mock_stations()));
     let app = spawn_app(Arc::new(weather)).await;
     let request = Request::get("/fragments/weather?view=list")

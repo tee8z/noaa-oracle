@@ -272,7 +272,10 @@ async fn weather_fragment_breakdown() {
         .unwrap();
     let ids: Vec<String> = AIRPORTS.split(',').map(str::to_string).collect();
     let now = OffsetDateTime::now_utc();
-    for calendar in [Calendar::Utc, Calendar::from_zone_name("America/New_York").unwrap()] {
+    for calendar in [
+        Calendar::Utc,
+        Calendar::from_zone_name("America/New_York").unwrap(),
+    ] {
         let day_start = calendar.start_of_day(now);
         let day_end = calendar.start_of(calendar.date_of(now).next_day().unwrap());
         let today = ObservationRequest {
@@ -298,7 +301,10 @@ async fn weather_fragment_breakdown() {
             weather.observation_data(&today, ids.clone()).await.unwrap();
             let a = started.elapsed().as_secs_f64() * 1000.0;
             let started = Instant::now();
-            weather.observation_data(&recent, ids.clone()).await.unwrap();
+            weather
+                .observation_data(&recent, ids.clone())
+                .await
+                .unwrap();
             let b = started.elapsed().as_secs_f64() * 1000.0;
             let started = Instant::now();
             weather

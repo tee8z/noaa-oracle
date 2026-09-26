@@ -437,8 +437,8 @@ fn back_icon() -> Markup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dlctix::secp::MaybeScalar;
     use crate::events::{Forecasted, Observed};
+    use dlctix::secp::MaybeScalar;
     use uuid::Uuid;
 
     fn entry(id: u128, score: Option<i64>, base_score: Option<i64>) -> WeatherEntry {
@@ -597,11 +597,19 @@ mod tests {
         assert!(!html.contains("Pending"), "{html}");
 
         let waiting = event(window, entries, None);
-        assert!(attestation_value(&waiting, later).into_string().contains("Pending"));
+        assert!(
+            attestation_value(&waiting, later)
+                .into_string()
+                .contains("Pending")
+        );
 
         let empty = event(window, vec![], None);
         let before = empty.signing_date - time::Duration::minutes(1);
-        assert!(attestation_value(&empty, before).into_string().contains("Pending"));
+        assert!(
+            attestation_value(&empty, before)
+                .into_string()
+                .contains("Pending")
+        );
         let html = attestation_value(&empty, later).into_string();
         assert!(html.contains("Not signed"), "{html}");
         assert!(html.contains("no entries"), "{html}");
@@ -612,9 +620,17 @@ mod tests {
     fn short_windows_never_settle_against_whole_day_forecasts() {
         let short = event(time::Duration::minutes(10), vec![], None);
         let later = short.signing_date + time::Duration::hours(5);
-        assert!(provisional(&short, later).unwrap().contains("shorter than a day"));
+        assert!(
+            provisional(&short, later)
+                .unwrap()
+                .contains("shorter than a day")
+        );
         let day = event(time::Duration::days(1), vec![], None);
-        assert!(provisional(&day, day.start_observation_date).unwrap().contains("still open"));
+        assert!(
+            provisional(&day, day.start_observation_date)
+                .unwrap()
+                .contains("still open")
+        );
         assert_eq!(provisional(&day, day.end_observation_date), None);
     }
 
@@ -623,12 +639,17 @@ mod tests {
         let short = time::Duration::minutes(10);
         let reason = shared_reason(true, short);
         assert!(
-            reason.starts_with("No hourly station report fell inside the 10 min observation window")
+            reason
+                .starts_with("No hourly station report fell inside the 10 min observation window")
         );
-        assert!(reason.contains("back to every entry in equal shares"), "{reason}");
+        assert!(
+            reason.contains("back to every entry in equal shares"),
+            "{reason}"
+        );
         assert!(!reason.contains("refund"), "{reason}");
         assert!(
-            shared_reason(false, time::Duration::hours(18)).starts_with("No entry scored any points.")
+            shared_reason(false, time::Duration::hours(18))
+                .starts_with("No entry scored any points.")
         );
         assert_eq!(duration(time::Duration::minutes(90)), "1 h 30 min");
 
