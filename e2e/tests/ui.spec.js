@@ -449,6 +449,14 @@ test.describe("API Endpoints", () => {
     }
   });
 
+  test("pages and fragments are gzipped", async ({ request }) => {
+    const response = await request.get("/fragments/weather?view=list", {
+      headers: { "Accept-Encoding": "gzip", "HX-Request": "true" },
+    });
+    expect(response.ok()).toBeTruthy();
+    expect(response.headers()["content-encoding"]).toBe("gzip");
+  });
+
   test("forecast fragment endpoint returns HTML", async ({ request }) => {
     const response = await request.get("/fragments/forecast/KATL");
     expect(response.ok()).toBeTruthy();

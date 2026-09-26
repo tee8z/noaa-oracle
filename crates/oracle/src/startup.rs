@@ -56,6 +56,10 @@ use tokio::{
     task::{JoinError, JoinHandle},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tower_http::compression::{
+    CompressionLayer, Predicate,
+    predicate::{DefaultPredicate, NotForContentType},
+};
 use tower_http::cors::{Any, CorsLayer};
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
@@ -577,6 +581,12 @@ pub fn app(app_state: Arc<AppState>) -> Router {
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .merge(Scalar::with_url("/docs", api_docs))
         .layer(cors)
+        // Pages, fragments and JSON shrink about twentyfold; the weather
+        // list is 160 KB of repetitive HTML. Assets arrive gzipped already
+        // and are passed through, and Parquet files are compressed inside.
+        .layer(CompressionLayer::new().compress_when(
+            DefaultPredicate::new().and(NotForContentType::const_new("application/parquet")),
+        ))
 }
 
 async fn log_request(request: Request<Body>, next: Next) -> impl IntoResponse {

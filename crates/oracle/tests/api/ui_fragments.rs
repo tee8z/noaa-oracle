@@ -1089,3 +1089,25 @@ async fn current_weather_is_built_once_per_selection_and_day() {
         assert!(html.contains("KORD"), "{path}: {html}");
     }
 }
+
+/// Pages, fragments and JSON are gzipped for clients that accept it.
+#[tokio::test]
+async fn responses_are_gzipped_when_accepted() {
+    let mut weather = MockWeatherAccess::new();
+    weather
+        .expect_observation_data()
+        .returning(|_, _| Ok(mock_observation_data()));
+    weather
+        .expect_forecasts_data()
+        .returning(|_, _| Ok(vec![]));
+    weather.expect_stations().returning(|| Ok(mock_stations()));
+    let app = spawn_app(Arc::new(weather)).await;
+    let request = Request::get("/fragments/weather?view=list")
+        .header("HX-Request", "true")
+        .header(header::ACCEPT_ENCODING, "gzip")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.app.clone().oneshot(request).await.unwrap();
+    assert!(response.status().is_success());
+    assert_eq!(response.headers()[header::CONTENT_ENCODING], "gzip");
+}
