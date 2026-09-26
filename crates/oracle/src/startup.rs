@@ -8,20 +8,21 @@
 
 use crate::{
     auth::AuthPolicy,
+    cache::{Cache, Cached},
     config::{Configuration, Storage},
     database::Database,
     file_access::{FileAccess, FileData, S3FileAccess},
     oracle::{Oracle, system_clock},
+    routes::ui::WeatherKey,
     routes::{
         add_event_entries, create_event, daily_observations, dashboard_handler, download,
         event_detail_handler, events_handler, files, forecast_handler, forecasts, get_event,
         get_event_entry, get_npub, get_pubkey, get_stations, health, healthy, list_events,
         list_sources, observations, raw_data_handler, ready, station_handler,
-        ui::policy::content_security_policy, update_data, upload, warm_forecast_cache,
-        weather_handler,
+        ui::policy::content_security_policy, update_data, upload, warm_caches, weather_handler,
     },
     sources::{NoaaWeather, Sources},
-    templates::assets::serve_asset,
+    templates::{assets::serve_asset, fragments::WeatherDisplay},
     weather_data::{self, Station, WeatherAccess, WeatherData},
 };
 use anyhow::{Context, Result, anyhow};
@@ -40,12 +41,11 @@ use axum::{
 };
 use log::{error, info, warn};
 use std::{
-    collections::HashMap,
     net::SocketAddr,
     path::PathBuf,
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -55,6 +55,10 @@ use tokio::{
     task::{JoinError, JoinHandle},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tower_http::compression::{
+    CompressionLayer, Predicate,
+    predicate::{DefaultPredicate, NotForContentType},
+};
 use tower_http::cors::{Any, CorsLayer};
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
@@ -64,17 +68,31 @@ const MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
 /// Every other request body: event and entry JSON is a few KiB.
 const MAX_BODY_BYTES: usize = 256 * 1024;
 /// Source data arrives hourly, so a 30 minute refresh keeps the cache at
-/// most 30 minutes stale.
+/// most 30 minutes stale, even when another oracle process received the
+/// new files.
 const FORECAST_CACHE_REFRESH: Duration = Duration::from_secs(30 * 60);
 /// Forecast fragments kept in memory, the least recently used dropped
 /// first: known stations in the readers' time zones.
 const MAX_CACHED_FORECASTS: usize = 4_096;
+/// Current weather is rebuilt at least this often: the latest reports
+/// arrive hourly, possibly through another oracle process.
+const WEATHER_CACHE_REFRESH: Duration = Duration::from_secs(5 * 60);
+/// Current weather kept in memory: a station selection and period in a
+/// reader's calendar each.
+const MAX_CACHED_WEATHER: usize = 64;
+/// Recently used current weather the warmer rebuilds after new data, at
+/// most: the default airports in the readers' time zones, mostly.
+const WARM_RECENT_WEATHER: usize = 16;
 /// How often recent forecast files are checked for query-ready copies and
 /// folds, besides after each upload: catches files another oracle process
 /// received.
 const PREPARE_FILES_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 type TaskResult = Result<Result<()>, JoinError>;
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Background producers of database writes. The runtime stops them after
 /// HTTP drains and before the writer closes.
@@ -101,45 +119,6 @@ impl Background {
     }
 }
 
-/// Rendered forecast fragments by key, dropping the least recently used
-/// once full. Eviction scans all entries, which is cheap at this size and
-/// only happens when a new key arrives.
-#[derive(Default)]
-struct ForecastCache {
-    entries: HashMap<String, (u64, String)>,
-    uses: u64,
-}
-
-impl ForecastCache {
-    fn get(&mut self, key: &str) -> Option<String> {
-        self.uses += 1;
-        let uses = self.uses;
-        self.entries.get_mut(key).map(|(used, html)| {
-            *used = uses;
-            html.clone()
-        })
-    }
-
-    fn insert(&mut self, key: String, html: String) {
-        self.uses += 1;
-        if self.entries.len() >= MAX_CACHED_FORECASTS
-            && !self.entries.contains_key(&key)
-            && let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, (used, _))| *used)
-                .map(|(key, _)| key.clone())
-        {
-            self.entries.remove(&oldest);
-        }
-        self.entries.insert(key, (self.uses, html));
-    }
-
-    fn clear(&mut self) {
-        self.entries.clear();
-    }
-}
-
 /// The station list and when it was read. It only changes when new files
 /// add a station, and reading it scans a month of observation files, so
 /// pages get the list last read while a refresh runs in the background.
@@ -161,7 +140,13 @@ pub struct AppState {
     pub weather_db: Arc<dyn WeatherData>,
     pub oracle: Arc<Oracle>,
     pub database: Database,
-    forecast_cache: Mutex<ForecastCache>,
+    forecast_cache: Mutex<Cache<String, String>>,
+    weather_cache: Mutex<Cache<WeatherKey, Arc<Vec<WeatherDisplay>>>>,
+    /// Counts arrivals of new data; cached values built from an older
+    /// generation are stale.
+    generation: AtomicU64,
+    /// Wakes the cache warmer after new data is ready for queries.
+    data_prepared: tokio::sync::Notify,
     stations: Arc<StationList>,
     background: Background,
     etl_slot: Arc<Semaphore>,
@@ -231,7 +216,10 @@ impl AppState {
             weather_db,
             oracle,
             database,
-            forecast_cache: Mutex::default(),
+            forecast_cache: Mutex::new(Cache::new(MAX_CACHED_FORECASTS, FORECAST_CACHE_REFRESH)),
+            weather_cache: Mutex::new(Cache::new(MAX_CACHED_WEATHER, WEATHER_CACHE_REFRESH)),
+            generation: AtomicU64::new(0),
+            data_prepared: tokio::sync::Notify::new(),
             stations: Arc::default(),
             background,
             etl_slot: Arc::new(Semaphore::new(1)),
@@ -265,19 +253,57 @@ impl AppState {
         let _ = stage.wait_for(|stage| *stage != Preparation::Running).await;
     }
 
-    pub fn cached_forecast(&self, key: &str) -> Option<String> {
-        self.forecast_cache
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(key)
+    /// The data generation cached values are fresh for. Read it before
+    /// building a value to cache.
+    pub fn data_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
-    /// Caches a rendered forecast. Callers pass only known station ids.
-    pub fn cache_forecast(&self, key: String, html: String) {
-        self.forecast_cache
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(key, html);
+    pub(crate) fn cached_forecast(&self, key: &str) -> Cached<String> {
+        let generation = self.data_generation();
+        lock(&self.forecast_cache).get(&key.to_owned(), generation)
+    }
+
+    /// Caches a rendered forecast built from data `generation`. Callers
+    /// pass only known station ids.
+    pub(crate) fn cache_forecast(&self, key: String, html: String, generation: u64) {
+        lock(&self.forecast_cache).insert(key, html, generation);
+    }
+
+    pub(crate) fn forecast_refresh_failed(&self, key: &str) {
+        lock(&self.forecast_cache).refresh_failed(&key.to_owned());
+    }
+
+    pub(crate) fn cached_weather(&self, key: &WeatherKey) -> Cached<Arc<Vec<WeatherDisplay>>> {
+        let generation = self.data_generation();
+        lock(&self.weather_cache).get(key, generation)
+    }
+
+    pub(crate) fn cache_weather(
+        &self,
+        key: WeatherKey,
+        weather: Arc<Vec<WeatherDisplay>>,
+        generation: u64,
+    ) {
+        lock(&self.weather_cache).insert(key, weather, generation);
+    }
+
+    pub(crate) fn weather_refresh_failed(&self, key: &WeatherKey) {
+        lock(&self.weather_cache).refresh_failed(key);
+    }
+
+    /// Current weather readers asked for lately, newest first.
+    pub(crate) fn recent_weather(&self) -> Vec<WeatherKey> {
+        let mut keys = lock(&self.weather_cache).recent_keys(MAX_CACHED_WEATHER as u64 * 4);
+        keys.truncate(WARM_RECENT_WEATHER);
+        keys
+    }
+
+    /// Runs `task` in the background, unless shutdown has begun.
+    pub(crate) fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
+        if !self.background.is_stopping() {
+            self.background.tasks.spawn(task);
+        }
     }
 
     /// A data file was published: prepare it for queries.
@@ -285,13 +311,10 @@ impl AppState {
         self.files_added.notify_one();
     }
 
-    /// Drops cached forecasts and marks the station list for a refresh
-    /// after new data arrives.
-    pub fn clear_forecast_cache(&self) {
-        self.forecast_cache
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+    /// New data arrived: cached forecasts and weather become stale, served
+    /// while they are rebuilt, and the station list is read again.
+    pub fn new_data(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.stations.stale.store(true, Ordering::Release);
     }
 
@@ -562,6 +585,12 @@ pub fn app(app_state: Arc<AppState>) -> Router {
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .merge(Scalar::with_url("/docs", api_docs))
         .layer(cors)
+        // Pages, fragments and JSON shrink about twentyfold; the weather
+        // list is 160 KB of repetitive HTML. Assets arrive gzipped already
+        // and are passed through, and Parquet files are compressed inside.
+        .layer(CompressionLayer::new().compress_when(
+            DefaultPredicate::new().and(NotForContentType::const_new("application/parquet")),
+        ))
 }
 
 async fn log_request(request: Request<Body>, next: Next) -> impl IntoResponse {
@@ -784,15 +813,20 @@ fn spawn_file_preparation(state: &Arc<AppState>) {
             let result = state.weather_db.prepare_files(&stopping).await;
             match &result {
                 Ok(0) => {}
-                Ok(made) => info!(
-                    "prepared {made} forecast files in {:.1}s",
-                    started.elapsed().as_secs_f64()
-                ),
+                Ok(made) => {
+                    info!(
+                        "prepared {made} forecast files in {:.1}s",
+                        started.elapsed().as_secs_f64()
+                    );
+                    // Possibly files another oracle process received.
+                    state.new_data();
+                }
                 Err(error) => warn!("cannot prepare forecast files for queries: {error}"),
             }
             // A pass cut short by shutdown did not prepare every file.
             if !stopping.is_cancelled() {
                 state.preparation_ended(result.is_ok());
+                state.data_prepared.notify_one();
             }
             tokio::select! {
                 biased;
@@ -804,10 +838,11 @@ fn spawn_file_preparation(state: &Arc<AppState>) {
     });
 }
 
-/// Warms the forecast cache once the first preparation pass has ended, then
-/// every [`FORECAST_CACHE_REFRESH`]. Warming from the published files
-/// before that would fill every query slot for minutes and take gigabytes
-/// of memory; from copies and folds it takes seconds.
+/// Warms the caches once the first preparation pass has ended, then after
+/// each pass that follows new data, and every [`FORECAST_CACHE_REFRESH`].
+/// Warming from the published files before that would fill every query
+/// slot for minutes and take gigabytes of memory; from copies and folds it
+/// takes seconds. Readers get the values warmed before while it runs.
 fn spawn_cache_warmer(state: &Arc<AppState>) {
     let state = state.clone();
     let stopping = state.background.stopping.clone();
@@ -817,18 +852,23 @@ fn spawn_cache_warmer(state: &Arc<AppState>) {
             () = stopping.cancelled() => return,
             () = state.first_preparation_ended() => {}
         }
-        warm_forecast_cache(&state).await;
+        let mut warmed = state.data_generation();
+        warm_caches(&state).await;
         let mut interval = tokio::time::interval(FORECAST_CACHE_REFRESH);
         interval.tick().await; // the first tick completes immediately
         loop {
             tokio::select! {
                 biased;
                 () = stopping.cancelled() => break,
-                _ = interval.tick() => {
-                    state.clear_forecast_cache();
-                    warm_forecast_cache(&state).await;
+                _ = interval.tick() => {}
+                () = state.data_prepared.notified() => {
+                    if state.data_generation() == warmed {
+                        continue;
+                    }
                 }
             }
+            warmed = state.data_generation();
+            warm_caches(&state).await;
         }
     });
 }
@@ -943,27 +983,3 @@ fn install_termination_signal(requested: CancellationToken) -> Result<JoinHandle
 
 #[cfg(test)]
 mod lifecycle_tests;
-
-#[cfg(test)]
-mod forecast_cache_tests {
-    use super::*;
-
-    #[test]
-    fn a_full_cache_drops_the_least_recently_used_forecast() {
-        let mut cache = ForecastCache::default();
-        for index in 0..MAX_CACHED_FORECASTS {
-            cache.insert(format!("K{index}"), index.to_string());
-        }
-        // Reading the oldest makes the second oldest the least recent.
-        assert_eq!(cache.get("K0").as_deref(), Some("0"));
-        cache.insert("KNEW".into(), "new".into());
-        assert_eq!(cache.entries.len(), MAX_CACHED_FORECASTS);
-        assert_eq!(cache.get("K1"), None);
-        assert_eq!(cache.get("K0").as_deref(), Some("0"));
-        assert_eq!(cache.get("KNEW").as_deref(), Some("new"));
-        // Replacing an entry never evicts another.
-        cache.insert("K2".into(), "two".into());
-        assert_eq!(cache.entries.len(), MAX_CACHED_FORECASTS);
-        assert_eq!(cache.get("K3").as_deref(), Some("3"));
-    }
-}

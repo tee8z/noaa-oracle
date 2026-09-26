@@ -83,6 +83,10 @@ fn summary(weather: &WeatherDisplay, context: &WeatherContext) -> String {
     text
 }
 
+/// A pin's station replaces the panel under the map and scrolls it into
+/// view: on a wide screen the panel starts below the fold.
+const PANEL_SWAP: &str = "innerHTML show:top";
+
 fn station_url(station_id: &str) -> String {
     format!("/fragments/station/{station_id}")
 }
@@ -120,7 +124,7 @@ pub(super) fn weather_map(weather: &[WeatherDisplay], context: &WeatherContext) 
                             circle class="pin-target" cx=(x) cy=(y) r="9"
                                 hx-get=(station_url(&station.station_id))
                                 hx-target="#map-station"
-                                hx-swap="innerHTML"
+                                hx-swap=(PANEL_SWAP)
                                 hx-sync="#map-station:replace"
                                 hx-indicator="#map-station-loading" {}
                         }
@@ -133,7 +137,7 @@ pub(super) fn weather_map(weather: &[WeatherDisplay], context: &WeatherContext) 
                           aria-label=(summary(station, context).replace('\n', ", "))
                           hx-get=(station_url(&station.station_id))
                           hx-target="#map-station"
-                          hx-swap="innerHTML"
+                          hx-swap=(PANEL_SWAP)
                           hx-sync="#map-station:replace"
                           hx-indicator="#map-station-loading" {
                             title { (summary(station, context)) }
@@ -156,7 +160,7 @@ pub(super) fn weather_map(weather: &[WeatherDisplay], context: &WeatherContext) 
                         a href=(list_url(&station.station_id))
                           hx-get=(station_url(&station.station_id))
                           hx-target="#map-station"
-                          hx-swap="innerHTML"
+                          hx-swap=(PANEL_SWAP)
                           hx-sync="#map-station:replace"
                           hx-indicator="#map-station-loading"
                           title=(summary(station, context)) {

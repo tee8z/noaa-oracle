@@ -5,7 +5,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
 };
-use maud::PreEscaped;
+use maud::{PreEscaped, html};
 use serde::Deserialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -118,17 +118,19 @@ pub async fn station_handler(
     if validate_station_id(&station_id).is_err() {
         return (StatusCode::BAD_REQUEST, "invalid station id").into_response();
     }
-    let calendar = reader_calendar(&headers);
-    let (forecast, stations) = tokio::join!(
-        forecast_html(&state, &station_id, calendar),
-        state.stations()
-    );
-    let place = stations.ok().and_then(|stations| {
-        stations
+    // The station list is cached, so an unknown station costs no query. If
+    // the list can't be read, the forecast query decides.
+    let place = match state.stations().await {
+        Ok(stations) => match stations
             .iter()
             .find(|station| station.station_id == station_id)
-            .map(|station| place_name(&station.station_name, &station.state))
-    });
+        {
+            Some(station) => Some(place_name(&station.station_name, &station.state)),
+            None => return unknown_station(&station_id),
+        },
+        Err(_) => None,
+    };
+    let forecast = forecast_html(&state, &station_id, reader_calendar(&headers)).await;
     let (status, detail) = match forecast {
         Ok(html) => (StatusCode::OK, PreEscaped(html)),
         Err(_) => (
@@ -159,6 +161,13 @@ pub async fn forecast_handler(
     if validate_station_id(&station_id).is_err() {
         return (StatusCode::BAD_REQUEST, "invalid station id").into_response();
     }
+    if let Ok(stations) = state.stations().await
+        && !stations
+            .iter()
+            .any(|station| station.station_id == station_id)
+    {
+        return unknown_station(&station_id);
+    }
     let mut response = match forecast_html(&state, &station_id, reader_calendar(&headers)).await {
         Ok(html) => Html(html).into_response(),
         Err(_) => (
@@ -176,4 +185,16 @@ pub async fn forecast_handler(
     };
     vary_on_cookie(response.headers_mut());
     response
+}
+
+/// A well-formed id that no station in the data has.
+fn unknown_station(station_id: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Html(
+            html! { p class="muted" { "No station " code { (station_id) } " in the data." } }
+                .into_string(),
+        ),
+    )
+        .into_response()
 }

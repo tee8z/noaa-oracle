@@ -149,7 +149,7 @@ async fn get_latest_weather(
     start: Option<OffsetDateTime>,
     end: Option<OffsetDateTime>,
     calendar: Calendar,
-) -> (Vec<WeatherDisplay>, bool) {
+) -> (Arc<Vec<WeatherDisplay>>, bool) {
     if let Some(station_ids) = station_ids {
         let weather_data =
             super::weather::load_weather(state, station_ids, start, end, calendar).await;
@@ -177,9 +177,12 @@ async fn get_latest_weather(
     first.sort();
     first.truncate(20);
     if first.is_empty() {
-        return (vec![], false);
+        return (Arc::default(), false);
     }
-    let mut weather_data = super::weather::load_weather(state, &first, start, end, calendar).await;
-    weather_data.sort_by(|a, b| a.station_id.cmp(&b.station_id));
-    (weather_data, false)
+    let weather_data = super::weather::load_weather(state, &first, start, end, calendar).await;
+    // The first stations by id, in the order they were chosen.
+    let mut sorted: Vec<_> = weather_data.iter().collect();
+    sorted.sort_by(|a, b| a.station_id.cmp(&b.station_id));
+    let sorted = sorted.into_iter().cloned().collect();
+    (Arc::new(sorted), false)
 }

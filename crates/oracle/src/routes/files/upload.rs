@@ -74,7 +74,7 @@ pub async fn upload(
     }
     info!("stored {file} ({:.3} MiB)", body.len() as f64 / 1_048_576.0);
     state.file_added();
-    state.clear_forecast_cache();
+    state.new_data();
     // New data may settle events; a pass already running will see it next time.
     if let Err(rejected) = state.start_etl() {
         info!("not starting processing after upload: {rejected:?}");

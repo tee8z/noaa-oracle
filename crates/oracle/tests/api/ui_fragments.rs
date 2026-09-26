@@ -123,7 +123,7 @@ async fn selected_utc_day_uses_its_previous_day_forecast_and_preserves_refresh_c
                 && request.station_ids == "KORD"
                 && stations == &["KORD"]
         })
-        .times(2)
+        .times(1)
         .returning(|_, _| Ok(mock_observation_data()));
     weather
         .expect_forecasts_data()
@@ -135,7 +135,7 @@ async fn selected_utc_day_uses_its_previous_day_forecast_and_preserves_refresh_c
                 && request.station_ids == "KORD"
                 && stations == &["KORD"]
         })
-        .times(2)
+        .times(1)
         .returning(|_, _| {
             let mut forecasts = mock_forecast_data();
             forecasts[0].date = "2024-08-12 00:00:00".into();
@@ -195,7 +195,7 @@ async fn start_only_weather_selection_keeps_its_bound_and_refresh_context() {
         .withf(move |request, stations| {
             request.start == Some(start) && request.station_ids == "KORD" && stations == &["KORD"]
         })
-        .times(2)
+        .times(1)
         .returning(move |request, _| {
             captured_ends.lock().unwrap().push(request.end.unwrap());
             Ok(mock_observation_data())
@@ -228,8 +228,8 @@ async fn start_only_weather_selection_keeps_its_bound_and_refresh_context() {
     let ends = requested_ends.lock().unwrap();
     assert_eq!(
         ends.len(),
-        2,
-        "selected windows do not fetch a second recent-report window"
+        1,
+        "the refresh is served from the cache, and a selected window fetches no recent-report window"
     );
     assert!(ends.iter().all(|end| *end >= before && *end <= after));
 }
@@ -376,7 +376,7 @@ async fn assert_dashboard_selection_survives_refresh(has_observations: bool) {
                 && request.station_ids == "KORD,KBOS"
                 && stations == &["KORD", "KBOS"]
         })
-        .times(3)
+        .times(1)
         .returning(move |_, _| {
             Ok(if has_observations {
                 mock_observation_data()
@@ -512,7 +512,7 @@ async fn forecast_fragment_handles_no_data() {
 
     let request = Request::builder()
         .method(Method::GET)
-        .uri("/fragments/forecast/KXYZ")
+        .uri("/fragments/forecast/KORD")
         .header(header::ACCEPT, "text/html")
         .body(Body::empty())
         .unwrap();
@@ -956,6 +956,23 @@ async fn map_station_panel_names_the_station() {
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
 }
 
+/// A well-formed id that no station has is not found, for the map panel
+/// and a list row alike, and costs no forecast query.
+#[tokio::test]
+async fn unknown_stations_are_not_found() {
+    let mut weather = MockWeatherAccess::new();
+    weather.expect_forecasts_data().never();
+    weather.expect_daily_observations().never();
+    weather.expect_stations().returning(|| Ok(mock_stations()));
+    let app = spawn_app(Arc::new(weather)).await;
+    for path in ["/fragments/station/ZZZZ", "/fragments/forecast/ZZZZ"] {
+        let (status, body) = app.get(path).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{path}");
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("No station"), "{path}: {html}");
+    }
+}
+
 /// A reader in New York gets their own day: it starts at their midnight,
 /// and "yesterday's forecast" is the one issued in the day before it.
 #[tokio::test]
@@ -1041,4 +1058,54 @@ async fn forecast_details_vary_by_the_readers_calendar() {
             assert_eq!(response.headers()[header::VARY], "Cookie", "{path}");
         }
     }
+}
+
+/// Current weather changes only when new reports arrive: repeated requests
+/// for the same stations and day are answered from the cache, whether they
+/// ask for the map, the list or a search.
+#[tokio::test]
+async fn current_weather_is_built_once_per_selection_and_day() {
+    let mut weather = MockWeatherAccess::new();
+    // Today so far and the latest 24 hours, once each.
+    weather
+        .expect_observation_data()
+        .times(2)
+        .returning(|_, _| Ok(mock_observation_data()));
+    weather
+        .expect_forecasts_data()
+        .times(1)
+        .returning(|_, _| Ok(vec![]));
+    weather.expect_stations().returning(|| Ok(mock_stations()));
+    let app = spawn_app(Arc::new(weather)).await;
+    for path in [
+        "/fragments/weather?view=map",
+        "/fragments/weather?view=list",
+        "/fragments/weather?view=list&q=chicago",
+        "/?view=list",
+    ] {
+        let (status, body) = app.get(path).await;
+        assert!(status.is_success(), "{path}");
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("KORD"), "{path}: {html}");
+    }
+}
+
+/// Pages, fragments and JSON are gzipped for clients that accept it.
+#[tokio::test]
+async fn responses_are_gzipped_when_accepted() {
+    let mut weather = MockWeatherAccess::new();
+    weather
+        .expect_observation_data()
+        .returning(|_, _| Ok(mock_observation_data()));
+    weather.expect_forecasts_data().returning(|_, _| Ok(vec![]));
+    weather.expect_stations().returning(|| Ok(mock_stations()));
+    let app = spawn_app(Arc::new(weather)).await;
+    let request = Request::get("/fragments/weather?view=list")
+        .header("HX-Request", "true")
+        .header(header::ACCEPT_ENCODING, "gzip")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.app.clone().oneshot(request).await.unwrap();
+    assert!(response.status().is_success());
+    assert_eq!(response.headers()[header::CONTENT_ENCODING], "gzip");
 }

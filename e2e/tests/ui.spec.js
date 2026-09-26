@@ -106,6 +106,66 @@ test.describe("Dashboard", () => {
     await expect(page.locator(".wx-station").first()).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(360);
   });
+
+  test("on a phone, an opened station's wide table scrolls in its own box", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto(dashboard("&view=list"));
+    const station = page.locator("#weather-list details.wx-station").first();
+    await station.locator("summary").click();
+    await expect(station.locator(".forecast-detail")).toHaveCount(1);
+    // The checked-in data has no past week to compare, so give the detail
+    // a past-week table as wide as a real one.
+    // The page enforces Trusted Types, so build it with DOM calls.
+    await station.locator(".forecast-detail").evaluate((detail) => {
+      const el = (tag, className, text) => {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        if (text) node.textContent = text;
+        return node;
+      };
+      const row = el("tr");
+      const day = el("th", null, "Tue, Sep 22");
+      day.scope = "row";
+      row.append(day);
+      for (let i = 0; i < 6; i++) {
+        const cell = el("td");
+        cell.append(el("span", "obs", "61°F −10°F"), el("span", "fcst", "71°F"));
+        row.append(cell);
+      }
+      const body = el("tbody");
+      body.append(row);
+      const table = el("table", "table is-narrow is-fullwidth past-table");
+      table.append(body);
+      const container = el("div", "table-container");
+      container.append(table);
+      const section = el("section");
+      section.append(
+        el("p", "forecast-note", "By day (UTC). Each forecast was issued the day before."),
+        container,
+      );
+      detail.prepend(section);
+    });
+    const container = station.locator(".table-container");
+    expect(await container.evaluate((box) => box.scrollWidth > box.clientWidth)).toBe(true);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  });
+
+  test("the search spinner shows only while a search runs", async ({ page }) => {
+    await page.goto(dashboard("&view=list"));
+    const spinner = page.locator("#weather-search-loading");
+    await expect(spinner).toBeHidden();
+    let release;
+    const held = new Promise((resolve) => (release = resolve));
+    const search = (url) => url.pathname === "/fragments/weather" && url.searchParams.get("q") === "K";
+    await page.route(search, async (route) => {
+      await held;
+      await route.continue();
+    });
+    await page.locator("#weather-search").fill("K");
+    await expect(spinner).toBeVisible();
+    release();
+    await expect(spinner).toBeHidden();
+  });
 });
 
 test.describe("Raw Data Page", () => {
@@ -285,6 +345,30 @@ test.describe("HTMX Navigation", () => {
     await expect(page.locator("#map-station .station-detail")).toHaveCount(1);
   });
 
+  test("a station's error reply shows the message and a retry, not its body", async ({ page }) => {
+    await page.goto(dashboard("&view=map"));
+    await page.route("**/fragments/station/**", (route) =>
+      route.fulfill({ status: 500, contentType: "text/plain", body: "boom" }),
+    );
+    await pin(page).click();
+    const panel = page.locator("#map-station");
+    await expect(panel.locator(".load-error")).toContainText("Couldn't load this station");
+    await expect(panel).not.toContainText("boom");
+    await expect(page.locator("#map-station-loading")).toBeHidden();
+    await page.unroute("**/fragments/station/**");
+    await panel.getByRole("button", { name: "Try again" }).click();
+    await expect(panel.locator(".station-detail .forecast-detail")).toHaveCount(1);
+  });
+
+  test("on a wide screen, a pin's station scrolls into view", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto(dashboard("&view=map"));
+    await pin(page).click();
+    const detail = page.locator("#map-station .station-detail");
+    await expect(detail).toHaveCount(1);
+    await expect(detail.locator(".station-detail-head h3")).toBeInViewport();
+  });
+
   test("a station request that gets no reply says so and can be retried", async ({ page }) => {
     await page.goto(dashboard("&view=map"));
     await page.route("**/fragments/station/**", (route) => route.abort("failed"));
@@ -375,6 +459,21 @@ test.describe("API Endpoints", () => {
   test("stations endpoint returns data", async ({ request }) => {
     const response = await request.get("/stations");
     expect(response.ok()).toBeTruthy();
+  });
+
+  test("an unknown station is not found", async ({ request }) => {
+    for (const path of ["/fragments/station/ZZZZ", "/fragments/forecast/ZZZZ"]) {
+      const response = await request.get(path);
+      expect(response.status()).toBe(404);
+    }
+  });
+
+  test("pages and fragments are gzipped", async ({ request }) => {
+    const response = await request.get("/fragments/weather?view=list", {
+      headers: { "Accept-Encoding": "gzip", "HX-Request": "true" },
+    });
+    expect(response.ok()).toBeTruthy();
+    expect(response.headers()["content-encoding"]).toBe("gzip");
   });
 
   test("forecast fragment endpoint returns HTML", async ({ request }) => {

@@ -106,8 +106,29 @@ async fn page_timings_on_real_data() {
             true,
         ),
         (
+            "weather map, New York",
+            "/fragments/weather?view=map".into(),
+            true,
+            Some(NEW_YORK),
+            true,
+        ),
+        (
+            "weather list, UTC",
+            "/fragments/weather?view=list".into(),
+            true,
+            None,
+            true,
+        ),
+        (
             "weather list, New York",
             "/fragments/weather?view=list".into(),
+            true,
+            Some(NEW_YORK),
+            true,
+        ),
+        (
+            "station search, New York",
+            "/fragments/weather?view=list&q=denver".into(),
             true,
             Some(NEW_YORK),
             true,
@@ -203,14 +224,15 @@ async fn page_timings_on_real_data() {
         ),
     ];
 
-    println!("\n| Request | First (ms) | Best of 3 (ms) | Bytes |");
+    println!("\n| Request | First (ms) | Best of 3 (ms) | Bytes sent |");
     println!("| --- | ---: | ---: | ---: |");
     let mut over = vec![];
     for (name, path, htmx, cookie, budgeted) in requests {
         let mut times = vec![];
         let mut size = 0;
         for _ in 0..3 {
-            let mut request = Request::get(&path);
+            // As a browser asks: compressed, if the server compresses.
+            let mut request = Request::get(&path).header("Accept-Encoding", "gzip");
             if htmx {
                 request = request.header("HX-Request", "true");
             }
@@ -230,4 +252,83 @@ async fn page_timings_on_real_data() {
         }
     }
     assert!(over.is_empty(), "over {BUDGET_MS} ms: {over:?}");
+}
+
+/// Where the weather fragment's time goes: each query it makes, alone,
+/// for UTC and New York days.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs ORACLE_PERF_DATA"]
+async fn weather_fragment_breakdown() {
+    use oracle::{ForecastRequest, ObservationRequest, TemperatureUnit, calendar::Calendar};
+    let directory =
+        std::env::var("ORACLE_PERF_DATA").expect("ORACLE_PERF_DATA must name a weather directory");
+    let weather = Arc::new(WeatherAccess::with_derived_forecasts(
+        Arc::new(FileAccess::new(directory.clone())),
+        &std::path::Path::new(&directory).join("derived"),
+    ));
+    weather
+        .prepare_files(&tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    let ids: Vec<String> = AIRPORTS.split(',').map(str::to_string).collect();
+    let now = OffsetDateTime::now_utc();
+    for calendar in [
+        Calendar::Utc,
+        Calendar::from_zone_name("America/New_York").unwrap(),
+    ] {
+        let day_start = calendar.start_of_day(now);
+        let day_end = calendar.start_of(calendar.date_of(now).next_day().unwrap());
+        let today = ObservationRequest {
+            start: Some(day_start),
+            end: Some(now),
+            station_ids: AIRPORTS.into(),
+            temperature_unit: TemperatureUnit::Fahrenheit,
+        };
+        let recent = ObservationRequest {
+            start: Some(now - Duration::hours(24)),
+            ..today.clone()
+        };
+        let forecast = ForecastRequest {
+            start: Some(day_start),
+            end: Some(day_end),
+            generated_start: Some(day_start - Duration::days(1)),
+            generated_end: Some(day_start - Duration::nanoseconds(1)),
+            station_ids: AIRPORTS.into(),
+            temperature_unit: TemperatureUnit::Fahrenheit,
+        };
+        for round in 0..3 {
+            let started = Instant::now();
+            weather.observation_data(&today, ids.clone()).await.unwrap();
+            let a = started.elapsed().as_secs_f64() * 1000.0;
+            let started = Instant::now();
+            weather
+                .observation_data(&recent, ids.clone())
+                .await
+                .unwrap();
+            let b = started.elapsed().as_secs_f64() * 1000.0;
+            let started = Instant::now();
+            weather
+                .calendar_forecasts(&forecast, ids.clone(), calendar)
+                .await
+                .unwrap();
+            let c = started.elapsed().as_secs_f64() * 1000.0;
+            let started = Instant::now();
+            let stations = weather.stations().await.unwrap();
+            let d = started.elapsed().as_secs_f64() * 1000.0;
+            let started = Instant::now();
+            let (x, y, z) = tokio::join!(
+                weather.observation_data(&today, ids.clone()),
+                weather.observation_data(&recent, ids.clone()),
+                weather.calendar_forecasts(&forecast, ids.clone(), calendar),
+            );
+            let e = started.elapsed().as_secs_f64() * 1000.0;
+            let _ = (x.unwrap(), y.unwrap(), z.unwrap());
+            println!(
+                "{} round {round}: today obs {a:.0} ms, 24 h obs {b:.0} ms, forecasts {c:.0} ms, \
+                 stations {d:.0} ms ({}), all three at once {e:.0} ms",
+                calendar.name(),
+                stations.len()
+            );
+        }
+    }
 }

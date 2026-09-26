@@ -35,7 +35,7 @@ futures.workspace = true
 
 # Web framework
 axum = { version = "0.8", features = ["http1", "json", "multipart", "query", "tokio", "original-uri"] }
-tower-http = { version = "0.7", default-features = false, features = ["cors"] }
+tower-http = { version = "0.7", default-features = false, features = ["cors", "compression-gzip"] }
 maud = { version = "0.27", features = ["axum"] }
 
 # Weather data (parquet files queried in-process)
