@@ -1,5 +1,8 @@
 .forecast-detail {
     display: grid;
+    /* One column no wider than its container: a wide table scrolls in its
+       own box (.table-container) instead of widening the page. */
+    grid-template-columns: minmax(0, 1fr);
     gap: 1rem;
     font-size: 0.85rem;
 }

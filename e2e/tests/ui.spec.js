@@ -106,6 +106,30 @@ test.describe("Dashboard", () => {
     await expect(page.locator(".wx-station").first()).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(360);
   });
+
+  test("on a phone, an opened station's wide table scrolls in its own box", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto(dashboard("&view=list"));
+    const station = page.locator("#weather-list details.wx-station").first();
+    await station.locator("summary").click();
+    await expect(station.locator(".forecast-detail")).toHaveCount(1);
+    // The checked-in data has no past week to compare, so give the detail
+    // a past-week table as wide as a real one.
+    await station.locator(".forecast-detail").evaluate((detail) => {
+      const cells =
+        '<th scope="row">Tue, Sep 22</th>' +
+        '<td><span class="obs">61°F −10°F</span><span class="fcst">71°F</span></td>'.repeat(6);
+      detail.insertAdjacentHTML(
+        "afterbegin",
+        `<section><p class="forecast-note">By day (UTC). Each forecast was issued the day before.</p>` +
+          `<div class="table-container"><table class="table is-narrow is-fullwidth past-table">` +
+          `<tbody><tr>${cells}</tr></tbody></table></div></section>`,
+      );
+    });
+    const container = station.locator(".table-container");
+    expect(await container.evaluate((box) => box.scrollWidth > box.clientWidth)).toBe(true);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  });
 });
 
 test.describe("Raw Data Page", () => {
