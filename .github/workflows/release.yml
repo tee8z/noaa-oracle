@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - "v*.*.*"
+    # A push to master builds the release binaries to warm their caches (see
+    # prepare-release), so a tagged release, including a hotfix, compiles only
+    # the workspace's own crates.
+    branches:
+      - master
   workflow_dispatch:
     inputs:
       version:
@@ -15,6 +20,14 @@ on:
         required: false
         type: boolean
         default: true
+
+# Releases run one at a time; on a branch a newer push replaces a warm pass.
+concurrency:
+  group: ${{ github.ref_type == 'tag' && 'release' || format('release-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' && github.event_name == 'push' }}
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -29,7 +42,13 @@ jobs:
       version: ${{ steps.get_version.outputs.version }}
       version_name: ${{ steps.get_version.outputs.version_name }}
       dry_run: ${{ steps.get_version.outputs.dry_run }}
+      build_images: ${{ steps.get_version.outputs.build_images }}
+      warm: ${{ steps.get_version.outputs.warm }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Get version from tag or input
         id: get_version
         env:
@@ -37,6 +56,19 @@ jobs:
           REQUESTED_VERSION: ${{ github.event.inputs.version }}
           REQUESTED_DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: |
+          if [ "$RELEASE_EVENT" = "push" ] && [ "$GITHUB_REF_TYPE" = "branch" ]; then
+            # Cache warming on master: build like a release, publish nothing.
+            VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+            {
+              echo "version=$VERSION"
+              echo "version_name=v$VERSION"
+              echo "dry_run=true"
+              echo "build_images=false"
+              echo "warm=true"
+            } >> "$GITHUB_OUTPUT"
+            echo "Warming release caches at $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           if [ "$RELEASE_EVENT" = "workflow_dispatch" ]; then
             VERSION="$REQUESTED_VERSION"
             DRY_RUN="$REQUESTED_DRY_RUN"
@@ -49,18 +81,26 @@ jobs:
             exit 1
           }
           [[ "$DRY_RUN" = true || "$DRY_RUN" = false ]] || exit 1
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "version_name=v$VERSION" >> $GITHUB_OUTPUT
-          echo "dry_run=$DRY_RUN" >> $GITHUB_OUTPUT
+          {
+            echo "version=$VERSION"
+            echo "version_name=v$VERSION"
+            echo "dry_run=$DRY_RUN"
+            echo "build_images=true"
+            echo "warm=false"
+          } >> "$GITHUB_OUTPUT"
           echo "Release version: $VERSION (dry_run: $DRY_RUN)"
 
   # Validate the tagged source; release jobs never rewrite commits or tags.
+  # Runs beside the build; nothing publishes until it passes.
   validate-versions:
     name: Validate Versions
     runs-on: ubuntu-latest
     needs: prepare-release
+    if: needs.prepare-release.outputs.warm != 'true'
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Check package and chart versions
         env:
@@ -106,353 +146,147 @@ jobs:
           print(f"Validated all package and chart versions: {version}")
           PYTHON
 
-  # Build release binaries for x86_64 using Nix
-  build-release-x86_64:
-    name: Build Release (x86_64)
-    runs-on: ubuntu-latest
-    needs: [prepare-release, validate-versions]
+  # Native binaries per architecture, packaged in the same job (packaging is
+  # only copying and archiving). They also go into the container images.
+  build-release:
+    name: Build Release (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    needs: prepare-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            system: x86_64-linux
+            image_arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            system: aarch64-linux
+            image_arch: arm64
     steps:
       - uses: actions/checkout@v4
-
-      - name: Free up disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force || true
-          sudo apt-get clean || true
-
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
-
-      - name: Setup Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
         with:
-          use-gha-cache: false
-          use-flakehub: false
+          persist-credentials: false
 
-      - name: Build with Nix
+      # Deleting these took minutes in the foreground; the build doesn't need
+      # the space until well after it has started.
+      - name: Free disk space (in the background)
         run: |
-          nix build .#oracle --print-build-logs
-          nix build .#daemon --print-build-logs -o result-daemon
+          nohup sudo sh -c 'rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; docker image prune --all --force; apt-get clean' \
+            >/dev/null 2>&1 &
 
-      - name: Build with Cargo (for compatibility)
+      - name: Read the pinned toolchain
+        id: toolchain
         run: |
-          nix develop -c cargo build --release --locked --workspace
+          echo "channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: ${{ matrix.target }}
+          components: clippy, rustfmt
+
+      # Compiled dependencies come from the cache that pushes to master write;
+      # only those runs save it, so a pull request can't change what a
+      # release links. The workspace's own crates always compile.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+          save-if: ${{ needs.prepare-release.outputs.warm == 'true' }}
+
+      # The library version and hash pinned in flake.nix.
+      - name: Fetch the DuckDB library
+        run: python3 .github/scripts/fetch_duckdb.py "${{ matrix.system }}" "$RUNNER_TEMP/duckdb"
+
+      - name: Build
         env:
-          RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+          TARGET: ${{ matrix.target }}
+          DUCKDB_LIB_DIR: ${{ runner.temp }}/duckdb
+          DUCKDB_INCLUDE_DIR: ${{ runner.temp }}/duckdb
+          # The oracle finds libduckdb.so beside it in lib/ (the zip, the
+          # image's /lib) without LD_LIBRARY_PATH.
+          RUSTFLAGS: "-C link-arg=-Wl,-rpath,$ORIGIN/../lib"
+        run: cargo build --release --locked --target "$TARGET" --bin oracle --bin daemon
+
+      # The images run on Debian 13 (glibc 2.41); the build host is older.
+      - name: Check the binaries' runtime libraries
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          for bin in oracle daemon; do
+            file="target/$TARGET/release/$bin"
+            readelf -d "$file" | grep -E 'NEEDED|RUNPATH'
+            glibc=$(objdump -T "$file" | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1)
+            echo "$bin needs $glibc"
+            [ "$(printf '%s\nGLIBC_2.41\n' "$glibc" | sort -V | tail -1)" = GLIBC_2.41 ] || {
+              echo "$bin needs $glibc, newer than the image's glibc 2.41" >&2
+              exit 1
+            }
+          done
 
       - name: Create release package
-        run: |
-          VERSION="${{ needs.prepare-release.outputs.version }}"
-          PKG_NAME="noaa-oracle-${VERSION}-x86_64-linux"
-
-          mkdir -p "${PKG_NAME}/bin"
-          mkdir -p "${PKG_NAME}/config"
-
-          # Copy the Nix-built binaries; the oracle embeds its UI
-          cp result/bin/oracle "${PKG_NAME}/bin/"
-          cp result-daemon/bin/daemon "${PKG_NAME}/bin/"
-
-          # Copy and rename config examples to usable defaults
-          cp config/oracle.example.toml "${PKG_NAME}/config/oracle.toml"
-          cp config/daemon.example.toml "${PKG_NAME}/config/daemon.toml"
-          # Signed uploads must use the same origin as the packaged oracle config.
-          sed -i 's|^base_url = "http://localhost:9800"$|base_url = "http://127.0.0.1:9800"|' "${PKG_NAME}/config/daemon.toml"
-
-          # Create setup script for first-time deployment
-          cat > "${PKG_NAME}/setup.sh" << 'EOF'
-          #!/bin/bash
-          set -e
-          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-          cd "$SCRIPT_DIR"
-
-          echo "NOAA Oracle Setup"
-          echo "================="
-
-          # Create data directories
-          echo "Creating data directories..."
-          mkdir -p weather_data event_data logs data
-
-          echo "Each service creates its signing key with mode 0600 on first startup."
-          echo "Existing keys remain in place. Back up both keys after startup."
-          echo "The oracle needs its original key to attest existing events."
-
-          echo ""
-          echo "Setup complete! You can now run:"
-          echo "  ./run-oracle.sh  - Start the oracle server"
-          echo "  ./run-daemon.sh  - Start the data fetching daemon"
-          EOF
-          chmod +x "${PKG_NAME}/setup.sh"
-
-          # Create run script for oracle
-          cat > "${PKG_NAME}/run-oracle.sh" << 'EOF'
-          #!/bin/bash
-          set -e
-          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-          cd "$SCRIPT_DIR"
-
-          # Create data directories if missing
-          mkdir -p weather_data event_data logs
-
-          export RUST_LOG="${RUST_LOG:-info}"
-          export NOAA_ORACLE_CONFIG="${NOAA_ORACLE_CONFIG:-$SCRIPT_DIR/config/oracle.toml}"
-          exec ./bin/oracle "$@"
-          EOF
-          chmod +x "${PKG_NAME}/run-oracle.sh"
-
-          # Create run script for daemon
-          cat > "${PKG_NAME}/run-daemon.sh" << 'EOF'
-          #!/bin/bash
-          set -e
-          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-          cd "$SCRIPT_DIR"
-
-          mkdir -p data logs
-
-          export RUST_LOG="${RUST_LOG:-info}"
-          export NOAA_DAEMON_CONFIG="${NOAA_DAEMON_CONFIG:-$SCRIPT_DIR/config/daemon.toml}"
-          exec ./bin/daemon "$@"
-          EOF
-          chmod +x "${PKG_NAME}/run-daemon.sh"
-
-          # Create README
-          cat > "${PKG_NAME}/README.txt" << EOF
-          NOAA Oracle v${VERSION}
-          =======================
-
-          Quick Start:
-            1. Run ./setup.sh to create the data directories
-            2. Run ./run-oracle.sh to start the oracle and create its key (port 9800)
-            3. Run ./run-daemon.sh to create its key and start fetching NOAA weather data
-            4. Copy the npub the daemon logs at startup into uploader_pubkeys
-               in config/oracle.toml and restart the oracle; until then the
-               oracle rejects the daemon's uploads (401)
-
-          Configuration:
-            - Edit config/oracle.toml for oracle settings
-            - Edit config/daemon.toml for daemon settings
-            - Keep daemon base_url equal to oracle remote_url, including scheme, host, and port
-            - The run scripts load these files; --config or NOAA_ORACLE_CONFIG /
-              NOAA_DAEMON_CONFIG can select another file
-
-          Directories:
-            - config/       Configuration files
-            - bin/          Service binaries
-            - weather_data/ Downloaded parquet files (created on first run)
-            - event_data/   DLC event database (created on first run)
-
-          Security:
-            - oracle_private_key.pem is your signing key - BACK IT UP!
-            - daemon_private_key.pem signs the daemon's uploads; its npub is
-              what uploader_pubkeys lists, so back it up too
-            - Each service creates its key with mode 0600 if the key is missing
-            - Keep both keys secret and preserve them across upgrades
-
-          For more info: https://github.com/tee8z/noaa-oracle
-          EOF
-
-          # Create zip
-          zip -r "${PKG_NAME}.zip" "${PKG_NAME}"
-
-          # Also create separate tarballs for cargo-built binaries
-          mkdir -p release
-          mv "${PKG_NAME}.zip" release/
-
-          # Cargo binaries tarball (for users who prefer dynamic linking).
-          # The oracle embeds its UI, so the binaries are all it needs.
-          mkdir -p cargo-pkg/bin
-          cp target/release/oracle cargo-pkg/bin/
-          cp target/release/daemon cargo-pkg/bin/
-          tar czf "release/noaa-oracle-${VERSION}-x86_64-linux-cargo.tar.gz" -C cargo-pkg .
-          rm -rf cargo-pkg
-
-          ls -lh release/
+        if: needs.prepare-release.outputs.warm != 'true'
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.target }}
+        run: bash .github/scripts/package-release.sh "$VERSION" "$ARCH" "target/$TARGET/release" "$RUNNER_TEMP/duckdb"
 
       - name: Upload release artifacts
+        if: needs.prepare-release.outputs.warm != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: release-x86_64-linux
+          name: release-${{ matrix.arch }}-linux
           path: release/*
+          if-no-files-found: error
           retention-days: 7
 
-  # Build release binaries for ARM64 (aarch64) using native ARM64 runner
-  build-release-arm64:
-    name: Build Release (ARM64)
-    runs-on: ubuntu-24.04-arm
-    needs: [prepare-release, validate-versions]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Free up disk space
+      # The container images copy these instead of compiling again.
+      - name: Stage the image files
+        if: needs.prepare-release.outputs.build_images == 'true'
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force || true
-          sudo apt-get clean || true
+          mkdir -p image-files
+          cp "target/$TARGET/release/oracle" "target/$TARGET/release/daemon" "$RUNNER_TEMP/duckdb/libduckdb.so" image-files/
 
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
-
-      - name: Setup Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
-        with:
-          use-gha-cache: false
-          use-flakehub: false
-
-      - name: Build with Nix for ARM64 (native)
-        run: |
-          # Build natively on ARM64 runner
-          nix build .#oracle --print-build-logs
-          nix build .#daemon --print-build-logs -o result-daemon
-
-      - name: Create release package
-        run: |
-          VERSION="${{ needs.prepare-release.outputs.version }}"
-          PKG_NAME="noaa-oracle-${VERSION}-aarch64-linux"
-
-          mkdir -p "${PKG_NAME}/bin"
-          mkdir -p "${PKG_NAME}/config"
-
-          # Copy the Nix-built binaries; the oracle embeds its UI
-          cp result/bin/oracle "${PKG_NAME}/bin/"
-          cp result-daemon/bin/daemon "${PKG_NAME}/bin/"
-
-          # Copy and rename config examples to usable defaults
-          cp config/oracle.example.toml "${PKG_NAME}/config/oracle.toml"
-          cp config/daemon.example.toml "${PKG_NAME}/config/daemon.toml"
-          # Signed uploads must use the same origin as the packaged oracle config.
-          sed -i 's|^base_url = "http://localhost:9800"$|base_url = "http://127.0.0.1:9800"|' "${PKG_NAME}/config/daemon.toml"
-
-          # Create setup script for first-time deployment
-          cat > "${PKG_NAME}/setup.sh" << 'EOF'
-          #!/bin/bash
-          set -e
-          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-          cd "$SCRIPT_DIR"
-
-          echo "NOAA Oracle Setup"
-          echo "================="
-
-          # Create data directories
-          echo "Creating data directories..."
-          mkdir -p weather_data event_data logs data
-
-          echo "Each service creates its signing key with mode 0600 on first startup."
-          echo "Existing keys remain in place. Back up both keys after startup."
-          echo "The oracle needs its original key to attest existing events."
-
-          echo ""
-          echo "Setup complete! You can now run:"
-          echo "  ./run-oracle.sh  - Start the oracle server"
-          echo "  ./run-daemon.sh  - Start the data fetching daemon"
-          EOF
-          chmod +x "${PKG_NAME}/setup.sh"
-
-          # Create run script for oracle
-          cat > "${PKG_NAME}/run-oracle.sh" << 'EOF'
-          #!/bin/bash
-          set -e
-          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-          cd "$SCRIPT_DIR"
-
-          # Create data directories if missing
-          mkdir -p weather_data event_data logs
-
-          export RUST_LOG="${RUST_LOG:-info}"
-          export NOAA_ORACLE_CONFIG="${NOAA_ORACLE_CONFIG:-$SCRIPT_DIR/config/oracle.toml}"
-          exec ./bin/oracle "$@"
-          EOF
-          chmod +x "${PKG_NAME}/run-oracle.sh"
-
-          # Create run script for daemon
-          cat > "${PKG_NAME}/run-daemon.sh" << 'EOF'
-          #!/bin/bash
-          set -e
-          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-          cd "$SCRIPT_DIR"
-
-          mkdir -p data logs
-
-          export RUST_LOG="${RUST_LOG:-info}"
-          export NOAA_DAEMON_CONFIG="${NOAA_DAEMON_CONFIG:-$SCRIPT_DIR/config/daemon.toml}"
-          exec ./bin/daemon "$@"
-          EOF
-          chmod +x "${PKG_NAME}/run-daemon.sh"
-
-          # Create README
-          cat > "${PKG_NAME}/README.txt" << EOF
-          NOAA Oracle v${VERSION} (ARM64/aarch64)
-          =======================================
-
-          Quick Start:
-            1. Run ./setup.sh to create the data directories
-            2. Run ./run-oracle.sh to start the oracle and create its key (port 9800)
-            3. Run ./run-daemon.sh to create its key and start fetching NOAA weather data
-            4. Copy the npub the daemon logs at startup into uploader_pubkeys
-               in config/oracle.toml and restart the oracle; until then the
-               oracle rejects the daemon's uploads (401)
-
-          Configuration:
-            - Edit config/oracle.toml for oracle settings
-            - Edit config/daemon.toml for daemon settings
-            - Keep daemon base_url equal to oracle remote_url, including scheme, host, and port
-            - The run scripts load these files; --config or NOAA_ORACLE_CONFIG /
-              NOAA_DAEMON_CONFIG can select another file
-
-          Directories:
-            - config/       Configuration files
-            - bin/          Service binaries
-            - weather_data/ Downloaded parquet files (created on first run)
-            - event_data/   DLC event database (created on first run)
-
-          Security:
-            - oracle_private_key.pem is your signing key - BACK IT UP!
-            - daemon_private_key.pem signs the daemon's uploads; its npub is
-              what uploader_pubkeys lists, so back it up too
-            - Each service creates its key with mode 0600 if the key is missing
-            - Keep both keys secret and preserve them across upgrades
-
-          For more info: https://github.com/tee8z/noaa-oracle
-          EOF
-
-          # Create zip
-          mkdir -p release
-          zip -r "release/${PKG_NAME}.zip" "${PKG_NAME}"
-
-          ls -lh release/
-
-      - name: Upload release artifacts
+      - name: Upload the image files
+        if: needs.prepare-release.outputs.build_images == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: release-aarch64-linux
-          path: release/*
+          name: image-${{ matrix.image_arch }}
+          path: image-files/*
+          if-no-files-found: error
           retention-days: 7
 
-  # Create GitHub release (skipped in dry-run)
+  # Create GitHub release (skipped in dry-run). The tarballs don't wait for
+  # the container images, which publish on their own.
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [prepare-release, build-release-x86_64, build-release-arm64]
+    needs: [prepare-release, validate-versions, build-release]
     if: needs.prepare-release.outputs.dry_run != 'true'
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-      - name: Download all artifacts
+      - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: release-*
           path: artifacts
 
       - name: Display structure of downloaded files
         run: ls -R artifacts
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           name: Release ${{ needs.prepare-release.outputs.version_name }}
           draft: false
@@ -464,121 +298,100 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # Build and push Docker images to GHCR (amd64)
-  build-docker-amd64:
-    name: Build Docker Images (amd64)
+  # Images assembled from build-release's binaries: nothing compiles here.
+  # The Dockerfiles have no RUN step, so both architectures build on one
+  # amd64 runner without emulation (QEMU only runs the smoke test).
+  build-docker:
+    name: Build Docker Images (${{ matrix.arch }})
     runs-on: ubuntu-latest
-    needs: [prepare-release, validate-versions]
+    needs: [prepare-release, validate-versions, build-release]
+    if: needs.prepare-release.outputs.build_images == 'true'
     permissions:
       contents: read
       packages: write
     strategy:
+      fail-fast: false
       matrix:
-        include:
-          - image: oracle
-            nix_output: docker-oracle
-          - image: daemon
-            nix_output: docker-daemon
+        arch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
-
-      - name: Free up disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force || true
-
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
-
-      - name: Setup Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
         with:
-          use-gha-cache: false
-          use-flakehub: false
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-${{ matrix.arch }}
+          path: image-files
+
+      - name: Assemble the image context
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p "image/bin/$ARCH" "image/lib/$ARCH" image/share/noaa-oracle/static
+          # Artifacts don't keep file modes.
+          install -m 755 image-files/oracle image-files/daemon "image/bin/$ARCH/"
+          install -m 755 image-files/libduckdb.so "image/lib/$ARCH/"
+          cp -r config image/share/noaa-oracle/
+          echo 'UI assets are embedded in bin/oracle.' > image/share/noaa-oracle/static/.embedded
+          ls -lR image
+
+      - uses: docker/setup-qemu-action@v3
+        if: matrix.arch != 'amd64'
+        with:
+          platforms: ${{ matrix.arch }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build images
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          REPO_LOWER="${GITHUB_REPOSITORY,,}"
+          for image in oracle daemon; do
+            docker buildx build --platform "linux/$ARCH" --load \
+              -f "deploy/docker/$image.Dockerfile" \
+              -t "ghcr.io/$REPO_LOWER/$image:$VERSION-$ARCH" \
+              -t "ghcr.io/$REPO_LOWER/$image:latest-$ARCH" \
+              image
+          done
+
+      # Both binaries start in their images: the loader finds every library.
+      - name: Smoke test the images
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          REPO_LOWER="${GITHUB_REPOSITORY,,}"
+          docker run --rm --platform "linux/$ARCH" "ghcr.io/$REPO_LOWER/oracle:$VERSION-$ARCH" /bin/oracle --version
+          docker run --rm --platform "linux/$ARCH" "ghcr.io/$REPO_LOWER/daemon:$VERSION-$ARCH" /bin/daemon --help > /dev/null
+          docker image ls "ghcr.io/$REPO_LOWER/*"
 
       - name: Log in to GHCR
+        if: needs.prepare-release.outputs.dry_run != 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and tag x86_64 image
+      - name: Push images
+        if: needs.prepare-release.outputs.dry_run != 'true'
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          ARCH: ${{ matrix.arch }}
         run: |
-          nix build .#${{ matrix.nix_output }} --print-build-logs
-          docker load < result
-          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          docker tag noaa-${{ matrix.image }}:latest ghcr.io/${REPO_LOWER}/${{ matrix.image }}:${{ needs.prepare-release.outputs.version }}-amd64
-          docker tag noaa-${{ matrix.image }}:latest ghcr.io/${REPO_LOWER}/${{ matrix.image }}:latest-amd64
-
-          if [ "${{ needs.prepare-release.outputs.dry_run }}" != "true" ]; then
-            docker push ghcr.io/${REPO_LOWER}/${{ matrix.image }}:${{ needs.prepare-release.outputs.version }}-amd64
-            docker push ghcr.io/${REPO_LOWER}/${{ matrix.image }}:latest-amd64
-          fi
-
-  # Build and push Docker images to GHCR (arm64) using native ARM64 runner
-  build-docker-arm64:
-    name: Build Docker Images (arm64)
-    runs-on: ubuntu-24.04-arm
-    needs: [prepare-release, validate-versions]
-    permissions:
-      contents: read
-      packages: write
-    strategy:
-      matrix:
-        include:
-          - image: oracle
-            nix_output: docker-oracle
-          - image: daemon
-            nix_output: docker-daemon
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Free up disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force || true
-
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
-
-      - name: Setup Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
-        with:
-          use-gha-cache: false
-          use-flakehub: false
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and tag ARM64 image
-        run: |
-          nix build .#${{ matrix.nix_output }} --print-build-logs
-          docker load < result
-          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          docker tag noaa-${{ matrix.image }}:latest ghcr.io/${REPO_LOWER}/${{ matrix.image }}:${{ needs.prepare-release.outputs.version }}-arm64
-          docker tag noaa-${{ matrix.image }}:latest ghcr.io/${REPO_LOWER}/${{ matrix.image }}:latest-arm64
-
-          if [ "${{ needs.prepare-release.outputs.dry_run }}" != "true" ]; then
-            docker push ghcr.io/${REPO_LOWER}/${{ matrix.image }}:${{ needs.prepare-release.outputs.version }}-arm64
-            docker push ghcr.io/${REPO_LOWER}/${{ matrix.image }}:latest-arm64
-          fi
+          REPO_LOWER="${GITHUB_REPOSITORY,,}"
+          for image in oracle daemon; do
+            docker push "ghcr.io/$REPO_LOWER/$image:$VERSION-$ARCH"
+            docker push "ghcr.io/$REPO_LOWER/$image:latest-$ARCH"
+          done
 
   # Create multi-arch Docker manifests
   create-docker-manifest:
     name: Create Docker Manifest
     runs-on: ubuntu-latest
-    needs: [prepare-release, build-docker-amd64, build-docker-arm64]
+    needs: [prepare-release, build-docker]
     if: needs.prepare-release.outputs.dry_run != 'true'
     permissions:
       contents: read
@@ -595,20 +408,22 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create and push multi-arch manifest
+        env:
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          IMAGE_NAME: ${{ matrix.image }}
         run: |
-          VERSION="${{ needs.prepare-release.outputs.version }}"
-          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          IMAGE="ghcr.io/${REPO_LOWER}/${{ matrix.image }}"
+          REPO_LOWER="${GITHUB_REPOSITORY,,}"
+          IMAGE="ghcr.io/${REPO_LOWER}/${IMAGE_NAME}"
 
           # Create and push multi-arch manifests
-          docker manifest create ${IMAGE}:${VERSION} \
-            ${IMAGE}:${VERSION}-amd64 \
-            ${IMAGE}:${VERSION}-arm64
-          docker manifest push ${IMAGE}:${VERSION}
+          docker manifest create "${IMAGE}:${VERSION}" \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+          docker manifest push "${IMAGE}:${VERSION}"
 
-          docker manifest create ${IMAGE}:latest \
-            ${IMAGE}:latest-amd64 \
-            ${IMAGE}:latest-arm64
-          docker manifest push ${IMAGE}:latest
+          docker manifest create "${IMAGE}:latest" \
+            "${IMAGE}:latest-amd64" \
+            "${IMAGE}:latest-arm64"
+          docker manifest push "${IMAGE}:latest"
 
           echo "Pushed multi-arch image: ${IMAGE}:${VERSION}"
