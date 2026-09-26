@@ -512,7 +512,7 @@ async fn forecast_fragment_handles_no_data() {
 
     let request = Request::builder()
         .method(Method::GET)
-        .uri("/fragments/forecast/KXYZ")
+        .uri("/fragments/forecast/KORD")
         .header(header::ACCEPT, "text/html")
         .body(Body::empty())
         .unwrap();
@@ -954,6 +954,23 @@ async fn map_station_panel_names_the_station() {
     assert!(html.contains("Forecasts and observations for KORD"));
     let (status, _) = app.get("/fragments/station/KORD%27x").await;
     assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+}
+
+/// A well-formed id that no station has is not found, for the map panel
+/// and a list row alike, and costs no forecast query.
+#[tokio::test]
+async fn unknown_stations_are_not_found() {
+    let mut weather = MockWeatherAccess::new();
+    weather.expect_forecasts_data().never();
+    weather.expect_daily_observations().never();
+    weather.expect_stations().returning(|| Ok(mock_stations()));
+    let app = spawn_app(Arc::new(weather)).await;
+    for path in ["/fragments/station/ZZZZ", "/fragments/forecast/ZZZZ"] {
+        let (status, body) = app.get(path).await;
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{path}");
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("No station"), "{path}: {html}");
+    }
 }
 
 /// A reader in New York gets their own day: it starts at their midnight,

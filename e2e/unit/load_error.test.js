@@ -100,3 +100,47 @@ test("a request replaced by a newer one, or an unmarked target, shows nothing", 
   // hx-on errors carry no request.
   listeners["htmx:error"]({ detail: {} });
 });
+
+test("an HTTP error reply shows the message and a retry, not its body", () => {
+  const { listeners, requests } = load();
+  const panel = target("Couldn't load this station's forecast and history.");
+  const pin = { isConnected: true };
+  const ctx = {
+    target: panel,
+    sourceElement: pin,
+    request: { action: "/fragments/station/KORD" },
+    response: { status: 500 },
+    text: "boom",
+  };
+  listeners["htmx:before:request"]({ detail: { ctx } });
+  let prevented = false;
+  listeners["htmx:after:request"]({ detail: { ctx }, preventDefault: () => (prevented = true) });
+
+  assert.ok(prevented, "the error body must not be swapped in");
+  const box = panel.content;
+  assert.equal(box.className, "load-error");
+  const [message, retry] = box.children;
+  assert.equal(message.textContent, "Couldn't load this station's forecast and history.");
+  assert.equal(retry.textContent, "Try again");
+  retry.listeners.click();
+  assert.equal(requests[0][1], "/fragments/station/KORD");
+});
+
+test("successful replies, and error replies for unmarked targets, are swapped as sent", () => {
+  const { listeners } = load();
+  const panel = target("Couldn't load.");
+  const ok = { target: panel, request: { action: "/fragments/station/KORD" }, response: { status: 200 } };
+  listeners["htmx:before:request"]({ detail: { ctx: ok } });
+  let prevented = false;
+  const preventDefault = () => (prevented = true);
+  listeners["htmx:after:request"]({ detail: { ctx: ok }, preventDefault });
+  assert.equal(prevented, false);
+  assert.equal(panel.content, null);
+
+  const page = target(undefined);
+  const missing = { target: page, request: { action: "/events/x" }, response: { status: 404 } };
+  listeners["htmx:before:request"]({ detail: { ctx: missing } });
+  listeners["htmx:after:request"]({ detail: { ctx: missing }, preventDefault });
+  assert.equal(prevented, false);
+  assert.equal(page.content, null);
+});

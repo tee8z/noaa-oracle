@@ -326,6 +326,21 @@ test.describe("HTMX Navigation", () => {
     await expect(page.locator("#map-station .station-detail")).toHaveCount(1);
   });
 
+  test("a station's error reply shows the message and a retry, not its body", async ({ page }) => {
+    await page.goto(dashboard("&view=map"));
+    await page.route("**/fragments/station/**", (route) =>
+      route.fulfill({ status: 500, contentType: "text/plain", body: "boom" }),
+    );
+    await pin(page).click();
+    const panel = page.locator("#map-station");
+    await expect(panel.locator(".load-error")).toContainText("Couldn't load this station");
+    await expect(panel).not.toContainText("boom");
+    await expect(page.locator("#map-station-loading")).toBeHidden();
+    await page.unroute("**/fragments/station/**");
+    await panel.getByRole("button", { name: "Try again" }).click();
+    await expect(panel.locator(".station-detail .forecast-detail")).toHaveCount(1);
+  });
+
   test("on a wide screen, a pin's station scrolls into view", async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 800 });
     await page.goto(dashboard("&view=map"));
@@ -425,6 +440,13 @@ test.describe("API Endpoints", () => {
   test("stations endpoint returns data", async ({ request }) => {
     const response = await request.get("/stations");
     expect(response.ok()).toBeTruthy();
+  });
+
+  test("an unknown station is not found", async ({ request }) => {
+    for (const path of ["/fragments/station/ZZZZ", "/fragments/forecast/ZZZZ"]) {
+      const response = await request.get(path);
+      expect(response.status()).toBe(404);
+    }
   });
 
   test("forecast fragment endpoint returns HTML", async ({ request }) => {
