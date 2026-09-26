@@ -326,6 +326,15 @@ test.describe("HTMX Navigation", () => {
     await expect(page.locator("#map-station .station-detail")).toHaveCount(1);
   });
 
+  test("on a wide screen, a pin's station scrolls into view", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.goto(dashboard("&view=map"));
+    await pin(page).click();
+    const detail = page.locator("#map-station .station-detail");
+    await expect(detail).toHaveCount(1);
+    await expect(detail.locator(".station-detail-head h3")).toBeInViewport();
+  });
+
   test("a station request that gets no reply says so and can be retried", async ({ page }) => {
     await page.goto(dashboard("&view=map"));
     await page.route("**/fragments/station/**", (route) => route.abort("failed"));

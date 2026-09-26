@@ -310,6 +310,10 @@
     color: var(--muted);
 }
 
+#map-station {
+    scroll-margin-top: 0.75rem;
+}
+
 #map-station:not(:empty) {
     margin-top: 0.75rem;
     border-top: 1px solid var(--bulma-border);
