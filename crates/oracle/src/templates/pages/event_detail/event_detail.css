@@ -8,8 +8,20 @@
 
 .event-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
-    gap: 0 1.5rem;
+    grid-template-columns: repeat(auto-fit, minmax(min(20rem, 100%), 1fr));
+    gap: 1.5rem;
+    margin-bottom: 1.5rem;
+}
+
+/* The grid spaces its boxes; Bulma's margin under each would double it. */
+.event-grid > .box {
+    margin-bottom: 0;
+    min-width: 0;
+}
+
+/* Its keys are long: the whole row, instead of a lone box beside a gap. */
+.event-grid > .attestation {
+    grid-column: 1 / -1;
 }
 
 .facts {
