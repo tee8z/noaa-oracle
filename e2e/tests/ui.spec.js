@@ -115,16 +115,35 @@ test.describe("Dashboard", () => {
     await expect(station.locator(".forecast-detail")).toHaveCount(1);
     // The checked-in data has no past week to compare, so give the detail
     // a past-week table as wide as a real one.
+    // The page enforces Trusted Types, so build it with DOM calls.
     await station.locator(".forecast-detail").evaluate((detail) => {
-      const cells =
-        '<th scope="row">Tue, Sep 22</th>' +
-        '<td><span class="obs">61°F −10°F</span><span class="fcst">71°F</span></td>'.repeat(6);
-      detail.insertAdjacentHTML(
-        "afterbegin",
-        `<section><p class="forecast-note">By day (UTC). Each forecast was issued the day before.</p>` +
-          `<div class="table-container"><table class="table is-narrow is-fullwidth past-table">` +
-          `<tbody><tr>${cells}</tr></tbody></table></div></section>`,
+      const el = (tag, className, text) => {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        if (text) node.textContent = text;
+        return node;
+      };
+      const row = el("tr");
+      const day = el("th", null, "Tue, Sep 22");
+      day.scope = "row";
+      row.append(day);
+      for (let i = 0; i < 6; i++) {
+        const cell = el("td");
+        cell.append(el("span", "obs", "61°F −10°F"), el("span", "fcst", "71°F"));
+        row.append(cell);
+      }
+      const body = el("tbody");
+      body.append(row);
+      const table = el("table", "table is-narrow is-fullwidth past-table");
+      table.append(body);
+      const container = el("div", "table-container");
+      container.append(table);
+      const section = el("section");
+      section.append(
+        el("p", "forecast-note", "By day (UTC). Each forecast was issued the day before."),
+        container,
       );
+      detail.prepend(section);
     });
     const container = station.locator(".table-container");
     expect(await container.evaluate((box) => box.scrollWidth > box.clientWidth)).toBe(true);
