@@ -130,6 +130,23 @@ test.describe("Dashboard", () => {
     expect(await container.evaluate((box) => box.scrollWidth > box.clientWidth)).toBe(true);
     expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
   });
+
+  test("the search spinner shows only while a search runs", async ({ page }) => {
+    await page.goto(dashboard("&view=list"));
+    const spinner = page.locator("#weather-search-loading");
+    await expect(spinner).toBeHidden();
+    let release;
+    const held = new Promise((resolve) => (release = resolve));
+    const search = (url) => url.pathname === "/fragments/weather" && url.searchParams.get("q") === "K";
+    await page.route(search, async (route) => {
+      await held;
+      await route.continue();
+    });
+    await page.locator("#weather-search").fill("K");
+    await expect(spinner).toBeVisible();
+    release();
+    await expect(spinner).toBeHidden();
+  });
 });
 
 test.describe("Raw Data Page", () => {

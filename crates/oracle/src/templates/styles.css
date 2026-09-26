@@ -139,20 +139,6 @@ code.key {
     white-space: nowrap;
 }
 
-/* htmx loading states */
-.htmx-indicator {
-    display: none;
-}
-
-.htmx-request .htmx-indicator,
-.htmx-request.htmx-indicator {
-    display: inline-block;
-}
-
-p.htmx-indicator.htmx-request {
-    display: block;
-}
-
 .loader {
     display: inline-block;
     width: 14px;
@@ -174,6 +160,22 @@ p.htmx-indicator.htmx-request {
     .loader {
         animation-duration: 3s;
     }
+}
+
+/* htmx loading states. After .loader, which also sets display, so an idle
+   indicator stays hidden whatever else it is. */
+.htmx-indicator {
+    display: none;
+}
+
+.htmx-request .htmx-indicator,
+.htmx-request.htmx-indicator {
+    display: inline-block;
+}
+
+p.htmx-indicator.htmx-request,
+.htmx-request p.htmx-indicator {
+    display: block;
 }
 
 /* Closed <details> hide their content; a marker shows they open. */
