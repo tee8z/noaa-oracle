@@ -12,7 +12,7 @@ use tokio::task::JoinError;
 use uuid::Uuid;
 
 use crate::{
-    database::{Database, EntryScore, WriteError},
+    database::{AwaitingAttestation, Database, EntryScore, WriteError},
     events::{
         AddEventEntry, CreateEvent, EntryRejection, Event, EventCounts, EventFilter,
         EventListQuery, EventRecord, EventRejection, EventStatus, EventSummary, NewEvent,
@@ -69,6 +69,15 @@ impl From<sqlx::Error> for Error {
     fn from(error: sqlx::Error) -> Self {
         Error::Read(Box::new(error))
     }
+}
+
+/// What one processing pass did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EtlSummary {
+    /// Events whose processing failed; they are retried next pass.
+    pub failed: usize,
+    /// Events attested in this pass.
+    pub attested: usize,
 }
 
 pub struct Oracle {
@@ -128,7 +137,8 @@ impl Oracle {
         &self.sources
     }
 
-    fn now(&self) -> OffsetDateTime {
+    /// The oracle's current time.
+    pub fn now(&self) -> OffsetDateTime {
         (self.clock)()
     }
 
@@ -174,6 +184,12 @@ impl Oracle {
     /// Events by status, counted like [`Self::event_page`] lists them.
     pub async fn event_counts(&self, include_unlisted: bool) -> Result<EventCounts, Error> {
         Ok(self.db.event_counts(include_unlisted, self.now()).await?)
+    }
+
+    /// Events past their observation window that still wait for an
+    /// attestation.
+    pub async fn awaiting_attestation(&self) -> Result<AwaitingAttestation, Error> {
+        Ok(self.db.awaiting_attestation(self.now()).await?)
     }
 
     pub async fn get_event(&self, id: Uuid) -> Result<Event, Error> {
@@ -259,23 +275,30 @@ impl Oracle {
     /// Refreshes readings, scores entries, and attests events whose signing
     /// date has passed. Safe to repeat: attestation happens at most once per
     /// event. A failing event is logged and does not stop the others.
-    /// Returns the number of events that failed.
-    pub async fn etl_data(&self, etl_process_id: u64) -> Result<usize, Error> {
+    pub async fn etl_data(&self, etl_process_id: u64) -> Result<EtlSummary, Error> {
         let events = self.db.unattested_events().await?;
         info!("etl {etl_process_id}: {} unattested events", events.len());
-        let mut failures = 0;
+        let mut summary = EtlSummary::default();
         for event in events {
             let id = event.id;
-            if let Err(error) = self.process_event(event).await {
-                failures += 1;
-                error!("etl {etl_process_id}: event {id} failed: {error:#}");
+            match self.process_event(event).await {
+                Ok(true) => summary.attested += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    summary.failed += 1;
+                    error!("etl {etl_process_id}: event {id} failed: {error:#}");
+                }
             }
         }
-        info!("etl {etl_process_id}: done, {failures} failed");
-        Ok(failures)
+        info!(
+            "etl {etl_process_id}: done, {} attested, {} failed",
+            summary.attested, summary.failed
+        );
+        Ok(summary)
     }
 
-    async fn process_event(&self, event: EventRecord) -> Result<(), Error> {
+    /// Returns whether the event was attested.
+    async fn process_event(&self, event: EventRecord) -> Result<bool, Error> {
         let source = self.source_for(&event)?;
         let window = ObservationWindow {
             start: event.start_observation_date,
@@ -286,7 +309,7 @@ impl Oracle {
 
         let now = self.now();
         if event.status(now) == EventStatus::Live {
-            return Ok(());
+            return Ok(false);
         }
         let entries = self.db.event_entries(event.id).await?;
         let scored = entries
@@ -317,20 +340,21 @@ impl Oracle {
             .await?;
 
         if event.status(now) == EventStatus::Completed && now >= event.signing_date {
-            self.attest(&event, &scored).await?;
+            return self.attest(&event, &scored).await;
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Signs the outcome for `scored`. The attestation is computed from the
     /// same scores that were just stored, and only for an announced outcome.
-    async fn attest(&self, event: &EventRecord, scored: &[Scored]) -> Result<(), Error> {
+    /// Returns whether this call stored the attestation.
+    async fn attest(&self, event: &EventRecord, scored: &[Scored]) -> Result<bool, Error> {
         if scored.is_empty() {
             warn!(
                 "event {} reached its signing date without entries",
                 event.id
             );
-            return Ok(());
+            return Ok(false);
         }
         let winners = scoring::winning_indices(scored, event.number_of_places_win);
         let message = scoring::outcome_message(&winners);
@@ -351,7 +375,8 @@ impl Oracle {
                 event: event.id,
                 source,
             })?;
-        if self.db.record_attestation(event.id, attestation).await? {
+        let stored = self.db.record_attestation(event.id, attestation).await?;
+        if stored {
             info!("attested event {} with winners {winners:?}", event.id);
         } else {
             warn!(
@@ -359,6 +384,6 @@ impl Oracle {
                 event.id
             );
         }
-        Ok(())
+        Ok(stored)
     }
 }

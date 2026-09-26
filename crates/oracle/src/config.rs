@@ -52,6 +52,12 @@ pub struct Cli {
     #[arg(short, long, env = "NOAA_ORACLE_PORT")]
     pub port: Option<u16>,
 
+    /// Address for a separate Prometheus metrics listener, e.g.
+    /// 127.0.0.1:9801. Serves only GET /metrics, without authentication.
+    /// Unset: no metrics listener.
+    #[arg(long, env = "NOAA_ORACLE_METRICS_BIND")]
+    pub metrics_bind: Option<SocketAddr>,
+
     /// Public URL clients use to reach the oracle, e.g. https://example.com.
     /// NIP-98 signatures must be made over this origin.
     #[arg(short, long, env = "NOAA_ORACLE_REMOTE_URL")]
@@ -107,6 +113,8 @@ pub struct Cli {
 #[derive(Clone, Debug)]
 pub struct Configuration {
     pub listen: SocketAddr,
+    /// Where metrics are served; `None` disables the metrics listener.
+    pub metrics_listen: Option<SocketAddr>,
     pub remote_url: String,
     pub weather_dir: PathBuf,
     pub event_dir: PathBuf,
@@ -171,6 +179,7 @@ impl Cli {
             level: self.level.or(file.level),
             host: self.host.or(file.host),
             port: self.port.or(file.port),
+            metrics_bind: self.metrics_bind.or(file.metrics_bind),
             remote_url: self.remote_url.or(file.remote_url),
             weather_dir: self.weather_dir.or(file.weather_dir),
             event_db: self.event_db.or(file.event_db),
@@ -203,6 +212,7 @@ impl Cli {
         };
         Ok(Configuration {
             listen: SocketAddr::new(host, port),
+            metrics_listen: self.metrics_bind,
             remote_url,
             weather_dir: self
                 .weather_dir
@@ -328,6 +338,26 @@ mod tests {
         assert_eq!(configuration.shutdown_timeout, Duration::from_secs(25));
         assert_eq!(configuration.storage, Storage::Local);
         assert!(configuration.coordinators.is_empty());
+        assert_eq!(configuration.metrics_listen, None, "metrics are off");
+    }
+
+    #[test]
+    fn metrics_bind_enables_the_metrics_listener() {
+        let parsed: Cli = toml::from_str("metrics_bind = \"127.0.0.1:9801\"").unwrap();
+        let configuration = parsed.configuration().unwrap();
+        assert_eq!(
+            configuration.metrics_listen,
+            Some("127.0.0.1:9801".parse().unwrap())
+        );
+        assert_eq!(configuration.listen.to_string(), "127.0.0.1:9800");
+
+        let flag = Cli::try_parse_from(["oracle", "--metrics-bind", "0.0.0.0:9900"]).unwrap();
+        assert_eq!(
+            flag.merge(parsed).configuration().unwrap().metrics_listen,
+            Some("0.0.0.0:9900".parse().unwrap()),
+            "the flag wins over the file"
+        );
+        assert!(toml::from_str::<Cli>("metrics_bind = \"not an address\"").is_err());
     }
 
     #[test]

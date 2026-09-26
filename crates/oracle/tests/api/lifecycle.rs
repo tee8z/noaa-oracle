@@ -2,7 +2,7 @@
 //! mocked NOAA data. The attestation must unlock exactly the locking point
 //! of the winning outcome, and never change once published.
 
-use crate::helpers::{MockWeatherAccess, TestApp, event_at, spawn_app};
+use crate::helpers::{MockWeatherAccess, TestApp, event_at, metric, spawn_app};
 use axum::http::StatusCode;
 use dlctix::{attestation_locking_point, secp::MaybePoint};
 use oracle::{
@@ -221,6 +221,77 @@ async fn the_best_entry_is_attested_after_the_signing_date() {
 }
 
 #[tokio::test]
+async fn metrics_follow_an_event_to_its_attestation() {
+    let test_app = app_with_weather().await;
+    let (event, _) = event_with_entries(
+        &test_app,
+        vec![
+            vec![pick("KORD", "temp_high", "Over")],
+            vec![pick("KORD", "temp_high", "Under")],
+            vec![pick("KSAW", "temp_high", "Par")],
+        ],
+    )
+    .await;
+    let text = test_app.metrics().await;
+    assert_eq!(metric(&text, r#"oracle_events{state="live"}"#), 1);
+    assert_eq!(metric(&text, r#"oracle_events{state="completed"}"#), 0);
+    assert_eq!(metric(&text, "oracle_events_awaiting_attestation"), 0);
+    assert_eq!(metric(&text, "oracle_etl_lease_held"), 0);
+
+    // The window ended; the signing date is still ahead.
+    test_app.clock.set(event.end_observation_date);
+    let text = test_app.metrics().await;
+    assert_eq!(metric(&text, r#"oracle_events{state="live"}"#), 0);
+    assert_eq!(metric(&text, r#"oracle_events{state="completed"}"#), 1);
+    assert_eq!(metric(&text, "oracle_events_awaiting_attestation"), 1);
+    assert_eq!(
+        metric(
+            &text,
+            "oracle_oldest_event_awaiting_attestation_age_seconds"
+        ),
+        0
+    );
+
+    // Overdue by a minute: the age shows how long.
+    test_app
+        .clock
+        .set(event.signing_date + Duration::seconds(60));
+    let text = test_app.metrics().await;
+    assert_eq!(
+        metric(
+            &text,
+            "oracle_oldest_event_awaiting_attestation_age_seconds"
+        ),
+        60
+    );
+
+    test_app.run_etl().await;
+    let text = test_app.metrics().await;
+    assert_eq!(metric(&text, r#"oracle_events{state="completed"}"#), 0);
+    assert_eq!(metric(&text, r#"oracle_events{state="signed"}"#), 1);
+    assert_eq!(metric(&text, "oracle_events_awaiting_attestation"), 0);
+    assert_eq!(
+        metric(
+            &text,
+            "oracle_oldest_event_awaiting_attestation_age_seconds"
+        ),
+        0
+    );
+    assert_eq!(metric(&text, "oracle_events_attested_total"), 1);
+    assert_eq!(metric(&text, "oracle_event_attestation_failures_total"), 0);
+    assert_eq!(
+        metric(&text, r#"oracle_etl_runs_total{result="completed"}"#),
+        1
+    );
+    assert_eq!(
+        metric(&text, r#"oracle_etl_runs_total{result="failed"}"#),
+        0
+    );
+    assert_eq!(metric(&text, "oracle_etl_lease_held"), 1);
+    assert!(metric(&text, "oracle_last_etl_completed_timestamp_seconds") > 0);
+}
+
+#[tokio::test]
 async fn when_nobody_scores_the_refund_outcome_is_attested() {
     let test_app = app_with_weather().await;
     let (event, _) = event_with_entries(
@@ -284,8 +355,9 @@ async fn one_failing_event_does_not_block_the_others() {
     )
     .await;
     test_app.clock.set(event.signing_date);
-    let failures = test_app.oracle.etl_data(1).await.unwrap();
-    assert_eq!(failures, 1);
+    let summary = test_app.oracle.etl_data(1).await.unwrap();
+    assert_eq!(summary.failed, 1);
+    assert_eq!(summary.attested, 1);
     assert_attests(&test_app, &fetch(&test_app, event.id).await, &[0]);
 }
 

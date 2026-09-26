@@ -61,6 +61,9 @@ log = { workspace = true, features = ["serde"] }
 fern.workspace = true
 tracing-appender = "0.2"
 
+# Metrics (Prometheus text format only)
+prometheus = { version = "0.13", default-features = false }
+
 # Time
 time.workspace = true
 # Readers' local days: IANA time zones and their daylight-saving rules.

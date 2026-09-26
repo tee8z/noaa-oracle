@@ -11,6 +11,7 @@ use crate::{
     config::{Configuration, Storage},
     database::Database,
     file_access::{FileAccess, FileData, S3FileAccess},
+    metrics::{self, Metrics},
     oracle::{Oracle, system_clock},
     routes::{
         add_event_entries, create_event, daily_observations, dashboard_handler, download,
@@ -171,6 +172,7 @@ pub struct AppState {
     files_added: tokio::sync::Notify,
     /// How far the first preparation of forecast files got.
     preparation: watch::Sender<Preparation>,
+    metrics: Metrics,
 }
 
 /// The first pass that prepares recent forecast files for queries. Until
@@ -238,7 +240,14 @@ impl AppState {
             instance: format!("oracle-{}", uuid::Uuid::now_v7()),
             files_added: tokio::sync::Notify::new(),
             preparation: watch::Sender::new(Preparation::Running),
+            metrics: Metrics::new(),
         }
+    }
+
+    /// Counters and gauges for the metrics listener. Kept up to date whether
+    /// or not the listener runs.
+    pub fn metrics(&self) -> &Metrics {
+        &self.metrics
     }
 
     /// Whether a preparation pass has made copies and folds of every recent
@@ -367,12 +376,14 @@ impl AppState {
                 .take_lease(ETL_LEASE, &state.instance, ETL_LEASE_TTL)
                 .await
             {
-                Ok(true) => {}
+                Ok(true) => state.metrics.set_etl_lease_held(true),
                 Ok(false) => {
+                    state.metrics.set_etl_lease_held(false);
                     info!("another oracle process runs processing; skipped {etl_process_id}");
                     return;
                 }
                 Err(e) => {
+                    state.metrics.etl_failed();
                     warn!("cannot take the processing lease; skipped {etl_process_id}: {e}");
                     return;
                 }
@@ -387,8 +398,11 @@ impl AppState {
                         .take_lease(ETL_LEASE, &state.instance, ETL_LEASE_TTL)
                         .await
                     {
-                        Ok(true) => {}
-                        Ok(false) => warn!("another oracle process took the processing lease"),
+                        Ok(true) => state.metrics.set_etl_lease_held(true),
+                        Ok(false) => {
+                            state.metrics.set_etl_lease_held(false);
+                            warn!("another oracle process took the processing lease");
+                        }
                         Err(e) => warn!("cannot renew the processing lease: {e}"),
                     }
                 }
@@ -398,9 +412,25 @@ impl AppState {
                 () = renewal => unreachable!("lease renewal never ends"),
             };
             match result {
-                Ok(0) => info!("completed etl process: {etl_process_id}"),
-                Ok(failed) => warn!("etl process {etl_process_id}: {failed} events failed"),
-                Err(e) => error!("failed etl process: {etl_process_id} {e:#}"),
+                Ok(summary) => {
+                    state.metrics.etl_completed(
+                        summary.attested,
+                        summary.failed,
+                        time::OffsetDateTime::now_utc(),
+                    );
+                    if summary.failed == 0 {
+                        info!("completed etl process: {etl_process_id}");
+                    } else {
+                        warn!(
+                            "etl process {etl_process_id}: {} events failed",
+                            summary.failed
+                        );
+                    }
+                }
+                Err(e) => {
+                    state.metrics.etl_failed();
+                    error!("failed etl process: {etl_process_id} {e:#}");
+                }
             }
         });
         Ok(etl_process_id)
@@ -613,6 +643,9 @@ struct ApplicationRuntime {
     database_shutdown: CancellationToken,
     shutdown_timeout: Duration,
     http: Option<JoinHandle<Result<()>>>,
+    /// The metrics listener, when `metrics_bind` is set. Stops with HTTP.
+    metrics: Option<JoinHandle<Result<()>>>,
+    metrics_address: Option<SocketAddr>,
     writer: Option<JoinHandle<Result<()>>>,
 }
 
@@ -636,6 +669,8 @@ impl ApplicationRuntime {
             database_shutdown: database_shutdown.clone(),
             shutdown_timeout: configuration.shutdown_timeout,
             http: None,
+            metrics: None,
+            metrics_address: None,
             writer: Some(tokio::spawn(writer.run(database_shutdown))),
         };
         let background = runtime.background.clone();
@@ -655,7 +690,19 @@ impl ApplicationRuntime {
             let address = listener
                 .local_addr()
                 .context("read HTTP listener address")?;
-            Ok::<_, anyhow::Error>((state, listener, address))
+            let metrics_listener = match configuration.metrics_listen {
+                Some(metrics_listen) => {
+                    let listener = TcpListener::bind(metrics_listen)
+                        .await
+                        .with_context(|| format!("bind metrics listener {metrics_listen}"))?;
+                    let address = listener
+                        .local_addr()
+                        .context("read metrics listener address")?;
+                    Some((listener, address))
+                }
+                None => None,
+            };
+            Ok::<_, anyhow::Error>((state, listener, address, metrics_listener))
         };
         let prepared = tokio::select! {
             biased;
@@ -666,7 +713,7 @@ impl ApplicationRuntime {
             }
             result = prepare => result.map(Some),
         };
-        let (state, listener, address) = match prepared {
+        let (state, listener, address, metrics_listener) = match prepared {
             Ok(Some(prepared)) if !runtime.requested.is_cancelled() => prepared,
             result => {
                 // Startup failures and signals must still close SQLite cleanly.
@@ -678,6 +725,14 @@ impl ApplicationRuntime {
         spawn_cache_warmer(&state);
         spawn_etl_schedule(&state, configuration.etl_interval);
         spawn_lease_release(&state);
+        if let Some((listener, address)) = metrics_listener {
+            runtime.metrics = Some(spawn_http(
+                listener,
+                metrics::router(state.clone()),
+                runtime.http_shutdown.clone(),
+            ));
+            runtime.metrics_address = Some(address);
+        }
         runtime.http = Some(spawn_http(
             listener,
             app(state),
@@ -687,6 +742,9 @@ impl ApplicationRuntime {
         info!("  Docs:         http://{address}/docs");
         info!("  Weather data: {}", configuration.weather_dir.display());
         info!("  Event DB:     {}", configuration.event_dir.display());
+        if let Some(address) = runtime.metrics_address {
+            info!("  Metrics:      http://{address}/metrics");
+        }
         Ok(Some(runtime))
     }
 
@@ -699,6 +757,9 @@ impl ApplicationRuntime {
             }
             completion = wait_for_task(&mut self.http) => {
                 task_failure("HTTP", completion, true)
+            }
+            completion = wait_for_task(&mut self.metrics) => {
+                task_failure("metrics", completion, true)
             }
             completion = wait_for_task(&mut self.writer) => {
                 task_failure("database writer", completion, true)
@@ -719,6 +780,9 @@ impl ApplicationRuntime {
                 if self.http.is_some() {
                     let _ = wait_for_task(&mut self.http).await;
                 }
+                if self.metrics.is_some() {
+                    let _ = wait_for_task(&mut self.metrics).await;
+                }
                 if self.writer.is_some() {
                     let _ = wait_for_task(&mut self.writer).await;
                 }
@@ -736,6 +800,16 @@ impl ApplicationRuntime {
         } else {
             None
         };
+        let metrics_failure = if self.metrics.is_some() {
+            task_failure("metrics", wait_for_task(&mut self.metrics).await, false)
+        } else {
+            None
+        };
+        let http_failure = first_failure(
+            http_failure.map_or(Ok(()), Err),
+            metrics_failure.map_or(Ok(()), Err),
+        )
+        .err();
         // Handlers and background tasks may submit writes until they finish.
         // Only then stop the writer and wait for its connection to close.
         self.background.stop().await;
@@ -756,7 +830,10 @@ impl ApplicationRuntime {
     }
 
     fn abort_tasks(&self) {
-        for task in [&self.http, &self.writer].into_iter().flatten() {
+        for task in [&self.http, &self.metrics, &self.writer]
+            .into_iter()
+            .flatten()
+        {
             task.abort();
         }
     }
@@ -849,6 +926,7 @@ fn spawn_lease_release(state: &Arc<AppState>) {
         {
             warn!("cannot release the processing lease: {e}");
         }
+        state.metrics.set_etl_lease_held(false);
     });
 }
 

@@ -196,6 +196,25 @@ impl TestApp {
         self.state.start_etl().expect("etl starts");
         self.state.wait_for_etl().await;
     }
+
+    /// Current metrics in the Prometheus text format, reread now rather
+    /// than when the scrape cache expires.
+    pub async fn metrics(&self) -> String {
+        self.state.metrics().refresh(&self.state).await;
+        self.state.metrics().encode()
+    }
+}
+
+/// The value of one series, such as `oracle_events{state="live"}`, in
+/// Prometheus text; panics if it is missing.
+pub fn metric(text: &str, series: &str) -> i64 {
+    text.lines()
+        .filter(|line| !line.starts_with('#'))
+        .find_map(|line| {
+            let (name, value) = line.rsplit_once(' ')?;
+            (name == series).then(|| value.parse::<i64>().expect("integer value"))
+        })
+        .unwrap_or_else(|| panic!("{series} missing from:\n{text}"))
 }
 
 /// A request signed the way the coordinator's and daemon's clients sign.
