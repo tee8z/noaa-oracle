@@ -1,4 +1,3 @@
-use dlctix::secp::MaybeScalar;
 use maud::{Markup, html};
 use std::cmp::Reverse;
 use time::OffsetDateTime;
@@ -102,9 +101,16 @@ fn event_problem(heading: &str, message: Markup) -> Markup {
 
 /// The attestation, a scalar, as hex like the API sends it; "Pending"
 /// until the event is signed. A signed event whose value can't be written
-/// out still reads "Signed", never "Pending".
-fn attestation_value(attestation: Option<&MaybeScalar>) -> Markup {
-    let Some(attestation) = attestation else {
+/// out still reads "Signed", never "Pending". An event that reached its
+/// signing time without entries is never signed: it has no outcome.
+fn attestation_value(event: &Event, now: OffsetDateTime) -> Markup {
+    let Some(attestation) = event.attestation.as_ref() else {
+        if event.entries.is_empty() && now >= event.signing_date {
+            return html! {
+                span class="tag is-light" { "Not signed" }
+                span class="muted" { " · no entries, so there is no outcome to sign" }
+            };
+        }
         return html! { span class="tag is-warning is-light" { "Pending" } };
     };
     let hex = serde_json::to_value(attestation)
@@ -175,13 +181,13 @@ pub fn event_detail_content(event: &Event, now: OffsetDateTime) -> Markup {
                 }
             }
 
-            section class="box" {
+            section class="box attestation" {
                 h3 class="title is-6" { "Attestation" }
                 dl class="facts" {
                     dt { "Outcomes" } dd { (event.event_announcement.locking_points.len()) }
                     dt { "Nonce point" } dd { code class="key" { (event.nonce_point.to_string()) } }
                     dt { "Attestation" }
-                    dd { (attestation_value(event.attestation.as_ref())) }
+                    dd { (attestation_value(event, now)) }
                 }
             }
         }
@@ -189,7 +195,7 @@ pub fn event_detail_content(event: &Event, now: OffsetDateTime) -> Markup {
         @if !event.weather.is_empty() {
             section class="box" {
                 h3 class="title is-6" { "Weather" }
-                (weather_comparison_table(&event.weather, settled(event, now)))
+                (weather_comparison_table(&event.weather, provisional(event, now)))
             }
         }
 
@@ -219,18 +225,28 @@ fn duration(span: time::Duration) -> String {
     }
 }
 
-/// Differences stay provisional until the observation window closes: until
-/// then the observed high and low can still move.
-fn settled(event: &Event, now: OffsetDateTime) -> values::Settled {
+/// Why the differences stay grey, if they do. The forecasts are for whole
+/// days: until the window closes the observed high and low can still move,
+/// and a window shorter than a day holds only some of a day's reports.
+fn provisional(event: &Event, now: OffsetDateTime) -> Option<&'static str> {
     if now < event.end_observation_date {
-        values::Settled::SoFar
+        Some("The window is still open, so differences stay grey.")
+    } else if event.end_observation_date - event.start_observation_date < time::Duration::days(1) {
+        Some(
+            "The window is shorter than a day, so differences stay grey: its reports can't be judged against a whole day's forecast.",
+        )
     } else {
-        values::Settled::Final
+        None
     }
 }
 
 /// Forecast baseline against what was observed during the window.
-fn weather_comparison_table(weather: &[Weather], settled: values::Settled) -> Markup {
+fn weather_comparison_table(weather: &[Weather], provisional: Option<&str>) -> Markup {
+    let settled = if provisional.is_some() {
+        values::Settled::SoFar
+    } else {
+        values::Settled::Final
+    };
     html! {
         div class="table-container" {
             table class="table is-fullwidth is-narrow event-weather" {
@@ -257,8 +273,8 @@ fn weather_comparison_table(weather: &[Weather], settled: values::Settled) -> Ma
         }
         p class="is-size-7 muted" {
             "Each cell: observed and observed − forecast, then " span class="fcst" { "forecast" } ". — means no report in the window."
-            @if settled == values::Settled::SoFar {
-                " The window is still open, so differences stay grey."
+            @if let Some(reason) = provisional {
+                " " (reason)
             }
         }
     }
@@ -286,16 +302,21 @@ fn observed_and_forecast(
     }
 }
 
-/// Why every entry was refunded, when the event says so.
-fn refund_reason(nothing_observed: bool, window: time::Duration) -> String {
-    if nothing_observed {
+/// Why every entry won, when nobody scored. The oracle then signs the
+/// outcome in which every entry wins; the coordinator splits the pot among
+/// them, which is not a refund of each entry's own fee.
+fn shared_reason(nothing_observed: bool, window: time::Duration) -> String {
+    let why = if nothing_observed {
         format!(
-            "All entries refunded: no hourly station report fell inside the {} observation window, so there was nothing to score.",
+            "No hourly station report fell inside the {} observation window, so no entry scored.",
             duration(window)
         )
     } else {
-        "All entries refunded: no entry scored any points.".into()
-    }
+        "No entry scored any points.".into()
+    };
+    format!(
+        "{why} The oracle signed the outcome in which every entry wins, so the pot is split equally among all entries."
+    )
 }
 
 fn entries_table(event: &Event, num_winners: usize, signed: bool) -> Markup {
@@ -312,7 +333,7 @@ fn entries_table(event: &Event, num_winners: usize, signed: bool) -> Markup {
         &event.entries,
         num_winners,
         signed,
-        &refund_reason(nothing_observed, window),
+        &shared_reason(nothing_observed, window),
     )
 }
 
@@ -320,7 +341,7 @@ fn entries_list(
     entries: &[WeatherEntry],
     num_winners: usize,
     signed: bool,
-    refunded: &str,
+    shared: &str,
 ) -> Markup {
     // API entries stay in id order because outcome indices depend on it.
     // Sort references for display only. Stored scores also preserve the
@@ -335,7 +356,7 @@ fn entries_list(
             p class="entries-note" { "Scores pending." }
         } @else if no_points {
             p class="entries-note" {
-                @if signed { (refunded) } @else { "No entry has scored yet." }
+                @if signed { (shared) } @else { "No entry has scored yet." }
             }
         }
         div class="table-container" {
@@ -344,7 +365,7 @@ fn entries_list(
                     tr {
                         th { "Rank" }
                         th { "Entry ID" }
-                        th class="has-text-right" { "Score" }
+                        th class="has-text-right" { "Points" }
                     }
                 }
                 tbody {
@@ -352,7 +373,9 @@ fn entries_list(
                         @let paid = show_ranks && idx < num_winners;
                         tr class=[paid.then_some("is-paid")] {
                             td {
-                                @if !show_ranks {
+                                @if no_points && signed {
+                                    span class="tag is-light" title="The pot is split equally among all entries" { "Split" }
+                                } @else if !show_ranks {
                                     span class="muted" { "—" }
                                 } @else if paid {
                                     span class="tag is-success" title="Paid place" { (format!("#{}", idx + 1)) }
@@ -364,9 +387,9 @@ fn entries_list(
                                 code class="entry-id" { (entry.id.to_string()) }
                             }
                             td class="has-text-right" {
-                                @if let Some(score) = entry.score {
+                                @if let Some(points) = points(entry) {
                                     span class=(if paid { "entry-score paid" } else { "entry-score" }) {
-                                        (score)
+                                        (points)
                                     }
                                 } @else {
                                     span class="muted" { "—" }
@@ -377,6 +400,16 @@ fn entries_list(
                 }
             }
         }
+    }
+}
+
+/// An entry's points, as the coordinator shows them. Events scored before
+/// points were stored show the stored score.
+fn points(entry: &WeatherEntry) -> Option<String> {
+    match (entry.base_score, entry.score) {
+        (Some(points), _) => Some(format!("{points} pts")),
+        (None, Some(score)) => Some(score.to_string()),
+        (None, None) => None,
     }
 }
 
@@ -401,6 +434,7 @@ fn back_icon() -> Markup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dlctix::secp::MaybeScalar;
     use crate::events::{Forecasted, Observed};
     use uuid::Uuid;
 
@@ -430,7 +464,7 @@ mod tests {
             entry(2, Some(200_000), Some(20)),
         ];
         let original = entries.clone();
-        let html = entries_list(&entries, 1, true, "All entries refunded.").into_string();
+        let html = entries_list(&entries, 1, true, "The pot is split equally.").into_string();
         assert_eq!(
             displayed_ids(&html),
             vec![entries[2].id, entries[1].id, entries[0].id]
@@ -446,12 +480,12 @@ mod tests {
             entry(1, Some(190_001), Some(20)),
             entry(2, Some(200_000), Some(20)),
         ];
-        let html = entries_list(&entries, 1, true, "All entries refunded.").into_string();
+        let html = entries_list(&entries, 1, true, "The pot is split equally.").into_string();
         assert_eq!(displayed_ids(&html), vec![entries[1].id, entries[0].id]);
     }
 
     #[test]
-    fn unscored_and_refunded_entries_do_not_get_arbitrary_winner_badges() {
+    fn unscored_and_split_entries_do_not_get_arbitrary_winner_badges() {
         for (entries, signed, message) in [
             (
                 vec![entry(1, None, None), entry(2, None, None)],
@@ -472,10 +506,10 @@ mod tests {
                     entry(2, Some(10_000), Some(0)),
                 ],
                 true,
-                "All entries refunded.",
+                "The pot is split equally.",
             ),
         ] {
-            let html = entries_list(&entries, 1, signed, "All entries refunded.").into_string();
+            let html = entries_list(&entries, 1, signed, "The pot is split equally.").into_string();
             assert!(html.contains(message));
             assert!(!html.contains("entry-score paid"));
             assert!(!html.contains("is-paid"));
@@ -500,36 +534,108 @@ mod tests {
                 wind_speed: None,
             },
         }];
-        let running = weather_comparison_table(&weather, values::Settled::SoFar).into_string();
+        let running =
+            weather_comparison_table(&weather, Some("The window is still open.")).into_string();
         assert!(running.contains("is-provisional"), "{running}");
         assert!(!running.contains("is-far"), "{running}");
         assert!(running.contains("still open"));
-        let ended = weather_comparison_table(&weather, values::Settled::Final).into_string();
+        let ended = weather_comparison_table(&weather, None).into_string();
         assert!(ended.contains("is-far"), "{ended}");
         assert!(!ended.contains("is-provisional"));
     }
 
-    #[test]
-    fn a_signed_event_shows_its_attestation_as_hex() {
-        let attestation = MaybeScalar::from_slice(&[7; 32]).unwrap();
-        let html = attestation_value(Some(&attestation)).into_string();
-        assert!(html.contains(&"07".repeat(32)), "{html}");
-        assert!(!html.contains("Pending"), "{html}");
-        assert!(attestation_value(None).into_string().contains("Pending"));
+    fn rfc3339(time: OffsetDateTime) -> String {
+        time.format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    }
+
+    fn event(
+        window: time::Duration,
+        entries: Vec<WeatherEntry>,
+        attestation: Option<MaybeScalar>,
+    ) -> Event {
+        let start = time::macros::datetime!(2026-09-25 16:46:51 UTC);
+        let mut event: Event = serde_json::from_value(serde_json::json!({
+            "id": Uuid::now_v7(),
+            "signing_date": rfc3339(start + window + time::Duration::minutes(5)),
+            "start_observation_date": rfc3339(start),
+            "end_observation_date": rfc3339(start + window),
+            "locations": ["KDEN"],
+            "number_of_values_per_entry": 3,
+            "status": "Completed",
+            "total_allowed_entries": 3,
+            "entry_ids": [],
+            "number_of_places_win": 1,
+            "entries": [],
+            "source": "noaa_weather",
+            "readings": [],
+            "weather": [],
+            "nonce_point": "03d0d3a122dab2922858fd9e61c2745723fabcdbb397cc077edc51e0b11073163f",
+            "event_announcement": {"locking_points": [], "expiry": 1_790_442_111},
+            "attestation": null,
+            "coordinator_pubkey": "npub1test",
+            "scoring_fields": ["temp_high"],
+        }))
+        .unwrap_or_else(|error| panic!("test event: {error}"));
+        event.entries = entries;
+        event.attestation = attestation;
+        event
     }
 
     #[test]
-    fn refunds_say_why() {
+    fn the_attestation_is_hex_pending_or_not_signed_without_entries() {
+        let window = time::Duration::minutes(10);
+        let attestation = MaybeScalar::from_slice(&[7; 32]).unwrap();
+        let entries = vec![entry(1, None, None)];
+        let signed = event(window, entries.clone(), Some(attestation));
+        let later = signed.signing_date + time::Duration::hours(5);
+        let html = attestation_value(&signed, later).into_string();
+        assert!(html.contains(&"07".repeat(32)), "{html}");
+        assert!(!html.contains("Pending"), "{html}");
+
+        let waiting = event(window, entries, None);
+        assert!(attestation_value(&waiting, later).into_string().contains("Pending"));
+
+        let empty = event(window, vec![], None);
+        let before = empty.signing_date - time::Duration::minutes(1);
+        assert!(attestation_value(&empty, before).into_string().contains("Pending"));
+        let html = attestation_value(&empty, later).into_string();
+        assert!(html.contains("Not signed"), "{html}");
+        assert!(html.contains("no entries"), "{html}");
+        assert!(!html.contains("Pending"), "{html}");
+    }
+
+    #[test]
+    fn short_windows_never_settle_against_whole_day_forecasts() {
+        let short = event(time::Duration::minutes(10), vec![], None);
+        let later = short.signing_date + time::Duration::hours(5);
+        assert!(provisional(&short, later).unwrap().contains("shorter than a day"));
+        let day = event(time::Duration::days(1), vec![], None);
+        assert!(provisional(&day, day.start_observation_date).unwrap().contains("still open"));
+        assert_eq!(provisional(&day, day.end_observation_date), None);
+    }
+
+    #[test]
+    fn when_nobody_scores_every_entry_shares_the_pot() {
         let short = time::Duration::minutes(10);
-        let reason = refund_reason(true, short);
-        assert!(reason.starts_with("All entries refunded"));
+        let reason = shared_reason(true, short);
         assert!(
-            reason.contains("no hourly station report fell inside the 10 min observation window")
+            reason.starts_with("No hourly station report fell inside the 10 min observation window")
         );
-        assert_eq!(
-            refund_reason(false, time::Duration::hours(18)),
-            "All entries refunded: no entry scored any points."
+        assert!(reason.contains("split equally among all entries"), "{reason}");
+        assert!(!reason.contains("refund"), "{reason}");
+        assert!(
+            shared_reason(false, time::Duration::hours(18)).starts_with("No entry scored any points.")
         );
         assert_eq!(duration(time::Duration::minutes(90)), "1 h 30 min");
+
+        let entries = [
+            entry(1, Some(10_000), Some(0)),
+            entry(2, Some(10_000), Some(0)),
+        ];
+        let html = entries_list(&entries, 1, true, &shared_reason(true, short)).into_string();
+        assert_eq!(html.matches(">Split<").count(), 2, "{html}");
+        assert!(html.contains("0 pts"), "{html}");
+        assert!(!html.contains("10000"), "{html}");
     }
 }
