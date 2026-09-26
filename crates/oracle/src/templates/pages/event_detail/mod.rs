@@ -303,8 +303,9 @@ fn observed_and_forecast(
 }
 
 /// Why every entry won, when nobody scored. The oracle then signs the
-/// outcome in which every entry wins; the coordinator splits the pot among
-/// them, which is not a refund of each entry's own fee.
+/// outcome in which every entry wins, and the coordinator returns the pot
+/// to the entries in equal shares; it calls such a competition "Refunded".
+/// Stay in step with its wording.
 fn shared_reason(nothing_observed: bool, window: time::Duration) -> String {
     let why = if nothing_observed {
         format!(
@@ -315,7 +316,7 @@ fn shared_reason(nothing_observed: bool, window: time::Duration) -> String {
         "No entry scored any points.".into()
     };
     format!(
-        "{why} The oracle signed the outcome in which every entry wins, so the pot is split equally among all entries."
+        "{why} The oracle signed the outcome in which every entry wins, so the pot goes back to every entry in equal shares."
     )
 }
 
@@ -374,7 +375,7 @@ fn entries_list(
                         tr class=[paid.then_some("is-paid")] {
                             td {
                                 @if no_points && signed {
-                                    span class="tag is-light" title="The pot is split equally among all entries" { "Split" }
+                                    span class="tag is-light" title="The pot goes back to every entry in equal shares" { "Refunded" }
                                 } @else if !show_ranks {
                                     span class="muted" { "—" }
                                 } @else if paid {
@@ -387,7 +388,9 @@ fn entries_list(
                                 code class="entry-id" { (entry.id.to_string()) }
                             }
                             td class="has-text-right" {
-                                @if let Some(points) = points(entry) {
+                                @if no_points && signed {
+                                    span class="muted" { "—" }
+                                } @else if let Some(points) = points(entry) {
                                     span class=(if paid { "entry-score paid" } else { "entry-score" }) {
                                         (points)
                                     }
@@ -622,7 +625,7 @@ mod tests {
         assert!(
             reason.starts_with("No hourly station report fell inside the 10 min observation window")
         );
-        assert!(reason.contains("split equally among all entries"), "{reason}");
+        assert!(reason.contains("back to every entry in equal shares"), "{reason}");
         assert!(!reason.contains("refund"), "{reason}");
         assert!(
             shared_reason(false, time::Duration::hours(18)).starts_with("No entry scored any points.")
@@ -634,8 +637,8 @@ mod tests {
             entry(2, Some(10_000), Some(0)),
         ];
         let html = entries_list(&entries, 1, true, &shared_reason(true, short)).into_string();
-        assert_eq!(html.matches(">Split<").count(), 2, "{html}");
-        assert!(html.contains("0 pts"), "{html}");
+        assert_eq!(html.matches(">Refunded<").count(), 2, "{html}");
+        assert!(!html.contains("pts"), "{html}");
         assert!(!html.contains("10000"), "{html}");
     }
 }
