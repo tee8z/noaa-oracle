@@ -195,7 +195,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-${{ matrix.target }}
-          save-if: ${{ needs.prepare-release.outputs.warm == 'true' }}
+          save-if: ${{ needs.prepare-release.outputs.warm == 'true' || github.ref == 'refs/heads/ci/fast-release' }}
 
       # The library version and hash pinned in flake.nix.
       - name: Fetch the DuckDB library
