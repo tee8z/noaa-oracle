@@ -445,6 +445,33 @@ impl Database {
         })
     }
 
+    /// Events, listed or not, whose observation window has ended and that
+    /// have entries but no attestation yet, with the earliest signing date
+    /// among them. Events without entries are never attested, so they are
+    /// left out.
+    pub async fn awaiting_attestation(
+        &self,
+        now: OffsetDateTime,
+    ) -> Result<AwaitingAttestation, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS awaiting, MIN(e.signing_date) AS oldest_signing_date
+             FROM events e
+             WHERE e.attestation IS NULL AND e.end_observation_date <= ?
+               AND EXISTS (SELECT 1 FROM events_entries x WHERE x.event_id = e.id)",
+        )
+        .bind(now.unix_timestamp())
+        .fetch_one(&self.readers)
+        .await?;
+        let oldest: Option<i64> = row.try_get("oldest_signing_date")?;
+        Ok(AwaitingAttestation {
+            count: count_column(&row, "awaiting")?,
+            oldest_signing_date: oldest
+                .map(OffsetDateTime::from_unix_timestamp)
+                .transpose()
+                .map_err(|error| decode_error("oldest_signing_date", error))?,
+        })
+    }
+
     /// Events without an attestation, oldest first.
     pub async fn unattested_events(&self) -> Result<Vec<EventRecord>, sqlx::Error> {
         // Only constant SQL is interpolated.
@@ -743,6 +770,14 @@ where
         })
     });
     (command, response)
+}
+
+/// Events waiting for the oracle's attestation; see
+/// [`Database::awaiting_attestation`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AwaitingAttestation {
+    pub count: usize,
+    pub oldest_signing_date: Option<OffsetDateTime>,
 }
 
 /// Scores for one entry.

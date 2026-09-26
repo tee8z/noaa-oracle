@@ -13,6 +13,7 @@ pub mod config;
 pub mod database;
 pub mod events;
 pub mod file_access;
+pub mod metrics;
 pub mod oracle;
 pub mod routes;
 pub mod scoring;

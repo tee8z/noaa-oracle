@@ -34,6 +34,8 @@ async fn runtime(directory: &Path) -> (ApplicationRuntime, Database) {
         database_shutdown: database_shutdown.clone(),
         shutdown_timeout: Duration::from_secs(3),
         http: None,
+        metrics: None,
+        metrics_address: None,
         writer: Some(tokio::spawn(writer.run(database_shutdown))),
     };
     (runtime, database)

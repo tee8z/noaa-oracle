@@ -73,6 +73,7 @@ pub async fn upload(
         }
     }
     info!("stored {file} ({:.3} MiB)", body.len() as f64 / 1_048_576.0);
+    state.metrics().upload_accepted(file.kind);
     state.file_added();
     state.new_data();
     // New data may settle events; a pass already running will see it next time.
