@@ -87,7 +87,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // initialize() can process triggers or application requests can return.
     let mut htmx_script = fs::read(&htmx)?;
     htmx_script.extend_from_slice(b"\n;");
-    htmx_script.extend_from_slice(&minify_scripts(&[htmx_security.clone()])?);
+    htmx_script.extend_from_slice(&minify_scripts(std::slice::from_ref(&htmx_security))?);
 
     let assets = [
         Asset {
