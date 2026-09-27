@@ -131,7 +131,7 @@
         # Oracle server
         oracle = craneLib.buildPackage ({
           pname = "oracle";
-          version = "2.3.3";
+          version = "2.3.4";
           inherit src;
           cargoArtifacts = workspaceDeps;
           buildInputs = buildDeps ++ [ pkgs.stdenv.cc.cc.lib ];
@@ -157,7 +157,7 @@
         # Daemon
         daemon = craneLib.buildPackage ({
           pname = "daemon";
-          version = "2.3.3";
+          version = "2.3.4";
           inherit src;
           cargoArtifacts = workspaceDeps;
           buildInputs = commonDeps;
