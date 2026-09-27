@@ -75,7 +75,15 @@ impl Source for NoaaForecasts {
     }
 
     async fn collect(&self, run: &Run) -> anyhow::Result<Vec<Artifact>> {
-        let stations = get_coordinates(self.fetcher.clone()).await?;
+        let catalog = get_coordinates(self.fetcher.clone()).await?;
+        let listed = catalog.city_data.len();
+        let stations = catalog.metar_stations();
+        info!(
+            self.logger,
+            "noaa forecasts: {} of {} catalog stations report METARs",
+            stations.city_data.len(),
+            listed
+        );
         let forecasts = run.artifact("forecasts");
         let report = ForecastService::new(self.logger.clone(), self.fetcher.clone())
             .get_forecasts_to_file(&stations, &forecasts.path.to_string_lossy())

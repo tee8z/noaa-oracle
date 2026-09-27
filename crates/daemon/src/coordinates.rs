@@ -13,6 +13,10 @@ pub struct WeatherStation {
     pub elevation_m: Option<f64>,
     pub latitude: String,
     pub longitude: String,
+    /// The catalog lists the station as a METAR site. Only METAR sites
+    /// have observations, so only they need forecasts.
+    #[serde(default)]
+    pub reports_metar: bool,
 }
 impl fmt::Display for WeatherStation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -45,6 +49,10 @@ impl Station {
 
         // Parse elevation if available
         let elevation_m = self.elevation_m.and_then(|e| e.parse::<f64>().ok());
+        let reports_metar = self
+            .site_type
+            .as_ref()
+            .is_some_and(|site_type| site_type.metar.is_some());
 
         Some(WeatherStation {
             station_id: self.station_id,
@@ -54,6 +62,7 @@ impl Station {
             elevation_m,
             latitude,
             longitude,
+            reports_metar,
         })
     }
 }
@@ -94,6 +103,20 @@ impl fmt::Display for CityWeather {
     }
 }
 impl CityWeather {
+    /// Only the stations the catalog lists as METAR sites. Observations
+    /// come from METARs, so a forecast for any other station can never be
+    /// scored; about a quarter of the US catalog (buoys and other sites
+    /// without a site type) is left out.
+    pub fn metar_stations(self) -> CityWeather {
+        CityWeather {
+            city_data: self
+                .city_data
+                .into_iter()
+                .filter(|(_, station)| station.reports_metar)
+                .collect(),
+        }
+    }
+
     pub fn get_coordinates_url(&self) -> String {
         self.get_coordinates().join("%20")
     }
@@ -222,9 +245,33 @@ mod tests {
         let weather = us_stations(index);
         assert_eq!(weather.city_data.len(), 1);
         let station = weather.city_data.get("K00U").unwrap();
+        assert!(station.reports_metar);
         assert_eq!(station.state, "MT");
         assert_eq!(station.get_latitude().as_deref(), Some("45.75"));
         assert_eq!(station.elevation_m, Some(922.0));
+    }
+
+    #[test]
+    fn forecasts_are_only_for_metar_sites() {
+        let station = |id: &str, reports_metar| WeatherStation {
+            station_id: id.into(),
+            station_name: String::new(),
+            state: "MT".into(),
+            iata_id: String::new(),
+            elevation_m: None,
+            latitude: "45.7".into(),
+            longitude: "-107.6".into(),
+            reports_metar,
+        };
+        let weather = CityWeather {
+            city_data: [("K00U", true), ("BUOY1", false)]
+                .into_iter()
+                .map(|(id, metar)| (id.to_owned(), station(id, metar)))
+                .collect(),
+        };
+        let kept = weather.metar_stations();
+        assert_eq!(kept.city_data.len(), 1);
+        assert!(kept.city_data.contains_key("K00U"));
     }
 }
 

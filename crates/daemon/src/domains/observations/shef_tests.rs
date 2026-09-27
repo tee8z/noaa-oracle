@@ -34,6 +34,7 @@ fn stations() -> CityWeather {
                 elevation_m: None,
                 latitude: "40.78".into(),
                 longitude: "-73.97".into(),
+                reports_metar: true,
             },
         )]
         .into(),
