@@ -1,4 +1,5 @@
 use anyhow::{Error, anyhow};
+use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
 use parquet::record::RecordWriter;
@@ -7,15 +8,30 @@ use parquet::{
     schema::types::Type,
 };
 use parquet_derive::ParquetRecordWriter;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use slog::{Logger, info, warn};
 use std::fs::File;
+use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339, macros::format_description};
 
-use crate::{CityWeather, Metar, ObservationData, Units, XmlFetcher, parse_xml};
+use super::history::{
+    ArchivedResponse, HISTORY_SOURCE, HistoryCollection, HistoryConfig, ObservationCoverage,
+    collect_history,
+};
+use crate::{CityWeather, Metar, Units, XmlFetcher};
+#[cfg(test)]
+use crate::{ObservationData, parse_xml};
+use std::collections::BTreeMap;
 
 #[derive(Clone)]
 pub struct CurrentWeather {
+    pub raw_text: String,
+    pub metar_type: Option<String>,
+    pub quality_status: String,
+    pub quality_reason: Option<String>,
     pub station_id: String,
     pub latitude: f64,
     pub longitude: f64,
@@ -36,85 +52,448 @@ pub struct CurrentWeather {
 impl TryFrom<Metar> for CurrentWeather {
     type Error = anyhow::Error;
     fn try_from(val: Metar) -> Result<Self, Self::Error> {
-        Ok(CurrentWeather {
-            station_id: val.station_id.clone(),
-            latitude: val.latitude.unwrap_or(String::from("")).parse::<f64>()?,
-            longitude: val.longitude.unwrap_or(String::from("")).parse::<f64>()?,
-            generated_at: OffsetDateTime::parse(
-                val.observation_time
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("report has no observation_time"))?,
-                &Rfc3339,
+        // Preserve malformed optional fields as rejected evidence, never as valid nulls.
+        let mut problems = Vec::new();
+        let temperature_value = checked_number(val.temp_c.as_deref(), "temperature", &mut problems);
+        let dewpoint_value = checked_number(val.dewpoint_c.as_deref(), "dewpoint", &mut problems);
+        let wind_speed = checked_integer(val.wind_speed_kt.as_deref(), "wind_speed", &mut problems);
+        let wind_direction = if val.wind_dir_degrees.as_deref() == Some("VRB") {
+            None
+        } else {
+            checked_integer(
+                val.wind_dir_degrees.as_deref(),
+                "wind_direction",
+                &mut problems,
             )
-            .map_err(|e| {
-                anyhow!(
-                    "error parsing observation_time time: {} {:?}",
-                    e,
-                    val.observation_time
-                )
-            })?,
-            temperature_value: val
-                .temp_c
-                .unwrap_or(String::from(""))
-                .parse::<f64>()
-                .map(Some)
-                .unwrap_or(None),
+        };
+        if let Err(reason) =
+            super::wind_validation::validate_wind(&val.raw_text, wind_speed, wind_direction)
+        {
+            problems.push(reason);
+        }
+        let raw_type = val
+            .raw_text
+            .split_whitespace()
+            .next()
+            .filter(|value| matches!(*value, "METAR" | "SPECI"));
+        if val.metar_type.as_deref().is_some_and(|kind| {
+            !matches!(kind, "METAR" | "SPECI") || raw_type.is_some_and(|raw| raw != kind)
+        }) {
+            problems.push("decoded metar_type conflicts with raw report type".into());
+        }
+        let metar_type = val
+            .metar_type
+            .clone()
+            .or_else(|| raw_type.map(str::to_owned));
+        let decoded_precip = checked_number(val.precip_in.as_deref(), "precip_in", &mut problems);
+        // An hourly P group is not mandatory in SPECI. Its absence cannot
+        // establish zero accumulation, even when a decoder supplies zero.
+        let special_without_precip = metar_type.as_deref() == Some("SPECI")
+            && matches!(raw_precipitation(&val.raw_text), Ok(None));
+        if special_without_precip && decoded_precip.is_some_and(|value| value != 0.0) {
+            problems.push("decoded SPECI precipitation has no raw hourly P group".into());
+        }
+        if temperature_value.is_none() {
+            problems.push("missing usable decoded temperature".into());
+        }
+        if wind_speed.is_some_and(|v| v < 0) {
+            problems.push("negative wind speed".into());
+        }
+        if wind_direction.is_some_and(|v| !(0..=360).contains(&v)) {
+            problems.push("wind direction outside 0..360 degrees".into());
+        }
+        if decoded_precip.is_some_and(|v| v < 0.0) {
+            problems.push("negative precipitation".into());
+        }
+        if let Err(error) = validate_precipitation(&val.raw_text, decoded_precip) {
+            problems.push(error.to_string());
+        }
+        if has_remark(&val.raw_text, "PNO") {
+            problems.push("rain gauge outage (PNO); precipitation cannot be verified".into());
+        }
+        if has_remark(&val.raw_text, "PWINO") {
+            problems.push(
+                "present weather sensor outage (PWINO); weather classification cannot be verified"
+                    .into(),
+            );
+        }
+        if let Err(error) = validate_temperatures(&val.raw_text, temperature_value, dewpoint_value)
+        {
+            problems.push(error.to_string());
+        }
+        let latitude = required_coordinate(val.latitude.as_deref(), "latitude", -90.0, 90.0)?;
+        let longitude = required_coordinate(val.longitude.as_deref(), "longitude", -180.0, 180.0)?;
+        let generated_at = OffsetDateTime::parse(
+            val.observation_time
+                .as_deref()
+                .ok_or_else(|| anyhow!("report has no observation_time"))?,
+            &Rfc3339,
+        )
+        .map_err(|e| anyhow!("error parsing observation_time: {e}"))?
+        .to_offset(time::UtcOffset::UTC);
+        if let Err(error) = validate_report_identity(&val.raw_text, &val.station_id, generated_at) {
+            problems.push(error.to_string());
+        }
+        let quality_status = if !problems.is_empty() {
+            "rejected"
+        } else if raw_temperatures(&val.raw_text).is_some() {
+            "validated"
+        } else {
+            problems.push("no unambiguous raw METAR temperature evidence".into());
+            "unverified"
+        };
+        Ok(CurrentWeather {
+            raw_text: val.raw_text.clone(),
+            metar_type,
+            quality_status: quality_status.into(),
+            quality_reason: (!problems.is_empty()).then(|| problems.join("; ")),
+            station_id: val.station_id,
+            latitude,
+            longitude,
+            generated_at,
+            temperature_value,
             temperature_unit_code: Units::Celcius.to_string(),
-            wind_direction: val
-                .wind_dir_degrees
-                .unwrap_or(String::from(""))
-                .parse::<i64>()
-                .map(Some)
-                .unwrap_or(None),
+            wind_direction,
             wind_direction_unit_code: Units::DegreesTrue.to_string(),
-            wind_speed: val
-                .wind_speed_kt
-                .unwrap_or(String::from(""))
-                .parse::<i64>()
-                .map(Some)
-                .unwrap_or(None),
+            wind_speed,
             wind_speed_unit_code: Units::Knots.to_string(),
-            dewpoint_value: val
-                .dewpoint_c
-                .unwrap_or(String::from(""))
-                .parse::<f64>()
-                .map(Some)
-                .unwrap_or(None),
+            dewpoint_value,
             dewpoint_unit_code: Units::Celcius.to_string(),
-            precip_in: precipitation(val.precip_in.as_deref(), &val.raw_text),
+            precip_in: if special_without_precip && decoded_precip.is_none_or(|value| value == 0.0)
+            {
+                None
+            } else if val.precip_in.is_some() {
+                decoded_precip
+            } else {
+                precipitation(None, &val.raw_text)
+            },
             precip_unit_code: Units::Inches.to_string(),
             wx_string: val.wx_string.unwrap_or_default(),
         })
     }
 }
 
+const VALIDATION_VERSION: &str = "metar-consistency-v1";
+#[cfg(test)]
+const OBSERVATION_SOURCE: &str = "https://aviationweather.gov/data/cache/metars.cache.xml.gz";
+
+pub(super) fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn validate_report_identity(
+    raw: &str,
+    station_id: &str,
+    timestamp: OffsetDateTime,
+) -> Result<(), Error> {
+    if raw.trim().is_empty() {
+        return Ok(());
+    }
+    let mut tokens = raw.split_whitespace();
+    let first = tokens.next().unwrap_or_default();
+    let raw_station = if matches!(first, "METAR" | "SPECI") {
+        tokens.next().unwrap_or_default()
+    } else {
+        first
+    };
+    if raw_station != station_id {
+        return Err(anyhow!(
+            "raw METAR station {raw_station:?} differs from decoded station {station_id:?}"
+        ));
+    }
+    let raw_time = tokens.next().unwrap_or_default();
+    let expected = format!(
+        "{:02}{:02}{:02}Z",
+        timestamp.day(),
+        timestamp.hour(),
+        timestamp.minute()
+    );
+    if raw_time != expected {
+        return Err(anyhow!(
+            "raw METAR time {raw_time:?} differs from decoded day/time {expected}"
+        ));
+    }
+    Ok(())
+}
+
+fn checked_number(value: Option<&str>, field: &str, problems: &mut Vec<String>) -> Option<f64> {
+    let value = value?;
+    match value.trim().parse::<f64>() {
+        Ok(number) if number.is_finite() => Some(number),
+        _ => {
+            problems.push(format!("invalid {field}: {value:?}"));
+            None
+        }
+    }
+}
+
+fn checked_integer(value: Option<&str>, field: &str, problems: &mut Vec<String>) -> Option<i64> {
+    let value = value?;
+    match value.trim().parse::<i64>() {
+        Ok(number) => Some(number),
+        Err(_) => {
+            problems.push(format!("invalid {field}: {value:?}"));
+            None
+        }
+    }
+}
+
+fn required_coordinate(value: Option<&str>, field: &str, min: f64, max: f64) -> Result<f64, Error> {
+    let number = value
+        .ok_or_else(|| anyhow!("missing {field}"))?
+        .parse::<f64>()?;
+    if !number.is_finite() || !(min..=max).contains(&number) {
+        return Err(anyhow!("invalid {field}: {number}"));
+    }
+    Ok(number)
+}
+
+/// Reject a decoded value that contradicts an unambiguous group in the original report.
+/// Keep the upstream values unchanged when they agree; missing raw or decoded values do
+/// not supply replacement readings. The caller retains rejected reports with flags.
+fn validate_temperatures(
+    raw_text: &str,
+    temperature: Option<f64>,
+    dewpoint: Option<f64>,
+) -> Result<(), Error> {
+    let Some(raw) = raw_temperatures(raw_text) else {
+        return Ok(());
+    };
+    for (name, decoded, reported) in [
+        ("temperature", temperature, Some(raw.temperature)),
+        ("dewpoint", dewpoint, raw.dewpoint),
+    ] {
+        if let (Some(decoded), Some(reported)) = (decoded, reported) {
+            // The body rounds to whole Celsius degrees; T remarks give tenths. Allow
+            // whole-degree decoded values too, including half-degree negative ties.
+            let rounding_tolerance = if raw.token.starts_with('T') && decoded.fract() != 0.0 {
+                1e-6
+            } else {
+                0.5 + 1e-6
+            };
+            if !decoded.is_finite() || (decoded - reported).abs() > rounding_tolerance {
+                return Err(anyhow!(
+                    "decoded {name} {decoded} C conflicts with raw METAR group {} ({reported} C)",
+                    raw.token,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+struct RawTemperatures<'a> {
+    token: &'a str,
+    temperature: f64,
+    dewpoint: Option<f64>,
+}
+
+/// AWC describes the whole-degree body group and the signed tenths T remark at
+/// https://aviationweather.gov/help/data/ . Prefer a unique T remark. Duplicate
+/// groups are ambiguous, so they cannot produce validated readings.
+fn raw_temperatures(raw_text: &str) -> Option<RawTemperatures<'_>> {
+    let (mut body, mut precise) = (None, None);
+    let (mut body_count, mut precise_count) = (0, 0);
+    let mut remarks = false;
+    for token in raw_text.split_whitespace() {
+        let token = token.trim_end_matches('=');
+        if token == "RMK" {
+            remarks = true;
+            continue;
+        }
+        let values = if remarks {
+            let Some(digits) = token.strip_prefix('T') else {
+                continue;
+            };
+            if !matches!(digits.len(), 4 | 8) || !digits.is_ascii() {
+                continue;
+            }
+            precise_temperature(&digits[..4]).and_then(|temperature| {
+                let dewpoint = if digits.len() == 8 {
+                    Some(precise_temperature(&digits[4..])?)
+                } else {
+                    None
+                };
+                Some((temperature, dewpoint))
+            })
+        } else {
+            let Some((temperature, dewpoint)) = token.split_once('/') else {
+                continue;
+            };
+            body_temperature(temperature).and_then(|temperature| {
+                let dewpoint = if dewpoint.is_empty() {
+                    None
+                } else {
+                    Some(body_temperature(dewpoint)?)
+                };
+                Some((temperature, dewpoint))
+            })
+        };
+        if let Some((temperature, dewpoint)) = values {
+            let raw = RawTemperatures {
+                token,
+                temperature,
+                dewpoint,
+            };
+            if remarks {
+                precise = Some(raw);
+                precise_count += 1;
+            } else {
+                body = Some(raw);
+                body_count += 1;
+            }
+        }
+    }
+    if precise_count > 1 || body_count > 1 {
+        return None;
+    }
+    if let (Some(body), Some(precise)) = (&body, &precise)
+        && ((body.temperature - precise.temperature).abs() > 0.5 + 1e-6
+            || body
+                .dewpoint
+                .zip(precise.dewpoint)
+                .is_some_and(|(a, b)| (a - b).abs() > 0.5 + 1e-6))
+    {
+        return None;
+    }
+    match (precise_count, body_count) {
+        (1, _) => precise,
+        (0, 1) => body,
+        _ => None,
+    }
+}
+
+fn body_temperature(token: &str) -> Option<f64> {
+    let digits = token.strip_prefix('M').unwrap_or(token);
+    // Exact two-digit groups exclude malformed wind tokens such as 060/03.
+    if digits.len() != 2 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let value: f64 = digits.parse().ok()?;
+    Some(if token.starts_with('M') {
+        -value
+    } else {
+        value
+    })
+}
+
+fn precise_temperature(token: &str) -> Option<f64> {
+    if token.len() != 4 || !token.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let value = token[1..].parse::<f64>().ok()? / 10.0;
+    match token.as_bytes()[0] {
+        b'0' => Some(value),
+        b'1' => Some(-value),
+        _ => None,
+    }
+}
+
+/// Prrrr encodes the hourly amount in hundredths of an inch. P0000 is
+/// trace, so decoded 0.005 is a source trace convention, not an exact amount.
+fn raw_precipitation(raw_text: &str) -> Result<Option<Option<f64>>, Error> {
+    let mut found = None;
+    for token in raw_text
+        .split_whitespace()
+        .skip_while(|token| *token != "RMK")
+        .skip(1)
+    {
+        let token = token.trim_end_matches('=');
+        let Some(digits) = token.strip_prefix('P') else {
+            continue;
+        };
+        if digits.len() != 4
+            || !(digits == "////" || digits.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            continue;
+        }
+        if found.is_some() {
+            return Err(anyhow!("ambiguous duplicate hourly precipitation groups"));
+        }
+        found = Some(if digits == "////" {
+            None
+        } else {
+            Some(digits.parse::<f64>()? / 100.0)
+        });
+    }
+    Ok(found)
+}
+
+fn validate_precipitation(raw_text: &str, decoded: Option<f64>) -> Result<(), Error> {
+    match (raw_precipitation(raw_text)?, decoded) {
+        (Some(Some(reported)), Some(decoded)) => {
+            let matches = if reported == 0.0 {
+                (0.0..0.01).contains(&decoded)
+            } else {
+                (reported - decoded).abs() < 1e-6
+            };
+            if !matches {
+                return Err(anyhow!(
+                    "decoded precipitation {decoded} inches conflicts with raw hourly P group ({reported} inches; zero group means trace)"
+                ));
+            }
+        }
+        (Some(Some(_)), None) => {
+            return Err(anyhow!(
+                "raw hourly precipitation is present but decoded precip_in is missing"
+            ));
+        }
+        (Some(None), _) => return Err(anyhow!("raw hourly precipitation is unavailable (P////)")),
+        (None, _) => {}
+    }
+    Ok(())
+}
+
 /// Hourly precipitation in inches. At AO2 automated stations the METAR
-/// precipitation group is omitted when none fell, so absence means 0.
-/// Elsewhere (AO1 and manual stations have no precipitation sensor)
+/// precipitation group is omitted from routine METAR when none fell, so
+/// absence means 0. In SPECI, elsewhere, or with a PNO rain-gauge outage,
 /// absence means unknown. `VRB` and absent wind directions likewise stay
 /// null rather than becoming 0 (north).
 fn precipitation(precip_in: Option<&str>, raw_text: &str) -> Option<f64> {
     match precip_in.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(value) => value.parse::<f64>().ok(),
-        None => is_ao2(raw_text).then_some(0.0),
+        Some(value) => value.parse::<f64>().ok().filter(|value| {
+            !(*value == 0.0
+                && raw_text.split_whitespace().next() == Some("SPECI")
+                && matches!(raw_precipitation(raw_text), Ok(None)))
+        }),
+        None => (is_ao2(raw_text)
+            && raw_text.split_whitespace().next() != Some("SPECI")
+            && !has_remark(raw_text, "PNO")
+            && matches!(raw_precipitation(raw_text), Ok(None)))
+        .then_some(0.0),
     }
 }
 
 /// Whether the report's remarks declare an AO2 station (precipitation
 /// discriminator), e.g. `KORD 032151Z 23006KT ... RMK AO2 SLP162`.
 fn is_ao2(raw_text: &str) -> bool {
+    has_remark(raw_text, "AO2")
+}
+
+fn has_remark(raw_text: &str, expected: &str) -> bool {
     raw_text
-        .split_once(" RMK ")
-        .is_some_and(|(_, remarks)| remarks.split_whitespace().any(|token| token == "AO2"))
+        .split_whitespace()
+        .skip_while(|token| *token != "RMK")
+        .skip(1)
+        .any(|token| token.trim_end_matches('=') == expected)
 }
 
 /// What one observation run wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObservationReport {
     pub written: usize,
-    /// Reports dropped because a required field did not parse.
+    /// Reports that could not be represented; any such configured station fails the run.
     pub skipped: usize,
+    pub rejected: usize,
+    pub unverified: usize,
 }
+
+#[cfg(test)]
+#[path = "metar_temperature_tests.rs"]
+mod temperature_tests;
 
 #[derive(Debug, ParquetRecordWriter)]
 pub struct Observation {
@@ -138,6 +517,11 @@ pub struct Observation {
     pub precip_in: Option<f64>,
     pub precip_unit_code: String,
     pub wx_string: String,
+    pub raw_text: Option<String>,
+    pub quality_status: Option<String>,
+    pub quality_reason: Option<String>,
+    pub validation_version: Option<String>,
+    pub metar_type: Option<String>,
 }
 
 impl TryFrom<CurrentWeather> for Observation {
@@ -169,6 +553,11 @@ impl TryFrom<CurrentWeather> for Observation {
             precip_in: val.precip_in,
             precip_unit_code: val.precip_unit_code,
             wx_string: val.wx_string,
+            raw_text: Some(val.raw_text),
+            quality_status: Some(val.quality_status),
+            quality_reason: val.quality_reason,
+            validation_version: Some(VALIDATION_VERSION.into()),
+            metar_type: val.metar_type,
         };
         Ok(parquet)
     }
@@ -309,9 +698,67 @@ pub fn create_observation_schema() -> Type {
             Arc::new(precip_in),
             Arc::new(precip_unit_code),
             Arc::new(wx_string),
+            optional_text("raw_text"),
+            optional_text("quality_status"),
+            optional_text("quality_reason"),
+            optional_text("validation_version"),
+            optional_text("metar_type"),
         ])
         .build()
         .unwrap()
+}
+
+fn optional_text(name: &str) -> Arc<Type> {
+    Arc::new(
+        Type::primitive_type_builder(name, PhysicalType::BYTE_ARRAY)
+            .with_repetition(Repetition::OPTIONAL)
+            .with_logical_type(Some(LogicalType::String))
+            .build()
+            .expect("optional UTF8 schema"),
+    )
+}
+
+#[derive(Serialize)]
+struct RejectedReport<'a> {
+    reason: String,
+    report: &'a Metar,
+}
+
+#[derive(Serialize)]
+struct ObservationAudit<'a> {
+    validation_version: &'static str,
+    source_url: &'static str,
+    source_sha256: String,
+    source_hash_kind: &'static str,
+    source_documents: Option<&'a BTreeMap<String, ArchivedResponse>>,
+    coverage: Option<&'a ObservationCoverage>,
+    precipitation: Option<&'a super::shef::ShefCollection>,
+    fetched_at: String,
+    received: usize,
+    out_of_scope: usize,
+    written: usize,
+    rejected: usize,
+    unverified: usize,
+    unrepresentable: usize,
+    issues: Vec<RejectedReport<'a>>,
+}
+
+/// Write and sync evidence before creating publishable data. Sidecars never pass
+/// Artifact::from_path; failed runs retain evidence instead of publishing partial rows.
+fn persist_audit(path: &Path, audit: &ObservationAudit<'_>) -> Result<String, Error> {
+    let json = serde_json::to_string(audit)?;
+    let mut file = File::create(path)?;
+    file.write_all(json.as_bytes())?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(json)
 }
 
 pub struct ObservationService {
@@ -323,59 +770,224 @@ impl ObservationService {
         ObservationService { logger, fetcher }
     }
 
-    /// Fetches observations and writes them directly to a parquet file.
-    /// Returns the path to the written parquet file.
+    /// Collect all reports in a bounded history window, preserving successful,
+    /// empty and failed query receipts in the same published artifact.
     pub async fn get_observations_to_file(
         &self,
         city_weather: &CityWeather,
         output_path: &str,
+        started_at: OffsetDateTime,
+        config: &HistoryConfig,
+        catalog: &crate::coordinates::StationCatalogEvidence,
     ) -> Result<ObservationReport, Error> {
-        let url = "https://aviationweather.gov/data/cache/metars.cache.xml.gz";
-        info!(self.logger, "fetching observations from {}", url);
-        let raw_observation = self.fetcher.fetch_xml_gzip(url).await?;
-        let converted_xml: ObservationData = parse_xml(&raw_observation)?;
+        info!(
+            self.logger,
+            "fetching {} hours of observation history", config.hours
+        );
+        let mut history = match collect_history(
+            self.fetcher.clone(),
+            city_weather.city_data.keys().cloned().collect(),
+            started_at,
+            config,
+        )
+        .await
+        {
+            Ok(history) => history,
+            Err(error) => HistoryCollection::unavailable(
+                started_at,
+                config,
+                format!("history collection failed: {error:#}"),
+            )?,
+        };
+        let complete = history
+            .coverage
+            .batches
+            .iter()
+            .filter(|batch| batch.status == "complete")
+            .count();
+        let empty = history
+            .coverage
+            .batches
+            .iter()
+            .filter(|batch| batch.status == "empty")
+            .count();
+        let failed = history.coverage.batches.len() - complete - empty;
+        info!(
+            self.logger,
+            "observation query receipts: {} complete, {} empty, {} failed", complete, empty, failed
+        );
+        history.precipitation = Some(
+            super::shef::collect(
+                self.fetcher.clone(),
+                city_weather,
+                catalog,
+                started_at,
+                config.hours,
+            )
+            .await,
+        );
+        self.write_history(city_weather, output_path, &history)
+    }
 
-        // Create parquet writer
-        let file = File::create(output_path)
-            .map_err(|e| anyhow!("failed to create parquet file: {}", e))?;
-        let props = WriterProperties::builder().build();
-        let mut writer =
-            SerializedFileWriter::new(file, Arc::new(create_observation_schema()), Arc::new(props))
-                .map_err(|e| anyhow!("failed to create parquet writer: {}", e))?;
+    pub fn write_unavailable_history(
+        &self,
+        output_path: &str,
+        started_at: OffsetDateTime,
+        config: &HistoryConfig,
+        error: String,
+    ) -> Result<ObservationReport, Error> {
+        let history = HistoryCollection::unavailable(started_at, config, error)?;
+        self.write_history(
+            &CityWeather {
+                city_data: Default::default(),
+            },
+            output_path,
+            &history,
+        )
+    }
 
+    pub(super) fn write_history(
+        &self,
+        city_weather: &CityWeather,
+        output_path: &str,
+        history: &HistoryCollection,
+    ) -> Result<ObservationReport, Error> {
+        let source_manifest = serde_json::to_vec(&history.sources)?;
+        let audit = ObservationAudit {
+            validation_version: VALIDATION_VERSION,
+            source_url: HISTORY_SOURCE,
+            source_sha256: sha256_hex(&source_manifest),
+            source_hash_kind: "source_documents-json-sha256",
+            source_documents: Some(&history.sources),
+            coverage: Some(&history.coverage),
+            precipitation: history.precipitation.as_ref(),
+            fetched_at: history.coverage.completed_at.clone(),
+            received: history.reports.len(),
+            out_of_scope: 0,
+            written: 0,
+            rejected: 0,
+            unverified: 0,
+            unrepresentable: 0,
+            issues: Vec::new(),
+        };
+        self.write_reports(city_weather, output_path, &history.reports, audit)
+    }
+
+    #[cfg(test)]
+    fn write_observations(
+        &self,
+        city_weather: &CityWeather,
+        output_path: &str,
+        raw_observation: &str,
+        converted_xml: &ObservationData,
+    ) -> Result<ObservationReport, Error> {
+        let audit = ObservationAudit {
+            validation_version: VALIDATION_VERSION,
+            source_url: OBSERVATION_SOURCE,
+            source_sha256: sha256_hex(raw_observation.as_bytes()),
+            source_hash_kind: "response-body-sha256",
+            source_documents: None,
+            coverage: None,
+            precipitation: None,
+            fetched_at: OffsetDateTime::now_utc().format(&Rfc3339)?,
+            received: converted_xml.data.metar.len(),
+            out_of_scope: 0,
+            written: 0,
+            rejected: 0,
+            unverified: 0,
+            unrepresentable: 0,
+            issues: Vec::new(),
+        };
+        self.write_reports(city_weather, output_path, &converted_xml.data.metar, audit)
+    }
+
+    fn write_reports<'a>(
+        &self,
+        city_weather: &CityWeather,
+        output_path: &str,
+        reports: &'a [Metar],
+        mut audit: ObservationAudit<'a>,
+    ) -> Result<ObservationReport, Error> {
         let mut observations = vec![];
-        let mut skipped = 0;
-        for value in converted_xml.data.metar.iter() {
-            if value.temp_c.is_none()
-                || value.longitude.is_none()
-                || value.latitude.is_none()
-                || value.observation_time.is_none()
-            {
-                // skip reading if missing key values
+        for value in reports {
+            let Some(city) = city_weather.city_data.get(&value.station_id) else {
+                audit.out_of_scope += 1;
                 continue;
-            }
-            // One malformed report must not lose every station's hour.
+            };
             let converted = CurrentWeather::try_from(value.clone()).and_then(Observation::try_from);
             let mut observation = match converted {
                 Ok(observation) => observation,
                 Err(error) => {
-                    skipped += 1;
-                    warn!(
-                        self.logger,
-                        "skipping METAR for {}: {}", value.station_id, error
-                    );
+                    audit.unrepresentable += 1;
+                    audit.issues.push(RejectedReport {
+                        reason: error.to_string(),
+                        report: value,
+                    });
                     continue;
                 }
             };
-            if let Some(city) = city_weather.city_data.get(&observation.station_id) {
-                // only add observation if we have a station_name with it
-                observation.station_name = city.station_name.clone();
-                observation.state = city.state.clone();
-                observation.iata_id = city.iata_id.clone();
-                observation.elevation_m = city.elevation_m;
-                observations.push(observation)
+            match observation.quality_status.as_deref() {
+                Some("rejected") => audit.rejected += 1,
+                Some("unverified") => audit.unverified += 1,
+                _ => {}
             }
+            if let Some(reason) = observation.quality_reason.as_ref() {
+                audit.issues.push(RejectedReport {
+                    reason: reason.clone(),
+                    report: value,
+                });
+            }
+            observation.station_name = city.station_name.clone();
+            observation.state = city.state.clone();
+            observation.iata_id = city.iata_id.clone();
+            observation.elevation_m = city.elevation_m;
+            observations.push(observation);
         }
+        audit.written = observations.len();
+        let sidecar = format!("{output_path}.quality.json");
+        let audit_json = persist_audit(Path::new(&sidecar), &audit)?;
+        if audit.unrepresentable > 0 && audit.coverage.is_none() {
+            return Err(anyhow!(
+                "{} configured METAR reports cannot be represented; publication refused; evidence: {}",
+                audit.unrepresentable,
+                sidecar
+            ));
+        }
+        if audit.rejected + audit.unverified > 0 {
+            warn!(
+                self.logger,
+                "observation data quality: {} rejected, {} unverified; evidence: {}",
+                audit.rejected,
+                audit.unverified,
+                sidecar
+            );
+        }
+        let file = File::create(output_path)
+            .map_err(|e| anyhow!("failed to create parquet file: {}", e))?;
+        let mut metadata = vec![
+            KeyValue::new("source_url".into(), Some(audit.source_url.into())),
+            KeyValue::new("source_sha256".into(), Some(audit.source_sha256.clone())),
+            KeyValue::new("validation_version".into(), Some(VALIDATION_VERSION.into())),
+            KeyValue::new("observation_audit".into(), Some(audit_json)),
+        ];
+        if let Some(coverage) = audit.coverage {
+            metadata.push(KeyValue::new(
+                "observation_coverage".into(),
+                Some(serde_json::to_string(coverage)?),
+            ));
+        }
+        if let Some(precipitation) = audit.precipitation {
+            metadata.push(KeyValue::new(
+                "precipitation_observations".into(),
+                Some(serde_json::to_string(precipitation)?),
+            ));
+        }
+        let props = WriterProperties::builder()
+            .set_key_value_metadata(Some(metadata))
+            .build();
+        let mut writer =
+            SerializedFileWriter::new(file, Arc::new(create_observation_schema()), Arc::new(props))
+                .map_err(|e| anyhow!("failed to create parquet writer: {}", e))?;
 
         // Write all observations as a single row group
         info!(
@@ -401,7 +1013,9 @@ impl ObservationService {
         info!(self.logger, "done writing observations to {}", output_path);
         Ok(ObservationReport {
             written: observations.len(),
-            skipped,
+            skipped: audit.unrepresentable,
+            rejected: audit.rejected,
+            unverified: audit.unverified,
         })
     }
 }

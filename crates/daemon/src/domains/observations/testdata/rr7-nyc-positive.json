@@ -1,0 +1,14 @@
+{
+    "@context": {
+        "@version": "1.1",
+        "@vocab": "https://api.weather.gov/ontology#"
+    },
+    "@id": "https://api.weather.gov/products/458b17e0-d6d0-401a-9ddd-436d4fb0b137",
+    "id": "458b17e0-d6d0-401a-9ddd-436d4fb0b137",
+    "wmoCollectiveId": "SRUS71",
+    "issuingOffice": "KOKX",
+    "issuanceTime": "2026-09-27T06:00:00+00:00",
+    "productCode": "RR7",
+    "productName": "Hydro-Met Data Report Part 7",
+    "productText": "\n000\nSRUS71 KOKX 270600\nRR7NYC\n.A NYC 0927 DH0600/PPH 0.14\n\n"
+}

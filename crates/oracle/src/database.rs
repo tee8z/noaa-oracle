@@ -41,7 +41,8 @@ use uuid::Uuid;
 
 use crate::{
     events::{
-        Entry, EventCounts, EventListQuery, EventRecord, EventStatus, NewEvent, ValueOptions,
+        Entry, EventCounts, EventListQuery, EventRecord, EventStatus, NewEvent, SettlementBlock,
+        ValueOptions,
     },
     scoring::Pick,
     signing::EventNonce,
@@ -564,6 +565,82 @@ impl Database {
             .collect()
     }
 
+    /// Latest failed checks for unsigned events. Signed history has no mutable
+    /// settlement state, even if a pre-signing failure was recorded earlier.
+    pub async fn settlement_blocks(
+        &self,
+        event_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, SettlementBlock>, sqlx::Error> {
+        if event_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ids = serde_json::to_string(&event_ids.iter().map(Uuid::to_string).collect::<Vec<_>>())
+            .expect("UUIDs serialize");
+        let rows = sqlx::query(
+            "SELECT b.event_id, b.code, b.message, b.checked_at
+             FROM event_settlement_blocks b JOIN events e ON e.id = b.event_id
+             WHERE e.attestation IS NULL AND b.event_id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(ids)
+        .fetch_all(&self.readers)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let timestamp: i64 = row.try_get("checked_at")?;
+                let checked_at = OffsetDateTime::from_unix_timestamp(timestamp)
+                    .map_err(|error| decode_error("checked_at", error.to_string()))?;
+                Ok((
+                    uuid_column(row, "event_id")?,
+                    SettlementBlock {
+                        code: row.try_get("code")?,
+                        message: row.try_get("message")?,
+                        checked_at,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Records a failure through the same single writer as event processing.
+    /// A signed event cannot acquire or overwrite a blocked reason.
+    pub async fn set_settlement_block(
+        &self,
+        event_id: Uuid,
+        block: SettlementBlock,
+    ) -> Result<(), WriteError> {
+        self.write_waiting(move |connection| {
+            Box::pin(async move {
+                sqlx::query(
+                    "INSERT INTO event_settlement_blocks (event_id, code, message, checked_at)
+                 SELECT id, ?, ?, ? FROM events WHERE id = ? AND attestation IS NULL
+                 ON CONFLICT(event_id) DO UPDATE SET code = excluded.code,
+                    message = excluded.message, checked_at = excluded.checked_at",
+                )
+                .bind(block.code)
+                .bind(block.message)
+                .bind(block.checked_at.unix_timestamp())
+                .bind(event_id.to_string())
+                .execute(connection)
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    pub async fn clear_settlement_block(&self, event_id: Uuid) -> Result<(), WriteError> {
+        self.write_waiting(move |connection| {
+            Box::pin(async move {
+                sqlx::query("DELETE FROM event_settlement_blocks WHERE event_id = ?")
+                    .bind(event_id.to_string())
+                    .execute(connection)
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
     /// Takes or renews the lease on `name` for `ttl`. False while another
     /// process holds it; an expired or released lease passes to `holder`.
     pub async fn take_lease(
@@ -610,10 +687,10 @@ impl Database {
         .await
     }
 
-    /// Stores the attestation unless the event already has one. Returns
-    /// whether it was stored. Never overwriting is what guarantees one
-    /// signature per nonce.
-    pub async fn record_attestation(
+    /// Creates signed fixtures for database tests. Production finalization
+    /// must use `settle_event` so evidence and signature cannot diverge.
+    #[cfg(test)]
+    async fn record_attestation(
         &self,
         event_id: Uuid,
         attestation: MaybeScalar,
@@ -635,7 +712,94 @@ impl Database {
         .await
     }
 
-    /// Stores scores in one transaction.
+    /// Finalizes the readings, all entry scores, and attestation together.
+    /// Competing or delayed workers cannot change an already signed event.
+    pub async fn settle_event(
+        &self,
+        event_id: Uuid,
+        readings: Vec<Reading>,
+        scores: Vec<EntryScore>,
+        attestation: MaybeScalar,
+    ) -> Result<bool, WriteError> {
+        let attestation = attestation.serialize().to_vec();
+        self.write_waiting(move |connection| {
+            Box::pin(async move {
+                let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
+                let event_id = event_id.to_string();
+                let result = sqlx::query(
+                    "UPDATE events SET attestation = ?, updated_at = unixepoch()
+                     WHERE id = ? AND attestation IS NULL",
+                )
+                .bind(attestation)
+                .bind(&event_id)
+                .execute(&mut *transaction)
+                .await?;
+                if result.rows_affected() == 0 {
+                    transaction.rollback().await?;
+                    return Ok(false);
+                }
+                let entry_count: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM events_entries WHERE event_id = ?")
+                        .bind(&event_id)
+                        .fetch_one(&mut *transaction)
+                        .await?;
+                let distinct_ids: std::collections::HashSet<_> =
+                    scores.iter().map(|score| score.id).collect();
+                if scores.is_empty()
+                    || entry_count != scores.len() as i64
+                    || distinct_ids.len() != scores.len()
+                {
+                    return Err(sqlx::Error::Protocol(
+                        "settlement scores must cover every event entry exactly once".into(),
+                    ));
+                }
+                for score in scores {
+                    let result = sqlx::query(
+                        "UPDATE events_entries
+                         SET score = ?, base_score = ?, updated_at = unixepoch()
+                         WHERE event_id = ? AND id = ?",
+                    )
+                    .bind(score.total_score)
+                    .bind(score.base_score)
+                    .bind(&event_id)
+                    .bind(score.id.to_string())
+                    .execute(&mut *transaction)
+                    .await?;
+                    if result.rows_affected() != 1 {
+                        return Err(sqlx::Error::Protocol(
+                            "settlement score does not belong to this event".into(),
+                        ));
+                    }
+                }
+                sqlx::query("DELETE FROM event_readings WHERE event_id = ?")
+                    .bind(&event_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                for reading in readings {
+                    sqlx::query(
+                        "INSERT INTO event_readings (event_id, target, metric, baseline, observed)
+                         VALUES (?, ?, ?, ?, ?)",
+                    )
+                    .bind(&event_id)
+                    .bind(reading.target)
+                    .bind(reading.metric)
+                    .bind(reading.baseline)
+                    .bind(reading.observed)
+                    .execute(&mut *transaction)
+                    .await?;
+                }
+                sqlx::query("DELETE FROM event_settlement_blocks WHERE event_id = ?")
+                    .bind(&event_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+                Ok(true)
+            })
+        })
+        .await
+    }
+
+    /// Stores provisional scores, without changing signed events.
     pub async fn update_entry_scores(&self, scores: Vec<EntryScore>) -> Result<(), WriteError> {
         if scores.is_empty() {
             return Ok(());
@@ -647,7 +811,11 @@ impl Database {
                     sqlx::query(
                         "UPDATE events_entries
                          SET score = ?, base_score = ?, updated_at = unixepoch()
-                         WHERE id = ?",
+                         WHERE id = ? AND EXISTS (
+                             SELECT 1 FROM events
+                             WHERE events.id = events_entries.event_id
+                               AND events.attestation IS NULL
+                         )",
                     )
                     .bind(score.total_score)
                     .bind(score.base_score)
@@ -662,7 +830,7 @@ impl Database {
     }
 
     /// Replaces an event's readings with the latest values, one row per
-    /// `(target, metric)`.
+    /// `(target, metric)`, without changing signed events.
     pub async fn replace_readings(
         &self,
         event_id: Uuid,
@@ -670,7 +838,16 @@ impl Database {
     ) -> Result<(), WriteError> {
         self.write_waiting(move |connection| {
             Box::pin(async move {
-                let mut transaction = connection.begin().await?;
+                let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
+                let unsigned: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM events WHERE id = ? AND attestation IS NULL)",
+                )
+                .bind(event_id.to_string())
+                .fetch_one(&mut *transaction)
+                .await?;
+                if !unsigned {
+                    return transaction.rollback().await;
+                }
                 sqlx::query("DELETE FROM event_readings WHERE event_id = ?")
                     .bind(event_id.to_string())
                     .execute(&mut *transaction)

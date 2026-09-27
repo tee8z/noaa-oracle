@@ -16,11 +16,11 @@ use crate::{
     events::{
         AddEventEntry, CreateEvent, EntryRejection, Event, EventCounts, EventFilter,
         EventListQuery, EventRecord, EventRejection, EventStatus, EventSummary, NewEvent,
-        WeatherEntry, validate_entries,
+        SettlementBlock, WeatherEntry, validate_entries,
     },
     scoring::{self, NotUuidV7, Scored},
     signing::{AttestError, KeyError, SigningKey},
-    sources::{ObservationWindow, OutcomeSource, SourceError, Sources},
+    sources::{ObservationWindow, OutcomeSource, Reading, SourceError, Sources},
 };
 
 /// The current time. Injected so tests can move through an event's
@@ -55,7 +55,7 @@ pub enum Error {
     Read(#[source] Box<sqlx::Error>),
     #[error(transparent)]
     Write(#[from] WriteError),
-    #[error("failed to read source data")]
+    #[error("failed to read source data: {0}")]
     Source(#[from] SourceError),
     #[error("refused to attest event {event}")]
     Attest { event: Uuid, source: AttestError },
@@ -158,12 +158,16 @@ impl Oracle {
             .await?;
         let ids: Vec<Uuid> = records.iter().map(|record| record.id).collect();
         let mut readings = self.db.readings(&ids).await?;
+        let mut blocks = self.db.settlement_blocks(&ids).await?;
         let now = self.now();
         Ok(records
             .into_iter()
             .map(|record| {
                 let readings = readings.remove(&record.id).unwrap_or_default();
-                record.into_summary(now, &readings)
+                let block = blocks.remove(&record.id);
+                let mut summary = record.into_summary(now, &readings);
+                summary.settlement_block = block;
+                summary
             })
             .collect())
     }
@@ -172,12 +176,17 @@ impl Oracle {
     /// the list does not show them.
     pub async fn event_page(&self, query: &EventListQuery) -> Result<Vec<EventSummary>, Error> {
         let now = self.now();
-        Ok(self
-            .db
-            .event_page(query, now)
-            .await?
+        let records = self.db.event_page(query, now).await?;
+        let ids = records.iter().map(|record| record.id).collect::<Vec<_>>();
+        let mut blocks = self.db.settlement_blocks(&ids).await?;
+        Ok(records
             .into_iter()
-            .map(|record| record.into_summary(now, &[]))
+            .map(|record| {
+                let block = blocks.remove(&record.id);
+                let mut summary = record.into_summary(now, &[]);
+                summary.settlement_block = block;
+                summary
+            })
             .collect())
     }
 
@@ -210,7 +219,10 @@ impl Oracle {
             .await?
             .remove(&id)
             .unwrap_or_default();
-        Ok(record.into_event(self.now(), announcement, entries, &readings))
+        let block = self.db.settlement_blocks(&[id]).await?.remove(&id);
+        let mut event = record.into_event(self.now(), announcement, entries, &readings);
+        event.settlement_block = block;
+        Ok(event)
     }
 
     pub async fn create_event(
@@ -299,16 +311,49 @@ impl Oracle {
 
     /// Returns whether the event was attested.
     async fn process_event(&self, event: EventRecord) -> Result<bool, Error> {
-        let source = self.source_for(&event)?;
+        let result = self.refresh_event(&event).await;
+        if let Err(error) = &result {
+            let code = match error {
+                Error::Source(SourceError::DataQuality { .. }) => "data_quality",
+                Error::Source(SourceError::SettlementBlocked(_)) => "incomplete_readings",
+                Error::Source(_) => "source_unavailable",
+                _ => "processing_failed",
+            };
+            self.db
+                .set_settlement_block(
+                    event.id,
+                    SettlementBlock {
+                        code: code.into(),
+                        message: error.to_string(),
+                        checked_at: self.now(),
+                    },
+                )
+                .await?;
+        }
+        result
+    }
+
+    async fn refresh_event(&self, event: &EventRecord) -> Result<bool, Error> {
+        let source = self.source_for(event)?;
         let window = ObservationWindow {
             start: event.start_observation_date,
             end: event.end_observation_date,
         };
-        let readings = source.readings(window, &event.locations).await?;
-        self.db.replace_readings(event.id, readings.clone()).await?;
-
         let now = self.now();
+        let signing_due = event.status(now) == EventStatus::Completed && now >= event.signing_date;
+        let readings = if signing_due {
+            let readings = source
+                .settlement_readings(window, &event.locations, event.signing_date)
+                .await?;
+            validate_settlement_readings(event, &readings)?;
+            readings
+        } else {
+            source.readings(window, &event.locations).await?
+        };
+        // Neither stale saved readings nor progress scores can pass the strict
+        // gate. Validation finishes before replacing either stored value.
         if event.status(now) == EventStatus::Live {
+            self.db.replace_readings(event.id, readings).await?;
             return Ok(false);
         }
         let entries = self.db.event_entries(event.id).await?;
@@ -326,36 +371,32 @@ impl Oracle {
                 })
             })
             .collect::<Result<Vec<Scored>, NotUuidV7>>()?;
-        self.db
-            .update_entry_scores(
-                scored
-                    .iter()
-                    .map(|scored| EntryScore {
-                        id: scored.id,
-                        total_score: scored.total_score,
-                        base_score: i64::try_from(scored.base_score).unwrap_or(i64::MAX),
-                    })
-                    .collect(),
-            )
-            .await?;
-
-        if event.status(now) == EventStatus::Completed && now >= event.signing_date {
-            return self.attest(&event, &scored).await;
+        if signing_due && !scored.is_empty() {
+            return self.attest(event, &scored, readings).await;
+        }
+        self.db.replace_readings(event.id, readings).await?;
+        self.db.update_entry_scores(entry_scores(&scored)).await?;
+        // No-entry events have no outcome to sign. A successful strict
+        // refresh can still clear their block; provisional refreshes cannot.
+        if signing_due {
+            self.db.clear_settlement_block(event.id).await?;
+            warn!(
+                "event {} reached its signing date without entries",
+                event.id
+            );
         }
         Ok(false)
     }
 
     /// Signs the outcome for `scored`. The attestation is computed from the
-    /// same scores that were just stored, and only for an announced outcome.
+    /// same readings and scores committed with it, and only for an announced outcome.
     /// Returns whether this call stored the attestation.
-    async fn attest(&self, event: &EventRecord, scored: &[Scored]) -> Result<bool, Error> {
-        if scored.is_empty() {
-            warn!(
-                "event {} reached its signing date without entries",
-                event.id
-            );
-            return Ok(false);
-        }
+    async fn attest(
+        &self,
+        event: &EventRecord,
+        scored: &[Scored],
+        readings: Vec<Reading>,
+    ) -> Result<bool, Error> {
         let winners = scoring::winning_indices(scored, event.number_of_places_win);
         let message = scoring::outcome_message(&winners);
         let announcement = self
@@ -375,7 +416,10 @@ impl Oracle {
                 event: event.id,
                 source,
             })?;
-        let stored = self.db.record_attestation(event.id, attestation).await?;
+        let stored = self
+            .db
+            .settle_event(event.id, readings, entry_scores(scored), attestation)
+            .await?;
         if stored {
             info!("attested event {} with winners {winners:?}", event.id);
         } else {
@@ -385,5 +429,47 @@ impl Oracle {
             );
         }
         Ok(stored)
+    }
+}
+
+fn entry_scores(scored: &[Scored]) -> Vec<EntryScore> {
+    scored
+        .iter()
+        .map(|scored| EntryScore {
+            id: scored.id,
+            total_score: scored.total_score,
+            base_score: i64::try_from(scored.base_score).unwrap_or(i64::MAX),
+        })
+        .collect()
+}
+
+/// Every enabled pair must occur exactly once with finite values. An absent
+/// station, forecast, metric, or duplicate cannot become an all-zero refund.
+fn validate_settlement_readings(
+    event: &EventRecord,
+    readings: &[Reading],
+) -> Result<(), SourceError> {
+    let mut missing = Vec::new();
+    for target in &event.locations {
+        for metric in &event.metrics {
+            let matches = readings
+                .iter()
+                .filter(|reading| &reading.target == target && &reading.metric == metric)
+                .collect::<Vec<_>>();
+            if matches.len() != 1
+                || !matches[0].baseline.is_some_and(f64::is_finite)
+                || !matches[0].observed.is_some_and(f64::is_finite)
+            {
+                missing.push(format!("{target}/{metric}"));
+            }
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(SourceError::SettlementBlocked(format!(
+            "verified baseline and observation required for every enabled pair; missing or ambiguous: {}",
+            missing.join(", ")
+        )))
     }
 }

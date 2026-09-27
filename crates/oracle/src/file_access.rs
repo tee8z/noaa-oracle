@@ -156,15 +156,20 @@ impl FileData for FileAccess {
 
     async fn grab_file_names(&self, params: FileParams) -> Result<Vec<String>, Error> {
         let mut file_names = vec![];
-        let Ok(mut entries) = fs::read_dir(&self.data_dir).await else {
-            return Ok(file_names);
+        let listing_error = |path: &std::path::Path, error: std::io::Error| {
+            Error::Io(format!("cannot list {}: {error}", path.display()))
         };
+        let root = std::path::Path::new(&self.data_dir);
+        let mut entries = fs::read_dir(root)
+            .await
+            .map_err(|error| listing_error(root, error))?;
         let date_format = format_description!("[year]-[month]-[day]");
-        while let Ok(Some(entry)) = entries.next_entry().await {
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|error| listing_error(root, error))?
+        {
             let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
             let Some(date) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
@@ -175,10 +180,17 @@ impl FileData for FileAccess {
             if !is_date_in_range(directory_date, &params) {
                 continue;
             }
-            let Ok(mut files) = fs::read_dir(path).await else {
-                continue;
-            };
-            while let Ok(Some(file)) = files.next_entry().await {
+            // A dated path that cannot be read is an archive failure, not
+            // evidence that the period had no reports. Never return a partial
+            // inventory that could turn missing data into a refund outcome.
+            let mut files = fs::read_dir(&path)
+                .await
+                .map_err(|error| listing_error(&path, error))?;
+            while let Some(file) = files
+                .next_entry()
+                .await
+                .map_err(|error| listing_error(&path, error))?
+            {
                 let name = file.file_name();
                 let Some(name) = name.to_str() else {
                     continue;
@@ -497,5 +509,40 @@ mod tests {
                 directory.path().display()
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn missing_archive_is_an_error_but_an_empty_archive_is_not() {
+        let directory = tempfile::tempdir().unwrap();
+        let params = bounds("2026-01-21T00:00:00Z", "2026-01-22T00:00:00Z");
+        let missing = FileAccess::new(
+            directory
+                .path()
+                .join("missing")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        assert!(matches!(
+            missing.grab_file_names(params.clone()).await,
+            Err(Error::Io(_))
+        ));
+        let empty = FileAccess::new(directory.path().to_string_lossy().into_owned());
+        assert!(empty.grab_file_names(params).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unreadable_dated_path_cannot_produce_a_partial_inventory() {
+        let directory = tempfile::tempdir().unwrap();
+        let access = FileAccess::new(directory.path().to_string_lossy().into_owned());
+        let good = directory.path().join("2026-01-21");
+        std::fs::create_dir(&good).unwrap();
+        std::fs::write(good.join("observations_2026-01-21T10:00:00Z.parquet"), b"").unwrap();
+        // A regular file in place of a date directory reliably fails read_dir,
+        // including when tests run as root and bypass permission bits.
+        std::fs::write(directory.path().join("2026-01-22"), b"broken archive").unwrap();
+        let result = access
+            .grab_file_names(bounds("2026-01-21T00:00:00Z", "2026-01-22T23:59:59Z"))
+            .await;
+        assert!(matches!(result, Err(Error::Io(_))));
     }
 }

@@ -12,8 +12,9 @@
 //!   reorder, or retype a column; add new columns at the end as nullable.
 //! - Missing source values stay null; never substitute zero or a previous
 //!   value unless the source's documentation defines it.
-//! - Return an error instead of files when a run is too incomplete to
-//!   publish; partial data would be attested as if it were complete.
+//! - Forecasts require sufficient validated coverage before publication.
+//!   Observations publish explicit failed/empty/complete coverage receipts;
+//!   the oracle must require continuous successful coverage before signing.
 
 use async_trait::async_trait;
 use slog::{Logger, info};
@@ -50,15 +51,14 @@ pub trait Source: Send + Sync {
     async fn collect(&self, run: &Run) -> anyhow::Result<Vec<Artifact>>;
 }
 
-/// NOAA weather: NDFD forecasts and METAR observations for the stations in
-/// the aviationweather.gov station catalog.
-pub struct NoaaWeather {
+/// NDFD forecasts publish independently of observation collection.
+pub struct NoaaForecasts {
     fetcher: Arc<XmlFetcher>,
     min_forecast_coverage: f64,
     logger: Logger,
 }
 
-impl NoaaWeather {
+impl NoaaForecasts {
     pub fn new(fetcher: Arc<XmlFetcher>, min_forecast_coverage: f64, logger: Logger) -> Self {
         Self {
             fetcher,
@@ -69,9 +69,9 @@ impl NoaaWeather {
 }
 
 #[async_trait]
-impl Source for NoaaWeather {
+impl Source for NoaaForecasts {
     fn name(&self) -> &'static str {
-        "noaa_weather"
+        "noaa_forecasts"
     }
 
     async fn collect(&self, run: &Run) -> anyhow::Result<Vec<Artifact>> {
@@ -89,18 +89,71 @@ impl Source for NoaaWeather {
                 self.min_forecast_coverage * 100.0
             );
         }
+        info!(
+            self.logger,
+            "noaa forecasts: {} rows for {} stations", report.rows, report.written_stations
+        );
+        Ok(vec![forecasts])
+    }
+}
+
+/// Historical observations publish before the independent forecast run. Failed
+/// leaf requests remain visible as receipts without certifying their intervals.
+pub struct NoaaObservations {
+    fetcher: Arc<XmlFetcher>,
+    history: crate::HistoryConfig,
+    logger: Logger,
+}
+
+impl NoaaObservations {
+    pub fn new(fetcher: Arc<XmlFetcher>, history: crate::HistoryConfig, logger: Logger) -> Self {
+        Self {
+            fetcher,
+            history,
+            logger,
+        }
+    }
+}
+
+#[async_trait]
+impl Source for NoaaObservations {
+    fn name(&self) -> &'static str {
+        "noaa_observations"
+    }
+
+    async fn collect(&self, run: &Run) -> anyhow::Result<Vec<Artifact>> {
         let observations = run.artifact("observations");
-        let observed = ObservationService::new(self.logger.clone(), self.fetcher.clone())
-            .get_observations_to_file(&stations, &observations.path.to_string_lossy())
+        let service = ObservationService::new(self.logger.clone(), self.fetcher.clone());
+        let (stations, catalog) =
+            match crate::coordinates::get_coordinates_with_evidence(self.fetcher.clone()).await {
+                Ok(stations) => stations,
+                Err(error) => {
+                    service.write_unavailable_history(
+                        &observations.path.to_string_lossy(),
+                        run.started_at,
+                        &self.history,
+                        format!("station catalog failed: {error:#}"),
+                    )?;
+                    return Ok(vec![observations]);
+                }
+            };
+        let observed = service
+            .get_observations_to_file(
+                &stations,
+                &observations.path.to_string_lossy(),
+                run.started_at,
+                &self.history,
+                &catalog,
+            )
             .await?;
         info!(
             self.logger,
-            "noaa run: {} forecast rows for {} stations, {} observations ({} reports skipped)",
-            report.rows,
-            report.written_stations,
+            "noaa observation history: {} rows ({} rejected, {} unverified, {} unrepresentable)",
             observed.written,
+            observed.rejected,
+            observed.unverified,
             observed.skipped
         );
-        Ok(vec![forecasts, observations])
+        Ok(vec![observations])
     }
 }

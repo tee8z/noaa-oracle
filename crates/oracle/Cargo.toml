@@ -50,6 +50,7 @@ dlctix = "0.1.0"
 nostr = { version = "0.45", default-features = false, features = ["std", "nip98"] }
 pem-rfc7468 = { version = "1.0", features = ["alloc"] }
 base64 = "0.23"
+flate2 = "1.1"
 # Match the rand version enabled by dlctix's secp256k1 so key and nonce
 # generation share one RNG API.
 rand = "0.9"

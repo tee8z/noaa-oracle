@@ -3255,6 +3255,8 @@ dependencies = [
  "anyhow",
  "log",
  "serde",
+ "serde-xml-rs",
+ "time",
  "toml",
 ]
 

@@ -52,10 +52,69 @@ pub fn forecast_detail(
     comparisons: &[ForecastComparison],
     forecasts: &[ForecastDisplay],
     days: &str,
+    quality: &crate::weather_data::ObservationQuality,
+    forecast_quality: &crate::weather_data::ForecastQuality,
 ) -> Markup {
     html! {
         div class="forecast-detail" {
             h3 class="is-sr-only" { "Forecasts and observations for " (station_id) }
+            @if quality.rejected_reports > 0 {
+                div class="notification is-danger quality-warning" role="alert" {
+                    strong { "Data quality warning — review required" }
+                    p { (quality.rejected_reports) " suspect report(s) were excluded from this station’s past week and current readings. Totals and extremes may be incomplete." }
+                    p { "Affected observations are blocked from new settlement. Inspect the source records before using these values." }
+                }
+            }
+            @if quality.unverified_reports > 0 {
+                div class="notification is-warning quality-warning" role="status" {
+                    strong { "Unverified observation history" }
+                    p { (quality.unverified_reports) " report(s) lack verified source provenance. Historical values are provisional; new settlement requires verified readings." }
+                }
+            }
+            @if forecast_quality.unavailable {
+                div class="notification is-warning quality-warning" role="status" {
+                    strong { "Forecast quality checks unavailable" }
+                    p { "These summaries have not been checked for source period conflicts. Verify the event window before relying on them." }
+                }
+            }
+            @if forecast_quality.rejected_rows > 0 || !forecast_quality.range_issues.is_empty() {
+                div class="notification is-danger quality-warning" role="alert" {
+                    strong { "Forecast data warning — review required" }
+                    @if forecast_quality.rejected_rows > 0 {
+                        p { (forecast_quality.rejected_rows) " rejected forecast period(s) were excluded. Daily totals and extremes may be incomplete." }
+                    }
+                    @for issue in &forecast_quality.range_issues {
+                        p {
+                            (when::calendar_day(&issue.date)) ": daily " (issue.metric) " range hidden because its minimum " (issue.minimum)
+                            @if issue.metric == "humidity" { "%" } @else { "°F" }
+                            " exceeds its maximum " (issue.maximum)
+                            @if issue.metric == "humidity" { "%" } @else { "°F" }
+                            ". The source extrema do not form a valid range for this calendar day."
+                        }
+                        @if issue.native_intervals.is_empty() {
+                            p { "Native source periods were not retained for this range." }
+                        } @else {
+                            ul {
+                                @for interval in &issue.native_intervals {
+                                    li {
+                                        (match interval.metric.as_str() {
+                                            "min_temp" => "Minimum temperature", "max_temp" => "Maximum temperature",
+                                            "relative_humidity_min" => "Minimum humidity", _ => "Maximum humidity",
+                                        }) ": " (interval.start) " to " (interval.end.as_deref().unwrap_or("unknown")) " (UTC)."
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    p { "Settlement checks the exact event window and native source periods before signing." }
+                }
+            }
+            @if forecast_quality.unverified_rows > 0 {
+                div class="notification is-warning quality-warning" role="status" {
+                    strong { "Unverified forecast periods" }
+                    p { (forecast_quality.unverified_rows) " forecast period(s) lack native source provenance. Their calendar summaries are provisional and cannot authorize settlement." }
+                }
+            }
             @if !comparisons.is_empty() {
                 (past_week(comparisons, days))
             }
@@ -69,7 +128,10 @@ fn past_week(comparisons: &[ForecastComparison], days: &str) -> Markup {
         section class="past-performance" {
             h4 class="title is-6" { "Past week: forecast vs observed" }
             p class="forecast-note" {
-                "By day (" (days) "). Each forecast was issued the day before. Differences are observed − forecast; + means it came in higher."
+                "By day (" (days) "). Forecast summaries can include later revisions. Differences are observed − forecast; + means it came in higher."
+            }
+            p class="forecast-note" {
+                "Calendar summaries are provisional. Observed rain and snow are report-based estimates; snow uses a 10:1 conversion from liquid precipitation. Humidity uses daily average temperature and dew point. Event scoring checks source data for the actual event window separately."
             }
             p class="forecast-note history-scroll-hint" {
                 "Scroll sideways for humidity, rain and snow."
@@ -85,7 +147,7 @@ fn past_week(comparisons: &[ForecastComparison], days: &str) -> Markup {
                             th scope="col" { "Max wind" }
                             th scope="col" title="Forecast range; observed is estimated from temperature and dew point" { "Humidity" }
                             th scope="col" { "Rain" }
-                            th scope="col" title="Observed snow is estimated from liquid precipitation at 10:1" { "Snow" }
+                            th scope="col" title="Observed snow is estimated from liquid precipitation at 10:1" { "Snow (est.)" }
                         }
                     }
                     tbody {
@@ -100,7 +162,7 @@ fn past_week(comparisons: &[ForecastComparison], days: &str) -> Markup {
     }
 }
 
-/// One past day. Past days are over, so their differences are final.
+/// One completed calendar day. Its comparisons remain provisional summaries.
 fn past_day(day: &ForecastComparison) -> Markup {
     let (forecast_high, forecast_low) = (day.forecast_high as f64, day.forecast_low as f64);
     let degrees = |observed: Option<f64>, forecast: f64| {
@@ -232,6 +294,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quality_warning_precedes_data_even_when_no_usable_observations_remain() {
+        let quality = crate::weather_data::ObservationQuality {
+            rejected_reports: 1,
+            unverified_reports: 3,
+        };
+        let html =
+            forecast_detail("KPWM", &[], &[], "UTC", &quality, &Default::default()).into_string();
+        assert!(html.contains("role=\"alert\""));
+        assert!(html.contains("1 suspect report(s)"));
+        assert!(html.contains("3 report(s) lack verified source provenance"));
+        assert!(html.contains("blocked from new settlement"));
+        assert!(!html.contains("140°F"));
+    }
+
+    #[test]
     fn past_comparisons_round_temperature_halves_like_scoring() {
         let comparison = ForecastComparison {
             date: "2026-09-19".into(),
@@ -249,7 +326,15 @@ mod tests {
             actual_rain: None,
             actual_snow: None,
         };
-        let html = forecast_detail("KPWM", &[comparison], &[], "UTC").into_string();
+        let html = forecast_detail(
+            "KPWM",
+            &[comparison],
+            &[],
+            "UTC",
+            &Default::default(),
+            &Default::default(),
+        )
+        .into_string();
         assert_eq!(html.matches("55°F").count(), 2);
         assert_eq!(html.matches("-3°F").count(), 2);
         assert!(!html.contains("54°F"));
@@ -276,7 +361,15 @@ mod tests {
             actual_rain: None,
             actual_snow: None,
         };
-        let html = forecast_detail("KPWM", &[comparison], &[], "UTC").into_string();
+        let html = forecast_detail(
+            "KPWM",
+            &[comparison],
+            &[],
+            "UTC",
+            &Default::default(),
+            &Default::default(),
+        )
+        .into_string();
         assert!(html.contains("+5°F"), "{html}");
         assert!(html.contains("-2°F"), "{html}");
         assert!(html.contains("+4 kt"), "{html}");

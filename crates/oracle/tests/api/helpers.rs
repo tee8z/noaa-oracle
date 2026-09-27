@@ -305,24 +305,117 @@ mock! {
 }
 
 mock! {
-    pub WeatherAccess{}
-    #[async_trait]
-    impl WeatherData for WeatherAccess {
-        async fn forecasts_data(
+    pub WeatherAccess {
+        pub async fn forecasts_data(
             &self,
             req: &oracle::ForecastRequest,
             station_ids: Vec<String>,
         ) -> Result<Vec<oracle::Forecast>, oracle::weather_data::Error>;
-        async fn observation_data(
+        pub async fn settlement_forecasts(
+            &self,
+            req: &oracle::ForecastRequest,
+            station_ids: Vec<String>,
+        ) -> Result<Vec<oracle::weather_data::SettlementValue>, oracle::weather_data::Error>;
+        pub async fn forecast_assessment(
+            &self,
+            req: &oracle::ForecastRequest,
+            station_ids: Vec<String>,
+        ) -> Result<Vec<oracle::weather_data::ForecastAssessment>, oracle::weather_data::Error>;
+        pub async fn precipitation_station_capabilities(
+            &self,
+            station_ids: Vec<String>,
+        ) -> Result<Vec<String>, oracle::weather_data::Error>;
+        pub async fn observation_data(
             &self,
             req: &oracle::ObservationRequest,
             station_ids: Vec<String>,
         ) -> Result<Vec<oracle::Observation>, oracle::weather_data::Error>;
-        async fn daily_observations(
+        pub async fn settlement_observations(
+            &self,
+            req: &oracle::ObservationRequest,
+            station_ids: Vec<String>,
+            required_collected_after: OffsetDateTime,
+        ) -> Result<Vec<oracle::Observation>, oracle::weather_data::Error>;
+        pub async fn daily_observations(
             &self,
             req: &oracle::ObservationRequest,
             station_ids: Vec<String>,
         ) -> Result<Vec<oracle::DailyObservation>, oracle::weather_data::Error>;
-        async fn stations(&self) -> Result<Vec<oracle::Station>, oracle::weather_data::Error>;
+        pub async fn stations(&self) -> Result<Vec<oracle::Station>, oracle::weather_data::Error>;
+    }
+}
+
+// Fixture rows represent audited input. Tests that exercise a settlement quality
+// failure configure expect_settlement_observations() explicitly. Production
+// WeatherData implementations retain the fail-closed default quality check.
+#[async_trait]
+impl WeatherData for MockWeatherAccess {
+    async fn forecasts_data(
+        &self,
+        req: &oracle::ForecastRequest,
+        station_ids: Vec<String>,
+    ) -> Result<Vec<oracle::Forecast>, oracle::weather_data::Error> {
+        MockWeatherAccess::forecasts_data(self, req, station_ids).await
+    }
+
+    async fn settlement_forecasts(
+        &self,
+        req: &oracle::ForecastRequest,
+        station_ids: Vec<String>,
+    ) -> Result<Vec<oracle::weather_data::SettlementValue>, oracle::weather_data::Error> {
+        MockWeatherAccess::settlement_forecasts(self, req, station_ids).await
+    }
+
+    async fn forecast_assessment(
+        &self,
+        req: &oracle::ForecastRequest,
+        station_ids: Vec<String>,
+    ) -> Result<Vec<oracle::weather_data::ForecastAssessment>, oracle::weather_data::Error> {
+        MockWeatherAccess::forecast_assessment(self, req, station_ids).await
+    }
+
+    async fn precipitation_station_capabilities(
+        &self,
+        station_ids: Vec<String>,
+    ) -> Result<Vec<String>, oracle::weather_data::Error> {
+        MockWeatherAccess::precipitation_station_capabilities(self, station_ids).await
+    }
+
+    async fn observation_data(
+        &self,
+        req: &oracle::ObservationRequest,
+        station_ids: Vec<String>,
+    ) -> Result<Vec<oracle::Observation>, oracle::weather_data::Error> {
+        MockWeatherAccess::observation_data(self, req, station_ids).await
+    }
+
+    async fn settlement_observations(
+        &self,
+        req: &oracle::ObservationRequest,
+        station_ids: Vec<String>,
+        required_collected_after: OffsetDateTime,
+    ) -> Result<Vec<oracle::Observation>, oracle::weather_data::Error> {
+        MockWeatherAccess::settlement_observations(self, req, station_ids, required_collected_after)
+            .await
+    }
+
+    async fn observation_quality(
+        &self,
+        _req: &oracle::ObservationRequest,
+        _station_ids: Vec<String>,
+    ) -> Result<oracle::weather_data::ObservationQuality, oracle::weather_data::Error> {
+        Ok(oracle::weather_data::ObservationQuality::default())
+    }
+
+    async fn daily_observations(
+        &self,
+        req: &oracle::ObservationRequest,
+        station_ids: Vec<String>,
+    ) -> Result<Vec<oracle::DailyObservation>, oracle::weather_data::Error> {
+        MockWeatherAccess::daily_observations(self, req, station_ids).await
+    }
+
+    async fn stations(&self) -> Result<Vec<oracle::Station>, oracle::weather_data::Error> {
+        MockWeatherAccess::stations(self).await
     }
 }

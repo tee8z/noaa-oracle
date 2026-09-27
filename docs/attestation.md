@@ -27,7 +27,8 @@ A source defines which targets exist (NOAA station ids), which metrics can
 be predicted, and each metric's par rule. For every target and metric the
 oracle reads a **baseline** (for NOAA, the forecast) and an **observed**
 value over the event's observation window. A missing value is missing, never
-zero, and earns no points.
+zero. During provisional scoring, a missing value earns no points. Settlement
+requires a finite baseline and observation for every enabled target and metric.
 
 | Par rule   | `Par` when                                   |
 |------------|----------------------------------------------|
@@ -40,38 +41,60 @@ zero, and earns no points.
 
 ### NOAA weather baseline
 
-NOAA scoring uses the latest forecast issued strictly before the observation
-window starts. The archive search covers the preceding seven days. Forecasts
-issued during the event cannot replace this baseline.
+Strict NOAA scoring selects one latest eligible forecast issue and publication per station.
+The issue must precede the window, and the recorded source receipt must be no later than its start.
+The archive search covers the preceding seven days. A later forecast cannot replace this baseline.
+A missing metric cannot fall back to a different, older issue.
 
 Observation windows include the start instant and exclude the end instant.
 Queries compare timestamps as instants and group daily values by UTC date.
 File discovery also checks publications up to 24 hours after the requested
-period, capped at the current time. Report timestamps must still fall inside
-the observation window.
+period, capped at the current time. Point measurements must still fall inside
+the observation window. Precipitation also reads the report ending an accumulation at the window boundary.
 
 Repeated snapshots of the same station report count once. The latest
 publication wins when a report changes. Missing precipitation remains missing;
 a measured zero remains zero.
 
-Multi-day baselines combine the matching UTC forecast days. Temperature highs
-and wind speeds use maxima; temperature lows use minima; precipitation uses
-sums. A missing day or metric leaves that baseline unavailable.
-The current weather API requires temperature extrema for each returned row.
-Rows without those extrema are unavailable even when other measurements exist.
+Provisional display baselines combine the matching UTC forecast days.
+Strict settlement baselines use validated native intervals over the full event window, separately for each metric.
+Temperature highs and wind speeds use maxima; temperature lows use minima; precipitation uses sums.
+Temperature extrema keep their native day or night periods.
+Permitted edge gaps cover only the opposite daily period: 24 hours minus the native period's duration.
+A cut native period or missing forecast day leaves that temperature metric unavailable.
+Wind values are forecast samples inside the requested interval; direction belongs to the selected peak wind.
+Precipitation requires a complete chain of native accumulation intervals with no gaps or boundary cuts.
+Forecast rainfall also needs complete snow and ice components to separate liquid rain from total water equivalent.
+Nonzero ice remains unavailable because accretion thickness is not a liquid-equivalent amount.
+Nonzero snow needs its forecast ratio for the same native interval.
+The public weather API still requires temperature extrema in its display rows.
+Strict forecast values do not depend on that display constraint.
 
 Wind direction is the bearing reported with the maximum wind speed. Equal
 speeds select the latest interval, then the latest UTC day for multi-day
 forecasts. Missing direction at that maximum remains unavailable.
 
-Forecast values retain their native intervals. An interval that overlaps an
-event boundary can include weather outside the event. The oracle does not
-prorate precipitation or infer hourly extrema from daily forecasts. UTC daily
-windows provide the closest comparison with the daily baseline.
+Forecast values retain their native intervals. A boundary overlap can include weather outside the event.
+The strict reader must establish a compatible interval before using a value for settlement.
+The oracle does not prorate precipitation or infer hourly extrema from daily forecasts.
+Choose event windows from compatible native ranges; a universal UTC-hour rule does not establish compatibility.
 
-Observed humidity is derived from period temperature and dewpoint averages.
-Its baseline remains the maximum forecast humidity. Observed snowfall uses
-the existing 10:1 liquid-to-snow estimate rather than a direct snowfall measurement.
+Strict observed humidity is the maximum relative humidity calculated from each report's temperature and dewpoint using the Magnus formula.
+Its baseline is the maximum forecast humidity. Provisional display humidity still uses period temperature and dewpoint averages.
+Strict observations require usable reports without gaps exceeding 90 minutes, including the event boundaries.
+Optional wind, direction, and humidity values also need adequate reporting coverage.
+
+Rain accumulations use the previous routine report as their reset anchor, as described in the
+[AWC precipitation definitions](https://aviationweather.gov/help/data/).
+Routine anchors must establish an hourly cadence between 45 and 75 minutes.
+Overlapping special reports cannot be added repeatedly. Accepted intervals must cover the exact event window without gaps.
+Trace amounts require review. Positive accumulations with unknown or mixed precipitation phase cannot become exact rainfall values.
+A rainfall or snowfall value needs evidence for that metric; a missing value is not zero.
+The provisional display's 10:1 snowfall estimate cannot authorize settlement.
+
+Verified NWS RR7/SHEF reports provide an additional fixed UTC-hour precipitation source at supported stations.
+The reader replays retained product text and station mappings, then requires an exact accumulation chain across the event window.
+Fixed-hour totals still need adequate evidence for precipitation phase. Recent source availability does not guarantee future reports.
 
 ## Events
 
@@ -100,6 +123,10 @@ and dashboard counts unless the reader chooses "Show unlisted"; its page,
 `/events/{id}`, and the API still serve it, and responses carry the flag.
 Limits: 2–25 entries, 1–5 places and fewer places than entries, at most
 20,000 outcomes, 1–50 distinct targets, start < end ≤ signing date.
+
+Before funding, coordinators can check proposed station, metric, and window combinations through
+[`GET /stations/window-compatibility`](settlement-operations.md#check-a-window-before-funding).
+It returns forecast availability, reasons, and native boundaries. It does not change an event or promise future observations.
 
 ## Entries
 
@@ -149,10 +176,43 @@ signing date.
 
 ## Attestation
 
-After the signing date the oracle ranks entries by the scoring rules, takes the
+After the signing date, the oracle rereads validated forecasts and observations.
+The source must prove collection coverage for every station across the event window.
+Missing, rejected, unverified, or incomplete readings block signing before saved readings or scores change.
+Every enabled target and metric must have exactly one finite baseline and observation.
+
+With complete data, the oracle ranks entries by the scoring rules and takes the
 top `places` indices (or the refund-all outcome when every base score is 0),
 and publishes `attestation` `s` with `s·G` equal to that outcome's locking
 point. The oracle attests each event at most once and only an announced
 outcome; the nonce behind `R` is derived from the oracle key and never
 published. A client verifies an attestation by finding the `i` with
 `locking_points[i] = s·G`.
+
+Final readings, entry scores, the attestation, and clearing the blocked reason commit in one SQLite transaction.
+Competing finalizations cannot mix their evidence. Delayed provisional updates cannot change a signed event's readings or scores.
+
+### Blocked settlement
+
+Unsigned event details and summaries can include `settlement_block`:
+
+```json
+{
+  "code": "incomplete_readings",
+  "message": "settlement blocked: verified baseline and observation required for KORD/rain_amt",
+  "checked_at": "2030-01-02T03:05:00Z"
+}
+```
+
+The reason persists in SQLite and appears on the event page and events list.
+The processing job retries automatically. Stored readings and scores remain provisional while settlement is blocked.
+A successful settlement check rereads the data, recomputes scores, and clears the reason.
+Signed events retain their stored readings, scores, and attestation.
+
+An empty result is not proof that all predictions were wrong.
+A source outage or missing station therefore cannot produce a signed refund-all outcome.
+The announced expiry remains available to the coordinator and participants under their DLC contract.
+
+Precipitation and other configured metrics remain eligible when their requested intervals have verifiable values.
+The oracle does not change an announced observation window to make missing data fit.
+See [settlement operations](settlement-operations.md) for rollout and blocked-event checks.

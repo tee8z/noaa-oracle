@@ -479,6 +479,8 @@ impl AppState {
         crate::routes::events::update_data,
         crate::routes::stations::forecasts,
         crate::routes::stations::observations,
+        crate::routes::stations::observation_quality,
+        crate::routes::window_compatibility::window_compatibility,
         crate::routes::stations::daily_observations,
         crate::routes::stations::get_stations,
         crate::routes::files::download::download,
@@ -494,6 +496,7 @@ impl AppState {
                 crate::sources::Reading,
                 crate::events::Event,
                 crate::events::EventSummary,
+                crate::events::SettlementBlock,
                 crate::events::WeatherEntry,
                 crate::events::AddEventEntry,
                 crate::events::CreateEvent,
@@ -596,7 +599,15 @@ pub fn app(app_state: Arc<AppState>) -> Router {
         )
         .route("/stations", get(get_stations))
         .route("/stations/forecasts", get(forecasts))
+        .route(
+            "/stations/window-compatibility",
+            get(crate::routes::window_compatibility::window_compatibility),
+        )
         .route("/stations/observations", get(observations))
+        .route(
+            "/stations/observation-quality",
+            get(crate::routes::stations::observation_quality),
+        )
         .route("/stations/daily-observations", get(daily_observations))
         .route("/oracle/npub", get(get_npub))
         .route("/oracle/pubkey", get(get_pubkey))

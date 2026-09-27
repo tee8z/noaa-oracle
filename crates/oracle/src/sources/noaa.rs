@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use std::{collections::BTreeMap, sync::Arc};
-use time::{Date, Duration, UtcOffset, macros::format_description};
+use time::{Date, Duration, OffsetDateTime, UtcOffset, macros::format_description};
 
 use super::{Metric, ObservationWindow, OutcomeSource, ParRule, Reading, SourceError, SourceId};
 use crate::{
@@ -96,38 +96,91 @@ impl OutcomeSource for NoaaWeather {
         window: ObservationWindow,
         targets: &[String],
     ) -> Result<Vec<Reading>, SourceError> {
+        self.load_readings(window, targets, None).await
+    }
+
+    async fn settlement_readings(
+        &self,
+        window: ObservationWindow,
+        targets: &[String],
+        required_collected_after: OffsetDateTime,
+    ) -> Result<Vec<Reading>, SourceError> {
+        self.load_readings(window, targets, Some(required_collected_after))
+            .await
+    }
+}
+
+impl NoaaWeather {
+    async fn load_readings(
+        &self,
+        window: ObservationWindow,
+        targets: &[String],
+        required_collected_after: Option<OffsetDateTime>,
+    ) -> Result<Vec<Reading>, SourceError> {
         if window.start >= window.end {
             return Ok(vec![]);
         }
-        let station_ids = targets.join(",");
+        let forecast_request = ForecastRequest {
+            start: Some(window.start),
+            end: Some(window.end),
+            generated_start: Some(window.start.saturating_sub(BASELINE_LOOKBACK)),
+            generated_end: Some(window.start.saturating_sub(Duration::nanoseconds(1))),
+            station_ids: targets.join(","),
+            temperature_unit: TemperatureUnit::Fahrenheit,
+        };
+        let observation_request = ObservationRequest {
+            start: Some(window.start),
+            end: Some(window.end - Duration::nanoseconds(1)),
+            station_ids: targets.join(","),
+            temperature_unit: TemperatureUnit::Fahrenheit,
+        };
+        if let Some(cutoff) = required_collected_after {
+            // The strict reader uses a half-open event window for point
+            // values and also reads the ending accumulation report for rain.
+            let observation_request = ObservationRequest {
+                end: Some(window.end),
+                ..observation_request
+            };
+            let forecasts = self
+                .weather
+                .settlement_forecasts(&forecast_request, targets.to_vec())
+                .await
+                .map_err(unavailable)?;
+            let observations = self
+                .weather
+                .settlement_observations(&observation_request, targets.to_vec(), cutoff)
+                .await
+                .map_err(unavailable)?;
+            // Strict forecasts already represent the full requested interval.
+            // Preserve duplicate metric rows so the lifecycle rejects ambiguity.
+            return Ok(forecasts
+                .into_iter()
+                .map(|forecast| {
+                    let mut station = observations
+                        .iter()
+                        .filter(|row| row.station_id == forecast.station_id);
+                    let observation = station.next().filter(|_| station.next().is_none());
+                    Reading {
+                        target: forecast.station_id,
+                        metric: forecast.metric.clone(),
+                        baseline: forecast.value,
+                        observed: observation
+                            .and_then(|row| observed_metric(row, &forecast.metric)),
+                    }
+                })
+                .collect());
+        }
         let forecasts = self
             .weather
-            .forecasts_data(
-                &ForecastRequest {
-                    start: Some(window.start),
-                    end: Some(window.end),
-                    generated_start: Some(window.start.saturating_sub(BASELINE_LOOKBACK)),
-                    generated_end: Some(window.start - Duration::nanoseconds(1)),
-                    station_ids: station_ids.clone(),
-                    temperature_unit: TemperatureUnit::Fahrenheit,
-                },
-                targets.to_vec(),
-            )
+            .forecasts_data(&forecast_request, targets.to_vec())
             .await
             .map_err(unavailable)?;
         let observations = self
             .weather
-            .observation_data(
-                &ObservationRequest {
-                    start: Some(window.start),
-                    end: Some(window.end - Duration::nanoseconds(1)),
-                    station_ids,
-                    temperature_unit: TemperatureUnit::Fahrenheit,
-                },
-                targets.to_vec(),
-            )
+            .observation_data(&observation_request, targets.to_vec())
             .await
             .map_err(unavailable)?;
+
         Ok(targets
             .iter()
             .flat_map(|target| station_readings(target, window, &forecasts, &observations))
@@ -135,15 +188,38 @@ impl OutcomeSource for NoaaWeather {
     }
 }
 
+fn observed_metric(observation: &Observation, metric: &str) -> Option<f64> {
+    match metric {
+        TEMP_HIGH => Some(observation.temp_high),
+        TEMP_LOW => Some(observation.temp_low),
+        WIND_SPEED => observation.wind_speed.map(|value| value as f64),
+        WIND_DIRECTION => observation.wind_direction.map(|value| value as f64),
+        RAIN_AMT => observation.rain_amt,
+        SNOW_AMT => observation.snow_amt,
+        HUMIDITY => observation.humidity.map(|value| value as f64),
+        _ => None,
+    }
+}
+
 fn unavailable(error: weather_data::Error) -> SourceError {
-    SourceError::Unavailable(Box::new(error))
+    match error {
+        weather_data::Error::DataQuality {
+            rejected_reports,
+            unverified_reports,
+        } => SourceError::DataQuality {
+            rejected_reports,
+            unverified_reports,
+        },
+        error => SourceError::Unavailable(Box::new(error)),
+    }
 }
 
 /// Readings for one station over the event's UTC days. Every day must have
 /// a forecast before an aggregate can be compared with the full observed
 /// window. Missing metrics on any day keep that metric's baseline missing.
 ///
-/// Missing values stay missing and earn no points for anyone:
+/// Missing values stay missing. They earn no provisional points and block
+/// settlement when the event enables that metric:
 /// - NDFD/DWML forecasts mark missing values with `xsi:nil="true"`; nil is
 ///   "no forecast", not zero
 ///   (<https://graphical.weather.gov/xml/mdl/XML/Design/MDL_XML_Design.htm>).

@@ -1,0 +1,14 @@
+{
+    "@context": {
+        "@version": "1.1",
+        "@vocab": "https://api.weather.gov/ontology#"
+    },
+    "@id": "https://api.weather.gov/products/96ec7fd5-9bc1-434e-b77d-25e8754abc79",
+    "id": "96ec7fd5-9bc1-434e-b77d-25e8754abc79",
+    "wmoCollectiveId": "SRUS73",
+    "issuingOffice": "KEAX",
+    "issuanceTime": "2026-09-26T08:00:00+00:00",
+    "productCode": "RR7",
+    "productName": "Hydro-Met Data Report Part 7",
+    "productText": "\n000\nSRUS73 KEAX 260800\nRR7MCI\n.A MCI 0926 DH0800/PPH 0.21\n\n"
+}

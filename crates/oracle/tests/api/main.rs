@@ -8,3 +8,5 @@ mod metrics;
 mod perf;
 mod ui_fragments;
 mod upload;
+
+mod window_compatibility;

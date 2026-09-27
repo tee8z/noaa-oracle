@@ -10,6 +10,17 @@ use crate::templates::{
     layouts::{CurrentPage, PageConfig, base, page_fragment},
 };
 
+#[derive(Clone, Copy)]
+pub enum SettlementQuality {
+    Signed,
+    Clear,
+    Blocked {
+        rejected_reports: u64,
+        unverified_reports: u64,
+    },
+    Unavailable,
+}
+
 fn config(event: &Event) -> (String, CurrentPage) {
     (
         format!(
@@ -21,26 +32,30 @@ fn config(event: &Event) -> (String, CurrentPage) {
 }
 
 /// Event detail page - shows full information about a single event
-pub fn event_detail_page(event: &Event, now: OffsetDateTime) -> Markup {
+pub fn event_detail_page(event: &Event, now: OffsetDateTime, quality: SettlementQuality) -> Markup {
     let (title, current_page) = config(event);
     base(
         &PageConfig {
             title: &title,
             current_page,
         },
-        event_detail_content(event, now),
+        event_detail_content(event, now, quality),
     )
 }
 
 /// What htmx swaps in when an event row is opened.
-pub fn event_detail_fragment(event: &Event, now: OffsetDateTime) -> Markup {
+pub fn event_detail_fragment(
+    event: &Event,
+    now: OffsetDateTime,
+    quality: SettlementQuality,
+) -> Markup {
     let (title, current_page) = config(event);
     page_fragment(
         &PageConfig {
             title: &title,
             current_page,
         },
-        event_detail_content(event, now),
+        event_detail_content(event, now, quality),
     )
 }
 
@@ -122,7 +137,39 @@ fn attestation_value(event: &Event, now: OffsetDateTime) -> Markup {
     }
 }
 
-pub fn event_detail_content(event: &Event, now: OffsetDateTime) -> Markup {
+fn quality_notice(quality: SettlementQuality) -> Markup {
+    match quality {
+        SettlementQuality::Signed => html! {},
+        SettlementQuality::Clear => html! {
+            div class="notification is-warning is-light" role="status" {
+                strong { "Not signed. " }
+                "Displayed readings and scores are provisional. The oracle checks data quality again before signing."
+            }
+        },
+        SettlementQuality::Blocked {
+            rejected_reports,
+            unverified_reports,
+        } => html! {
+            div class="notification is-danger is-light" role="alert" {
+                strong { "Settlement blocked: observation data needs review." }
+                p { "Rejected reports: " (rejected_reports) ". Unverified reports: " (unverified_reports) "." }
+                p { "Stored weather and scores below are from the last successful refresh. They are not approved for settlement." }
+            }
+        },
+        SettlementQuality::Unavailable => html! {
+            div class="notification is-danger is-light" role="alert" {
+                strong { "Settlement quality could not be verified." }
+                p { "Stored weather and scores below are provisional. The oracle must verify observation quality before signing." }
+            }
+        },
+    }
+}
+
+pub fn event_detail_content(
+    event: &Event,
+    now: OffsetDateTime,
+    quality: SettlementQuality,
+) -> Markup {
     let window = event.end_observation_date - event.start_observation_date;
     html! {
         div class="event-detail-header" {
@@ -140,6 +187,17 @@ pub fn event_detail_content(event: &Event, now: OffsetDateTime) -> Markup {
                     "Unlisted"
                 }
             }
+        }
+
+        @if let Some(block) = &event.settlement_block {
+            div class="notification is-danger is-light" role="alert" {
+                strong { "Settlement blocked" }
+                p { (block.message) }
+                p { "Last checked " (when::absolute(block.checked_at)) ". The oracle retries automatically." }
+                p { "Displayed readings and scores are provisional. No outcome has been signed." }
+            }
+        } @else {
+            (quality_notice(quality))
         }
 
         div class="event-grid" {
@@ -612,6 +670,39 @@ mod tests {
         assert!(html.contains("Not signed"), "{html}");
         assert!(html.contains("no entries"), "{html}");
         assert!(!html.contains("Pending"), "{html}");
+    }
+
+    #[test]
+    fn blocked_settlement_is_flagged_before_the_stored_weather() {
+        let mut pending = event(time::Duration::days(1), vec![], None);
+        pending.weather.push(Weather {
+            station_id: "KPWM".into(),
+            observed: Some(Observed {
+                date: pending.start_observation_date,
+                temp_high: 140,
+                temp_low: 41,
+                wind_speed: None,
+            }),
+            forecasted: Forecasted {
+                date: pending.start_observation_date,
+                temp_high: 66,
+                temp_low: 42,
+                wind_speed: None,
+            },
+        });
+        for quality in [
+            SettlementQuality::Blocked {
+                rejected_reports: 1,
+                unverified_reports: 27,
+            },
+            SettlementQuality::Unavailable,
+        ] {
+            let html = event_detail_content(&pending, pending.signing_date, quality).into_string();
+            let alert = html.find("role=\"alert\"").expect("visible quality alert");
+            let weather = html.find(">Weather</h3>").expect("stored weather retained");
+            assert!(alert < weather, "{html}");
+            assert!(html.contains("Stored weather and scores below"), "{html}");
+        }
     }
 
     #[test]
