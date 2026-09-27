@@ -360,11 +360,6 @@ fn evaluate_selected(
                 .as_ref()
                 .map_err(|reason| *reason)
                 .and_then(|station| station.value(metric, start, end));
-            if let Err(reason) = value {
-                log::warn!(
-                    "settlement forecast unavailable: station={station} metric={metric} reason={reason}"
-                );
-            }
             output.push(ForecastAssessment {
                 station_id: station.clone(),
                 metric: metric.into(),
@@ -529,15 +524,17 @@ impl<'a> Station<'a> {
             if begin > finish {
                 return Err("forecast interval is reversed");
             }
+            // A period belongs to the window that holds its midpoint. Back to
+            // back windows then share none, and any 24-hour window holds one
+            // daytime high and one overnight low, whatever its start or the
+            // station's time zone.
             if if begin == finish {
                 begin < start || begin >= end
             } else {
-                finish <= start || begin >= end
+                let middle = begin + (finish - begin) / 2;
+                middle < start || middle >= end
             } {
                 continue;
-            }
-            if begin < start || finish > end {
-                return Err("event boundary cuts a native source period");
             }
             if row.quality_status.as_deref() != Some("validated")
                 || row
@@ -642,16 +639,21 @@ impl<'a> Station<'a> {
                     _ => "relative_humidity_max",
                 };
                 let samples = self.samples(source, start, end, false)?;
-                // Daily extrema may have the opposing day/night half absent.
-                // A whole missing day must not become a partial event baseline.
+                // One such period comes a day after the last (an hour either
+                // way across a daylight saving change). A whole missing day
+                // must not become a partial event baseline: no gap between
+                // midpoints, or from the window's edges to them, may leave
+                // room for another.
                 const DAY: i64 = 86_400_000_000;
-                let first = &samples[0];
-                let last = samples.last().unwrap();
-                if first.start - start > (DAY - (first.end - first.start)).max(0)
-                    || end - last.end > (DAY - (last.end - last.start)).max(0)
+                const SLACK: i64 = 2 * 3_600_000_000;
+                let middle = |sample: &Sample| sample.start + (sample.end - sample.start) / 2;
+                let first = middle(&samples[0]);
+                let last = middle(samples.last().unwrap());
+                if first - start >= DAY + SLACK
+                    || end - last > DAY + SLACK
                     || samples
                         .windows(2)
-                        .any(|pair| pair[1].start - pair[0].start > DAY)
+                        .any(|pair| middle(&pair[1]) - middle(&pair[0]) > DAY + SLACK)
                 {
                     return Err("daily native extrema do not span the event window");
                 }
@@ -753,19 +755,32 @@ fn normalize(metric: &str, units: &str, value: f64) -> Check<f64> {
     }
 }
 
+/// Sums the precipitation periods whose midpoints fall in the window. They
+/// must follow one another without a gap, and none may be missing at either
+/// end: a period before the first, or after the last, of the same length
+/// would have its midpoint in the window too.
 fn sum_chain(samples: &[Sample], start: i64, end: i64) -> Check<f64> {
-    let mut through = start;
+    const GAP: &str = "precipitation periods do not cover the event window";
+    let (Some(first), Some(last)) = (samples.first(), samples.last()) else {
+        return Err(GAP);
+    };
+    if 2 * (first.start - start) >= first.end - first.start
+        || 2 * (end - last.end) > last.end - last.start
+    {
+        return Err(GAP);
+    }
+    let mut through = first.start;
     let mut total = 0.0;
     for sample in samples {
         if sample.start != through || sample.end <= sample.start {
-            return Err("precipitation periods do not cover the exact event window");
+            return Err(GAP);
         }
         through = sample.end;
         total += sample.value;
     }
-    if through != end || !total.is_finite() {
-        Err("precipitation periods do not cover the exact event window")
-    } else {
+    if total.is_finite() {
         Ok(total)
+    } else {
+        Err(GAP)
     }
 }

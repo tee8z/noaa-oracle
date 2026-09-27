@@ -45,6 +45,11 @@ pub const MAX_PLACES: usize = 5;
 pub const MAX_OUTCOMES: usize = 20_000;
 pub const MAX_LOCATIONS: usize = 50;
 pub const MAX_LIST_LIMIT: usize = 100;
+/// Shortest observation window an event may watch. NOAA forecasts one
+/// daytime high and one overnight low a day; a window of at least a day holds
+/// one whole period of each, whatever its start or its stations' time zones,
+/// so every metric can be attested against a complete forecast.
+pub const MIN_WINDOW: Duration = Duration::DAY;
 /// Participants can claim a refund this long after the signing date if the
 /// oracle has not attested.
 const EXPIRY_AFTER_SIGNING: Duration = Duration::DAY;
@@ -107,6 +112,10 @@ pub enum EventRejection {
     UnknownSource(String),
     #[error("observation start must be before its end, and the end no later than the signing date")]
     DatesOutOfOrder,
+    #[error(
+        "the observation window must be at least 24 hours, so every forecast period it scores is whole"
+    )]
+    WindowTooShort,
     #[error("signing date is outside the DLC expiry range")]
     ExpiryOutOfRange,
     #[error("total_allowed_entries must be between 2 and {MAX_ENTRIES}, requested {0}")]
@@ -239,6 +248,9 @@ impl NewEvent {
             || event.end_observation_date > event.signing_date
         {
             return Err(EventRejection::DatesOutOfOrder);
+        }
+        if event.end_observation_date - event.start_observation_date < MIN_WINDOW {
+            return Err(EventRejection::WindowTooShort);
         }
         let entries = event.total_allowed_entries;
         let places = event.number_of_places_win;
@@ -1159,9 +1171,9 @@ mod tests {
         let start = OffsetDateTime::now_utc();
         CreateEvent {
             id: Uuid::now_v7(),
-            signing_date: start + Duration::hours(3),
+            signing_date: start + Duration::hours(26),
             start_observation_date: start,
-            end_observation_date: start + Duration::hours(1),
+            end_observation_date: start + Duration::hours(24),
             locations: vec!["KORD".into(), "KSAW".into()],
             number_of_values_per_entry: 3,
             total_allowed_entries: entries,
@@ -1232,6 +1244,14 @@ mod tests {
             rejected(|e| e.signing_date = e.end_observation_date - Duration::hours(1)),
             EventRejection::DatesOutOfOrder
         ));
+        assert!(matches!(
+            rejected(|e| e.end_observation_date = e.start_observation_date + Duration::hours(23)),
+            EventRejection::WindowTooShort
+        ));
+        assert!(
+            build(event(3, 1)).is_ok(),
+            "a 24-hour window is long enough"
+        );
         assert!(matches!(
             rejected(|e| e.number_of_places_win = 3),
             EventRejection::Places(3)
