@@ -64,8 +64,10 @@ use tower_http::cors::{Any, CorsLayer};
 use utoipa::OpenApi;
 use utoipa_scalar::{Scalar, Servable};
 
-/// Parquet uploads from the daemon.
-const MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
+/// Parquet uploads from the daemon. The 2.3.3 daemon wrote forecast files
+/// uncompressed, near 90 MiB with their source provenance; files it left
+/// unpublished must still fit. Compressed files are a small fraction of this.
+const MAX_UPLOAD_BYTES: usize = 128 * 1024 * 1024;
 /// Every other request body: event and entry JSON is a few KiB.
 const MAX_BODY_BYTES: usize = 256 * 1024;
 /// Source data arrives hourly, so a 30 minute refresh keeps the cache at

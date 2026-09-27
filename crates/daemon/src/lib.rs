@@ -4,6 +4,7 @@
 mod coordinates;
 mod domains;
 pub mod keys;
+mod parquet_file;
 pub mod publish;
 mod s3_storage;
 pub mod source;

@@ -5,6 +5,9 @@
 //! marker beside it and a successful archive an `.archived` marker, so a
 //! file whose publication failed is retried on the next run and a file is
 //! deleted only after it is fully published and older than the retention
+//! period. A file that is not complete parquet can never be accepted, so it
+//! is set aside as `.invalid` rather than retried; set-aside files and
+//! `.partial` files from interrupted writes are removed after the retention
 //! period.
 //!
 //! Uploads are the raw parquet bytes, signed with NIP-98 over the exact
@@ -26,11 +29,13 @@ use std::{
 };
 use time::{Date, OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::{S3Storage, keys::npub};
+use crate::{S3Storage, keys::npub, parquet_file::PARTIAL};
 
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const UPLOADED: &str = "uploaded";
 const ARCHIVED: &str = "archived";
+const INVALID: &str = "invalid";
+const PARQUET_MAGIC: &[u8] = b"PAR1";
 
 /// A data file ready to publish.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +103,10 @@ pub enum PublishError {
     Archive(String),
     #[error("writing a publication marker failed")]
     Marker(#[source] io::Error),
+    #[error("{name} is not a complete parquet file; set it aside as {name}.{INVALID}")]
+    Incomplete { name: String },
+    #[error("setting aside an incomplete file failed")]
+    SetAside(#[source] io::Error),
     #[error("signing the upload failed: {0}")]
     Sign(String),
 }
@@ -162,6 +171,16 @@ impl Publisher {
                 path: artifact.path.clone(),
                 source,
             })?;
+        // A file cut short mid-write, as by a restart before data files were
+        // renamed into place, would be rejected on every run.
+        if !is_complete_parquet(&body) {
+            tokio::fs::rename(&artifact.path, artifact.marker(INVALID))
+                .await
+                .map_err(PublishError::SetAside)?;
+            return Err(PublishError::Incomplete {
+                name: artifact.name.clone(),
+            });
+        }
         let url = self
             .base_url
             .join(&format!("file/{}", artifact.name))
@@ -267,7 +286,45 @@ impl Publisher {
         // Failed collection runs have no parquet artifact. Bound their local
         // evidence lifetime with the same configured retention as published data.
         prune_orphan_quality_audits(data_dir, cutoff);
+        prune_unpublishable(data_dir, cutoff);
         removed
+    }
+}
+
+fn is_complete_parquet(body: &[u8]) -> bool {
+    body.len() >= 2 * PARQUET_MAGIC.len()
+        && body.starts_with(PARQUET_MAGIC)
+        && body.ends_with(PARQUET_MAGIC)
+}
+
+/// Removes `.partial` files left by interrupted writes and `.invalid` files
+/// set aside by the publisher once their run is older than `cutoff`.
+fn prune_unpublishable(data_dir: &Path, cutoff: OffsetDateTime) {
+    let Ok(days) = std::fs::read_dir(data_dir) else {
+        return;
+    };
+    for day in days.filter_map(Result::ok) {
+        let Ok(files) = std::fs::read_dir(day.path()) else {
+            continue;
+        };
+        for entry in files.filter_map(Result::ok) {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(original_name) = [PARTIAL, INVALID]
+                .iter()
+                .find_map(|suffix| name.strip_suffix(&format!(".{suffix}")))
+            else {
+                continue;
+            };
+            let Some(artifact) = Artifact::from_path(&path.with_file_name(original_name)) else {
+                continue;
+            };
+            if artifact.generated_at < cutoff {
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
 }
 
@@ -433,5 +490,46 @@ mod tests {
         assert_eq!(artifact.name, "forecasts_2030-01-01T05:00:00.5Z.parquet");
         assert!(Artifact::from_path(Path::new("/d/x.parquet.uploaded")).is_none());
         assert!(Artifact::from_path(Path::new("/d/forecasts_nope.parquet")).is_none());
+    }
+
+    #[tokio::test]
+    async fn incomplete_files_are_set_aside_instead_of_retried() {
+        let directory = tempfile::tempdir().unwrap();
+        let day = directory.path().join("2030-01-01");
+        std::fs::create_dir_all(&day).unwrap();
+        let truncated = day.join("forecasts_2030-01-01T00:00:00Z.parquet");
+        std::fs::write(&truncated, b"PAR1 rows cut short").unwrap();
+        let publisher = publisher(Keys::generate());
+        assert_eq!(publisher.publish_pending(directory.path()).await, 1);
+        assert!(!truncated.exists());
+        assert!(
+            day.join("forecasts_2030-01-01T00:00:00Z.parquet.invalid")
+                .exists(),
+            "the file is kept for inspection"
+        );
+        assert_eq!(
+            publisher.publish_pending(directory.path()).await,
+            0,
+            "a set-aside file is not retried"
+        );
+    }
+
+    #[test]
+    fn interrupted_and_set_aside_files_are_pruned_after_retention() {
+        let directory = tempfile::tempdir().unwrap();
+        let day = directory.path().join("2030-01-01");
+        std::fs::create_dir_all(&day).unwrap();
+        let old_partial = day.join("forecasts_2030-01-01T00:00:00Z.parquet.partial");
+        let old_invalid = day.join("forecasts_2030-01-01T01:00:00Z.parquet.invalid");
+        let recent_partial = day.join("forecasts_2030-01-01T10:00:00Z.parquet.partial");
+        for path in [&old_partial, &old_invalid, &recent_partial] {
+            std::fs::write(path, b"PAR1").unwrap();
+        }
+        let publisher = publisher(Keys::generate());
+        let now = time::macros::datetime!(2030-01-01 12:00 UTC);
+        publisher.prune(directory.path(), Duration::from_secs(4 * 3600), now);
+        assert!(!old_partial.exists());
+        assert!(!old_invalid.exists());
+        assert!(recent_partial.exists(), "a write in progress is untouched");
     }
 }

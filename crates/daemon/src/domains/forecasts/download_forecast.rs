@@ -2,6 +2,7 @@ use crate::Type::{
     Ice, Liquid, Maximum, MaximumRelative, Minimum, MinimumRelative,
     ProbabilityOfPrecipitationWithin12Hours, Snow, SnowRatio, Sustained, Wind,
 };
+use crate::parquet_file::{self, PartialFile};
 use crate::{CityWeather, DataReading, Dwml, Units, WeatherStation, XmlFetcher, split_cityweather};
 use anyhow::{Error, anyhow};
 use async_compression::tokio::write::GzipEncoder;
@@ -10,7 +11,6 @@ use core::time::Duration as StdDuration;
 use futures::stream::{self, StreamExt};
 use parquet::basic::LogicalType;
 use parquet::file::metadata::KeyValue;
-use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
 use parquet::record::RecordWriter;
 use parquet::{
@@ -21,7 +21,6 @@ use parquet_derive::ParquetRecordWriter;
 use sha2::{Digest, Sha256};
 use slog::{Logger, error, info};
 use std::collections::{BTreeMap, HashMap};
-use std::fs::File;
 use std::sync::Arc;
 use time::{
     Duration, OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339,
@@ -852,9 +851,9 @@ impl ForecastService {
     ) -> Result<ForecastReport, Error> {
         let batches = split_cityweather(city_weather.clone(), STATIONS_PER_REQUEST);
         let stations = &StationLookup::new(city_weather, &self.logger);
-        let file = File::create(output_path)
+        let (output, file) = PartialFile::create(output_path)
             .map_err(|e| anyhow!("failed to create parquet file: {}", e))?;
-        let props = WriterProperties::builder()
+        let props = parquet_file::properties()
             .set_key_value_metadata(Some(vec![KeyValue::new(
                 "noaa_forecast_interval_version".into(),
                 Some(FORECAST_INTERVAL_VERSION.into()),
@@ -932,6 +931,9 @@ impl ForecastService {
         writer
             .close()
             .map_err(|e| anyhow!("failed to close parquet writer: {}", e))?;
+        output
+            .commit()
+            .map_err(|e| anyhow!("failed to finish parquet file: {}", e))?;
         info!(
             self.logger,
             "forecasts: {} rows for {}/{} stations, {} failed batches, written to {}",
