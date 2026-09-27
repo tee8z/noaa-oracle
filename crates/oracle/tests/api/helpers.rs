@@ -291,6 +291,38 @@ pub fn event_at(now: OffsetDateTime) -> CreateEvent {
         scoring_fields: None,
         unlisted: false,
         scoring_rules: None,
+        lines_from_event: None,
+    }
+}
+
+/// A stored line fit at `now` on 60 windows: a station line, or the pooled
+/// line of `metric` when `target` is empty.
+pub fn fitted_line(
+    now: OffsetDateTime,
+    target: &str,
+    metric: &str,
+    lower: f64,
+    upper: f64,
+) -> oracle::lines::Line {
+    use oracle::lines::{Line, LineLevel};
+    Line {
+        target: target.into(),
+        metric: metric.into(),
+        lower,
+        upper,
+        level: if target.is_empty() {
+            LineLevel::Pooled
+        } else {
+            LineLevel::Station
+        },
+        window_hours: 24,
+        windows: 60,
+        over: 20,
+        par: 20,
+        under: 20,
+        first_window: now - Duration::days(60),
+        last_window: now - Duration::days(1),
+        fitted_at: now,
     }
 }
 
