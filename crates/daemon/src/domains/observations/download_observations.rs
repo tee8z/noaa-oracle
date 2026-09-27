@@ -1,6 +1,5 @@
 use anyhow::{Error, anyhow};
 use parquet::file::metadata::KeyValue;
-use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
 use parquet::record::RecordWriter;
 use parquet::{
@@ -21,6 +20,7 @@ use super::history::{
     ArchivedResponse, HISTORY_SOURCE, HistoryCollection, HistoryConfig, ObservationCoverage,
     collect_history,
 };
+use crate::parquet_file::{self, PartialFile};
 use crate::{CityWeather, Metar, Units, XmlFetcher};
 #[cfg(test)]
 use crate::{ObservationData, parse_xml};
@@ -962,7 +962,7 @@ impl ObservationService {
                 sidecar
             );
         }
-        let file = File::create(output_path)
+        let (output, file) = PartialFile::create(output_path)
             .map_err(|e| anyhow!("failed to create parquet file: {}", e))?;
         let mut metadata = vec![
             KeyValue::new("source_url".into(), Some(audit.source_url.into())),
@@ -982,7 +982,7 @@ impl ObservationService {
                 Some(serde_json::to_string(precipitation)?),
             ));
         }
-        let props = WriterProperties::builder()
+        let props = parquet_file::properties()
             .set_key_value_metadata(Some(metadata))
             .build();
         let mut writer =
@@ -1009,6 +1009,9 @@ impl ObservationService {
         writer
             .close()
             .map_err(|e| anyhow!("failed to close parquet writer: {}", e))?;
+        output
+            .commit()
+            .map_err(|e| anyhow!("failed to finish parquet file: {}", e))?;
 
         info!(self.logger, "done writing observations to {}", output_path);
         Ok(ObservationReport {

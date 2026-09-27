@@ -42,6 +42,20 @@ async fn uploader_publishes_parquet_into_the_dated_directory() {
 }
 
 #[tokio::test]
+async fn uncompressed_forecast_files_fit_the_upload_limit() {
+    let test_app = spawn_app(Arc::new(MockWeatherAccess::new())).await;
+    let name = "forecasts_2030-01-01T00:00:00Z.parquet";
+    // A 2.3.3 daemon's forecast file with its per-value source provenance.
+    let body = parquet(&vec![b'x'; 90 * 1024 * 1024]);
+    assert_eq!(
+        upload(&test_app, name, body.clone(), &test_app.uploader).await,
+        StatusCode::CREATED
+    );
+    let stored = test_app.weather_dir.join("2030-01-01").join(name);
+    assert_eq!(std::fs::metadata(stored).unwrap().len(), body.len() as u64);
+}
+
+#[tokio::test]
 async fn published_files_are_never_replaced() {
     let test_app = spawn_app(Arc::new(MockWeatherAccess::new())).await;
     let original = parquet(b"original");

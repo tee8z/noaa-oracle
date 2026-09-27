@@ -44,7 +44,7 @@ time = { version = "0.3", features = ["parsing", "formatting", "macros", "serde"
 
 # Parquet. Keep in step with the arrow version re-exported by the `duckdb`
 # crate so the workspace builds one copy of arrow.
-parquet = { version = "58", default-features = false }
+parquet = { version = "58", default-features = false, features = ["zstd"] }
 parquet_derive = "58"
 
 # S3
