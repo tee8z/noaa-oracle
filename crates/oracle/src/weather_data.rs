@@ -1251,6 +1251,15 @@ impl WeatherData for WeatherAccess {
             .native_forecast_assessment(req, station_ids)
             .await?
             .into_iter()
+            .inspect(|assessment| {
+                if let Some(reason) = &assessment.reason {
+                    log::warn!(
+                        "settlement forecast unavailable: station={} metric={} reason={reason}",
+                        assessment.station_id,
+                        assessment.metric
+                    );
+                }
+            })
             .map(|assessment| SettlementValue {
                 station_id: assessment.station_id,
                 metric: assessment.metric,

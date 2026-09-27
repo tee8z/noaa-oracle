@@ -29,11 +29,30 @@ where
         + 'static,
 {
     weather.expect_forecasts_data().returning(result.clone());
+    let assessed = result.clone();
+    weather
+        .expect_forecast_assessment()
+        .returning(move |request, stations| assessed(request, stations).map(forecast_assessments));
     weather
         .expect_settlement_forecasts()
         .returning(move |request, stations| {
             result(request, stations).map(settlement_forecast_values)
         });
+}
+
+/// The whole-period baselines provisional readings use, from the same daily
+/// fixture forecasts as settlement.
+fn forecast_assessments(rows: Vec<Forecast>) -> Vec<oracle::weather_data::ForecastAssessment> {
+    settlement_forecast_values(rows)
+        .into_iter()
+        .map(|value| oracle::weather_data::ForecastAssessment {
+            reason: value.value.is_none().then(|| "no forecast".into()),
+            station_id: value.station_id,
+            metric: value.metric,
+            value: value.value,
+            native_intervals: vec![],
+        })
+        .collect()
 }
 
 /// Convert daily fixture forecasts into the strict whole-window value shape.
@@ -606,7 +625,10 @@ async fn forecast_revisions_during_the_event_do_not_change_the_baseline_or_score
     let forecast_revised = revised.clone();
     set_forecasts(&mut weather, move |request, _| {
         let start = request.start.unwrap();
-        assert_eq!(request.generated_start, Some(start - Duration::days(7)));
+        // Settlement looks a week back for the latest publication before the
+        // event; provisional readings only the last few hours.
+        let generated_start = request.generated_start.unwrap();
+        assert!(generated_start >= start - Duration::days(7) && generated_start < start);
         assert_eq!(
             request.generated_end,
             Some(start - Duration::nanoseconds(1))
@@ -759,12 +781,14 @@ async fn a_missing_station_or_metric_cannot_be_scored_as_zero() {
 #[tokio::test]
 async fn strict_forecast_failure_preserves_provisional_scores() {
     let mut weather = MockWeatherAccess::new();
-    weather.expect_forecasts_data().returning(|request, _| {
-        Ok(forecasts_in_window(
-            request,
-            &[("KORD", 70, 50, 10), ("KSAW", 40, 30, 5)],
-        ))
-    });
+    weather
+        .expect_forecast_assessment()
+        .returning(|request, _| {
+            Ok(forecast_assessments(forecasts_in_window(
+                request,
+                &[("KORD", 70, 50, 10), ("KSAW", 40, 30, 5)],
+            )))
+        });
     weather
         .expect_settlement_forecasts()
         .returning(|_, _| Err(oracle::weather_data::Error::QualityUnavailable));
