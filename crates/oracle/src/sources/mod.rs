@@ -72,7 +72,11 @@ pub enum ParRule {
 pub struct Metric {
     /// Stable wire and storage name, e.g. `temp_high`.
     pub id: &'static str,
+    /// The fixed rule, used by events scored with `fixed` rules.
     pub par: ParRule,
+    /// Whether events can score this metric against fitted lines
+    /// (`lines` rules, see [`crate::lines`]).
+    pub calibrated: bool,
 }
 
 /// The time range an event watches.
@@ -146,6 +150,12 @@ pub trait OutcomeSource: Send + Sync {
         Err(SourceError::SettlementBlocked(
             "this source has no verified settlement reader".into(),
         ))
+    }
+
+    /// Every target the source tracks, for fitting lines. Empty when the
+    /// source has no line history.
+    async fn line_targets(&self) -> Result<Vec<String>, SourceError> {
+        Ok(vec![])
     }
 
     fn metric(&self, id: &str) -> Option<Metric> {

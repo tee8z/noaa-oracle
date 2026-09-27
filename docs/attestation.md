@@ -16,12 +16,14 @@ entry, and attestation shapes. The dlctix construction is described in
   "default": true,
   "default_metrics": ["temp_high", "temp_low", "wind_speed"],
   "metrics": [
-    {"id": "temp_high", "par": {"rule": "rounded"}},
-    {"id": "rain_amt",  "par": {"rule": "within", "tolerance": 0.1}},
-    {"id": "wind_direction", "par": {"rule": "compass", "tolerance": 22.0}}
+    {"id": "temp_high", "par": {"rule": "rounded"}, "calibrated": true},
+    {"id": "rain_amt",  "par": {"rule": "within", "tolerance": 0.1}, "calibrated": false},
+    {"id": "wind_direction", "par": {"rule": "compass", "tolerance": 22.0}, "calibrated": false}
   ]
 }]
 ```
+
+`calibrated` metrics can also be scored against lines (see [Scoring](#scoring)).
 
 A source defines which targets exist (NOAA station ids), which metrics can
 be predicted, and each metric's par rule. For every target and metric the
@@ -112,7 +114,8 @@ Fixed-hour totals still need adequate evidence for precipitation phase. Recent s
   "total_allowed_entries": 10,
   "number_of_places_win": 3,
   "number_of_values_per_entry": 4,
-  "unlisted": false
+  "unlisted": false,
+  "scoring_rules": "lines"
 }
 ```
 
@@ -123,6 +126,10 @@ and dashboard counts unless the reader chooses "Show unlisted"; its page,
 `/events/{id}`, and the API still serve it, and responses carry the flag.
 Limits: 2–25 entries, 1–5 places and fewer places than entries, at most
 20,000 outcomes, 1–50 distinct targets, start < end ≤ signing date.
+`scoring_rules` is `fixed` (the default) or `lines`; see [Scoring](#scoring).
+A `lines` event is refused when a metric is not `calibrated`, or when a
+target and metric has no line yet. The event response carries
+`scoring_rules`, and a `lines` event its `lines`.
 
 Before funding, coordinators can check proposed station, metric, and window combinations through
 [`GET /stations/window-compatibility`](settlement-operations.md#check-a-window-before-funding).
@@ -149,7 +156,40 @@ an entry uses one form or the other.
 
 ## Scoring
 
-Per pick: `Par` earns 20 points, a correct `Over`/`Under` 10, otherwise 0.
+An event is scored with the rules it was created with.
+
+**Fixed** (`"scoring_rules": "fixed"`, and every event created before lines
+existed): per pick, `Par` earns 20 points under the metric's Par rule, a
+correct `Over`/`Under` 10, otherwise 0.
+
+**Lines** (`"scoring_rules": "lines"`): each target and metric has a line, a
+band on the miss `observed − baseline`. `Under` when the miss is below
+`lower`, `Over` when it is above `upper`, `Par` from `lower` to `upper`,
+both included. Exactly one outcome happens, and a right pick earns 10
+points, otherwise 0. Values are compared unrounded.
+
+The oracle fits lines itself and refits them as windows end:
+
+- History: for every station the source tracks, the baseline and observation
+  of each past 24-hour window starting at 00:00 UTC, read with the
+  provisional reader three hours after the window ends. The last 60 days
+  are used.
+- Fit: cuts sit midway between neighbouring past misses. Of the three cuts
+  either side of the 1/3 and 2/3 marks, the pair whose largest outcome share
+  is nearest a third is kept, lower cuts first on a tie. The airport audit's
+  `walk_forward.py` (`fit_cuts`) does the same, and the oracle's tests check
+  both give the same lines.
+- A target with fewer than 20 past windows uses the pooled line of every
+  station for that metric (`"level": "pooled"`).
+- An event uses lines fitted on the window length nearest its own.
+
+When an event is created, the oracle copies the current line for each of
+its targets and metrics into the event, and scores it against those copies
+only. Each line carries its history: how many windows, how many fell Over,
+Par, and Under it, the first and last window, and when it was fitted.
+`GET /oracle/lines?targets=KORD,KSAW&metrics=temp_high` shows the lines an
+event created now would copy, and any target and metric without one.
+
 An entry's base score is the sum over its picks. Its total score is
 `max(1, base) × 10,000`. Entries rank by descending base score, then ascending
 full UUIDv7 entry id. Earlier UUIDv7 timestamps win ties, including across

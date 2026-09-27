@@ -16,10 +16,10 @@ use crate::{
     oracle::{Oracle, system_clock},
     routes::ui::WeatherKey,
     routes::{
-        add_event_entries, create_event, daily_observations, dashboard_handler, download,
-        event_detail_handler, events_handler, files, forecast_handler, forecasts, get_event,
-        get_event_entry, get_npub, get_pubkey, get_stations, health, healthy, list_events,
-        list_sources, observations, raw_data_handler, ready, station_handler,
+        add_event_entries, create_event, current_lines, daily_observations, dashboard_handler,
+        download, event_detail_handler, events_handler, files, forecast_handler, forecasts,
+        get_event, get_event_entry, get_npub, get_pubkey, get_stations, health, healthy,
+        list_events, list_sources, observations, raw_data_handler, ready, station_handler,
         ui::policy::content_security_policy, update_data, upload, warm_caches, weather_handler,
     },
     sources::{NoaaWeather, Sources},
@@ -181,6 +181,11 @@ const ETL_LEASE: &str = "etl";
 /// Longer than the processing interval, so the holder keeps the lease between
 /// passes; a stopped holder's passes move to another process after this.
 const ETL_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
+/// Line passes read forecast history and refit lines (see [`crate::lines`]).
+/// One process runs them; the lease outlasts a pass.
+const LINES_LEASE: &str = "lines";
+const LINES_LEASE_TTL: Duration = Duration::from_secs(30 * 60);
+const LINES_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum EtlRejected {
@@ -473,6 +478,7 @@ impl AppState {
         crate::routes::events::get_npub,
         crate::routes::events::get_pubkey,
         crate::routes::events::list_sources,
+        crate::routes::events::current_lines,
         crate::routes::events::list_events,
         crate::routes::events::create_event,
         crate::routes::events::get_event,
@@ -494,6 +500,10 @@ impl AppState {
                 crate::routes::files::get_names::Files,
                 crate::routes::events::ErrorBody,
                 crate::routes::events::SourceInfo,
+                crate::routes::events::CurrentLines,
+                crate::lines::Line,
+                crate::lines::LineLevel,
+                crate::scoring::ScoringRules,
                 crate::scoring::Pick,
                 crate::sources::Reading,
                 crate::events::Event,
@@ -614,6 +624,7 @@ pub fn app(app_state: Arc<AppState>) -> Router {
         .route("/oracle/npub", get(get_npub))
         .route("/oracle/pubkey", get(get_pubkey))
         .route("/oracle/sources", get(list_sources))
+        .route("/oracle/lines", get(current_lines))
         .route("/oracle/update", post(update_data))
         .route("/oracle/events", get(list_events))
         .route("/oracle/events", post(create_event))
@@ -766,6 +777,7 @@ impl ApplicationRuntime {
         spawn_file_preparation(&state);
         spawn_cache_warmer(&state);
         spawn_etl_schedule(&state, configuration.etl_interval);
+        spawn_line_schedule(&state);
         spawn_lease_release(&state);
         if let Some((listener, address)) = metrics_listener {
             runtime.metrics = Some(spawn_http(
@@ -980,6 +992,48 @@ fn spawn_lease_release(state: &Arc<AppState>) {
             warn!("cannot release the processing lease: {e}");
         }
         state.metrics.set_etl_lease_held(false);
+    });
+}
+
+/// Runs a line pass every [`LINES_INTERVAL`] once the first preparation of
+/// forecast files has ended, while this process holds the lines lease. A
+/// pass reads a few past windows, so history fills over the first passes
+/// after a deploy, then keeps up with one window a day.
+fn spawn_line_schedule(state: &Arc<AppState>) {
+    let state = state.clone();
+    let stopping = state.background.stopping.clone();
+    state.background.tasks.clone().spawn(async move {
+        tokio::select! {
+            biased;
+            () = stopping.cancelled() => return,
+            () = state.first_preparation_ended() => {}
+        }
+        let mut interval = tokio::time::interval(LINES_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                () = stopping.cancelled() => break,
+                _ = interval.tick() => {}
+            }
+            match state
+                .database
+                .take_lease(LINES_LEASE, &state.instance, LINES_LEASE_TTL)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    warn!("cannot take the lines lease: {e}");
+                    continue;
+                }
+            }
+            tokio::select! {
+                biased;
+                () = stopping.cancelled() => break,
+                _ = state.oracle.run_line_pass() => {}
+            }
+        }
     });
 }
 

@@ -29,7 +29,8 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::{
-    scoring::{self, Pick},
+    lines::Line,
+    scoring::{self, Pick, ScoringRules},
     signing::{EventNonce, SigningKey},
     sources::{OutcomeSource, Reading, SourceError, Sources, noaa},
 };
@@ -81,6 +82,13 @@ pub struct CreateEvent {
     /// its id, on its own page and over the API. Defaults to `false`.
     #[serde(default)]
     pub unlisted: bool,
+    /// How picks score. `lines` scores each target and metric against a
+    /// line fitted on its recent forecast misses, copied into the event when
+    /// it is created; every metric must support lines (`calibrated` in
+    /// `GET /oracle/sources`) and have one. Defaults to `fixed`, each
+    /// metric's Par rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoring_rules: Option<ScoringRules>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -111,6 +119,10 @@ pub enum EventRejection {
     ScoringFields,
     #[error("number_of_values_per_entry must be between 1 and {max}, requested {requested}")]
     ValuesPerEntry { requested: usize, max: usize },
+    #[error("{0} cannot be scored against lines; use fixed scoring rules")]
+    NotCalibrated(String),
+    #[error("no line has been fitted yet for {0}; use fixed scoring rules or try later")]
+    LinesUnavailable(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -170,6 +182,10 @@ pub struct NewEvent {
     /// The coordinator's npub.
     pub coordinator_pubkey: String,
     pub unlisted: bool,
+    pub scoring_rules: ScoringRules,
+    /// One per location and metric for `lines` events, added by the oracle
+    /// after [`NewEvent::build`]; empty for `fixed` events.
+    pub lines: Vec<Line>,
 }
 
 impl NewEvent {
@@ -237,6 +253,16 @@ impl NewEvent {
         {
             return Err(EventRejection::ScoringFields);
         }
+        let scoring_rules = event.scoring_rules.unwrap_or_default();
+        if scoring_rules == ScoringRules::Lines
+            && let Some(metric) = metrics.iter().find(|metric| {
+                source
+                    .metric(metric)
+                    .is_some_and(|metric| !metric.calibrated)
+            })
+        {
+            return Err(EventRejection::NotCalibrated(metric.clone()));
+        }
         let max_values = event.locations.len() * metrics.len();
         if !(1..=max_values).contains(&event.number_of_values_per_entry) {
             return Err(EventRejection::ValuesPerEntry {
@@ -277,6 +303,8 @@ impl NewEvent {
             },
             coordinator_pubkey,
             unlisted: event.unlisted,
+            scoring_rules,
+            lines: vec![],
         })
     }
 }
@@ -299,6 +327,7 @@ pub struct EventRecord {
     pub attestation: Option<MaybeScalar>,
     pub total_entries: usize,
     pub unlisted: bool,
+    pub scoring_rules: ScoringRules,
 }
 
 impl EventRecord {
@@ -333,6 +362,7 @@ impl EventRecord {
         event_announcement: EventLockingConditions,
         entries: Vec<Entry>,
         readings: &[Reading],
+        lines: Vec<Line>,
     ) -> Event {
         Event {
             id: self.id,
@@ -356,6 +386,8 @@ impl EventRecord {
             locations: self.locations,
             unlisted: self.unlisted,
             settlement_block: None,
+            scoring_rules: self.scoring_rules,
+            lines,
         }
     }
 
@@ -379,6 +411,7 @@ impl EventRecord {
             locations: self.locations,
             unlisted: self.unlisted,
             settlement_block: None,
+            scoring_rules: self.scoring_rules,
         }
     }
 }
@@ -640,6 +673,9 @@ pub struct EventSummary {
     /// Latest persisted reason that unsigned settlement could not proceed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settlement_block: Option<SettlementBlock>,
+    /// How picks score; the lines of a `lines` event are on the event itself
+    #[serde(default)]
+    pub scoring_rules: ScoringRules,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
@@ -687,6 +723,13 @@ pub struct Event {
     /// Latest persisted reason that unsigned settlement could not proceed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settlement_block: Option<SettlementBlock>,
+    /// How picks score
+    #[serde(default)]
+    pub scoring_rules: ScoringRules,
+    /// For `lines` events, the line each location and metric scores
+    /// against, fixed when the event was created
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<Line>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -974,6 +1017,7 @@ mod tests {
             &[Metric {
                 id: "high_tide_ft",
                 par: ParRule::Within(0.1),
+                calibrated: false,
             }]
         }
         fn validate_target(&self, _target: &str) -> Result<(), SourceError> {
@@ -1005,14 +1049,17 @@ mod tests {
                 Metric {
                     id: noaa::TEMP_HIGH,
                     par: ParRule::Rounded,
+                    calibrated: true,
                 },
                 Metric {
                     id: noaa::TEMP_LOW,
                     par: ParRule::Rounded,
+                    calibrated: true,
                 },
                 Metric {
                     id: noaa::WIND_SPEED,
                     par: ParRule::Exact,
+                    calibrated: true,
                 },
             ]
         }
@@ -1055,6 +1102,7 @@ mod tests {
             source: None,
             scoring_fields: None,
             unlisted: false,
+            scoring_rules: None,
         }
     }
 
@@ -1085,6 +1133,7 @@ mod tests {
             attestation: None,
             total_entries: 0,
             unlisted: new.unlisted,
+            scoring_rules: new.scoring_rules,
         }
     }
 
@@ -1230,6 +1279,7 @@ mod tests {
                 baseline: Some(5.2),
                 observed: None,
             }],
+            vec![],
         );
         assert!(wire.weather.is_empty(), "weather rows are NOAA only");
         assert_eq!(wire.readings.len(), 1);

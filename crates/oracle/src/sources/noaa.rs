@@ -26,37 +26,48 @@ pub const HUMIDITY: &str = "humidity";
 /// NOAA publishes up to a week of forecast periods per issue.
 const BASELINE_LOOKBACK: Duration = Duration::days(7);
 
-/// Par rules: temperatures compare whole degrees; wind speed is exact knots;
-/// direction is par within 22° either way; rain within 0.1", snow within
-/// 0.5", humidity within 5 points (against the forecast maximum).
+/// Fixed Par rules: temperatures compare whole degrees; wind speed is exact
+/// knots; direction is par within 22° either way; rain within 0.1", snow
+/// within 0.5", humidity within 5 points (against the forecast maximum).
+///
+/// Temperatures, wind speed, and humidity can also be scored against fitted
+/// lines. Direction wraps around the compass and precipitation is mostly
+/// zero, so neither has lines.
 const METRICS: &[Metric] = &[
     Metric {
         id: TEMP_HIGH,
         par: ParRule::Rounded,
+        calibrated: true,
     },
     Metric {
         id: TEMP_LOW,
         par: ParRule::Rounded,
+        calibrated: true,
     },
     Metric {
         id: WIND_SPEED,
         par: ParRule::Exact,
+        calibrated: true,
     },
     Metric {
         id: WIND_DIRECTION,
         par: ParRule::Compass(22.0),
+        calibrated: false,
     },
     Metric {
         id: RAIN_AMT,
         par: ParRule::Within(0.1),
+        calibrated: false,
     },
     Metric {
         id: SNOW_AMT,
         par: ParRule::Within(0.5),
+        calibrated: false,
     },
     Metric {
         id: HUMIDITY,
         par: ParRule::Within(5.0),
+        calibrated: true,
     },
 ];
 
@@ -107,6 +118,21 @@ impl OutcomeSource for NoaaWeather {
     ) -> Result<Vec<Reading>, SourceError> {
         self.load_readings(window, targets, Some(required_collected_after))
             .await
+    }
+
+    async fn line_targets(&self) -> Result<Vec<String>, SourceError> {
+        let mut stations: Vec<String> = self
+            .weather
+            .stations()
+            .await
+            .map_err(unavailable)?
+            .into_iter()
+            .map(|station| station.station_id)
+            .filter(|station| validate_station_id(station).is_ok())
+            .collect();
+        stations.sort();
+        stations.dedup();
+        Ok(stations)
     }
 }
 

@@ -4,6 +4,9 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::events::{Event, EventStatus, Weather, WeatherEntry};
+use crate::lines::{Line, LineLevel};
+use crate::scoring::{LINE_POINTS, OVER_OR_UNDER_POINTS, PAR_POINTS, ScoringRules};
+use crate::sources::Reading;
 use crate::templates::{
     components::{time as when, values},
     fragments::events::status_tag,
@@ -210,6 +213,19 @@ pub fn event_detail_content(
                         @for location in &event.locations { span class="tag" { (location) } " " }
                     }
                     dt { "Values per entry" } dd { (event.number_of_values_per_entry) }
+                    dt { "Scoring" }
+                    dd {
+                        @match event.scoring_rules {
+                            ScoringRules::Lines => {
+                                "Lines: one of Over, Par, and Under happens for each pick; a right pick earns "
+                                (LINE_POINTS) " points."
+                            }
+                            ScoringRules::Fixed => {
+                                "Fixed: Par earns " (PAR_POINTS) " points, a right Over or Under "
+                                (OVER_OR_UNDER_POINTS) "."
+                            }
+                        }
+                    }
                     dt { "Coordinator" } dd { code class="key" { (event.coordinator_pubkey) } }
                 }
             }
@@ -257,10 +273,79 @@ pub fn event_detail_content(
             }
         }
 
+        @if !event.lines.is_empty() {
+            section class="box" {
+                h3 class="title is-6" { "Par lines" }
+                (lines_table(&event.lines, &event.readings))
+            }
+        }
+
         @if !event.entries.is_empty() && event.status != EventStatus::Live {
             section class="box" {
                 h3 class="title is-6" { "Entries" }
                 (entries_table(event, event.number_of_places_win as usize, event.status == EventStatus::Signed))
+            }
+        }
+    }
+}
+
+/// A metric's unit after a value.
+fn unit(metric: &str) -> &'static str {
+    match metric {
+        "temp_high" | "temp_low" => "°F",
+        "wind_speed" => " kt",
+        "humidity" => "%",
+        _ => "",
+    }
+}
+
+/// Each location and metric's line: Par as a miss from the forecast, the
+/// same range around the current forecast, and the history it was fitted on.
+fn lines_table(lines: &[Line], readings: &[Reading]) -> Markup {
+    html! {
+        p class="muted" {
+            "Fixed when the event was created. Par when the observed value minus the forecast "
+            "falls inside the band, both ends included; Over above it, Under below. Each band "
+            "was fitted so that over its past windows the three came out about equally often."
+        }
+        div class="table-container" {
+            table class="table is-fullwidth is-narrow lines-table" {
+                thead {
+                    tr {
+                        th { "Location" }
+                        th { "Metric" }
+                        th { "Par (observed − forecast)" }
+                        th { "Par now" }
+                        th { "Fitted on" }
+                    }
+                }
+                tbody {
+                    @for line in lines {
+                        @let unit = unit(&line.metric);
+                        @let forecast = readings
+                            .iter()
+                            .find(|reading| reading.target == line.target && reading.metric == line.metric)
+                            .and_then(|reading| reading.baseline);
+                        tr {
+                            td { (line.target) }
+                            td { code { (line.metric) } }
+                            td { (format!("{:+.1} to {:+.1}{unit}", line.lower, line.upper)) }
+                            td {
+                                @match forecast {
+                                    Some(forecast) => {
+                                        (format!("{:.1}–{:.1}{unit}", forecast + line.lower, forecast + line.upper))
+                                    }
+                                    None => { span class="muted" { "no forecast yet" } }
+                                }
+                            }
+                            td class="muted" {
+                                (line.windows) " windows"
+                                @if line.level == LineLevel::Pooled { ", all stations" }
+                                " · Over " (line.over) ", Par " (line.par) ", Under " (line.under)
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -574,6 +659,45 @@ mod tests {
             assert!(!html.contains("is-paid"));
             assert!(!html.contains("#1"));
         }
+    }
+
+    #[test]
+    fn lines_show_par_around_the_forecast_and_their_history() {
+        let now = time::macros::datetime!(2026-09-27 00:00 UTC);
+        let line = |target: &str, level| Line {
+            target: target.into(),
+            metric: "temp_high".into(),
+            lower: -1.6,
+            upper: 1.2,
+            level,
+            window_hours: 24,
+            windows: 58,
+            over: 19,
+            par: 20,
+            under: 19,
+            first_window: now - time::Duration::days(60),
+            last_window: now - time::Duration::days(1),
+            fitted_at: now,
+        };
+        let readings = [Reading {
+            target: "KDEN".into(),
+            metric: "temp_high".into(),
+            baseline: Some(70.0),
+            observed: None,
+        }];
+        let html = lines_table(
+            &[
+                line("KDEN", LineLevel::Station),
+                line("KBJC", LineLevel::Pooled),
+            ],
+            &readings,
+        )
+        .into_string();
+        assert!(html.contains("-1.6 to +1.2°F"), "{html}");
+        assert!(html.contains("68.4–71.2°F"), "{html}");
+        assert!(html.contains("no forecast yet"));
+        assert_eq!(html.matches("all stations").count(), 1);
+        assert!(html.contains("Over 19, Par 20, Under 19"));
     }
 
     #[test]

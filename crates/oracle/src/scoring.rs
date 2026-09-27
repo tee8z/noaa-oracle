@@ -12,11 +12,51 @@ use uuid::Uuid;
 
 use crate::{
     events::ValueOptions,
-    sources::{Metric, ParRule, Reading},
+    lines::Band,
+    sources::{ParRule, Reading},
 };
 
+/// Points under `fixed` rules.
 pub const OVER_OR_UNDER_POINTS: u64 = 10;
 pub const PAR_POINTS: u64 = 20;
+/// Points for any right pick under `lines` rules.
+pub const LINE_POINTS: u64 = 10;
+
+/// How an event scores its picks. Chosen when the event is created and
+/// stored with it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoringRules {
+    /// Each metric's fixed Par rule (see `GET /oracle/sources`). Par earns
+    /// 20 points, a right Over or Under 10.
+    #[default]
+    Fixed,
+    /// The event's lines, fixed when it was created: exactly one of Over,
+    /// Par, and Under happens for each pick, and the right one earns 10.
+    Lines,
+}
+
+impl ScoringRules {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::Lines => "lines",
+        }
+    }
+
+    pub fn from_storage(value: &str) -> Option<Self> {
+        [Self::Fixed, Self::Lines]
+            .into_iter()
+            .find(|rules| rules.as_str() == value)
+    }
+}
+
+/// What one pick is scored against.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PickRule {
+    Fixed(ParRule),
+    Line(Band),
+}
 
 /// One prediction in an entry: `prediction` for `metric` at `target`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -54,23 +94,47 @@ pub fn points(prediction: &ValueOptions, rule: ParRule, reading: &Reading) -> u6
     }
 }
 
+/// Points for one prediction against a line: [`LINE_POINTS`] when the miss
+/// `observed - baseline` falls on the predicted side of it. Returns 0 when
+/// either value is missing.
+pub fn line_points(prediction: &ValueOptions, band: Band, reading: &Reading) -> u64 {
+    match (reading.baseline, reading.observed) {
+        (Some(baseline), Some(observed))
+            if baseline.is_finite()
+                && observed.is_finite()
+                && band.outcome(observed - baseline) == *prediction =>
+        {
+            LINE_POINTS
+        }
+        _ => 0,
+    }
+}
+
+pub fn pick_points(prediction: &ValueOptions, rule: PickRule, reading: &Reading) -> u64 {
+    match rule {
+        PickRule::Fixed(rule) => points(prediction, rule, reading),
+        PickRule::Line(band) => line_points(prediction, band, reading),
+    }
+}
+
 /// Base score of an entry: the sum of its picks' points, counting only
-/// metrics enabled for the event.
+/// metrics enabled for the event. `rule` gives the rule for a target and
+/// metric; a pick without one earns nothing.
 pub fn base_score(
     picks: &[Pick],
     readings: &[Reading],
     enabled: &[String],
-    metric: impl Fn(&str) -> Option<Metric>,
+    rule: impl Fn(&str, &str) -> Option<PickRule>,
 ) -> u64 {
     picks
         .iter()
         .filter(|pick| enabled.contains(&pick.metric))
         .filter_map(|pick| {
-            let rule = metric(&pick.metric)?.par;
+            let rule = rule(&pick.target, &pick.metric)?;
             let reading = readings
                 .iter()
                 .find(|reading| reading.target == pick.target && reading.metric == pick.metric)?;
-            Some(points(&pick.prediction, rule, reading))
+            Some(pick_points(&pick.prediction, rule, reading))
         })
         .sum()
 }
@@ -234,18 +298,68 @@ mod tests {
                 prediction: ValueOptions::Par,
             },
         ];
-        let metric = |id: &str| {
-            Some(Metric {
-                id: if id == "m" { "m" } else { "other" },
-                par: ParRule::Exact,
-            })
-        };
+        let rule = |_: &str, _: &str| Some(PickRule::Fixed(ParRule::Exact));
         let readings = vec![reading(1.0, 1.0)];
         assert_eq!(
-            base_score(&picks, &readings, &["m".into()], metric),
+            base_score(&picks, &readings, &["m".into()], rule),
             PAR_POINTS
         );
-        assert_eq!(base_score(&picks, &readings, &["other".into()], metric), 0);
+        assert_eq!(base_score(&picks, &readings, &["other".into()], rule), 0);
+        assert_eq!(
+            base_score(&picks, &readings, &["m".into()], |_, _| None),
+            0,
+            "a pick without a rule earns nothing"
+        );
+    }
+
+    #[test]
+    fn line_picks_have_one_right_answer_worth_ten() {
+        use ValueOptions::{Over, Par, Under};
+        let band = Band {
+            lower: -1.5,
+            upper: 0.5,
+        };
+        let score = |observed| {
+            [Over, Par, Under]
+                .map(|prediction| line_points(&prediction, band, &reading(70.0, observed)))
+        };
+        assert_eq!(score(68.4), [0, 0, LINE_POINTS], "a miss of -1.6 is Under");
+        assert_eq!(score(68.5), [0, LINE_POINTS, 0], "the lower cut is Par");
+        assert_eq!(score(70.0), [0, LINE_POINTS, 0]);
+        assert_eq!(score(70.5), [0, LINE_POINTS, 0], "the upper cut is Par");
+        assert_eq!(score(70.6), [LINE_POINTS, 0, 0]);
+        for invalid in [f64::NAN, f64::INFINITY] {
+            assert_eq!(score(invalid), [0, 0, 0]);
+        }
+        let missing = Reading {
+            baseline: None,
+            ..reading(70.0, 70.0)
+        };
+        assert_eq!(line_points(&Par, band, &missing), 0);
+        assert_eq!(
+            pick_points(&Par, PickRule::Line(band), &reading(70.0, 70.0)),
+            LINE_POINTS
+        );
+        assert_eq!(
+            pick_points(&Par, PickRule::Fixed(ParRule::Exact), &reading(70.0, 70.0)),
+            PAR_POINTS
+        );
+    }
+
+    #[test]
+    fn scoring_rules_have_a_stable_encoding() {
+        assert_eq!(
+            serde_json::to_string(&ScoringRules::Lines).unwrap(),
+            r#""lines""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ScoringRules::Fixed).unwrap(),
+            r#""fixed""#
+        );
+        assert_eq!(ScoringRules::default(), ScoringRules::Fixed);
+        for rules in [ScoringRules::Fixed, ScoringRules::Lines] {
+            assert_eq!(ScoringRules::from_storage(rules.as_str()), Some(rules));
+        }
     }
 
     #[test]

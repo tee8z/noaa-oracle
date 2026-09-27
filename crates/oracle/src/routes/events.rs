@@ -8,19 +8,22 @@ use log::{error, info, warn};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use std::sync::Arc;
-use utoipa::ToSchema;
+use time::Duration;
+use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::{
     AppState, EtlRejected,
     auth::{Role, Signed},
     database::WriteError,
+    events::MAX_LOCATIONS,
     events::{
         AddEventEntries, CreateEvent, EntryRejection, Event, EventFilter, EventSummary,
         WeatherEntry,
     },
+    lines::Line,
     oracle::Error,
-    sources::Metric,
+    sources::{Metric, ObservationWindow},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -99,6 +102,110 @@ pub async fn list_sources(State(state): State<Arc<AppState>>) -> Json<Vec<Source
             })
             .collect(),
     )
+}
+
+/// Which current lines to show.
+#[derive(Debug, Clone, Deserialize, IntoParams)]
+pub struct LinesQuery {
+    /// Comma separated targets, at most 50
+    pub targets: String,
+    /// Comma separated metric ids; defaults to the source's default metrics
+    pub metrics: Option<String>,
+    /// Source id; defaults to the default source
+    pub source: Option<String>,
+    /// Length of the event window, in hours; defaults to 24
+    pub window_hours: Option<i64>,
+}
+
+/// The lines an event created now would copy.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CurrentLines {
+    pub lines: Vec<Line>,
+    /// `target/metric` pairs without a line yet
+    pub missing: Vec<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/oracle/lines",
+    params(LinesQuery),
+    responses(
+        (status = OK, description = "The line each target and metric would score against if an event were created now", body = CurrentLines),
+        (status = BAD_REQUEST, description = "Unknown source, target, or metric, or a metric without lines", body = ErrorBody),
+    ))]
+pub async fn current_lines(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<LinesQuery>,
+) -> Response {
+    let sources = state.oracle.sources();
+    let source = match &query.source {
+        Some(id) => match sources.get(id) {
+            Some(source) => source,
+            None => return bad_request(format!("unknown source {id:?}")),
+        },
+        None => sources.default_source(),
+    };
+    let list = |values: &str| -> Vec<String> {
+        values
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    let targets = list(&query.targets);
+    if targets.is_empty() || targets.len() > MAX_LOCATIONS {
+        return bad_request(format!("targets must list 1 to {MAX_LOCATIONS} targets"));
+    }
+    if let Some(error) = targets
+        .iter()
+        .find_map(|target| source.validate_target(target).err())
+    {
+        return bad_request(error.to_string());
+    }
+    let metrics = match &query.metrics {
+        Some(metrics) => list(metrics),
+        None => source
+            .default_metrics()
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+    };
+    if let Some(metric) = metrics.iter().find(|metric| {
+        !source
+            .metric(metric)
+            .is_some_and(|metric| metric.calibrated)
+    }) {
+        return bad_request(format!(
+            "{metric:?} is not a metric of this source with lines"
+        ));
+    }
+    let hours = query.window_hours.unwrap_or(24);
+    if !(1..=24 * 14).contains(&hours) {
+        return bad_request("window_hours must be between 1 and 336".into());
+    }
+    let start = state.oracle.now();
+    let window = ObservationWindow {
+        start,
+        end: start + Duration::hours(hours),
+    };
+    match state
+        .oracle
+        .current_lines(source.id().as_str(), window, &targets, &metrics)
+        .await
+    {
+        Ok(Ok(lines)) => Json(CurrentLines {
+            lines,
+            missing: vec![],
+        })
+        .into_response(),
+        Ok(Err(missing)) => Json(CurrentLines {
+            lines: vec![],
+            missing,
+        })
+        .into_response(),
+        Err(error) => error.into_response(),
+    }
 }
 
 #[utoipa::path(
