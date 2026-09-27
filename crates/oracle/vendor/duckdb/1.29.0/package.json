@@ -1,0 +1,19 @@
+{
+  "name": "oracle-duckdb-browser-vendor",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "build": "node build.cjs"
+  },
+  "dependencies": {
+    "@duckdb/duckdb-wasm": "1.29.0",
+    "apache-arrow": "17.0.0"
+  },
+  "overrides": {
+    "tslib": "2.6.3",
+    "flatbuffers": "24.3.25"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.10"
+  }
+}

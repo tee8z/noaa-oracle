@@ -30,10 +30,14 @@ use sha2::{Digest, Sha256};
 
 /// The script that runs in `<head>`, before the page paints.
 const HEAD_SCRIPT: &str = "layouts/head.js";
+/// Installs the HTML policy after htmx loads, before application requests.
+const HTMX_SECURITY_SCRIPT: &str = "layouts/htmx_security.js";
 /// Scripts that only the raw data page loads.
 const RAW_DATA_DIR: &str = "pages/raw_data";
 /// htmx as published on npm (see the README beside it).
 const HTMX: &str = "vendor/htmx/4.0.0/htmx.min.js";
+/// Pinned DuckDB and Arrow browser module; workers/WASM remain on jsDelivr.
+const DUCKDB: &str = "vendor/duckdb/1.29.0/duckdb.js";
 
 struct Asset {
     /// Rust constant naming the asset in `assets.rs`.
@@ -53,6 +57,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let static_dir = templates.join("static");
     let htmx = Path::new(&manifest).join(HTMX);
     println!("cargo::rerun-if-changed={}", htmx.display());
+    let duckdb = Path::new(&manifest).join(DUCKDB);
+    println!("cargo::rerun-if-changed={}", duckdb.display());
     let output = Path::new(&output);
 
     let mut files = Vec::new();
@@ -63,6 +69,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let head = templates.join(HEAD_SCRIPT);
+    let htmx_security = templates.join(HTMX_SECURITY_SCRIPT);
     let raw_data = templates.join(RAW_DATA_DIR);
     let scripts = |wanted: &dyn Fn(&Path) -> bool| -> Vec<PathBuf> {
         files
@@ -76,6 +83,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     if head_scripts.is_empty() {
         return Err(format!("{} is missing", head.display()).into());
     }
+    // Install security in the same script task as htmx, before its deferred
+    // initialize() can process triggers or application requests can return.
+    let mut htmx_script = fs::read(&htmx)?;
+    htmx_script.extend_from_slice(b"\n;");
+    htmx_script.extend_from_slice(&minify_scripts(std::slice::from_ref(&htmx_security))?);
 
     let assets = [
         Asset {
@@ -98,7 +110,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             extension: "js",
             content_type: "text/javascript; charset=utf-8",
             bytes: minify_scripts(&scripts(&|file| {
-                file != head && !file.starts_with(&raw_data)
+                file != head && file != htmx_security && !file.starts_with(&raw_data)
             }))?,
         },
         Asset {
@@ -113,7 +125,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             stem: "htmx",
             extension: "js",
             content_type: "text/javascript; charset=utf-8",
-            bytes: fs::read(&htmx)?,
+            bytes: htmx_script,
+        },
+        Asset {
+            constant: "DUCKDB_JS",
+            stem: "duckdb",
+            extension: "js",
+            content_type: "text/javascript; charset=utf-8",
+            bytes: fs::read(&duckdb)?,
         },
         Asset {
             constant: "USA_MAP_SVG",

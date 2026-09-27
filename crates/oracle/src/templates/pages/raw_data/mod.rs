@@ -1,6 +1,7 @@
 use maud::{Markup, html};
 use time::{Duration, OffsetDateTime, Time, macros::format_description};
 
+use crate::templates::assets;
 use crate::templates::layouts::{CurrentPage, PageConfig, base};
 
 const CONFIG: PageConfig<'static> = PageConfig {
@@ -43,7 +44,7 @@ fn yesterday(now: OffsetDateTime) -> (String, String) {
 pub fn raw_data_content(now: OffsetDateTime) -> Markup {
     let (start, end) = yesterday(now);
     html! {
-        div id="raw-data" class="box raw-data" {
+        div id="raw-data" class="box raw-data" data-duckdb-module=(assets::DUCKDB_JS.url) {
             h2 class="title is-5" { "NOAA forecast and observation data" }
             p class="muted is-size-7 mb-3" {
                 "Load the parquet files for a window, then query them with DuckDB in your browser. "

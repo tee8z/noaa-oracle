@@ -22,6 +22,29 @@
     background: transparent;
 }
 
+.history-scroll-hint {
+    display: none;
+}
+
+.past-table-scroll:focus-visible {
+    outline: 2px solid var(--bulma-link);
+    outline-offset: 2px;
+}
+
+@media (max-width: 1023px) {
+    .history-scroll-hint {
+        display: block;
+    }
+
+    .past-table th:first-child {
+        position: sticky;
+        left: 0;
+        z-index: 1;
+        background: var(--bulma-scheme-main-bis);
+        box-shadow: 2px 0 0 var(--bulma-border-weak);
+    }
+}
+
 .past-table th[scope="row"] {
     white-space: nowrap;
     font-weight: 600;

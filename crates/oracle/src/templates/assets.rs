@@ -156,5 +156,19 @@ mod tests {
         assert!(!site.contains("duckdb"));
         let raw_data = std::str::from_utf8(RAW_DATA_JS.bytes).unwrap();
         assert!(raw_data.contains("duckdb"));
+        assert!(!raw_data.contains("/+esm"));
+        let duckdb = std::str::from_utf8(DUCKDB_JS.bytes).unwrap();
+        assert!(duckdb.contains("AsyncDuckDB"));
+        assert!(!duckdb.contains("/npm/apache-arrow"));
+    }
+
+    #[test]
+    fn htmx_security_is_in_the_same_script_task_as_htmx() {
+        let head = std::str::from_utf8(HEAD_JS.bytes).unwrap();
+        let htmx = std::str::from_utf8(HTMX_JS.bytes).unwrap();
+        let site = std::str::from_utf8(SITE_JS.bytes).unwrap();
+        assert!(!head.contains("createPolicy"));
+        assert!(!site.contains("createPolicy"));
+        assert!(htmx.rfind("createPolicy").unwrap() > htmx.find("var htmx=").unwrap());
     }
 }

@@ -74,7 +74,7 @@ pub fn page_fragment(config: &PageConfig, content: Markup) -> Markup {
 /// the markup uses neither `hx-on` nor `js:` values. Here: requests only to
 /// this site (the default, stated), a 10 s limit instead of 60 s, loading
 /// styles from our stylesheet rather than an injected one, and only our
-/// Trusted Types extension (`head.js`). History needs no setting: htmx 4
+/// Trusted Types extension (`htmx_security.js`). History needs no setting: htmx 4
 /// keeps no copies in localStorage, and going back re-requests the page
 /// with `HX-History-Restore-Request`.
 pub const HTMX_CONFIG: &str = r#"{"mode":"same-origin","defaultTimeout":10000,"includeIndicatorCSS":false,"extensions":"trusted-types"}"#;

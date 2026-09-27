@@ -17,7 +17,7 @@ module.exports = defineConfig({
     // Disable HTTP/2 to avoid connection issues
     ignoreHTTPSErrors: true,
   },
-  // Chromium enforces the pages' Trusted Types; Firefox checks the rest.
+  // Include WebKit: its deferred initialization and CDN preloads differ.
   projects: [
     {
       name: "chromium",
@@ -26,6 +26,10 @@ module.exports = defineConfig({
     {
       name: "firefox",
       use: { ...devices["Desktop Firefox"] },
+    },
+    {
+      name: "webkit",
+      use: { ...devices["Desktop Safari"] },
     },
   ],
   // In CI, we manage the server externally; locally, start it automatically

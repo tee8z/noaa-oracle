@@ -89,3 +89,68 @@ test("a page rendered before the time zone was known fetches its weather once mo
   listeners["DOMContentLoaded"]();
   assert.equal(requests.length, 1);
 });
+
+test("a refreshed map selects the station in its preserved panel, not the last request", () => {
+  const { listeners, document } = load();
+  const pins = ["KSLC", "KSEA"].map((station) => ({
+    dataset: { station },
+    attributes: {},
+    setAttribute(name, value) { this.attributes[name] = value; },
+    removeAttribute(name) { delete this.attributes[name]; },
+  }));
+  const heading = { textContent: " KSLC " };
+  document.getElementById = () => ({ querySelector: () => heading });
+  document.querySelectorAll = () => pins;
+
+  // The refreshed pins have no selection, but the panel was preserved.
+  listeners["htmx:after:process"]();
+  assert.equal(pins[0].attributes["aria-current"], "true");
+  assert.equal(pins[1].attributes["aria-current"], undefined);
+
+  // A successful second station response moves the marker.
+  heading.textContent = "KSEA";
+  listeners["htmx:after:process"]();
+  assert.equal(pins[0].attributes["aria-current"], undefined);
+  assert.equal(pins[1].attributes["aria-current"], "true");
+});
+
+test("HTTP and network failures clear map selection when the panel becomes an error", () => {
+  for (const name of ["htmx:after:request", "htmx:error"]) {
+    const { listeners, document } = load();
+    const pin = {
+      dataset: { station: "KSLC" },
+      attributes: { "aria-current": "true" },
+      removeAttribute(name) { delete this.attributes[name]; },
+    };
+    document.getElementById = () => ({ querySelector: () => null });
+    document.querySelectorAll = () => [pin];
+    listeners[name]();
+    assert.equal(pin.attributes["aria-current"], undefined);
+
+    // These global events also run on pages without a map.
+    document.getElementById = () => null;
+    assert.doesNotThrow(() => listeners[name]());
+  }
+});
+
+test("opening a station moves keyboard focus into its panel, while a refresh leaves focus alone", () => {
+  const { listeners, document } = load();
+  const focused = {};
+  const heading = { focus() { document.activeElement = this; } };
+  const source = { contains: (element) => element === focused };
+  const panel = { id: "map-station", querySelector: () => heading };
+  document.activeElement = focused;
+  listeners["htmx:after:swap"]({ detail: { ctx: { sourceElement: source, target: panel } } });
+  assert.equal(document.activeElement, heading);
+  assert.equal(heading.tabIndex, -1);
+
+  document.activeElement = focused;
+  listeners["htmx:after:swap"]({ detail: { ctx: { sourceElement: source, target: { id: "weather-table-container" } } } });
+  assert.equal(document.activeElement, focused);
+
+  // If the reader tabs elsewhere while loading, do not take their focus.
+  const elsewhere = {};
+  document.activeElement = elsewhere;
+  listeners["htmx:after:swap"]({ detail: { ctx: { sourceElement: source, target: panel } } });
+  assert.equal(document.activeElement, elsewhere);
+});

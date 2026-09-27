@@ -302,10 +302,9 @@ fn observed_and_forecast(
     }
 }
 
-/// Why every entry ties, when nobody scored: the oracle then signs the
-/// outcome in which every entry wins. What that outcome pays is up to
-/// whoever built a contract on the event, so this says nothing about it.
-fn tie_reason(nothing_observed: bool, window: time::Duration) -> String {
+/// Explain the all-entry outcome without confusing it with ranked ties or
+/// claiming that a contract has paid. Missing observations are only one cause.
+fn no_score_reason(nothing_observed: bool, window: time::Duration) -> String {
     let why = if nothing_observed {
         format!(
             "No hourly station report fell inside the {} observation window, so no entry scored.",
@@ -314,7 +313,9 @@ fn tie_reason(nothing_observed: bool, window: time::Duration) -> String {
     } else {
         "No entry scored any points.".into()
     };
-    format!("{why} The oracle signed the outcome in which every entry ties.")
+    format!(
+        "No-score outcome. {why} The oracle signed the outcome for all entries. Payments depend on the competition's signed contract."
+    )
 }
 
 fn entries_table(event: &Event, num_winners: usize, signed: bool) -> Markup {
@@ -331,11 +332,16 @@ fn entries_table(event: &Event, num_winners: usize, signed: bool) -> Markup {
         &event.entries,
         num_winners,
         signed,
-        &tie_reason(nothing_observed, window),
+        &no_score_reason(nothing_observed, window),
     )
 }
 
-fn entries_list(entries: &[WeatherEntry], num_winners: usize, signed: bool, tied: &str) -> Markup {
+fn entries_list(
+    entries: &[WeatherEntry],
+    num_winners: usize,
+    signed: bool,
+    no_score: &str,
+) -> Markup {
     // API entries stay in id order because outcome indices depend on it.
     // Sort references for display only. Stored scores also preserve the
     // ranking of historical events signed with the older score formula.
@@ -349,7 +355,7 @@ fn entries_list(entries: &[WeatherEntry], num_winners: usize, signed: bool, tied
             p class="entries-note" { "Scores pending." }
         } @else if no_points {
             p class="entries-note" {
-                @if signed { (tied) } @else { "No entry has scored yet." }
+                @if signed { (no_score) } @else { "No entry has scored yet." }
             }
         }
         div class="table-container" {
@@ -367,7 +373,7 @@ fn entries_list(entries: &[WeatherEntry], num_winners: usize, signed: bool, tied
                         tr class=[paid.then_some("is-paid")] {
                             td {
                                 @if no_points && signed {
-                                    span class="tag is-light" title="No entry scored, so every entry ties" { "Tied" }
+                                    span class="tag is-light" title="No entry scored any points; the oracle signed the outcome for all entries" { "No score" }
                                 } @else if !show_ranks {
                                     span class="muted" { "—" }
                                 } @else if paid {
@@ -459,7 +465,7 @@ mod tests {
             entry(2, Some(200_000), Some(20)),
         ];
         let original = entries.clone();
-        let html = entries_list(&entries, 1, true, "Every entry ties.").into_string();
+        let html = entries_list(&entries, 1, true, "No-score outcome.").into_string();
         assert_eq!(
             displayed_ids(&html),
             vec![entries[2].id, entries[1].id, entries[0].id]
@@ -475,7 +481,7 @@ mod tests {
             entry(1, Some(190_001), Some(20)),
             entry(2, Some(200_000), Some(20)),
         ];
-        let html = entries_list(&entries, 1, true, "Every entry ties.").into_string();
+        let html = entries_list(&entries, 1, true, "No-score outcome.").into_string();
         assert_eq!(displayed_ids(&html), vec![entries[1].id, entries[0].id]);
     }
 
@@ -501,10 +507,10 @@ mod tests {
                     entry(2, Some(10_000), Some(0)),
                 ],
                 true,
-                "Every entry ties.",
+                "No-score outcome.",
             ),
         ] {
-            let html = entries_list(&entries, 1, signed, "Every entry ties.").into_string();
+            let html = entries_list(&entries, 1, signed, "No-score outcome.").into_string();
             assert!(html.contains(message));
             assert!(!html.contains("entry-score paid"));
             assert!(!html.contains("is-paid"));
@@ -627,29 +633,30 @@ mod tests {
     }
 
     #[test]
-    fn when_nobody_scores_every_entry_ties() {
+    fn no_score_outcomes_explain_observations_without_claiming_payment() {
         let short = time::Duration::minutes(10);
-        let reason = tie_reason(true, short);
+        let reason = no_score_reason(true, short);
         assert!(
-            reason
-                .starts_with("No hourly station report fell inside the 10 min observation window")
+            reason.contains("No hourly station report fell inside the 10 min observation window")
         );
-        assert!(reason.contains("every entry ties"), "{reason}");
+        assert!(reason.starts_with("No-score outcome."), "{reason}");
+        assert!(reason.contains("outcome for all entries"), "{reason}");
+        assert!(reason.contains("Payments depend on the competition's signed contract."));
         assert!(
-            !reason.contains("refund") && !reason.contains("pot"),
+            !reason.contains("refund") && !reason.contains("pot") && !reason.contains("ties"),
             "{reason}"
         );
-        assert!(
-            tie_reason(false, time::Duration::hours(18)).starts_with("No entry scored any points.")
-        );
+        let with_readings = no_score_reason(false, time::Duration::hours(18));
+        assert!(with_readings.contains("No entry scored any points."));
+        assert!(!with_readings.contains("No hourly station report"));
         assert_eq!(duration(time::Duration::minutes(90)), "1 h 30 min");
 
         let entries = [
             entry(1, Some(10_000), Some(0)),
             entry(2, Some(10_000), Some(0)),
         ];
-        let html = entries_list(&entries, 1, true, &tie_reason(true, short)).into_string();
-        assert_eq!(html.matches(">Tied<").count(), 2, "{html}");
+        let html = entries_list(&entries, 1, true, &reason).into_string();
+        assert_eq!(html.matches(">No score<").count(), 2, "{html}");
         assert!(!html.contains("pts"), "{html}");
         assert!(!html.contains("10000"), "{html}");
     }

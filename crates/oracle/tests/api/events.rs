@@ -503,10 +503,7 @@ async fn pages_allow_only_their_own_script_files() {
         (
             "/raw".to_string(),
             StatusCode::OK,
-            Some(
-                "'wasm-unsafe-eval' https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/ \
-                 https://cdn.jsdelivr.net/npm/apache-arrow@17.0.0/+esm",
-            ),
+            Some("'wasm-unsafe-eval' https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/"),
         ),
     ] {
         let response = test_app
@@ -530,10 +527,31 @@ async fn pages_allow_only_their_own_script_files() {
         }
         assert!(!policy.contains("unsafe-inline"), "{path}: {policy}");
         assert!(!policy.contains("'unsafe-eval'"), "{path}: {policy}");
+        let script_directives: Vec<_> = policy
+            .split(';')
+            .map(str::trim)
+            .filter(|directive| directive.starts_with("script-src "))
+            .collect();
+        let expected_script = match extra {
+            Some(sources) => format!("script-src 'self' {sources}"),
+            None => "script-src 'self'".to_string(),
+        };
+        assert_eq!(
+            script_directives,
+            [expected_script.as_str()],
+            "{path}: {policy}"
+        );
         match extra {
-            Some(sources) => {
-                assert!(policy.contains(sources), "{path}: {policy}");
-                // Only the exact modules, not the whole CDN.
+            Some(_) => {
+                // Only the pinned DuckDB worker/Wasm directory is remote. The
+                // DuckDB/Arrow module is bundled locally, so it needs no CDN exception.
+                assert!(
+                    policy
+                        .split(';')
+                        .any(|directive| directive.trim() == "worker-src blob:"),
+                    "{path}: {policy}"
+                );
+                assert!(!policy.contains("apache-arrow"), "{path}: {policy}");
                 assert!(!policy.contains("jsdelivr.net "), "{path}: {policy}");
                 assert!(!policy.contains("jsdelivr.net;"), "{path}: {policy}");
             }
@@ -567,6 +585,11 @@ async fn pages_allow_only_their_own_script_files() {
         assert!(html.contains("&quot;defaultTimeout&quot;:10000"), "{path}");
         // Only the raw data page loads its DuckDB script.
         assert_eq!(html.contains("/assets/raw-data."), path == "/raw", "{path}");
+        assert_eq!(
+            html.contains("data-duckdb-module=\"/assets/duckdb."),
+            path == "/raw",
+            "{path}"
+        );
     }
     assert_eq!(inline_handlers(r#"<a onclick="x()">once</a>"#), ["onclick"]);
     assert!(inline_handlers(r#"<p hx-trigger="toggle once">on = off</p>"#).is_empty());
