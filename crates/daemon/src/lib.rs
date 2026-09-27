@@ -9,7 +9,10 @@ mod s3_storage;
 pub mod source;
 mod utils;
 
-pub use coordinates::{CityWeather, WeatherStation, get_coordinates, split_cityweather};
+pub use coordinates::{
+    CityWeather, StationCatalogEvidence, WeatherStation, get_coordinates,
+    get_coordinates_with_evidence, split_cityweather,
+};
 pub use domains::*;
 pub use s3_storage::S3Storage;
 pub use utils::{

@@ -29,7 +29,7 @@ pub struct ObservationData {
 
 #[derive(Serialize, Deserialize)]
 pub struct CurrentData {
-    #[serde(rename = "METAR")]
+    #[serde(rename = "METAR", default)]
     pub metar: Vec<Metar>,
 
     #[serde(rename = "@num_results", default)]
@@ -40,6 +40,9 @@ pub struct CurrentData {
 pub struct Metar {
     #[serde(rename = "raw_text")]
     pub raw_text: String,
+
+    #[serde(default)]
+    pub metar_type: Option<String>,
 
     #[serde(rename = "station_id")]
     pub station_id: String,

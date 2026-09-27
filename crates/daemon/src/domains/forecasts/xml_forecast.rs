@@ -118,39 +118,62 @@ impl TimeLayout {
         let description = format_description!(
             "[year]-[month]-[day]T[hour]:[minute]:[second][offset_hour]:[offset_minute]"
         );
-        let mut result =
-            self.time
-                .iter()
-                .fold(vec![], |mut time_ranges: Vec<TimeRange>, current_time| {
-                    match current_time {
-                        Time::LayoutKey(key) => time_ranges.push(TimeRange {
-                            key: key.to_string(),
-                            start_time: OffsetDateTime::UNIX_EPOCH,
-                            end_time: None,
-                        }),
-                        Time::StartTime(start_time) => {
-                            let current_time = OffsetDateTime::parse(start_time, description)
-                                .map_err(|e| anyhow!("error parsing time start time: {}", e))
-                                .unwrap();
-                            let previous = time_ranges.last().unwrap();
-                            time_ranges.push(TimeRange {
-                                key: previous.key.clone(),
-                                start_time: current_time,
-                                end_time: None,
-                            })
-                        }
-                        Time::EndTime(end_time) => {
-                            let current_time = OffsetDateTime::parse(end_time, description)
-                                .map_err(|e| anyhow!("error parsing end time: {}", e))
-                                .unwrap();
-                            let previous = time_ranges.last_mut().unwrap();
-                            previous.end_time = Some(current_time);
-                        }
+        let mut result: Vec<TimeRange> = Vec::new();
+        let mut key = None;
+        for value in &self.time {
+            match value {
+                Time::LayoutKey(value) => {
+                    if value.is_empty()
+                        || key.replace(value.clone()).is_some()
+                        || !result.is_empty()
+                    {
+                        return Err(anyhow!(
+                            "forecast layout has an empty, repeated, or misplaced key"
+                        ));
                     }
-                    time_ranges
-                });
-        result.retain(|time_range| time_range.start_time != OffsetDateTime::UNIX_EPOCH);
-        Ok(result.clone())
+                }
+                Time::StartTime(value) => {
+                    let key = key
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("forecast start precedes layout-key"))?;
+                    let start_time =
+                        OffsetDateTime::parse(value, description).map_err(|error| {
+                            anyhow!("invalid forecast start time {value:?}: {error}")
+                        })?;
+                    if result
+                        .last()
+                        .is_some_and(|previous| start_time <= previous.start_time)
+                    {
+                        return Err(anyhow!(
+                            "forecast layout start times are not strictly increasing"
+                        ));
+                    }
+                    result.push(TimeRange {
+                        key: key.clone(),
+                        start_time,
+                        end_time: None,
+                    });
+                }
+                Time::EndTime(value) => {
+                    let previous = result
+                        .last_mut()
+                        .ok_or_else(|| anyhow!("forecast end precedes start time"))?;
+                    let end_time = OffsetDateTime::parse(value, description)
+                        .map_err(|error| anyhow!("invalid forecast end time {value:?}: {error}"))?;
+                    if end_time <= previous.start_time
+                        || previous.end_time.replace(end_time).is_some()
+                    {
+                        return Err(anyhow!(
+                            "forecast interval has a repeated or nonpositive end time"
+                        ));
+                    }
+                }
+            }
+        }
+        if result.is_empty() {
+            return Err(anyhow!("forecast layout contains no start times"));
+        }
+        Ok(result)
     }
 }
 
@@ -284,7 +307,12 @@ pub enum Units {
     #[serde(rename = "Fahrenheit")]
     Fahrenheit,
 
-    #[serde(rename = "Celcius")]
+    #[serde(
+        rename = "Celcius",
+        alias = "Celsius",
+        alias = "celsius",
+        alias = "celcius"
+    )]
     #[default]
     Celcius,
 
@@ -296,6 +324,11 @@ pub enum Units {
 
     #[serde(rename = "percent")]
     Percent,
+
+    // Preserve an unfamiliar source unit so the native row can be quarantined
+    // with its original evidence instead of being interpreted using defaults.
+    #[serde(untagged)]
+    Unknown(String),
 }
 
 impl Display for Units {
@@ -307,6 +340,7 @@ impl Display for Units {
             Units::Inches => write!(f, "inches"),
             Units::Knots => write!(f, "knots"),
             Units::Percent => write!(f, "percent"),
+            Units::Unknown(value) => write!(f, "{value}"),
         }
     }
 }
@@ -358,5 +392,38 @@ mod tests {
             parameters.humidity.as_ref().unwrap()[1].reading_type,
             Type::MinimumRelative
         );
+    }
+}
+
+#[cfg(test)]
+mod invalid_layout_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_source_layouts_return_errors_instead_of_panicking() {
+        let start = Time::StartTime("2026-09-24T18:00:00+00:00".into());
+        let key = Time::LayoutKey("hourly".into());
+        for time in [
+            vec![start.clone()],
+            vec![key.clone(), Time::StartTime("bad date".into())],
+            vec![
+                key.clone(),
+                Time::EndTime("2026-09-24T19:00:00+00:00".into()),
+            ],
+            vec![key.clone(), start.clone(), Time::EndTime("bad date".into())],
+            vec![
+                key.clone(),
+                start.clone(),
+                Time::EndTime("2026-09-24T17:00:00+00:00".into()),
+            ],
+            vec![key.clone(), start.clone(), start],
+            vec![key.clone(), key],
+        ] {
+            let layout = TimeLayout {
+                time,
+                ..Default::default()
+            };
+            assert!(layout.to_time_ranges().is_err());
+        }
     }
 }

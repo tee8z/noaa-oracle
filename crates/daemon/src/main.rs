@@ -3,7 +3,7 @@ use daemon::{
     Cli, RateLimiter, S3Storage, XmlFetcher, keys,
     publish::Publisher,
     setup_logger,
-    source::{NoaaWeather, Run, Source},
+    source::{NoaaForecasts, NoaaObservations, Run, Source},
 };
 use slog::{Logger, error, info, warn};
 use std::{sync::Arc, time::Duration};
@@ -61,11 +61,18 @@ async fn main() -> anyhow::Result<()> {
         &configuration.user_agent,
         rate_limiter,
     )?);
-    let sources: Vec<Box<dyn Source>> = vec![Box::new(NoaaWeather::new(
-        fetcher,
-        configuration.min_forecast_coverage,
-        logger.clone(),
-    ))];
+    let sources: Vec<Box<dyn Source>> = vec![
+        Box::new(NoaaObservations::new(
+            fetcher.clone(),
+            configuration.observation_history.clone(),
+            logger.clone(),
+        )),
+        Box::new(NoaaForecasts::new(
+            fetcher,
+            configuration.min_forecast_coverage,
+            logger.clone(),
+        )),
+    ];
 
     let stop = CancellationToken::new();
     tokio::spawn(stop_on_signal(stop.clone(), logger.clone()));

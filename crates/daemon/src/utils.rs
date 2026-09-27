@@ -80,6 +80,14 @@ pub struct Cli {
     #[arg(long, env = "NOAA_DAEMON_MIN_FORECAST_COVERAGE")]
     pub min_forecast_coverage: Option<f64>,
 
+    /// Hours of METAR history fetched per run (1..24; must exceed fetch interval)
+    #[arg(long, env = "NOAA_DAEMON_OBSERVATION_HISTORY_HOURS")]
+    pub observation_history_hours: Option<u32>,
+
+    /// Stations in each history API request (1..25)
+    #[arg(long, env = "NOAA_DAEMON_OBSERVATION_BATCH_SIZE")]
+    pub observation_batch_size: Option<usize>,
+
     /// Days to keep published parquet files locally
     #[arg(long, env = "NOAA_DAEMON_RETENTION_DAYS")]
     pub retention_days: Option<u64>,
@@ -105,6 +113,7 @@ pub struct Configuration {
     pub user_agent: String,
     pub private_key: PathBuf,
     pub min_forecast_coverage: f64,
+    pub observation_history: crate::HistoryConfig,
     pub retention: Duration,
     pub s3: Option<S3Settings>,
 }
@@ -131,6 +140,8 @@ pub enum ConfigError {
     NotPositive(&'static str),
     #[error("min_forecast_coverage must be between 0 and 1")]
     Coverage,
+    #[error("invalid observation history configuration: {0}")]
+    ObservationHistory(String),
 }
 
 impl Cli {
@@ -161,6 +172,10 @@ impl Cli {
             user_agent: cli.user_agent.or(file.user_agent),
             private_key: cli.private_key.or(file.private_key),
             min_forecast_coverage: cli.min_forecast_coverage.or(file.min_forecast_coverage),
+            observation_history_hours: cli
+                .observation_history_hours
+                .or(file.observation_history_hours),
+            observation_batch_size: cli.observation_batch_size.or(file.observation_batch_size),
             retention_days: cli.retention_days.or(file.retention_days),
             s3_bucket: cli.s3_bucket.or(file.s3_bucket),
             s3_endpoint: cli.s3_endpoint.or(file.s3_endpoint),
@@ -202,6 +217,20 @@ impl Cli {
         if !(0.0..=1.0).contains(&min_forecast_coverage) {
             return Err(ConfigError::Coverage);
         }
+        let observation_history = crate::HistoryConfig {
+            hours: self.observation_history_hours.unwrap_or(4),
+            batch_size: self.observation_batch_size.unwrap_or(25),
+        };
+        observation_history
+            .validate()
+            .map_err(|e| ConfigError::ObservationHistory(e.to_string()))?;
+        if self.sleep_interval.unwrap_or(DEFAULT_FETCH_INTERVAL)
+            >= u64::from(observation_history.hours) * 3600
+        {
+            return Err(ConfigError::ObservationHistory(
+                "history window must exceed fetch interval".into(),
+            ));
+        }
         let retention_days = self.retention_days.unwrap_or(7);
         if retention_days == 0 {
             return Err(ConfigError::NotPositive("retention_days"));
@@ -228,6 +257,7 @@ impl Cli {
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("./daemon_private_key.pem")),
             min_forecast_coverage,
+            observation_history,
             retention: Duration::from_secs(retention_days * 24 * 60 * 60),
             s3: self
                 .s3_bucket
@@ -351,6 +381,7 @@ pub enum FetchError {
 pub struct XmlFetcher {
     logger: Logger,
     client: ClientWithMiddleware,
+    history_client: Client,
     rate_limiter: Arc<Mutex<RateLimiter>>,
 }
 
@@ -368,6 +399,7 @@ impl XmlFetcher {
         let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
         Ok(Self {
             logger,
+            history_client: client.clone(),
             client: ClientBuilder::new(client)
                 .with(RetryTransientMiddleware::new_with_policy(retry_policy))
                 .build(),
@@ -404,6 +436,58 @@ impl XmlFetcher {
             });
         }
         Ok(response)
+    }
+
+    /// One bounded request preserving the status of the history API. Retrying
+    /// middleware is deliberately bypassed: every physical request takes a
+    /// rate-limit token, and the history collector records any failure.
+    pub async fn fetch_history_xml(&self, url: &str) -> Result<(u16, String), FetchError> {
+        RateLimiter::acquire(&self.rate_limiter).await;
+        self.fetch_bounded_evidence(url, MAX_RESPONSE_BYTES).await
+    }
+
+    /// The RR7 collector enforces its separate one-request-per-second NWS limit.
+    pub(crate) async fn fetch_shef_json(&self, url: &str) -> Result<(u16, String), FetchError> {
+        self.fetch_bounded_evidence(url, 8 * 1024 * 1024).await
+    }
+
+    async fn fetch_bounded_evidence(
+        &self,
+        url: &str,
+        limit: u64,
+    ) -> Result<(u16, String), FetchError> {
+        let response = self
+            .history_client
+            .get(url)
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await
+            .map_err(|source| FetchError::Request {
+                url: redact(url),
+                source: source.into(),
+            })?;
+        let status = response.status();
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit)
+        {
+            return Err(FetchError::TooLarge {
+                url: redact(url),
+                limit,
+            });
+        }
+        let body = read_limited(
+            response
+                .bytes_stream()
+                .map_err(std::io::Error::other)
+                .into_async_read()
+                .compat(),
+            limit,
+            url,
+        )
+        .await?;
+        let body = String::from_utf8(body).map_err(|_| FetchError::NotUtf8 { url: redact(url) })?;
+        Ok((status.as_u16(), body))
     }
 
     pub async fn fetch_xml(&self, url: &str) -> Result<String, FetchError> {
@@ -541,6 +625,37 @@ mod tests {
             read_limited(decoder, 64 * 1024, "https://x.test/a").await,
             Err(FetchError::TooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn observation_history_configuration_requires_bounded_overlap() {
+        for change in [
+            |cli: &mut Cli| cli.observation_history_hours = Some(0),
+            |cli: &mut Cli| cli.observation_history_hours = Some(25),
+            |cli: &mut Cli| cli.observation_batch_size = Some(0),
+            |cli: &mut Cli| cli.observation_batch_size = Some(26),
+            |cli: &mut Cli| cli.sleep_interval = Some(4 * 3600),
+        ] {
+            let mut cli = Cli::default();
+            change(&mut cli);
+            assert!(matches!(
+                cli.configuration(),
+                Err(ConfigError::ObservationHistory(_))
+            ));
+        }
+        let config: Cli =
+            toml::from_str("observation_history_hours = 4\nobservation_batch_size = 10").unwrap();
+        let validated = config.configuration().unwrap();
+        assert_eq!(validated.observation_history.hours, 4);
+        assert_eq!(validated.observation_history.batch_size, 10);
+        assert_eq!(
+            Cli::default()
+                .configuration()
+                .unwrap()
+                .observation_history
+                .hours,
+            4
+        );
     }
 
     #[test]

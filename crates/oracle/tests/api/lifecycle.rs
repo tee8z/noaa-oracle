@@ -3,7 +3,10 @@
 //! of the winning outcome, and never change once published.
 
 use crate::helpers::{MockWeatherAccess, TestApp, event_at, metric, spawn_app};
-use axum::http::StatusCode;
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
 use dlctix::{attestation_locking_point, secp::MaybePoint};
 use oracle::{
     Event, EventStatus, Forecast, ForecastRequest, Observation, scoring::outcome_message,
@@ -11,10 +14,88 @@ use oracle::{
 use serde_json::{Value, json};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
 };
 use time::{Duration, Time, UtcOffset, format_description::well_known::Rfc3339};
 use uuid::{NoContext, Timestamp, Uuid};
+
+/// Explicitly configure both provisional and audited fixture paths. Production
+/// readers must never implement the strict methods by delegating this way.
+fn set_forecasts<F>(weather: &mut MockWeatherAccess, result: F)
+where
+    F: Fn(&ForecastRequest, Vec<String>) -> Result<Vec<Forecast>, oracle::weather_data::Error>
+        + Clone
+        + Send
+        + 'static,
+{
+    weather.expect_forecasts_data().returning(result.clone());
+    weather
+        .expect_settlement_forecasts()
+        .returning(move |request, stations| {
+            result(request, stations).map(settlement_forecast_values)
+        });
+}
+
+/// Convert daily fixture forecasts into the strict whole-window value shape.
+fn settlement_forecast_values(rows: Vec<Forecast>) -> Vec<oracle::weather_data::SettlementValue> {
+    use std::collections::BTreeMap;
+    let mut values: BTreeMap<(String, &str), Option<f64>> = BTreeMap::new();
+    for row in rows {
+        for (metric, value) in [
+            ("temp_high", Some(row.temp_high as f64)),
+            ("temp_low", Some(row.temp_low as f64)),
+            ("wind_speed", row.wind_speed.map(|value| value as f64)),
+            (
+                "wind_direction",
+                row.wind_direction.map(|value| value as f64),
+            ),
+            ("rain_amt", row.rain_amt),
+            ("snow_amt", row.snow_amt),
+            ("humidity", row.humidity_max.map(|value| value as f64)),
+        ] {
+            values
+                .entry((row.station_id.clone(), metric))
+                .and_modify(|existing| {
+                    *existing = existing.zip(value).map(|(a, b)| match metric {
+                        "rain_amt" | "snow_amt" => a + b,
+                        "temp_low" => a.min(b),
+                        _ => a.max(b),
+                    });
+                })
+                .or_insert(value);
+        }
+    }
+    values
+        .into_iter()
+        .map(
+            |((station_id, metric), value)| oracle::weather_data::SettlementValue {
+                station_id,
+                metric: metric.into(),
+                value,
+            },
+        )
+        .collect()
+}
+
+fn set_observations<F>(weather: &mut MockWeatherAccess, result: F)
+where
+    F: Fn(
+            &oracle::ObservationRequest,
+            Vec<String>,
+        ) -> Result<Vec<Observation>, oracle::weather_data::Error>
+        + Clone
+        + Send
+        + 'static,
+{
+    weather.expect_observation_data().returning(result.clone());
+    weather
+        .expect_settlement_observations()
+        .returning(move |request, stations, cutoff| {
+            // All lifecycle fixtures configure a two-hour signing grace.
+            assert_eq!(cutoff, request.end.unwrap() + Duration::hours(2));
+            result(request, stations)
+        });
+}
 
 fn forecast(station: &str, temp_high: i64, temp_low: i64, wind_speed: i64) -> Forecast {
     Forecast {
@@ -89,13 +170,13 @@ fn forecasts_in_window(
 /// observed 40/29/8.
 async fn app_with_weather() -> TestApp {
     let mut weather = MockWeatherAccess::new();
-    weather.expect_forecasts_data().returning(|request, _| {
+    set_forecasts(&mut weather, |request, _| {
         Ok(forecasts_in_window(
             request,
             &[("KORD", 70, 50, 10), ("KSAW", 40, 30, 5)],
         ))
     });
-    weather.expect_observation_data().returning(|_, _| {
+    set_observations(&mut weather, |_, _| {
         Ok(vec![
             observation("KORD", 75.0, 50.0, 10),
             observation("KSAW", 40.0, 29.4, 8),
@@ -312,6 +393,160 @@ async fn when_nobody_scores_the_refund_outcome_is_attested() {
 }
 
 #[tokio::test]
+async fn an_empty_window_blocks_instead_of_attesting_a_refund() {
+    let mut weather = MockWeatherAccess::new();
+    set_forecasts(&mut weather, |request, _| {
+        Ok(forecasts_in_window(
+            request,
+            &[("KORD", 70, 50, 10), ("KSAW", 40, 30, 5)],
+        ))
+    });
+    set_observations(&mut weather, |_, _| Ok(vec![]));
+    let app = spawn_app(Arc::new(weather)).await;
+    let (event, _) = event_with_entries(
+        &app,
+        vec![
+            vec![pick("KORD", "temp_high", "Over")],
+            vec![pick("KORD", "temp_high", "Under")],
+            vec![pick("KORD", "temp_high", "Par")],
+        ],
+    )
+    .await;
+    app.clock.set(event.signing_date);
+    let summary = app.oracle.etl_data(1).await.unwrap();
+    assert_eq!(summary.failed, 1);
+    assert_eq!(summary.attested, 0);
+    let blocked = fetch(&app, event.id).await;
+    assert!(blocked.attestation.is_none());
+    assert!(
+        blocked
+            .entries
+            .iter()
+            .all(|entry| entry.base_score.is_none())
+    );
+    let block = blocked.settlement_block.unwrap();
+    assert_eq!(block.code, "incomplete_readings");
+    assert!(block.message.contains("KORD/temp_high"));
+    assert!(block.message.contains("KSAW/wind_speed"));
+    let (_, body) = app.get(&format!("/events/{}", event.id)).await;
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains("Settlement blocked"));
+    assert!(html.contains("KORD/temp_high"));
+    assert!(html.contains("role=\"alert\""));
+    assert!(html.find("Settlement blocked").unwrap() < html.find("KORD/temp_high").unwrap());
+    let (status, body) = app.get("/events").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("Settlement blocked")
+    );
+    for (path, target) in [
+        (format!("/events/{}", event.id), "main#main-content"),
+        ("/events".to_string(), "div#events-list"),
+    ] {
+        let (status, body) = app
+            .send(
+                Request::get(path)
+                    .header("hx-request", "true")
+                    .header("hx-target", target)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let fragment = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!fragment.contains("<!DOCTYPE html>"));
+        assert!(fragment.contains("Settlement blocked"));
+        assert!(fragment.contains("KORD/temp_high"));
+    }
+    let summaries: Vec<oracle::EventSummary> = app.get_json("/oracle/events").await;
+    assert_eq!(summaries[0].settlement_block, Some(block));
+}
+
+/// A quality failure must preserve the previous provisional values without
+/// allowing those values, or an artificial no-data refund, to be signed.
+async fn quality_failure_blocks_stale_scores(rejected_reports: u64, unverified_reports: u64) {
+    let phase = Arc::new(AtomicU8::new(0));
+    let mut weather = MockWeatherAccess::new();
+    set_forecasts(&mut weather, |request, _| {
+        Ok(forecasts_in_window(
+            request,
+            &[("KORD", 70, 50, 10), ("KSAW", 40, 30, 5)],
+        ))
+    });
+    let observation_phase = phase.clone();
+    set_observations(&mut weather, move |_, _| {
+        match observation_phase.load(Ordering::SeqCst) {
+            0 => Ok(vec![
+                observation("KORD", 75.0, 50.0, 10),
+                observation("KSAW", 40.0, 29.4, 8),
+            ]),
+            1 => Err(oracle::weather_data::Error::DataQuality {
+                rejected_reports,
+                unverified_reports,
+            }),
+            _ => Ok(vec![
+                observation("KORD", 65.0, 50.0, 10),
+                observation("KSAW", 40.0, 29.4, 8),
+            ]),
+        }
+    });
+    let app = spawn_app(Arc::new(weather)).await;
+    let (event, _) = event_with_entries(
+        &app,
+        vec![
+            vec![pick("KORD", "temp_high", "Over")],
+            vec![pick("KORD", "temp_high", "Under")],
+            vec![pick("KORD", "temp_high", "Par")],
+        ],
+    )
+    .await;
+    app.clock
+        .set(event.start_observation_date + Duration::hours(1));
+    app.run_etl().await;
+    let provisional = fetch(&app, event.id).await;
+    assert_eq!(provisional.entries[0].base_score, Some(10));
+
+    phase.store(1, Ordering::SeqCst);
+    app.clock.set(event.signing_date);
+    for pass in 1..=2 {
+        let summary = app.oracle.etl_data(pass).await.unwrap();
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.attested, 0);
+        let blocked = fetch(&app, event.id).await;
+        assert!(blocked.attestation.is_none());
+        assert_eq!(blocked.status, EventStatus::Completed);
+        assert_eq!(blocked.readings, provisional.readings);
+        assert_eq!(blocked.entries, provisional.entries);
+        assert_eq!(
+            blocked.settlement_block.as_ref().unwrap().code,
+            "data_quality"
+        );
+    }
+
+    // A later audited result must be scored again before signing. The
+    // formerly losing Under entry now wins; old provisional scores cannot.
+    phase.store(2, Ordering::SeqCst);
+    let summary = app.oracle.etl_data(3).await.unwrap();
+    assert_eq!(summary.failed, 0);
+    assert_eq!(summary.attested, 1);
+    let signed = fetch(&app, event.id).await;
+    assert_attests(&app, &signed, &[1]);
+    assert!(signed.settlement_block.is_none());
+}
+
+#[tokio::test]
+async fn rejected_observations_block_attestation_and_stale_scores() {
+    quality_failure_blocks_stale_scores(1, 0).await;
+}
+
+#[tokio::test]
+async fn unverified_observations_block_attestation_and_stale_scores() {
+    quality_failure_blocks_stale_scores(0, 1).await;
+}
+
+#[tokio::test]
 async fn events_without_entries_are_never_signed() {
     let test_app = app_with_weather().await;
     let (status, body) = test_app.create_event(&event_at(test_app.clock.now())).await;
@@ -327,7 +562,7 @@ async fn events_without_entries_are_never_signed() {
 #[tokio::test]
 async fn one_failing_event_does_not_block_the_others() {
     let mut weather = MockWeatherAccess::new();
-    weather.expect_forecasts_data().returning(|request, _| {
+    set_forecasts(&mut weather, |request, _| {
         if request.station_ids.contains("KMSP") {
             Err(oracle::weather_data::Error::InvalidStationId("KMSP".into()))
         } else {
@@ -337,9 +572,12 @@ async fn one_failing_event_does_not_block_the_others() {
             ))
         }
     });
-    weather
-        .expect_observation_data()
-        .returning(|_, _| Ok(vec![observation("KORD", 75.0, 50.0, 10)]));
+    set_observations(&mut weather, |_, _| {
+        Ok(vec![
+            observation("KORD", 75.0, 50.0, 10),
+            observation("KSAW", 40.0, 29.4, 8),
+        ])
+    });
     let test_app = spawn_app(Arc::new(weather)).await;
     let mut failing = event_at(test_app.clock.now());
     failing.locations = vec!["KMSP".into()];
@@ -366,33 +604,35 @@ async fn forecast_revisions_during_the_event_do_not_change_the_baseline_or_score
     let revised = Arc::new(AtomicBool::new(false));
     let mut weather = MockWeatherAccess::new();
     let forecast_revised = revised.clone();
-    weather
-        .expect_forecasts_data()
-        .returning(move |request, _| {
-            let start = request.start.unwrap();
-            assert_eq!(request.generated_start, Some(start - Duration::days(7)));
-            assert_eq!(
-                request.generated_end,
-                Some(start - Duration::nanoseconds(1))
-            );
-            // A query without the pre-event cutoff would now see the revised
-            // 75°F forecast and change the winner from Over to Par.
-            let high = if forecast_revised.load(Ordering::SeqCst)
-                && request.generated_end.is_none_or(|end| end >= start)
-            {
-                75
-            } else {
-                70
-            };
-            Ok(forecasts_in_window(request, &[("KORD", high, 50, 10)]))
-        });
-    weather.expect_observation_data().returning(|request, _| {
+    set_forecasts(&mut weather, move |request, _| {
         let start = request.start.unwrap();
+        assert_eq!(request.generated_start, Some(start - Duration::days(7)));
         assert_eq!(
-            request.end,
-            Some(start + Duration::hours(24) - Duration::nanoseconds(1))
+            request.generated_end,
+            Some(start - Duration::nanoseconds(1))
         );
-        Ok(vec![observation("KORD", 75.0, 50.0, 10)])
+        // A query without the pre-event cutoff would now see the revised
+        // 75°F forecast and change the winner from Over to Par.
+        let high = if forecast_revised.load(Ordering::SeqCst)
+            && request.generated_end.is_none_or(|end| end >= start)
+        {
+            75
+        } else {
+            70
+        };
+        Ok(forecasts_in_window(
+            request,
+            &[("KORD", high, 50, 10), ("KSAW", 40, 30, 5)],
+        ))
+    });
+    set_observations(&mut weather, |request, _| {
+        let start = request.start.unwrap();
+        let end = start + Duration::hours(24);
+        assert!(request.end == Some(end) || request.end == Some(end - Duration::nanoseconds(1)));
+        Ok(vec![
+            observation("KORD", 75.0, 50.0, 10),
+            observation("KSAW", 40.0, 29.4, 8),
+        ])
     });
     let app = spawn_app(Arc::new(weather)).await;
     let (event, _) = event_with_entries(
@@ -466,4 +706,150 @@ async fn equal_scores_across_a_ten_second_boundary_attest_the_earlier_entry() {
     assert_eq!(signed.entries[1].base_score, Some(10));
     assert_eq!(signed.entries[0].score, signed.entries[1].score);
     assert_attests(&app, &signed, &[0]);
+}
+
+#[tokio::test]
+async fn a_missing_station_or_metric_cannot_be_scored_as_zero() {
+    for missing_case in 0..3 {
+        let mut weather = MockWeatherAccess::new();
+        set_forecasts(&mut weather, |request, _| {
+            Ok(forecasts_in_window(
+                request,
+                &[("KORD", 70, 50, 10), ("KSAW", 40, 30, 5)],
+            ))
+        });
+        set_observations(&mut weather, move |_, _| {
+            let mut rows = vec![observation("KORD", 75.0, 50.0, 10)];
+            if missing_case != 0 {
+                let mut station = observation("KSAW", 40.0, 29.4, 8);
+                if missing_case == 1 {
+                    station.wind_speed = None;
+                } else {
+                    station.temp_high = f64::NAN;
+                }
+                rows.push(station);
+            }
+            Ok(rows)
+        });
+        let app = spawn_app(Arc::new(weather)).await;
+        let (event, _) = event_with_entries(
+            &app,
+            vec![
+                vec![pick("KORD", "temp_high", "Over")],
+                vec![pick("KORD", "temp_high", "Under")],
+                vec![pick("KORD", "temp_high", "Par")],
+            ],
+        )
+        .await;
+        app.clock.set(event.signing_date);
+        let summary = app.oracle.etl_data(1).await.unwrap();
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.attested, 0);
+        let blocked = fetch(&app, event.id).await;
+        assert!(blocked.attestation.is_none());
+        let metric = if missing_case == 2 {
+            "KSAW/temp_high"
+        } else {
+            "KSAW/wind_speed"
+        };
+        assert!(blocked.settlement_block.unwrap().message.contains(metric));
+    }
+}
+
+#[tokio::test]
+async fn strict_forecast_failure_preserves_provisional_scores() {
+    let mut weather = MockWeatherAccess::new();
+    weather.expect_forecasts_data().returning(|request, _| {
+        Ok(forecasts_in_window(
+            request,
+            &[("KORD", 70, 50, 10), ("KSAW", 40, 30, 5)],
+        ))
+    });
+    weather
+        .expect_settlement_forecasts()
+        .returning(|_, _| Err(oracle::weather_data::Error::QualityUnavailable));
+    weather.expect_observation_data().returning(|_, _| {
+        Ok(vec![
+            observation("KORD", 75.0, 50.0, 10),
+            observation("KSAW", 40.0, 29.4, 8),
+        ])
+    });
+    weather.expect_settlement_observations().times(0);
+    let app = spawn_app(Arc::new(weather)).await;
+    let (event, _) = event_with_entries(
+        &app,
+        vec![
+            vec![pick("KORD", "temp_high", "Over")],
+            vec![pick("KORD", "temp_high", "Under")],
+            vec![pick("KORD", "temp_high", "Par")],
+        ],
+    )
+    .await;
+    app.clock
+        .set(event.start_observation_date + Duration::hours(1));
+    app.run_etl().await;
+    let before = fetch(&app, event.id).await;
+    app.clock.set(event.signing_date);
+    let summary = app.oracle.etl_data(1).await.unwrap();
+    assert_eq!(summary.failed, 1);
+    assert_eq!(summary.attested, 0);
+    let after = fetch(&app, event.id).await;
+    assert_eq!(after.readings, before.readings);
+    assert_eq!(after.entries, before.entries);
+    assert!(after.attestation.is_none());
+    assert_eq!(after.settlement_block.unwrap().code, "source_unavailable");
+}
+
+#[tokio::test]
+async fn verified_precipitation_remains_eligible_for_scoring() {
+    let mut weather = MockWeatherAccess::new();
+    set_forecasts(&mut weather, |request, _| {
+        Ok(forecasts_in_window(request, &[("KORD", 70, 50, 10)])
+            .into_iter()
+            .map(|mut row| {
+                row.rain_amt = Some(0.25);
+                row
+            })
+            .collect())
+    });
+    set_observations(&mut weather, |_, _| {
+        let mut row = observation("KORD", 75.0, 50.0, 10);
+        row.rain_amt = Some(0.75);
+        Ok(vec![row])
+    });
+    let app = spawn_app(Arc::new(weather)).await;
+    let mut request = event_at(app.clock.now());
+    // Use one UTC day so the baseline has one native daily total.
+    request.start_observation_date = request
+        .start_observation_date
+        .date()
+        .next_day()
+        .unwrap()
+        .with_time(Time::MIDNIGHT)
+        .assume_utc();
+    request.end_observation_date = request.start_observation_date + Duration::days(1);
+    request.signing_date = request.end_observation_date + Duration::hours(2);
+    request.locations = vec!["KORD".into()];
+    request.scoring_fields = Some(vec!["rain_amt".into()]);
+    request.number_of_values_per_entry = 1;
+    let (status, body) = app.create_event(&request).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let event: Event = serde_json::from_slice(&body).unwrap();
+    let entries = ["Over", "Under", "Par"].map(|prediction| {
+        json!({
+            "id": Uuid::now_v7(), "event_id": event.id,
+            "picks": [pick("KORD", "rain_amt", prediction)]
+        })
+    });
+    assert_eq!(
+        app.submit_entries(event.id, json!({"event_id": event.id, "entries": entries}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    app.clock.set(event.signing_date);
+    let summary = app.oracle.etl_data(1).await.unwrap();
+    assert_eq!(summary.failed, 0);
+    assert_eq!(summary.attested, 1);
+    assert_attests(&app, &fetch(&app, event.id).await, &[0]);
 }

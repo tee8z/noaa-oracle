@@ -45,8 +45,14 @@ data_dir = "./data"
 # Scheduling
 # =============================================================================
 # Fetch interval in seconds (default: 1 hour = 3600)
-# NOAA updates data hourly, so shorter intervals provide no benefit
+# METAR observations and special reports are fetched with overlapping history.
 sleep_interval = 3600
+
+# Bounded lookback in hours (1..24), strictly longer than the fetch interval.
+# An outage longer than this window creates a coverage gap that blocks signing.
+observation_history_hours = 4
+# Stations per official AWC history request (1..25); capped responses split.
+observation_batch_size = 25
 
 # =============================================================================
 # HTTP Client
@@ -71,9 +77,9 @@ private_key = "./daemon_private_key.pem"
 # =============================================================================
 # Publishing
 # =============================================================================
-# A run is published only when at least this fraction of stations received
-# a forecast (0.0 to 1.0). A sparser run is discarded and retried at the
-# next interval, so partial data is never attested as if it were complete.
+# A forecast run is published only at this station coverage (0.0 to 1.0).
+# Observation runs publish independently first, including explicit failed query
+# receipts. Only successful observation intervals can authorize settlement.
 min_forecast_coverage = 0.8
 
 # Days to keep published parquet files under data_dir. Files the oracle has

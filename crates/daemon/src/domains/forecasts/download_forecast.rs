@@ -4,9 +4,12 @@ use crate::Type::{
 };
 use crate::{CityWeather, DataReading, Dwml, Units, WeatherStation, XmlFetcher, split_cityweather};
 use anyhow::{Error, anyhow};
+use async_compression::tokio::write::GzipEncoder;
+use base64::Engine;
 use core::time::Duration as StdDuration;
 use futures::stream::{self, StreamExt};
 use parquet::basic::LogicalType;
+use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
 use parquet::record::RecordWriter;
@@ -15,14 +18,16 @@ use parquet::{
     schema::types::Type,
 };
 use parquet_derive::ParquetRecordWriter;
+use sha2::{Digest, Sha256};
 use slog::{Logger, error, info};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::sync::Arc;
 use time::{
     Duration, OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339,
     macros::format_description,
 };
+use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
 /*
 More Options defined  here:
@@ -66,6 +71,29 @@ pub struct WeatherForecast {
     pub ice_amt_unit_code: String,
     pub twelve_hour_probability_of_precipitation: Option<i64>,
     pub twelve_hour_probability_of_precipitation_unit_code: String,
+    pub provenance: ForecastProvenance,
+}
+
+const FORECAST_INTERVAL_VERSION: &str = "ndfd-native-v1";
+
+#[derive(Debug, Clone, Default)]
+pub struct ForecastProvenance {
+    pub source_url: Option<String>,
+    pub received_at: Option<String>,
+    pub xml_sha256: Option<String>,
+    pub location: String,
+    pub layouts: BTreeMap<String, NativeValueProvenance>,
+    pub problems: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NativeValueProvenance {
+    pub layout: String,
+    pub start: String,
+    pub end: Option<String>,
+    pub index: usize,
+    pub value: String,
+    pub units: String,
 }
 
 #[derive(ParquetRecordWriter, Debug)]
@@ -101,16 +129,35 @@ pub struct Forecast {
     pub snow_ratio_unit_code: String,
     pub ice_amt: Option<f64>,
     pub ice_amt_unit_code: String,
+    // Native intervals and source evidence. Historical files omit these columns.
+    pub forecast_interval_version: Option<String>,
+    pub interval_kind: Option<String>,
+    pub source_url: Option<String>,
+    pub source_received_at: Option<String>,
+    pub source_xml_sha256: Option<String>,
+    pub source_location: Option<String>,
+    pub source_layouts: Option<String>,
+    pub quality_status: Option<String>,
+    pub quality_reason: Option<String>,
 }
 
 impl TryFrom<WeatherForecast> for Forecast {
     type Error = anyhow::Error;
     fn try_from(val: WeatherForecast) -> Result<Self, Self::Error> {
+        let latitude = val.latitude.parse::<f64>()?;
+        let longitude = val.longitude.parse::<f64>()?;
+        if !latitude.is_finite()
+            || !longitude.is_finite()
+            || !(-90.0..=90.0).contains(&latitude)
+            || !(-180.0..=180.0).contains(&longitude)
+        {
+            return Err(anyhow!("invalid forecast coordinates"));
+        }
         let parquet = Forecast {
             station_id: val.station_id,
             station_name: String::from(""),
-            latitude: val.latitude.parse::<f64>()?,
-            longitude: val.longitude.parse::<f64>()?,
+            latitude,
+            longitude,
             generated_at: val
                 .generated_at
                 .format(&Rfc3339)
@@ -148,6 +195,30 @@ impl TryFrom<WeatherForecast> for Forecast {
             snow_ratio_unit_code: val.snow_ratio_unit_code,
             ice_amt: val.ice_amt,
             ice_amt_unit_code: val.ice_amt_unit_code,
+            forecast_interval_version: Some(FORECAST_INTERVAL_VERSION.into()),
+            interval_kind: Some(
+                if val.begin_time == val.end_time {
+                    "instant"
+                } else {
+                    "period"
+                }
+                .into(),
+            ),
+            source_url: val.provenance.source_url,
+            source_received_at: val.provenance.received_at,
+            source_xml_sha256: val.provenance.xml_sha256,
+            source_location: Some(val.provenance.location),
+            source_layouts: Some(serde_json::to_string(&val.provenance.layouts)?),
+            quality_status: Some(
+                if val.provenance.problems.is_empty() {
+                    "validated"
+                } else {
+                    "rejected"
+                }
+                .into(),
+            ),
+            quality_reason: (!val.provenance.problems.is_empty())
+                .then(|| val.provenance.problems.join("; ")),
         };
         Ok(parquet)
     }
@@ -371,9 +442,28 @@ pub fn create_forecast_schema() -> Type {
             Arc::new(snow_ratio_unit_code),
             Arc::new(ice_amt),
             Arc::new(ice_amt_unit_code),
+            optional_forecast_text("forecast_interval_version"),
+            optional_forecast_text("interval_kind"),
+            optional_forecast_text("source_url"),
+            optional_forecast_text("source_received_at"),
+            optional_forecast_text("source_xml_sha256"),
+            optional_forecast_text("source_location"),
+            optional_forecast_text("source_layouts"),
+            optional_forecast_text("quality_status"),
+            optional_forecast_text("quality_reason"),
         ])
         .build()
         .unwrap()
+}
+
+fn optional_forecast_text(name: &str) -> Arc<Type> {
+    Arc::new(
+        Type::primitive_type_builder(name, PhysicalType::BYTE_ARRAY)
+            .with_logical_type(Some(LogicalType::String))
+            .with_repetition(Repetition::OPTIONAL)
+            .build()
+            .expect("valid optional forecast text column"),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -383,354 +473,308 @@ pub struct TimeRange {
     pub end_time: Option<OffsetDateTime>,
 }
 
-//***THIS IS WHERE THE FLATTENING OF THE DATA OCCURS, IF THERE ARE ISSUES IN THE END DATA START HERE TO SOLVE***
+/// Keep values on their own source intervals. Two metrics share a row only
+/// when their native start and end instants are identical. A point sample has
+/// begin_time == end_time; the reader must not invent a duration for it.
 impl TryFrom<Dwml> for HashMap<String, Vec<WeatherForecast>> {
     type Error = anyhow::Error;
     fn try_from(raw_data: Dwml) -> Result<Self, Self::Error> {
-        let mut time_layouts: HashMap<String, Vec<TimeRange>> = HashMap::new();
-        for time_layout in raw_data.data.time_layout.clone() {
-            let time_range: Vec<TimeRange> = time_layout.to_time_ranges()?;
-            if let Some(first) = time_range.first() {
-                time_layouts.insert(first.key.clone(), time_range);
+        let generated_at = get_generated_at(&raw_data)
+            .ok_or_else(|| anyhow!("forecast has no parseable creation-date"))?
+            .to_offset(UtcOffset::UTC);
+        let mut time_layouts = HashMap::new();
+        for layout in &raw_data.data.time_layout {
+            let ranges = layout.to_time_ranges()?;
+            let key = ranges[0].key.clone();
+            if time_layouts.insert(key.clone(), ranges).is_some() {
+                return Err(anyhow!("duplicate forecast time layout {key:?}"));
             }
         }
-
-        let mut all_time_ranges: Vec<TimeRange> = Vec::new();
-        for time_range_set in time_layouts.values() {
-            for time_range in time_range_set {
-                if let Some(end_time) = time_range.end_time {
-                    // Compare as UTC instants to deduplicate cross-timezone duplicates
-                    // (e.g., 07:00-06:00 CST and 08:00-05:00 EST are the same UTC instant)
-                    let start_utc = time_range.start_time.to_offset(UtcOffset::UTC);
-                    let end_utc = end_time.to_offset(UtcOffset::UTC);
-                    if !all_time_ranges.iter().any(|existing| {
-                        existing.start_time.to_offset(UtcOffset::UTC) == start_utc
-                            && existing.end_time.map(|e| e.to_offset(UtcOffset::UTC))
-                                == Some(end_utc)
-                    }) {
-                        all_time_ranges.push(time_range.clone());
-                    }
-                } else {
-                    // For time ranges without end_time,
-                    // we estimate end_time from the next time range
-
-                    let estimated_end_time = estimate_end_time(time_range, time_range_set);
-                    if let Some(end_time) = estimated_end_time {
-                        let estimated_range = TimeRange {
-                            key: time_range.key.clone(),
-                            start_time: time_range.start_time,
-                            end_time: Some(end_time),
-                        };
-
-                        let start_utc = estimated_range.start_time.to_offset(UtcOffset::UTC);
-                        let end_utc = end_time.to_offset(UtcOffset::UTC);
-                        if !all_time_ranges.iter().any(|existing| {
-                            existing.start_time.to_offset(UtcOffset::UTC) == start_utc
-                                && existing.end_time.map(|e| e.to_offset(UtcOffset::UTC))
-                                    == Some(end_utc)
-                        }) {
-                            all_time_ranges.push(estimated_range);
-                        }
-                    }
-                    // If we can't estimate, we skip this time range
+        let mut locations = HashMap::new();
+        for location in &raw_data.data.location {
+            if locations
+                .insert(location.location_key.as_str(), location)
+                .is_some()
+            {
+                return Err(anyhow!(
+                    "duplicate forecast location {:?}",
+                    location.location_key
+                ));
+            }
+        }
+        let mut weather: HashMap<
+            String,
+            BTreeMap<(OffsetDateTime, OffsetDateTime), WeatherForecast>,
+        > = HashMap::new();
+        for parameters in &raw_data.data.parameters {
+            let location = locations
+                .get(parameters.applicable_location.as_str())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "parameters for unknown location {:?}",
+                        parameters.applicable_location
+                    )
+                })?;
+            let Some(station_id) = &location.station_id else {
+                continue;
+            };
+            let station = weather.entry(station_id.clone()).or_default();
+            let readings = parameters
+                .temperature
+                .iter()
+                .flatten()
+                .chain(parameters.humidity.iter().flatten())
+                .chain(parameters.precipitation.iter().flatten())
+                .chain(parameters.probability_of_precipitation.iter())
+                .chain(parameters.wind_direction.iter())
+                .chain(parameters.wind_speed.iter())
+                .chain(parameters.winter_weather_outlook.iter());
+            for reading in readings {
+                let ranges = time_layouts.get(&reading.time_layout).ok_or_else(|| {
+                    anyhow!("unknown forecast time layout {:?}", reading.time_layout)
+                })?;
+                if reading.value.len() != ranges.len() {
+                    return Err(anyhow!(
+                        "forecast {:?} has {} values for {} native intervals",
+                        reading.reading_type,
+                        reading.value.len(),
+                        ranges.len()
+                    ));
+                }
+                for (index, range) in ranges.iter().enumerate() {
+                    let begin = range.start_time.to_offset(UtcOffset::UTC);
+                    let end = range
+                        .end_time
+                        .unwrap_or(range.start_time)
+                        .to_offset(UtcOffset::UTC);
+                    let row = station
+                        .entry((begin, end))
+                        .or_insert_with(|| WeatherForecast {
+                            station_id: station_id.clone(),
+                            station_name: String::new(),
+                            latitude: location.point.latitude.clone(),
+                            longitude: location.point.longitude.clone(),
+                            generated_at,
+                            begin_time: begin,
+                            end_time: end,
+                            max_temp: None,
+                            min_temp: None,
+                            temperature_unit_code: Units::Fahrenheit.to_string(),
+                            wind_speed: None,
+                            wind_speed_unit_code: Units::Knots.to_string(),
+                            wind_direction: None,
+                            wind_direction_unit_code: Units::DegreesTrue.to_string(),
+                            relative_humidity_max: None,
+                            relative_humidity_min: None,
+                            relative_humidity_unit_code: Units::Percent.to_string(),
+                            liquid_precipitation_amt: None,
+                            liquid_precipitation_unit_code: Units::Inches.to_string(),
+                            snow_amt: None,
+                            snow_amt_unit_code: Units::Inches.to_string(),
+                            snow_ratio: None,
+                            snow_ratio_unit_code: Units::Percent.to_string(),
+                            ice_amt: None,
+                            ice_amt_unit_code: Units::Inches.to_string(),
+                            twelve_hour_probability_of_precipitation: None,
+                            twelve_hour_probability_of_precipitation_unit_code: Units::Percent
+                                .to_string(),
+                            provenance: ForecastProvenance {
+                                location: location.location_key.clone(),
+                                ..Default::default()
+                            },
+                        });
+                    add_native_value(row, range, reading, index)?;
                 }
             }
         }
-
-        // Sort by start time to ensure consistent ordering
-        all_time_ranges.sort_by_key(|range| range.start_time);
-
-        let generated_at = get_generated_at(&raw_data)
-            .ok_or_else(|| anyhow!("forecast has no parseable creation-date"))?;
-
-        // Create weather forecasts based on actual NOAA time ranges
-        let mut weather: HashMap<String, Vec<WeatherForecast>> = HashMap::new();
-
-        for location in &raw_data.data.location {
-            let weather_forecasts: Vec<WeatherForecast> = all_time_ranges
-                .iter()
-                .filter_map(|time_range| Some((time_range, time_range.end_time?)))
-                .map(|(time_range, end_time)| WeatherForecast {
-                    station_id: location.station_id.clone().unwrap_or_default(),
-                    station_name: String::from(""),
-                    latitude: location.point.latitude.clone(),
-                    longitude: location.point.longitude.clone(),
-                    generated_at,
-                    begin_time: time_range.start_time,
-                    end_time,
-                    max_temp: None,
-                    min_temp: None,
-                    temperature_unit_code: Units::Fahrenheit.to_string(),
-                    wind_speed: None,
-                    wind_speed_unit_code: Units::Knots.to_string(),
-                    wind_direction: None,
-                    wind_direction_unit_code: Units::DegreesTrue.to_string(),
-                    relative_humidity_max: None,
-                    relative_humidity_min: None,
-                    relative_humidity_unit_code: Units::Percent.to_string(),
-                    liquid_precipitation_amt: None,
-                    liquid_precipitation_unit_code: Units::Inches.to_string(),
-                    snow_amt: None,
-                    snow_amt_unit_code: Units::Inches.to_string(),
-                    snow_ratio: None,
-                    snow_ratio_unit_code: Units::Percent.to_string(),
-                    ice_amt: None,
-                    ice_amt_unit_code: Units::Inches.to_string(),
-                    twelve_hour_probability_of_precipitation: None,
-                    twelve_hour_probability_of_precipitation_unit_code: Units::Percent.to_string(),
-                })
-                .collect();
-
-            weather.insert(location.location_key.clone(), weather_forecasts);
-        }
-
-        for parameter_point in raw_data.data.parameters {
-            let location_key = parameter_point.applicable_location.clone();
-            let Some(weather_data) = weather.get_mut(&location_key) else {
-                return Err(anyhow!("parameters for unknown location {location_key:?}"));
-            };
-            let layout = |key: &str| {
-                time_layouts
-                    .get(key)
-                    .ok_or_else(|| anyhow!("unknown time layout {key:?}"))
-            };
-            let readings = parameter_point
-                .temperature
-                .into_iter()
-                .flatten()
-                .chain(parameter_point.humidity.into_iter().flatten())
-                .chain(parameter_point.precipitation.into_iter().flatten())
-                .chain(parameter_point.probability_of_precipitation)
-                .chain(parameter_point.wind_direction)
-                .chain(parameter_point.wind_speed)
-                .chain(parameter_point.winter_weather_outlook);
-            for reading in readings {
-                add_data(weather_data, layout(&reading.time_layout)?, &reading);
-            }
-        }
-        // The `station_id` is the key for each hashmap entry, if location doesn't have station_id, we skip
-        let mut weather_by_station: HashMap<String, Vec<WeatherForecast>> = HashMap::new();
-        raw_data.data.location.iter().for_each(|location| {
-            if let Some(weather_forecast) = weather.get(&location.location_key)
-                && let Some(station_id) = &location.station_id
-            {
-                weather_by_station.insert(station_id.clone(), weather_forecast.clone());
-            }
-        });
-
-        Ok(weather_by_station)
+        Ok(weather
+            .into_iter()
+            .map(|(station, rows)| (station, rows.into_values().collect()))
+            .collect())
     }
 }
 
-/// When NOAA generated the forecast. Without it a batch cannot be ordered
-/// against other forecasts for the same window, so it is rejected rather
-/// than stamped with the current time.
+/// The source issue instant, never the collector's current time.
 fn get_generated_at(raw_data: &Dwml) -> Option<OffsetDateTime> {
     raw_data
         .head
         .as_ref()
         .and_then(|head| head.product.as_ref())
         .and_then(|product| product.creation_date.as_ref())
-        .and_then(|creation_date| OffsetDateTime::parse(&creation_date.value, &Rfc3339).ok())
+        .and_then(|creation| OffsetDateTime::parse(&creation.value, &Rfc3339).ok())
 }
 
-/// The reading's value for `index`, if the window matched and NOAA gave a
-/// value. DWML marks missing values with `xsi:nil`, which deserialize as
-/// empty strings and parse to `None`: missing, never zero or a previous
-/// window's value.
-fn value_at<T: std::str::FromStr>(data: &DataReading, index: Option<usize>) -> Option<T> {
-    index
-        .and_then(|index| data.value.get(index))
-        .and_then(|value| value.trim().parse().ok())
+fn metric_name(kind: &crate::Type) -> &'static str {
+    match kind {
+        Maximum => "max_temp",
+        Minimum => "min_temp",
+        Sustained => "wind_speed",
+        Wind => "wind_direction",
+        MaximumRelative => "relative_humidity_max",
+        MinimumRelative => "relative_humidity_min",
+        Liquid => "liquid_precipitation_amt",
+        Snow => "snow_amt",
+        Ice => "ice_amt",
+        SnowRatio => "snow_ratio",
+        ProbabilityOfPrecipitationWithin12Hours => "twelve_hour_probability_of_precipitation",
+    }
 }
 
-/// Fills one reading into the 3-hour forecast windows. Instantaneous and
-/// daily values (temperature, humidity, wind, probability) apply to every
-/// window their NOAA range covers; accumulations (liquid, snow, ice, snow
-/// ratio) apply only to the exactly matching window so a 12-hour total is
-/// not counted four times. Windows the reading does not cover stay empty:
-/// carrying a value forward would let yesterday's maximum leak into today.
-fn add_data(weather_data: &mut [WeatherForecast], time_ranges: &[TimeRange], data: &DataReading) {
+fn add_native_value(
+    row: &mut WeatherForecast,
+    range: &TimeRange,
+    data: &DataReading,
+    index: usize,
+) -> Result<(), Error> {
+    let metric = metric_name(&data.reading_type);
+    let raw = &data.value[index];
     let units = data.units.to_string();
-    for current in weather_data.iter_mut() {
-        let covering = get_interval(current, time_ranges);
-        let exact = get_interval_exact(current, time_ranges);
-        match data.reading_type {
-            Liquid => {
-                if exact.is_some() {
-                    current.liquid_precipitation_amt = value_at(data, exact);
-                }
-                current.liquid_precipitation_unit_code = units.clone();
-            }
-            Snow => {
-                if exact.is_some() {
-                    current.snow_amt = value_at(data, exact);
-                }
-                current.snow_amt_unit_code = units.clone();
-            }
-            SnowRatio => {
-                if exact.is_some() {
-                    current.snow_ratio = value_at(data, exact);
-                }
-                current.snow_ratio_unit_code = units.clone();
-            }
-            Ice => {
-                if exact.is_some() {
-                    current.ice_amt = value_at(data, exact);
-                }
-                current.ice_amt_unit_code = units.clone();
-            }
-            Maximum => {
-                if covering.is_some() {
-                    current.max_temp = value_at(data, covering);
-                }
-                current.temperature_unit_code = units.clone();
-            }
-            Minimum => {
-                if covering.is_some() {
-                    current.min_temp = value_at(data, covering);
-                }
-                current.temperature_unit_code = units.clone();
-            }
-            MaximumRelative => {
-                if covering.is_some() {
-                    current.relative_humidity_max = value_at(data, covering);
-                }
-                current.relative_humidity_unit_code = units.clone();
-            }
-            MinimumRelative => {
-                if covering.is_some() {
-                    current.relative_humidity_min = value_at(data, covering);
-                }
-                current.relative_humidity_unit_code = units.clone();
-            }
-            Sustained => {
-                if covering.is_some() {
-                    current.wind_speed = value_at(data, covering);
-                }
-                current.wind_speed_unit_code = units.clone();
-            }
-            Wind => {
-                if covering.is_some() {
-                    current.wind_direction = value_at(data, covering);
-                }
-                current.wind_direction_unit_code = units.clone();
-            }
-            ProbabilityOfPrecipitationWithin12Hours => {
-                if covering.is_some() {
-                    current.twelve_hour_probability_of_precipitation = value_at(data, covering);
-                }
-                current.twelve_hour_probability_of_precipitation_unit_code = units.clone();
-            }
-        }
+    if row.provenance.layouts.contains_key(metric) {
+        row.provenance
+            .problems
+            .push(format!("duplicate native {metric} for one interval"));
+        return Ok(());
     }
-}
-
-fn estimate_end_time(
-    current_range: &TimeRange,
-    all_ranges: &[TimeRange],
-) -> Option<OffsetDateTime> {
-    // Find the next time range with the same key that starts after this one
-    let next_range = all_ranges
-        .iter()
-        .filter(|r| r.key == current_range.key && r.start_time > current_range.start_time)
-        .min_by_key(|r| r.start_time);
-
-    if let Some(next) = next_range {
-        // Use the next range's start time as this range's end time
-        Some(next.start_time)
+    if matches!(data.reading_type, Maximum | Minimum)
+        && row.provenance.layouts.iter().any(|(other, source)| {
+            matches!(other.as_str(), "max_temp" | "min_temp") && source.units != units
+        })
+    {
+        row.provenance
+            .problems
+            .push("mixed temperature units on the same native interval".into());
+    }
+    row.provenance.layouts.insert(
+        metric.into(),
+        NativeValueProvenance {
+            layout: range.key.clone(),
+            start: range.start_time.format(&Rfc3339)?,
+            end: range.end_time.map(|end| end.format(&Rfc3339)).transpose()?,
+            index,
+            value: raw.clone(),
+            units: units.clone(),
+        },
+    );
+    if range.end_time.is_none() && !matches!(data.reading_type, Sustained | Wind) {
+        row.provenance
+            .problems
+            .push(format!("{metric} has no explicit source interval"));
+    }
+    let valid_units = match data.reading_type {
+        Maximum | Minimum => matches!(data.units, Units::Fahrenheit | Units::Celcius),
+        Sustained => data.units == Units::Knots,
+        Wind => data.units == Units::DegreesTrue,
+        MaximumRelative | MinimumRelative | ProbabilityOfPrecipitationWithin12Hours | SnowRatio => {
+            data.units == Units::Percent
+        }
+        Liquid | Snow | Ice => data.units == Units::Inches,
+    };
+    if !valid_units {
+        row.provenance
+            .problems
+            .push(format!("unsupported {metric} units {units:?}"));
+    }
+    let (minimum, maximum) = match data.reading_type {
+        Maximum | Minimum if data.units == Units::Fahrenheit => (-148.0, 140.0),
+        Maximum | Minimum => (-100.0, 60.0),
+        Wind => (0.0, 360.0),
+        Sustained => (0.0, 250.0),
+        MaximumRelative | MinimumRelative | ProbabilityOfPrecipitationWithin12Hours => (0.0, 100.0),
+        SnowRatio => (0.0, 1000.0),
+        Liquid | Snow | Ice => (0.0, f64::MAX),
+    };
+    let value = if raw.trim().is_empty() {
+        None
     } else {
-        // If no next range found, estimate based on common intervals
-        // Most NOAA forecasts are 1, 3, 6, 12, or 24 hours
-        // We'll default to 3 hours as a reasonable estimate
-        Some(current_range.start_time + Duration::hours(3))
-    }
-}
-
-fn get_interval(current_data: &WeatherForecast, time_ranges: &[TimeRange]) -> Option<usize> {
-    // First, try to find an exact match for the time range (when end_time is available)
-    for (index, time_range) in time_ranges.iter().enumerate() {
-        if let Some(end_time) = time_range.end_time
-            && time_range.start_time == current_data.begin_time
-            && end_time == current_data.end_time
-        {
-            return Some(index);
-        }
-    }
-
-    // Try to find a match by start time only (for time ranges without end_time, like hourly wind data)
-    for (index, time_range) in time_ranges.iter().enumerate() {
-        if time_range.start_time == current_data.begin_time {
-            return Some(index);
-        }
-    }
-
-    // If no exact match, find the time range that contains this forecast's begin_time
-    for (index, time_range) in time_ranges.iter().enumerate() {
-        if let Some(end_time) = time_range.end_time
-            && time_range.start_time <= current_data.begin_time
-            && current_data.begin_time < end_time
-        {
-            return Some(index);
-        }
-    }
-
-    // For time ranges without end_time, check if the forecast begin_time falls within
-    // the implied interval (start_time to next start_time)
-    for (index, time_range) in time_ranges.iter().enumerate() {
-        if time_range.end_time.is_none() {
-            // Find the next time range to determine the implied end time
-            let next_start = time_ranges
-                .get(index + 1)
-                .map(|r| r.start_time)
-                .unwrap_or(time_range.start_time + Duration::hours(3));
-
-            if time_range.start_time <= current_data.begin_time
-                && current_data.begin_time < next_start
-            {
-                return Some(index);
+        match raw.trim().parse::<f64>() {
+            Ok(value) if value.is_finite() && value >= minimum && value <= maximum => Some(value),
+            _ => {
+                row.provenance
+                    .problems
+                    .push(format!("invalid {metric} value {raw:?}"));
+                None
             }
         }
-    }
-
-    // If still no match, try to find overlap between time ranges
-    for (index, time_range) in time_ranges.iter().enumerate() {
-        if let Some(end_time) = time_range.end_time
-            && ((time_range.start_time <= current_data.begin_time
-                && current_data.begin_time < end_time)
-                || (current_data.begin_time <= time_range.start_time
-                    && time_range.start_time < current_data.end_time))
-        {
-            return Some(index);
+    };
+    let integer = if matches!(data.reading_type, Liquid | Snow | Ice | SnowRatio) {
+        None
+    } else {
+        match value {
+            Some(value) if value.fract() == 0.0 => Some(value as i64),
+            Some(_) => {
+                row.provenance
+                    .problems
+                    .push(format!("noninteger {metric} value {raw:?}"));
+                None
+            }
+            None => None,
+        }
+    };
+    match data.reading_type {
+        Maximum => {
+            row.max_temp = integer;
+            row.temperature_unit_code = units;
+        }
+        Minimum => {
+            row.min_temp = integer;
+            row.temperature_unit_code = units;
+        }
+        Sustained => {
+            row.wind_speed = integer;
+            row.wind_speed_unit_code = units;
+        }
+        Wind => {
+            row.wind_direction = integer;
+            row.wind_direction_unit_code = units;
+        }
+        MaximumRelative => {
+            row.relative_humidity_max = integer;
+            row.relative_humidity_unit_code = units;
+        }
+        MinimumRelative => {
+            row.relative_humidity_min = integer;
+            row.relative_humidity_unit_code = units;
+        }
+        ProbabilityOfPrecipitationWithin12Hours => {
+            row.twelve_hour_probability_of_precipitation = integer;
+            row.twelve_hour_probability_of_precipitation_unit_code = units;
+        }
+        Liquid => {
+            row.liquid_precipitation_amt = value;
+            row.liquid_precipitation_unit_code = units;
+        }
+        Snow => {
+            row.snow_amt = value;
+            row.snow_amt_unit_code = units;
+        }
+        Ice => {
+            row.ice_amt = value;
+            row.ice_amt_unit_code = units;
+        }
+        SnowRatio => {
+            row.snow_ratio = value;
+            row.snow_ratio_unit_code = units;
         }
     }
-
-    None
-}
-
-/// Strict interval matching for accumulative fields (QPF, snow, ice).
-/// Only matches exact time range (begin+end) or exact start time.
-/// Does NOT match sub-windows within larger NOAA ranges, preventing
-/// the same accumulative value from being written to multiple overlapping windows.
-fn get_interval_exact(current_data: &WeatherForecast, time_ranges: &[TimeRange]) -> Option<usize> {
-    // Exact match: both begin and end times match
-    for (index, time_range) in time_ranges.iter().enumerate() {
-        if let Some(end_time) = time_range.end_time
-            && time_range.start_time == current_data.begin_time
-            && end_time == current_data.end_time
-        {
-            return Some(index);
-        }
+    if row
+        .min_temp
+        .zip(row.max_temp)
+        .is_some_and(|(minimum, maximum)| minimum > maximum)
+    {
+        row.provenance
+            .problems
+            .push("minimum temperature exceeds maximum on the same native interval".into());
     }
-
-    // Start time match only (for time ranges without end_time)
-    for (index, time_range) in time_ranges.iter().enumerate() {
-        if time_range.end_time.is_none() && time_range.start_time == current_data.begin_time {
-            return Some(index);
-        }
+    if row
+        .relative_humidity_min
+        .zip(row.relative_humidity_max)
+        .is_some_and(|(minimum, maximum)| minimum > maximum)
+    {
+        row.provenance
+            .problems
+            .push("minimum humidity exceeds maximum on the same native interval".into());
     }
-
-    None
+    Ok(())
 }
 
 /// Stations per NDFD request.
@@ -765,6 +809,33 @@ pub struct ForecastService {
     pub logger: Logger,
 }
 
+struct FetchedForecastBatch {
+    rows: HashMap<String, Vec<WeatherForecast>>,
+    source_document: KeyValue,
+}
+
+/// Keep the original response inside the published artifact. Compression
+/// prevents repeated layout XML from dominating the Parquet footer; the hash
+/// is over the original UTF-8 XML bytes, before compression.
+async fn forecast_source_document(
+    xml: &str,
+    url: &str,
+    received_at: &str,
+    sha256: &str,
+) -> Result<KeyValue, Error> {
+    let mut encoder = GzipEncoder::new(Vec::new());
+    encoder.write_all(xml.as_bytes()).await?;
+    encoder.shutdown().await?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(encoder.into_inner());
+    Ok(KeyValue::new(
+        format!("noaa_forecast_source:{sha256}"),
+        Some(serde_json::to_string(&serde_json::json!({
+            "url": url, "received_at": received_at, "sha256": sha256,
+            "encoding": "gzip+base64", "content": encoded,
+        }))?),
+    ))
+}
+
 impl ForecastService {
     pub fn new(logger: Logger, fetcher: Arc<XmlFetcher>) -> Self {
         ForecastService { logger, fetcher }
@@ -783,7 +854,12 @@ impl ForecastService {
         let stations = &StationLookup::new(city_weather, &self.logger);
         let file = File::create(output_path)
             .map_err(|e| anyhow!("failed to create parquet file: {}", e))?;
-        let props = WriterProperties::builder().build();
+        let props = WriterProperties::builder()
+            .set_key_value_metadata(Some(vec![KeyValue::new(
+                "noaa_forecast_interval_version".into(),
+                Some(FORECAST_INTERVAL_VERSION.into()),
+            )]))
+            .build();
         let mut writer =
             SerializedFileWriter::new(file, Arc::new(create_forecast_schema()), Arc::new(props))
                 .map_err(|e| anyhow!("failed to create parquet writer: {}", e))?;
@@ -801,16 +877,17 @@ impl ForecastService {
             })
             .buffer_unordered(CONCURRENT_REQUESTS);
         while let Some(result) = results.next().await {
-            let data = match result {
-                Ok(data) => data,
+            let batch = match result {
+                Ok(batch) => batch,
                 Err(error) => {
                     report.failed_batches += 1;
                     error!(self.logger, "forecast batch failed: {:#}", error);
                     continue;
                 }
             };
+            writer.append_key_value_metadata(batch.source_document);
             let mut batch_forecasts = Vec::new();
-            for (station_id, all_forecasts) in &data {
+            for (station_id, all_forecasts) in &batch.rows {
                 let Some(city) = city_weather.city_data.get(station_id) else {
                     continue;
                 };
@@ -873,7 +950,7 @@ impl ForecastService {
         &self,
         url: &str,
         stations: &StationLookup,
-    ) -> Result<HashMap<String, Vec<WeatherForecast>>, Error> {
+    ) -> Result<FetchedForecastBatch, Error> {
         let mut delay = StdDuration::from_secs(5);
         let mut attempt = 1;
         let xml = loop {
@@ -894,12 +971,35 @@ impl ForecastService {
                 Err(error) => return Err(Error::new(error).context("forecast request failed")),
             }
         };
+        let received = OffsetDateTime::now_utc();
+        let received_at = received.format(&Rfc3339)?;
+        let xml_sha256 = Sha256::digest(xml.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         if xml.trim_start().starts_with("<error>") {
             return Err(anyhow!("NOAA returned an error document"));
         }
         let converted: Dwml = crate::parse_xml(&xml)
             .map_err(|error| anyhow!("forecast XML did not parse: {error}"))?;
-        stations.assign(converted).try_into()
+        let mut rows: HashMap<String, Vec<WeatherForecast>> =
+            stations.assign(converted).try_into()?;
+        for station in rows.values_mut() {
+            for row in station {
+                row.provenance.source_url = Some(url.into());
+                row.provenance.received_at = Some(received_at.clone());
+                row.provenance.xml_sha256 = Some(xml_sha256.clone());
+                if row.generated_at > received + Duration::minutes(10) {
+                    row.provenance.problems.push(
+                        "forecast issue is more than ten minutes after source receipt".into(),
+                    );
+                }
+            }
+        }
+        Ok(FetchedForecastBatch {
+            rows,
+            source_document: forecast_source_document(&xml, url, &received_at, &xml_sha256).await?,
+        })
     }
 }
 
@@ -972,3 +1072,7 @@ fn get_url(city_weather: &CityWeather) -> Result<String, Error> {
         (begin + Duration::weeks(1)).format(&format)?,
     ))
 }
+
+#[cfg(test)]
+#[path = "native_interval_tests.rs"]
+mod native_interval_tests;

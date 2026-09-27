@@ -83,7 +83,8 @@ pub struct ObservationWindow {
 }
 
 /// Baseline and observation for one metric at one target. `None` means the
-/// source has no value; such readings never earn points.
+/// source has no value; these readings earn no provisional points and cannot
+/// authorize settlement for an enabled metric.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct Reading {
     pub target: String,
@@ -97,8 +98,17 @@ pub struct Reading {
 pub enum SourceError {
     #[error("invalid target {target:?}: {reason}")]
     InvalidTarget { target: String, reason: String },
-    #[error("source data is unavailable")]
+    #[error("source data is unavailable: {0}")]
     Unavailable(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("settlement blocked: {0}")]
+    SettlementBlocked(String),
+    #[error(
+        "settlement blocked by observation quality: {rejected_reports} rejected reports, {unverified_reports} unverified reports"
+    )]
+    DataQuality {
+        rejected_reports: u64,
+        unverified_reports: u64,
+    },
 }
 
 #[async_trait]
@@ -117,13 +127,26 @@ pub trait OutcomeSource: Send + Sync {
     /// stored or used in a query.
     fn validate_target(&self, target: &str) -> Result<(), SourceError>;
 
-    /// Readings for `targets` over `window`. Targets without data are
-    /// omitted rather than reported as errors.
+    /// Provisional readings for display and progress scoring. Missing data
+    /// does not establish a settlement outcome.
     async fn readings(
         &self,
         window: ObservationWindow,
         targets: &[String],
     ) -> Result<Vec<Reading>, SourceError>;
+
+    /// Fresh, validated readings suitable for an irreversible signature.
+    /// Implementations must verify provenance and complete collection coverage.
+    async fn settlement_readings(
+        &self,
+        _window: ObservationWindow,
+        _targets: &[String],
+        _required_collected_after: OffsetDateTime,
+    ) -> Result<Vec<Reading>, SourceError> {
+        Err(SourceError::SettlementBlocked(
+            "this source has no verified settlement reader".into(),
+        ))
+    }
 
     fn metric(&self, id: &str) -> Option<Metric> {
         self.metrics()

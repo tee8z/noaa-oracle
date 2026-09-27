@@ -254,6 +254,7 @@ impl Publisher {
                 artifact.path.clone(),
                 artifact.marker(UPLOADED),
                 artifact.marker(ARCHIVED),
+                artifact.marker("quality.json"),
             ] {
                 let _ = std::fs::remove_file(path);
             }
@@ -263,7 +264,37 @@ impl Publisher {
                 let _ = std::fs::remove_dir(parent);
             }
         }
+        // Failed collection runs have no parquet artifact. Bound their local
+        // evidence lifetime with the same configured retention as published data.
+        prune_orphan_quality_audits(data_dir, cutoff);
         removed
+    }
+}
+
+fn prune_orphan_quality_audits(data_dir: &Path, cutoff: OffsetDateTime) {
+    let Ok(days) = std::fs::read_dir(data_dir) else {
+        return;
+    };
+    for day in days.filter_map(Result::ok) {
+        let Ok(files) = std::fs::read_dir(day.path()) else {
+            continue;
+        };
+        for entry in files.filter_map(Result::ok) {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(original_name) = name.strip_suffix(".quality.json") else {
+                continue;
+            };
+            let original_path = path.with_file_name(original_name);
+            let Some(artifact) = Artifact::from_path(&original_path) else {
+                continue;
+            };
+            if !original_path.exists() && artifact.generated_at < cutoff {
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
 }
 
@@ -306,6 +337,27 @@ mod tests {
             logger(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn orphan_quality_evidence_obeys_retention_but_pending_publications_keep_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let day = directory.path().join("2030-01-01");
+        std::fs::create_dir(&day).unwrap();
+        let old = day.join("observations_2030-01-01T00:00:00Z.parquet.quality.json");
+        let recent = day.join("observations_2030-01-01T10:00:00Z.parquet.quality.json");
+        let pending = day.join("observations_2030-01-01T01:00:00Z.parquet");
+        let pending_audit = day.join("observations_2030-01-01T01:00:00Z.parquet.quality.json");
+        for path in [&old, &recent, &pending, &pending_audit] {
+            std::fs::write(path, b"evidence").unwrap();
+        }
+        prune_orphan_quality_audits(
+            directory.path(),
+            OffsetDateTime::parse("2030-01-01T05:00:00Z", &Rfc3339).unwrap(),
+        );
+        assert!(!old.exists());
+        assert!(recent.exists());
+        assert!(pending_audit.exists());
     }
 
     #[test]

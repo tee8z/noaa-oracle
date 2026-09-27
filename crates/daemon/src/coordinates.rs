@@ -151,13 +151,31 @@ static STATE_ABBERVIATIONS: &[&str] = &[
     "WV", "WI", "WY",
 ];
 
+pub const STATION_CATALOG_URL: &str =
+    "https://aviationweather.gov/data/cache/stations.cache.xml.gz";
+
+pub struct StationCatalogEvidence {
+    pub raw_xml: String,
+    pub received_at: time::OffsetDateTime,
+}
+
 pub async fn get_coordinates(fetcher: Arc<XmlFetcher>) -> Result<CityWeather, Error> {
-    // Broken @ NOAA: https://forecast.weather.gov/xml/current_obs/index.xml
-    let raw_xml = fetcher
-        .fetch_xml_gzip("https://aviationweather.gov/data/cache/stations.cache.xml.gz")
-        .await?;
+    Ok(get_coordinates_with_evidence(fetcher).await?.0)
+}
+
+pub async fn get_coordinates_with_evidence(
+    fetcher: Arc<XmlFetcher>,
+) -> Result<(CityWeather, StationCatalogEvidence), Error> {
+    let raw_xml = fetcher.fetch_xml_gzip(STATION_CATALOG_URL).await?;
+    let received_at = time::OffsetDateTime::now_utc();
     let converted_xml: WxStationIndex = parse_xml(&raw_xml)?;
-    Ok(us_stations(converted_xml))
+    Ok((
+        us_stations(converted_xml),
+        StationCatalogEvidence {
+            raw_xml,
+            received_at,
+        },
+    ))
 }
 
 /// Keeps stations in a US state with usable coordinates.

@@ -1,0 +1,245 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<dwml version="1.0" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="https://digital.weather.gov/xml/schema/DWML.xsd">
+  <head>
+    <product srsName="WGS 1984" concise-name="time-series" operational-mode="official">
+      <title>NOAA's National Weather Service Forecast Data</title>
+      <field>meteorological</field>
+      <category>forecast</category>
+      <creation-date refresh-frequency="PT30M">2026-09-27T13:38:29Z</creation-date>
+    </product>
+    <source>
+      <more-information>https://digital.weather.gov/xml/</more-information>
+      <production-center>Meteorological Development Laboratory<sub-center>Weather Information Applications Division</sub-center></production-center>
+      <disclaimer>http://www.nws.noaa.gov/disclaimer.html</disclaimer>
+      <credit>https://www.weather.gov/</credit>
+      <credit-logo>https://www.weather.gov/logorequest</credit-logo>
+      <feedback>https://www.weather.gov/contact</feedback>
+    </source>
+  </head>
+  <data>
+    <location>
+      <location-key>point1</location-key>
+      <point latitude="40.35" longitude="-106.70"/>
+    </location>
+    <location>
+      <location-key>point2</location-key>
+      <point latitude="32.50" longitude="-79.10"/>
+    </location>
+    <moreWeatherInformation applicable-location="point1">http://forecast.weather.gov/MapClick.php?textField1=40.35&amp;textField2=-106.70</moreWeatherInformation>
+    <moreWeatherInformation applicable-location="point2">http://forecast.weather.gov/MapClick.php?textField1=32.50&amp;textField2=-79.10</moreWeatherInformation>
+    <time-layout time-coordinate="local" summarization="none">
+      <layout-key>k-p24h-n7-1</layout-key>
+      <start-valid-time>2026-09-27T08:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-09-27T20:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-09-28T08:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-09-28T20:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-09-29T08:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-09-29T20:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-09-30T08:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-09-30T20:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-10-01T08:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-10-01T20:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-10-02T08:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-10-02T20:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-10-03T08:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-10-03T20:00:00-06:00</end-valid-time>
+    </time-layout>
+    <time-layout time-coordinate="local" summarization="none">
+      <layout-key>k-p24h-n6-2</layout-key>
+      <start-valid-time>2026-09-27T20:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-09-28T09:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-09-28T20:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-09-29T09:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-09-29T20:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-09-30T09:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-09-30T20:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-10-01T09:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-10-01T20:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-10-02T09:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-10-02T20:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-10-03T09:00:00-06:00</end-valid-time>
+    </time-layout>
+    <time-layout time-coordinate="local" summarization="none">
+      <layout-key>k-p12h-n7-3</layout-key>
+      <start-valid-time>2026-09-27T00:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-09-27T12:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-09-28T00:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-09-28T12:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-09-29T00:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-09-29T12:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-09-30T00:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-09-30T12:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-10-01T00:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-10-01T12:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-10-02T00:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-10-02T12:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-10-03T00:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-10-03T12:00:00-06:00</end-valid-time>
+    </time-layout>
+    <time-layout time-coordinate="local" summarization="none">
+      <layout-key>k-p12h-n7-4</layout-key>
+      <start-valid-time>2026-09-27T12:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-09-28T00:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-09-28T12:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-09-29T00:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-09-29T12:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-09-30T00:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-09-30T12:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-10-01T00:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-10-01T12:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-10-02T00:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-10-02T12:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-10-03T00:00:00-06:00</end-valid-time>
+      <start-valid-time>2026-10-03T12:00:00-06:00</start-valid-time>
+      <end-valid-time>2026-10-04T00:00:00-06:00</end-valid-time>
+    </time-layout>
+    <time-layout time-coordinate="local" summarization="none">
+      <layout-key>k-p24h-n7-5</layout-key>
+      <start-valid-time>2026-09-27T08:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-09-27T20:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-09-28T08:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-09-28T20:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-09-29T08:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-09-29T20:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-09-30T08:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-09-30T20:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-10-01T08:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-10-01T20:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-10-02T08:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-10-02T20:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-10-03T08:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-10-03T20:00:00-04:00</end-valid-time>
+    </time-layout>
+    <time-layout time-coordinate="local" summarization="none">
+      <layout-key>k-p24h-n6-6</layout-key>
+      <start-valid-time>2026-09-27T20:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-09-28T09:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-09-28T20:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-09-29T09:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-09-29T20:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-09-30T09:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-09-30T20:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-10-01T09:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-10-01T20:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-10-02T09:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-10-02T20:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-10-03T09:00:00-04:00</end-valid-time>
+    </time-layout>
+    <time-layout time-coordinate="local" summarization="none">
+      <layout-key>k-p12h-n7-7</layout-key>
+      <start-valid-time>2026-09-27T02:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-09-27T14:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-09-28T02:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-09-28T14:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-09-29T02:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-09-29T14:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-09-30T02:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-09-30T14:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-10-01T02:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-10-01T14:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-10-02T02:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-10-02T14:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-10-03T02:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-10-03T14:00:00-04:00</end-valid-time>
+    </time-layout>
+    <time-layout time-coordinate="local" summarization="none">
+      <layout-key>k-p12h-n7-8</layout-key>
+      <start-valid-time>2026-09-27T14:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-09-28T02:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-09-28T14:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-09-29T02:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-09-29T14:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-09-30T02:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-09-30T14:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-10-01T02:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-10-01T14:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-10-02T02:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-10-02T14:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-10-03T02:00:00-04:00</end-valid-time>
+      <start-valid-time>2026-10-03T14:00:00-04:00</start-valid-time>
+      <end-valid-time>2026-10-04T02:00:00-04:00</end-valid-time>
+    </time-layout>
+    <parameters applicable-location="point1">
+      <temperature type="maximum" units="Fahrenheit" time-layout="k-p24h-n7-1">
+        <name>Daily Maximum Temperature</name>
+        <value>57</value>
+        <value>46</value>
+        <value>46</value>
+        <value>50</value>
+        <value>53</value>
+        <value>55</value>
+        <value>53</value>
+      </temperature>
+      <temperature type="minimum" units="Fahrenheit" time-layout="k-p24h-n6-2">
+        <name>Daily Minimum Temperature</name>
+        <value>41</value>
+        <value>39</value>
+        <value>37</value>
+        <value>35</value>
+        <value>37</value>
+        <value>39</value>
+      </temperature>
+      <humidity type="maximum relative" units="percent" time-layout="k-p12h-n7-3">
+        <name>Daily Maximum Relative Humidity</name>
+        <value>82</value>
+        <value>83</value>
+        <value>100</value>
+        <value>96</value>
+        <value>78</value>
+        <value>72</value>
+        <value>70</value>
+      </humidity>
+      <humidity type="minimum relative" units="percent" time-layout="k-p12h-n7-4">
+        <name>Daily Minimum Relative Humidity</name>
+        <value>42</value>
+        <value>90</value>
+        <value>79</value>
+        <value>58</value>
+        <value>46</value>
+        <value>45</value>
+        <value>48</value>
+      </humidity>
+    </parameters>
+    <parameters applicable-location="point2">
+      <temperature type="maximum" units="Fahrenheit" time-layout="k-p24h-n7-5">
+        <name>Daily Maximum Temperature</name>
+        <value>80</value>
+        <value>80</value>
+        <value>82</value>
+        <value>82</value>
+        <value>82</value>
+        <value>82</value>
+        <value>82</value>
+      </temperature>
+      <temperature type="minimum" units="Fahrenheit" time-layout="k-p24h-n6-6">
+        <name>Daily Minimum Temperature</name>
+        <value>78</value>
+        <value>80</value>
+        <value>80</value>
+        <value>80</value>
+        <value>80</value>
+        <value>80</value>
+      </temperature>
+      <humidity type="maximum relative" units="percent" time-layout="k-p12h-n7-7">
+        <name>Daily Maximum Relative Humidity</name>
+        <value>57</value>
+        <value>67</value>
+        <value>62</value>
+        <value>67</value>
+        <value>74</value>
+        <value>79</value>
+        <value>85</value>
+      </humidity>
+      <humidity type="minimum relative" units="percent" time-layout="k-p12h-n7-8">
+        <name>Daily Minimum Relative Humidity</name>
+        <value>48</value>
+        <value>61</value>
+        <value>60</value>
+        <value>65</value>
+        <value>71</value>
+        <value>77</value>
+        <value>77</value>
+      </humidity>
+    </parameters>
+  </data>
+</dwml>

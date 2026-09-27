@@ -28,7 +28,7 @@ use time::Date;
 
 /// Names the copies' layout. Change it whenever their columns, types or
 /// order change; copies of other versions are then ignored and deleted.
-pub(super) const VERSION: &str = "forecasts-v1";
+pub(super) const VERSION: &str = "forecasts-v2-native-intervals";
 
 /// Rows per row group: about 26 stations' periods, so a query for one
 /// station reads one or two groups of each file.
@@ -54,6 +54,15 @@ const COLUMN_TYPES: &[(&str, &str)] = &[
     ("snow_amt", "DOUBLE"),
     ("snow_ratio", "DOUBLE"),
     ("ice_amt", "DOUBLE"),
+    ("forecast_interval_version", "VARCHAR"),
+    ("interval_kind", "VARCHAR"),
+    ("source_url", "VARCHAR"),
+    ("source_received_at", "VARCHAR"),
+    ("source_xml_sha256", "VARCHAR"),
+    ("source_location", "VARCHAR"),
+    ("source_layouts", "VARCHAR"),
+    ("quality_status", "VARCHAR"),
+    ("quality_reason", "VARCHAR"),
 ];
 
 /// What happened when copying one file.

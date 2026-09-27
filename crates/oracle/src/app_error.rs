@@ -36,6 +36,12 @@ impl IntoResponse for AppError {
                 client_error(format!("invalid station id: {id:?}"))
             }
             AppError::WeatherData(
+                error @ (weather_data::Error::DataQuality { .. }
+                | weather_data::Error::ObservationCoverage { .. }
+                | weather_data::Error::ForecastQuality { .. }
+                | weather_data::Error::QualityUnavailable),
+            ) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+            AppError::WeatherData(
                 weather_data::Error::Query(_)
                 | weather_data::Error::TimeFormat(_)
                 | weather_data::Error::TimeParse(_)

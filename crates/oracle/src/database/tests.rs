@@ -600,3 +600,267 @@ async fn the_events_list_filters_unlisted_events_and_status_before_its_limit() {
     shutdown.cancel();
     bounded(task).await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn competing_settlements_commit_one_consistent_snapshot_and_reject_stale_writes() {
+    let (directory, first, writer) = open(16).await;
+    let (first_shutdown, first_task) = start(writer);
+    let event = add(&first, 2).await;
+    let participant = entry(event.id, "KORD");
+    first
+        .add_event_entries(event.id, vec![participant.clone()])
+        .await
+        .unwrap();
+    first
+        .set_settlement_block(
+            event.id,
+            SettlementBlock {
+                code: "incomplete_readings".into(),
+                message: "waiting for source".into(),
+                checked_at: OffsetDateTime::now_utc(),
+            },
+        )
+        .await
+        .unwrap();
+    // Separate writers reproduce overlapping processes against the same file,
+    // rather than relying on the in-process write queue for serialization.
+    let (second, writer) = Database::open(directory.path()).await.unwrap();
+    let (second_shutdown, second_task) = start(writer);
+    let reading = |value| {
+        vec![Reading {
+            target: "KORD".into(),
+            metric: "temp_high".into(),
+            baseline: Some(60.0),
+            observed: Some(value),
+        }]
+    };
+    let score = |value| {
+        vec![EntryScore {
+            id: participant.id,
+            total_score: value * 10_000,
+            base_score: value,
+        }]
+    };
+    let first_signature = MaybeScalar::from_slice(&[1; 32]).unwrap();
+    let second_signature = MaybeScalar::from_slice(&[2; 32]).unwrap();
+    let (a, b) = bounded(async {
+        tokio::join!(
+            first.settle_event(event.id, reading(70.0), score(10), first_signature),
+            second.settle_event(event.id, reading(50.0), score(20), second_signature),
+        )
+    })
+    .await;
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_ne!(a, b, "exactly one process must finalize the event");
+    let (expected_readings, expected_score, expected_signature) = if a {
+        (reading(70.0), 10, first_signature)
+    } else {
+        (reading(50.0), 20, second_signature)
+    };
+    // A slow worker can still reach these provisional writes after a different
+    // worker signs. Neither operation may alter the committed evidence.
+    bounded(second.replace_readings(event.id, reading(99.0)))
+        .await
+        .unwrap();
+    bounded(first.update_entry_scores(score(99))).await.unwrap();
+    assert_eq!(
+        first.readings(&[event.id]).await.unwrap().remove(&event.id),
+        Some(expected_readings)
+    );
+    let stored_entry = first.event_entries(event.id).await.unwrap().remove(0);
+    assert_eq!(stored_entry.base_score, Some(expected_score));
+    assert_eq!(stored_entry.score, Some(expected_score * 10_000));
+    assert_eq!(
+        first
+            .get_event(event.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .attestation,
+        Some(expected_signature)
+    );
+    let blocks: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM event_settlement_blocks WHERE event_id = ?")
+            .bind(event.id.to_string())
+            .fetch_one(&first.readers)
+            .await
+            .unwrap();
+    assert_eq!(
+        blocks, 0,
+        "the block clears in the finalization transaction"
+    );
+    second_shutdown.cancel();
+    bounded(second_task).await.unwrap().unwrap();
+    first_shutdown.cancel();
+    bounded(first_task).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn failed_settlement_rolls_back_signature_scores_readings_and_block() {
+    let (_directory, database, writer) = open(16).await;
+    let (shutdown, task) = start(writer);
+    let event = add(&database, 2).await;
+    let participant = entry(event.id, "KORD");
+    database
+        .add_event_entries(event.id, vec![participant.clone()])
+        .await
+        .unwrap();
+    let reading = Reading {
+        target: "KORD".into(),
+        metric: "temp_high".into(),
+        baseline: Some(60.0),
+        observed: Some(65.0),
+    };
+    database
+        .replace_readings(event.id, vec![reading.clone()])
+        .await
+        .unwrap();
+    let original = EntryScore {
+        id: participant.id,
+        total_score: 10_000,
+        base_score: 10,
+    };
+    database.update_entry_scores(vec![original]).await.unwrap();
+    let block = SettlementBlock {
+        code: "incomplete_readings".into(),
+        message: "waiting for source".into(),
+        checked_at: OffsetDateTime::now_utc().replace_nanosecond(0).unwrap(),
+    };
+    database
+        .set_settlement_block(event.id, block.clone())
+        .await
+        .unwrap();
+    let replacement = EntryScore {
+        id: participant.id,
+        total_score: 20_000,
+        base_score: 20,
+    };
+    // Duplicate keys fail after signature, scores, and the first reading were
+    // changed inside the transaction. None of those changes may become visible.
+    assert!(matches!(
+        database
+            .settle_event(
+                event.id,
+                vec![reading.clone(), reading.clone()],
+                vec![replacement],
+                MaybeScalar::Zero,
+            )
+            .await,
+        Err(WriteError::Database(_))
+    ));
+    // A partial or foreign score set also cannot commit an attestation.
+    for scores in [
+        vec![],
+        vec![replacement, replacement],
+        vec![EntryScore {
+            id: Uuid::now_v7(),
+            ..replacement
+        }],
+    ] {
+        assert!(matches!(
+            database
+                .settle_event(event.id, vec![reading.clone()], scores, MaybeScalar::Zero,)
+                .await,
+            Err(WriteError::Database(_))
+        ));
+    }
+    assert!(
+        database
+            .get_event(event.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .attestation
+            .is_none()
+    );
+    assert_eq!(
+        database
+            .readings(&[event.id])
+            .await
+            .unwrap()
+            .remove(&event.id),
+        Some(vec![reading])
+    );
+    let stored = database.event_entries(event.id).await.unwrap().remove(0);
+    assert_eq!(stored.score, Some(original.total_score));
+    assert_eq!(stored.base_score, Some(original.base_score));
+    assert_eq!(
+        database
+            .settlement_blocks(&[event.id])
+            .await
+            .unwrap()
+            .remove(&event.id),
+        Some(block)
+    );
+    shutdown.cancel();
+    bounded(task).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn settlement_blocks_survive_restart_and_cannot_modify_signed_events() {
+    let (directory, database, writer) = open(16).await;
+    let (shutdown, task) = start(writer);
+    let event = add(&database, 3).await;
+    let block = SettlementBlock {
+        code: "incomplete_readings".into(),
+        message: "KORD/rain_amt has no complete accumulation interval".into(),
+        checked_at: OffsetDateTime::now_utc().replace_nanosecond(0).unwrap(),
+    };
+    database
+        .set_settlement_block(event.id, block.clone())
+        .await
+        .unwrap();
+    shutdown.cancel();
+    bounded(task).await.unwrap().unwrap();
+    drop(database);
+
+    let (database, writer) = Database::open(directory.path()).await.unwrap();
+    let (shutdown, task) = start(writer);
+    assert_eq!(
+        database
+            .settlement_blocks(&[event.id])
+            .await
+            .unwrap()
+            .remove(&event.id),
+        Some(block.clone())
+    );
+    database
+        .record_attestation(event.id, MaybeScalar::Zero)
+        .await
+        .unwrap();
+    database
+        .set_settlement_block(
+            event.id,
+            SettlementBlock {
+                code: "must_not_replace".into(),
+                ..block.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        database
+            .settlement_blocks(&[event.id])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let stored: String =
+        sqlx::query_scalar("SELECT code FROM event_settlement_blocks WHERE event_id = ?")
+            .bind(event.id.to_string())
+            .fetch_one(&database.readers)
+            .await
+            .unwrap();
+    assert_eq!(stored, block.code);
+    assert_eq!(
+        database
+            .get_event(event.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .attestation,
+        Some(MaybeScalar::Zero)
+    );
+    shutdown.cancel();
+    bounded(task).await.unwrap().unwrap();
+}

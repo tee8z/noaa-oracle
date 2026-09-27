@@ -34,13 +34,19 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use utoipa::ToSchema;
 
+mod coverage;
 mod derived;
 mod folds;
+mod forecast_display_quality;
+mod forecast_quality;
 #[cfg(test)]
 mod legacy;
+mod precipitation;
+mod shef;
 
 pub use derived::DerivedForecasts;
 pub use folds::Folds;
+pub use forecast_display_quality::{ForecastQuality, ForecastRangeIssue};
 
 /// METAR present weather (`wx_string`) to `rain`, `snow`, or `ice`. Each
 /// token is an optional intensity (`+`/`-`), an optional `VC`, then
@@ -62,7 +68,15 @@ const PRECIP_TYPE_SQL: &str = r#"CASE
 // instant. Prefer the newest publication, including corrected reports, before
 // calculating extrema, averages, or precipitation totals.
 const DEDUP_OBSERVATIONS_SQL: &str = r#"
-    SELECT * EXCLUDE (filename)
+    SELECT * EXCLUDE (filename),
+        regexp_extract(filename, '(^|/)observations_([^/]+)\.parquet$', 2)::TIMESTAMPTZ AS publication_time,
+        COUNT(DISTINCT STRUCT_PACK(
+            temp := temperature_value, unit := temperature_unit_code,
+            dew := dewpoint_value, dew_unit := dewpoint_unit_code,
+            wind := wind_speed, wind_unit := wind_speed_unit_code, direction := wind_direction, direction_unit := wind_direction_unit_code,
+            precip := precip_in, precip_unit := precip_unit_code, weather := wx_string,
+            quality := quality_status, raw := raw_text, version := validation_version, reason := quality_reason, report_type := metar_type
+        )) OVER (PARTITION BY station_id, generated_at::TIMESTAMPTZ, filename) > 1 AS publication_conflict
     FROM parquet_data
     QUALIFY ROW_NUMBER() OVER (
         PARTITION BY station_id, generated_at::TIMESTAMPTZ
@@ -75,7 +89,12 @@ const DEDUP_OBSERVATIONS_SQL: &str = r#"
 
 // Normalize each report before aggregating. Temperature extrema, the Magnus
 // humidity formula, and the precipitation fallback all need one common unit.
+// Broad screening bounds bracket the WMO air-temperature records. They flag
+// suspect input for review; values inside these bounds are not proof of accuracy.
+// Never clamp or replace a rejected measurement. Retain its row for quality counts,
+// including windows containing no usable temperatures.
 const NORMALIZE_OBSERVATIONS_SQL: &str = r#"
+    WITH converted AS (
     SELECT * EXCLUDE (temperature_value, dewpoint_value, temperature_unit_code, dewpoint_unit_code),
         CASE WHEN isfinite(temperature_value) THEN
             CASE lower(temperature_unit_code)
@@ -91,8 +110,52 @@ const NORMALIZE_OBSERVATIONS_SQL: &str = r#"
                 WHEN 'celcius' THEN dewpoint_value
             END
         END::DOUBLE AS dewpoint_value,
-        'celsius'::VARCHAR AS temperature_unit_code
+        'celsius'::VARCHAR AS temperature_unit_code,
+        precip_in AS source_precip_in
+        , (temperature_value IS NULL OR
+            (NOT isfinite(temperature_value) OR lower(temperature_unit_code) NOT IN ('fahrenheit', 'celsius', 'celcius')
+             OR temperature_unit_code IS NULL)) AS invalid_temperature,
+        (dewpoint_value IS NOT NULL AND
+            (NOT isfinite(dewpoint_value) OR (COALESCE(quality_status = 'validated', false) AND dewpoint_unit_code IS NULL)
+             OR lower(COALESCE(dewpoint_unit_code, temperature_unit_code)) NOT IN ('fahrenheit', 'celsius', 'celcius')
+             OR COALESCE(dewpoint_unit_code, temperature_unit_code) IS NULL)) AS invalid_dewpoint
     FROM deduped
+    ), contextual AS (
+        SELECT *, LAG(temperature_value) OVER station_reports AS previous_temperature,
+            LAG(generated_at::TIMESTAMPTZ) OVER station_reports AS previous_time
+        FROM converted
+        WINDOW station_reports AS (PARTITION BY station_id ORDER BY generated_at::TIMESTAMPTZ)
+    ), assessed AS (
+        SELECT *,
+            ((quality_status IS NOT NULL AND quality_status NOT IN ('validated', 'unverified'))
+             OR publication_conflict OR invalid_temperature OR invalid_dewpoint
+             OR (wind_speed IS NOT NULL AND (COALESCE(quality_status = 'validated', false) OR wind_speed_unit_code IS NOT NULL)
+                 AND (wind_speed_unit_code IS NULL OR lower(wind_speed_unit_code) != 'knots'))
+             OR (wind_direction IS NOT NULL AND (COALESCE(quality_status = 'validated', false) OR wind_direction_unit_code IS NOT NULL)
+                 AND (wind_direction_unit_code IS NULL OR lower(wind_direction_unit_code) NOT IN ('degrees true', 'degrees')))
+             OR (precip_in IS NOT NULL AND (COALESCE(quality_status = 'validated', false) OR precip_unit_code IS NOT NULL)
+                 AND (precip_unit_code IS NULL OR lower(precip_unit_code) != 'inches'))
+             OR COALESCE(temperature_value < -90 OR temperature_value > 57, false)
+             OR COALESCE(dewpoint_value < -100 OR dewpoint_value > 57, false)
+             OR COALESCE(dewpoint_value > temperature_value + 0.5 + 1e-6, false)
+             OR COALESCE(wind_speed < 0 OR wind_speed > 500, false)
+             OR COALESCE(wind_direction < 0 OR wind_direction > 360, false)
+             OR COALESCE(NOT isfinite(precip_in) OR precip_in < 0 OR precip_in > 5, false)
+             OR COALESCE(ABS(temperature_value - previous_temperature) >= 15
+                AND generated_at::TIMESTAMPTZ - previous_time <= INTERVAL '2 hours', false)) AS qc_rejected,
+            (quality_status IS DISTINCT FROM 'validated'
+             OR validation_version IS DISTINCT FROM 'metar-consistency-v1'
+             OR COALESCE(trim(quality_reason) != '', false)
+             OR raw_text IS NULL OR trim(raw_text) = '') AS qc_unverified
+        FROM contextual
+    )
+    SELECT * EXCLUDE (temperature_value, dewpoint_value, wind_speed, wind_direction, precip_in),
+        CASE WHEN NOT qc_rejected AND COALESCE(quality_status, 'legacy') != 'unverified' THEN temperature_value END AS temperature_value,
+        CASE WHEN NOT qc_rejected AND COALESCE(quality_status, 'legacy') != 'unverified' THEN dewpoint_value END AS dewpoint_value,
+        CASE WHEN NOT qc_rejected AND COALESCE(quality_status, 'legacy') != 'unverified' THEN wind_speed END AS wind_speed,
+        CASE WHEN NOT qc_rejected AND COALESCE(quality_status, 'legacy') != 'unverified' THEN wind_direction END AS wind_direction,
+        CASE WHEN NOT qc_rejected AND COALESCE(quality_status, 'legacy') != 'unverified' AND metar_type IS DISTINCT FROM 'SPECI' THEN precip_in END AS precip_in
+    FROM assessed
 "#;
 
 /// A report or forecast issue can reach a snapshot after its validity window.
@@ -134,6 +197,22 @@ pub struct WeatherAccess {
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[error("observation coverage is incomplete for {stations:?}: {reason}")]
+    ObservationCoverage {
+        stations: Vec<String>,
+        reason: String,
+    },
+    #[error("forecast inputs require review: {reason}")]
+    ForecastQuality { reason: String },
+    #[error("observation quality verification is unavailable")]
+    QualityUnavailable,
+    #[error(
+        "observations require review: {rejected_reports} rejected reports, {unverified_reports} unverified reports"
+    )]
+    DataQuality {
+        rejected_reports: u64,
+        unverified_reports: u64,
+    },
     #[error("Failed to query duckdb: {0}")]
     Query(#[from] duckdb::Error),
     #[error("Failed to format time string: {0}")]
@@ -196,6 +275,33 @@ fn sql_string_list(values: &[String]) -> String {
         .join(", ")
 }
 
+/// A metric over the exact requested settlement window. Missing values remain explicit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SettlementValue {
+    pub station_id: String,
+    pub metric: String,
+    pub value: Option<f64>,
+}
+
+/// Valid native forecast boundaries from the selected source publication.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ForecastNativeInterval {
+    pub metric: String,
+    pub start: String,
+    /// Absent for a forecast instant, present for an accumulation or extremum.
+    pub end: Option<String>,
+}
+
+/// The same per-metric assessment used by settlement, with planning evidence.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ForecastAssessment {
+    pub station_id: String,
+    pub metric: String,
+    pub value: Option<f64>,
+    pub reason: Option<String>,
+    pub native_intervals: Vec<ForecastNativeInterval>,
+}
+
 #[async_trait]
 pub trait WeatherData: Sync + Send {
     async fn forecasts_data(
@@ -203,11 +309,61 @@ pub trait WeatherData: Sync + Send {
         req: &ForecastRequest,
         station_ids: Vec<String>,
     ) -> Result<Vec<Forecast>, Error>;
+    async fn settlement_forecasts(
+        &self,
+        _req: &ForecastRequest,
+        _station_ids: Vec<String>,
+    ) -> Result<Vec<SettlementValue>, Error> {
+        Err(Error::QualityUnavailable)
+    }
+    async fn forecast_assessment(
+        &self,
+        _req: &ForecastRequest,
+        _station_ids: Vec<String>,
+    ) -> Result<Vec<ForecastAssessment>, Error> {
+        Err(Error::QualityUnavailable)
+    }
+    async fn calendar_forecasts_with_quality(
+        &self,
+        req: &ForecastRequest,
+        station_ids: Vec<String>,
+        calendar: Calendar,
+    ) -> Result<(Vec<Forecast>, ForecastQuality), Error> {
+        Ok((
+            self.calendar_forecasts(req, station_ids, calendar).await?,
+            ForecastQuality::unavailable(),
+        ))
+    }
+    /// Stations with recent verified fixed-hour precipitation reports.
+    /// An empty list means capability is unknown, not unsupported.
+    async fn precipitation_station_capabilities(
+        &self,
+        _station_ids: Vec<String>,
+    ) -> Result<Vec<String>, Error> {
+        Ok(vec![])
+    }
     async fn observation_data(
         &self,
         req: &ObservationRequest,
         station_ids: Vec<String>,
     ) -> Result<Vec<Observation>, Error>;
+    /// Settlement must validate and aggregate the same selected publications.
+    /// Implementations without this guarantee cannot authorize an attestation.
+    async fn settlement_observations(
+        &self,
+        _req: &ObservationRequest,
+        _station_ids: Vec<String>,
+        _required_collected_after: OffsetDateTime,
+    ) -> Result<Vec<Observation>, Error> {
+        Err(Error::QualityUnavailable)
+    }
+    async fn observation_quality(
+        &self,
+        _req: &ObservationRequest,
+        _station_ids: Vec<String>,
+    ) -> Result<ObservationQuality, Error> {
+        Err(Error::QualityUnavailable)
+    }
     /// Get daily aggregated observations (grouped by UTC date)
     async fn daily_observations(
         &self,
@@ -301,7 +457,8 @@ const FORECAST_SOURCE_COLUMNS: &str = "
            NULL::VARCHAR AS temperature_unit_code, NULL::DOUBLE AS twelve_hour_probability_of_precipitation,
            NULL::DOUBLE AS liquid_precipitation_amt, NULL::DOUBLE AS snow_amt,
            NULL::DOUBLE AS snow_ratio, NULL::DOUBLE AS ice_amt,
-           NULL::VARCHAR AS generated_at, NULL::VARCHAR AS filename
+           NULL::VARCHAR AS generated_at, NULL::VARCHAR AS filename,
+           NULL::VARCHAR AS forecast_interval_version, NULL::VARCHAR AS interval_kind, NULL::VARCHAR AS source_url, NULL::VARCHAR AS source_received_at, NULL::VARCHAR AS source_xml_sha256, NULL::VARCHAR AS source_location, NULL::VARCHAR AS source_layouts, NULL::VARCHAR AS quality_status, NULL::VARCHAR AS quality_reason
     WHERE false";
 
 /// The order a query picks each station and period's row by: the newest
@@ -318,7 +475,7 @@ const DEDUPE_ORDER: &str = "generated_ts DESC NULLS LAST, published_ts DESC NULL
 /// The columns of a forecast row as queries read it, in order.
 const FORECAST_ROW_COLUMNS: &str = "station_id, begin_ts, end_ts, generated_ts, published_ts, source, \
      min_temp, max_temp, wind_speed, wind_direction, relative_humidity_max, relative_humidity_min, \
-     precip_chance, liquid_precipitation_amt, snow_amt, snow_ratio, ice_amt";
+     precip_chance, liquid_precipitation_amt, snow_amt, snow_ratio, ice_amt, forecast_interval_version, interval_kind, source_url, source_received_at, source_xml_sha256, source_location, source_layouts, quality_status, quality_reason";
 
 /// Forecast rows from daemon files: times as instants, temperatures in
 /// Fahrenheit, and the publication each row came from (`published_ts` from
@@ -352,7 +509,8 @@ fn source_forecast_rows_sql(files: &[String], filter: &str) -> String {
             liquid_precipitation_amt,
             snow_amt,
             snow_ratio,
-            ice_amt
+            ice_amt,
+            forecast_interval_version, interval_kind, source_url, source_received_at, source_xml_sha256, source_location, source_layouts, quality_status, quality_reason
         FROM ({FORECAST_SOURCE_COLUMNS}
               UNION ALL BY NAME
               SELECT * FROM read_parquet([{}], union_by_name = true, filename = true))
@@ -370,8 +528,8 @@ fn forecast_row_conditions(
     let mut conditions = Vec::new();
     if let Some(start) = &req.start {
         conditions.push(format!(
-            "end_ts > '{}'::TIMESTAMPTZ",
-            start.format(&Rfc3339)?
+            "(end_ts > '{}'::TIMESTAMPTZ OR (interval_kind = 'instant' AND begin_ts >= '{}'::TIMESTAMPTZ))",
+            start.format(&Rfc3339)?, start.format(&Rfc3339)?
         ));
     }
     if let Some(end) = &req.end {
@@ -475,6 +633,11 @@ fn forecasts_sql(
         "",
         "SUM(ice_amt) FILTER (WHERE ice_amt >= 0) AS ice_amt",
     );
+    let native_period = format!(
+        "STRUCT_PACK(\"start\" := {}, \"end\" := {}, version := forecast_interval_version, layouts := source_layouts)",
+        utc_timestamp_sql("begin_ts"),
+        utc_timestamp_sql("end_ts")
+    );
     Ok(format!(
         r#"
     WITH forecast_rows AS (
@@ -482,7 +645,7 @@ fn forecasts_sql(
     ),
     -- Per station and period, the newest issue, then the newest
     -- publication of that issue. Value ties are deterministic.
-    deduped AS (
+    selected AS (
         SELECT station_id, begin_ts, end_ts, picked.*,
             {date} AS date,
             EXTRACT(EPOCH FROM (end_ts - begin_ts)) AS duration_secs
@@ -495,11 +658,33 @@ fn forecasts_sql(
                     relative_humidity_min := relative_humidity_min,
                     precip_chance := precip_chance,
                     liquid_precipitation_amt := liquid_precipitation_amt,
-                    snow_amt := snow_amt, snow_ratio := snow_ratio, ice_amt := ice_amt
+                    snow_amt := snow_amt, snow_ratio := snow_ratio, ice_amt := ice_amt,
+                    quality_status := quality_status,
+                    forecast_interval_version := forecast_interval_version,
+                    source_layouts := source_layouts
                 ) ORDER BY {DEDUPE_ORDER}) AS picked
             FROM forecast_rows
             GROUP BY station_id, begin_ts, end_ts
         )
+    ),
+    -- Keep the newest publication even when quarantined; removing it before
+    -- selection would silently restore an older value. Historical files have
+    -- no producer status and remain provisional display data.
+    deduped AS (
+        SELECT station_id, begin_ts, end_ts, date, duration_secs,
+            quality_status, forecast_interval_version, source_layouts,
+            CASE WHEN quality_status IS DISTINCT FROM 'rejected' THEN min_temp END AS min_temp,
+            CASE WHEN quality_status IS DISTINCT FROM 'rejected' THEN max_temp END AS max_temp,
+            CASE WHEN quality_status IS DISTINCT FROM 'rejected' THEN wind_speed END AS wind_speed,
+            CASE WHEN quality_status IS DISTINCT FROM 'rejected' THEN wind_direction END AS wind_direction,
+            CASE WHEN quality_status IS DISTINCT FROM 'rejected' THEN relative_humidity_max END AS relative_humidity_max,
+            CASE WHEN quality_status IS DISTINCT FROM 'rejected' THEN relative_humidity_min END AS relative_humidity_min,
+            CASE WHEN quality_status IS DISTINCT FROM 'rejected' THEN precip_chance END AS precip_chance,
+            CASE WHEN quality_status IS DISTINCT FROM 'rejected' THEN liquid_precipitation_amt END AS liquid_precipitation_amt,
+            CASE WHEN quality_status IS DISTINCT FROM 'rejected' THEN snow_amt END AS snow_amt,
+            CASE WHEN quality_status IS DISTINCT FROM 'rejected' THEN snow_ratio END AS snow_ratio,
+            CASE WHEN quality_status IS DISTINCT FROM 'rejected' THEN ice_amt END AS ice_amt
+        FROM selected
     ),{qpf}{snow}{ice}
     daily AS (
         SELECT
@@ -516,7 +701,14 @@ fn forecasts_sql(
                 FILTER (WHERE wind_speed >= 0 AND wind_speed <= 500) AS wind_direction,
             MAX(relative_humidity_max) FILTER (WHERE relative_humidity_max >= 0 AND relative_humidity_max <= 100) AS humidity_max,
             MIN(relative_humidity_min) FILTER (WHERE relative_humidity_min >= 0 AND relative_humidity_min <= 100) AS humidity_min,
-            MAX(precip_chance) AS precip_chance
+            MAX(precip_chance) AS precip_chance,
+            COUNT(*) FILTER (WHERE quality_status = 'rejected') AS rejected_rows,
+            COUNT(*) FILTER (WHERE forecast_interval_version IS DISTINCT FROM 'ndfd-native-v1'
+                OR quality_status IS NULL OR source_layouts IS NULL) AS unverified_rows,
+            to_json(arg_min({native_period}, min_temp) FILTER (WHERE min_temp >= -200 AND min_temp <= 200))::VARCHAR AS min_temp_period,
+            to_json(arg_max({native_period}, max_temp) FILTER (WHERE max_temp >= -200 AND max_temp <= 200))::VARCHAR AS max_temp_period,
+            to_json(arg_min({native_period}, relative_humidity_min) FILTER (WHERE relative_humidity_min >= 0 AND relative_humidity_min <= 100))::VARCHAR AS humidity_min_period,
+            to_json(arg_max({native_period}, relative_humidity_max) FILTER (WHERE relative_humidity_max >= 0 AND relative_humidity_max <= 100))::VARCHAR AS humidity_max_period
         FROM deduped
         GROUP BY station_id, date
     )
@@ -525,19 +717,23 @@ fn forecasts_sql(
         d.date::VARCHAR AS date,
         ({})::VARCHAR AS start_time,
         ({})::VARCHAR AS end_time,
-        d.temp_low::BIGINT AS temp_low,
-        d.temp_high::BIGINT AS temp_high,
+        CASE WHEN d.temp_low > d.temp_high THEN NULL ELSE d.temp_low END::BIGINT AS temp_low,
+        CASE WHEN d.temp_low > d.temp_high THEN NULL ELSE d.temp_high END::BIGINT AS temp_high,
         d.wind_speed::BIGINT AS wind_speed,
         d.wind_direction::BIGINT AS wind_direction,
-        d.humidity_max::BIGINT AS humidity_max,
-        d.humidity_min::BIGINT AS humidity_min,
+        CASE WHEN d.humidity_min > d.humidity_max THEN NULL ELSE d.humidity_max END::BIGINT AS humidity_max,
+        CASE WHEN d.humidity_min > d.humidity_max THEN NULL ELSE d.humidity_min END::BIGINT AS humidity_min,
         'fahrenheit'::VARCHAR AS temperature_unit_code,
         d.precip_chance::DOUBLE AS precip_chance,
         CASE WHEN q.total_qpf IS NULL THEN NULL ELSE GREATEST(0,
             q.total_qpf - COALESCE(s.snow_liquid_amt, 0) - COALESCE(i.ice_amt, 0)
         ) END::DOUBLE AS rain_amt,
         s.snow_amt::DOUBLE AS snow_amt,
-        i.ice_amt::DOUBLE AS ice_amt
+        i.ice_amt::DOUBLE AS ice_amt,
+        d.rejected_rows::BIGINT AS rejected_rows, d.unverified_rows::BIGINT AS unverified_rows,
+        d.temp_low::DOUBLE AS raw_temp_low, d.temp_high::DOUBLE AS raw_temp_high,
+        d.humidity_min::DOUBLE AS raw_humidity_min, d.humidity_max::DOUBLE AS raw_humidity_max,
+        d.min_temp_period, d.max_temp_period, d.humidity_min_period, d.humidity_max_period
     FROM daily d
     LEFT JOIN qpf_daily q ON d.station_id = q.station_id AND d.date = q.date
     LEFT JOIN snow_daily s ON d.station_id = s.station_id AND d.date = s.date
@@ -604,6 +800,223 @@ fn empty_publication_window(params: &FileParams) -> bool {
 }
 
 impl WeatherAccess {
+    async fn observation_batches(
+        &self,
+        req: &ObservationRequest,
+        station_ids: Vec<String>,
+        coverage: Option<coverage::Requirement>,
+    ) -> Result<Vec<RecordBatch>, Error> {
+        let station_filter = station_filter(&station_ids)?;
+        let file_params = observation_file_params(req, OffsetDateTime::now_utc());
+        if empty_publication_window(&file_params) {
+            if let Some(coverage) = &coverage {
+                return Err(coverage.unavailable("the requested publication window is empty"));
+            }
+            return Ok(vec![]);
+        }
+        let parquet_files = self.file_access.grab_file_names(file_params).await?;
+        let file_paths = self.file_access.build_file_paths(parquet_files);
+        if file_paths.is_empty() {
+            if let Some(coverage) = &coverage {
+                return Err(
+                    coverage.unavailable("no source-history files cover the requested window")
+                );
+            }
+            return Ok(vec![]);
+        }
+
+        // Build time filter clauses
+        let mut time_filters = Vec::new();
+        if let Some(start) = &req.start {
+            time_filters.push(format!(
+                "generated_at::TIMESTAMPTZ >= '{}'::TIMESTAMPTZ",
+                start.saturating_sub(Duration::hours(2)).format(&Rfc3339)?
+            ));
+        }
+        // A later routine METAR can report precipitation beginning/ending
+        // before the event ended. Read it only for phase closure; the separate
+        // point bounds below still exclude every post-window extremum.
+        let read_end = coverage
+            .as_ref()
+            .map(|value| value.end + Duration::minutes(75))
+            .or(req.end);
+        if let Some(end) = &read_end {
+            time_filters.push(format!(
+                "generated_at::TIMESTAMPTZ <= '{}'::TIMESTAMPTZ",
+                end.format(&Rfc3339)?
+            ));
+        }
+
+        let mut result_bounds = Vec::new();
+        if let Some(start) = req.start {
+            result_bounds.push(format!(
+                "generated_at::TIMESTAMPTZ >= '{}'::TIMESTAMPTZ",
+                start.format(&Rfc3339)?
+            ));
+        }
+        if let Some(end) = req.end {
+            result_bounds.push(format!(
+                "generated_at::TIMESTAMPTZ <= '{}'::TIMESTAMPTZ",
+                end.format(&Rfc3339)?
+            ));
+        }
+        let result_time_filter = if result_bounds.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", result_bounds.join(" AND "))
+        };
+        let time_filter = if time_filters.is_empty() {
+            String::new()
+        } else if station_filter.is_empty() {
+            format!("WHERE {}", time_filters.join(" AND "))
+        } else {
+            format!("AND {}", time_filters.join(" AND "))
+        };
+
+        // Build start/end time expressions
+        let start_time_expr = if let Some(start) = &req.start {
+            format!(
+                "GREATEST('{}'::TIMESTAMPTZ, MIN(generated_at::TIMESTAMPTZ))",
+                start.format(&Rfc3339)?
+            )
+        } else {
+            "MIN(generated_at::TIMESTAMPTZ)".to_string()
+        };
+        let end_time_expr = if let Some(end) = &req.end {
+            format!(
+                "LEAST('{}'::TIMESTAMPTZ, MAX(generated_at::TIMESTAMPTZ))",
+                end.format(&Rfc3339)?
+            )
+        } else {
+            "MAX(generated_at::TIMESTAMPTZ)".to_string()
+        };
+
+        // Use raw SQL with UNION ALL BY NAME to handle schema differences
+        // Old parquet files may not have wind_direction, dewpoint_value, precip_in, or wx_string
+        // Humidity is derived from temperature and dewpoint using the Magnus formula
+        // Precipitation is split into rain/snow/ice by PRECIP_TYPE_SQL
+        // precip_in is liquid equivalent; snow inches = precip_in * snow_ratio (default 10)
+        let precip_type = PRECIP_TYPE_SQL;
+        let dedup = DEDUP_OBSERVATIONS_SQL;
+        let normalized = NORMALIZE_OBSERVATIONS_SQL;
+        let query_sql = format!(
+            r#"
+            WITH parquet_data AS (
+                SELECT * FROM (
+                    SELECT NULL::VARCHAR AS station_id, NULL::VARCHAR AS generated_at,
+                           NULL::DOUBLE AS temperature_value, NULL::BIGINT AS wind_speed,
+                           NULL::BIGINT AS wind_direction,
+                           NULL::DOUBLE AS dewpoint_value, NULL::DOUBLE AS precip_in,
+                           NULL::VARCHAR AS temperature_unit_code,
+                           NULL::VARCHAR AS wx_string, NULL::VARCHAR AS filename,
+                           NULL::VARCHAR AS dewpoint_unit_code,
+                           NULL::VARCHAR AS quality_status, NULL::VARCHAR AS quality_reason,
+                           NULL::VARCHAR AS validation_version, NULL::VARCHAR AS raw_text,
+                           NULL::VARCHAR AS wind_speed_unit_code, NULL::VARCHAR AS wind_direction_unit_code,
+                           NULL::VARCHAR AS precip_unit_code, NULL::VARCHAR AS metar_type
+                    WHERE false
+                    UNION ALL BY NAME
+                    SELECT * FROM read_parquet([{}], union_by_name = true, filename = true)
+                )
+                {} {}
+            ),
+            deduped AS ({dedup}),
+            normalized AS ({normalized}),
+            -- Classify each observation's precipitation type
+            classified AS (
+                SELECT *, {precip_type} AS precip_type
+                FROM normalized
+            )
+            SELECT
+                station_id::VARCHAR AS station_id,
+                COUNT(*) FILTER (WHERE qc_rejected)::BIGINT AS rejected_reports,
+                COUNT(*) FILTER (WHERE NOT qc_rejected AND qc_unverified)::BIGINT AS unverified_reports,
+                ({})::VARCHAR AS start_time,
+                ({})::VARCHAR AS end_time,
+                MIN(temperature_value)::DOUBLE AS temp_low,
+                MAX(temperature_value)::DOUBLE AS temp_high,
+                -- Keep the latest usable temperature, its timestamp, and its
+                -- source unit from the same report. A newer report without a
+                -- temperature must not make an older reading look fresh.
+                FIRST(temperature_value ORDER BY generated_at::TIMESTAMPTZ DESC,
+                      temperature_value DESC, temperature_unit_code DESC)
+                    FILTER (WHERE temperature_value IS NOT NULL AND isfinite(temperature_value))::DOUBLE AS latest_temp,
+                FIRST(generated_at ORDER BY generated_at::TIMESTAMPTZ DESC,
+                      temperature_value DESC, temperature_unit_code DESC)
+                    FILTER (WHERE temperature_value IS NOT NULL AND isfinite(temperature_value))::VARCHAR AS latest_temp_time,
+                FIRST(temperature_unit_code ORDER BY generated_at::TIMESTAMPTZ DESC,
+                      temperature_value DESC, temperature_unit_code DESC)
+                    FILTER (WHERE temperature_value IS NOT NULL AND isfinite(temperature_value))::VARCHAR AS latest_temp_unit_code,
+                (MAX(wind_speed) FILTER (WHERE wind_speed IS NOT NULL AND wind_speed >= 0 AND wind_speed <= 500))::BIGINT AS wind_speed,
+                MAX(temperature_unit_code)::VARCHAR AS temperature_unit_code,
+                FIRST(wind_direction ORDER BY wind_speed DESC, generated_at::TIMESTAMPTZ DESC)
+                    FILTER (WHERE wind_speed IS NOT NULL AND wind_speed >= 0 AND wind_speed <= 500)::BIGINT AS wind_direction,
+                -- Derive humidity from temperature and dewpoint using Magnus formula
+                CASE
+                    WHEN AVG(dewpoint_value) IS NOT NULL AND AVG(temperature_value) IS NOT NULL
+                    THEN ROUND(100.0 * EXP((17.625 * AVG(dewpoint_value)) / (243.04 + AVG(dewpoint_value)))
+                         / EXP((17.625 * AVG(temperature_value)) / (243.04 + AVG(temperature_value))))::BIGINT
+                    ELSE NULL
+                END::BIGINT AS humidity,
+                -- Rain: sum precip_in where type is rain (already liquid inches)
+                SUM(CASE WHEN precip_type = 'rain' THEN precip_in ELSE 0 END)
+                    FILTER (WHERE precip_in IS NOT NULL AND isfinite(precip_in) AND precip_in >= 0)::DOUBLE AS rain_amt,
+                -- Snow: precip_in * 10 (default snow ratio) to convert liquid equivalent to snow inches
+                SUM(CASE WHEN precip_type = 'snow' THEN precip_in * 10.0 ELSE 0 END)
+                    FILTER (WHERE precip_in IS NOT NULL AND isfinite(precip_in) AND precip_in >= 0)::DOUBLE AS snow_amt,
+                -- Ice: liquid equivalent inches (roughly 1:1)
+                SUM(CASE WHEN precip_type = 'ice' THEN precip_in ELSE 0 END)
+                    FILTER (WHERE precip_in IS NOT NULL AND isfinite(precip_in) AND precip_in >= 0)::DOUBLE AS ice_amt
+            FROM classified
+            {result_time_filter}
+            GROUP BY station_id
+            "#,
+            sql_string_list(&file_paths),
+            station_filter,
+            time_filter,
+            utc_timestamp_sql(&start_time_expr),
+            utc_timestamp_sql(&end_time_expr),
+        );
+
+        let precipitation_sql = coverage.as_ref().map(|_| {
+            // Reuse the exact immutable file selection and normalization. This
+            // branch retains lookback anchors and the accumulation endpoint.
+            let prefix = query_sql
+                .split("            SELECT\n                station_id::VARCHAR AS station_id,")
+                .next()
+                .unwrap();
+            format!(
+                "{prefix} SELECT station_id, generated_at, metar_type, raw_text, source_precip_in, \
+                (NOT qc_rejected AND NOT qc_unverified) AS verified, \
+                wind_speed IS NOT NULL, wind_direction IS NOT NULL, \
+                ROUND(100.0 * EXP((17.625 * dewpoint_value) / (243.04 + dewpoint_value)) / \
+                    EXP((17.625 * temperature_value) / (243.04 + temperature_value)))::BIGINT \
+                FROM classified ORDER BY station_id, generated_at::TIMESTAMPTZ"
+            )
+        });
+        self.query_with_connection(query_sql, move |connection, batches| {
+            if let Some(coverage) = coverage {
+                let quality = decode_quality(batches)?;
+                if quality.rejected_reports > 0 || quality.unverified_reports > 0 {
+                    return Err(Error::DataQuality {
+                        rejected_reports: quality.rejected_reports,
+                        unverified_reports: quality.unverified_reports,
+                    });
+                }
+                coverage.verify(connection, &file_paths)?;
+                return precipitation::apply(
+                    connection,
+                    &file_paths,
+                    precipitation_sql.as_deref().unwrap(),
+                    &coverage,
+                    batches,
+                );
+            }
+            Ok(batches.to_vec())
+        })
+        .await
+    }
+
     /// Reads published files only.
     pub fn new(file_access: Arc<dyn FileData>) -> Self {
         Self {
@@ -700,6 +1113,15 @@ impl WeatherAccess {
         sql: String,
         decode: impl FnOnce(&[RecordBatch]) -> Result<Vec<T>, Error> + Send + 'static,
     ) -> Result<Vec<T>, Error> {
+        self.query_with_connection(sql, move |_, batches| decode(batches))
+            .await
+    }
+
+    async fn query_with_connection<T: Send + 'static>(
+        &self,
+        sql: String,
+        decode: impl FnOnce(&Connection, &[RecordBatch]) -> Result<Vec<T>, Error> + Send + 'static,
+    ) -> Result<Vec<T>, Error> {
         let slot = self.slot().await?;
         let database = self.database.clone();
         tokio::task::spawn_blocking(move || {
@@ -717,7 +1139,7 @@ impl WeatherAccess {
             };
             let mut statement = connection.prepare(&sql)?;
             let batches: Vec<RecordBatch> = statement.query_arrow([])?.collect();
-            decode(&batches)
+            decode(&connection, &batches)
         })
         .await?
     }
@@ -754,12 +1176,72 @@ impl WeatherData for WeatherAccess {
             .await
     }
 
+    async fn settlement_forecasts(
+        &self,
+        req: &ForecastRequest,
+        station_ids: Vec<String>,
+    ) -> Result<Vec<SettlementValue>, Error> {
+        Ok(self
+            .native_forecast_assessment(req, station_ids)
+            .await?
+            .into_iter()
+            .map(|assessment| SettlementValue {
+                station_id: assessment.station_id,
+                metric: assessment.metric,
+                value: assessment.value,
+            })
+            .collect())
+    }
+
+    async fn precipitation_station_capabilities(
+        &self,
+        station_ids: Vec<String>,
+    ) -> Result<Vec<String>, Error> {
+        station_filter(&station_ids)?;
+        let now = OffsetDateTime::now_utc();
+        let req = ObservationRequest {
+            start: Some(now - Duration::hours(3)),
+            end: Some(now),
+            station_ids: station_ids.join(","),
+            temperature_unit: TemperatureUnit::Celsius,
+        };
+        let files = self
+            .file_access
+            .grab_file_names(observation_file_params(&req, now))
+            .await?;
+        let paths = self.file_access.build_file_paths(files);
+        self.query_with_connection("SELECT 1".into(), move |connection, _| {
+            Ok(shef::Evidence::read(connection, &paths)?.recent_stations(&station_ids, now))
+        })
+        .await
+    }
+
+    async fn forecast_assessment(
+        &self,
+        req: &ForecastRequest,
+        station_ids: Vec<String>,
+    ) -> Result<Vec<ForecastAssessment>, Error> {
+        self.native_forecast_assessment(req, station_ids).await
+    }
+
     async fn calendar_forecasts(
         &self,
         req: &ForecastRequest,
         station_ids: Vec<String>,
         calendar: Calendar,
     ) -> Result<Vec<Forecast>, Error> {
+        Ok(self
+            .calendar_forecasts_with_quality(req, station_ids, calendar)
+            .await?
+            .0)
+    }
+
+    async fn calendar_forecasts_with_quality(
+        &self,
+        req: &ForecastRequest,
+        station_ids: Vec<String>,
+        calendar: Calendar,
+    ) -> Result<(Vec<Forecast>, ForecastQuality), Error> {
         let stations = station_condition(&station_ids)?;
         let now = OffsetDateTime::now_utc();
         let window = forecast_generated_window(req, now);
@@ -767,11 +1249,11 @@ impl WeatherData for WeatherAccess {
         // qualifying issue can be published after the generation cutoff.
         let file_params = forecast_file_params(window, now);
         if empty_publication_window(&file_params) {
-            return Ok(vec![]);
+            return Ok((vec![], ForecastQuality::default()));
         }
         let names = self.file_access.grab_file_names(file_params).await?;
         if names.is_empty() {
-            return Ok(vec![]);
+            return Ok((vec![], ForecastQuality::default()));
         }
         let rows = self.forecast_rows_sql(
             names,
@@ -780,12 +1262,19 @@ impl WeatherData for WeatherAccess {
             &forecast_row_conditions(req, window)?,
         );
         if rows.is_empty() {
-            return Ok(vec![]);
+            return Ok((vec![], ForecastQuality::default()));
         }
         let query_sql = forecasts_sql(&rows, req, calendar, window)?;
         let unit = req.temperature_unit;
-        self.query(query_sql, move |batches| decode_forecasts(batches, &unit))
-            .await
+        let mut result = self
+            .query(query_sql, move |batches| {
+                Ok(vec![(
+                    decode_forecasts(batches, &unit)?,
+                    forecast_display_quality::decode(batches)?,
+                )])
+            })
+            .await?;
+        Ok(result.pop().unwrap_or_default())
     }
 
     async fn observation_data(
@@ -793,144 +1282,47 @@ impl WeatherData for WeatherAccess {
         req: &ObservationRequest,
         station_ids: Vec<String>,
     ) -> Result<Vec<Observation>, Error> {
-        let station_filter = station_filter(&station_ids)?;
-        let file_params = observation_file_params(req, OffsetDateTime::now_utc());
-        if empty_publication_window(&file_params) {
-            return Ok(vec![]);
-        }
-        let parquet_files = self.file_access.grab_file_names(file_params).await?;
-        let file_paths = self.file_access.build_file_paths(parquet_files);
+        let batches = self.observation_batches(req, station_ids, None).await?;
+        decode_observations(&batches, &req.temperature_unit)
+    }
 
-        if file_paths.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Build time filter clauses
-        let mut time_filters = Vec::new();
-        if let Some(start) = &req.start {
-            time_filters.push(format!(
-                "generated_at::TIMESTAMPTZ >= '{}'::TIMESTAMPTZ",
-                start.format(&Rfc3339)?
-            ));
-        }
-        if let Some(end) = &req.end {
-            time_filters.push(format!(
-                "generated_at::TIMESTAMPTZ <= '{}'::TIMESTAMPTZ",
-                end.format(&Rfc3339)?
-            ));
-        }
-
-        let time_filter = if time_filters.is_empty() {
-            String::new()
-        } else if station_filter.is_empty() {
-            format!("WHERE {}", time_filters.join(" AND "))
-        } else {
-            format!("AND {}", time_filters.join(" AND "))
+    async fn settlement_observations(
+        &self,
+        req: &ObservationRequest,
+        station_ids: Vec<String>,
+        required_collected_after: OffsetDateTime,
+    ) -> Result<Vec<Observation>, Error> {
+        let coverage = coverage::Requirement {
+            start: req.start.ok_or(Error::QualityUnavailable)?,
+            end: req.end.ok_or(Error::QualityUnavailable)?,
+            stations: station_ids.clone(),
+            collected_after: required_collected_after,
         };
-
-        // Build start/end time expressions
-        let start_time_expr = if let Some(start) = &req.start {
-            format!(
-                "GREATEST('{}'::TIMESTAMPTZ, MIN(generated_at::TIMESTAMPTZ))",
-                start.format(&Rfc3339)?
-            )
-        } else {
-            "MIN(generated_at::TIMESTAMPTZ)".to_string()
+        let point_request = ObservationRequest {
+            start: req.start,
+            end: req.end.map(|end| end - Duration::nanoseconds(1)),
+            station_ids: req.station_ids.clone(),
+            temperature_unit: req.temperature_unit,
         };
-        let end_time_expr = if let Some(end) = &req.end {
-            format!(
-                "LEAST('{}'::TIMESTAMPTZ, MAX(generated_at::TIMESTAMPTZ))",
-                end.format(&Rfc3339)?
-            )
-        } else {
-            "MAX(generated_at::TIMESTAMPTZ)".to_string()
-        };
+        let batches = self
+            .observation_batches(&point_request, station_ids, Some(coverage))
+            .await?;
+        let quality = decode_quality(&batches)?;
+        if quality.rejected_reports > 0 || quality.unverified_reports > 0 {
+            return Err(Error::DataQuality {
+                rejected_reports: quality.rejected_reports,
+                unverified_reports: quality.unverified_reports,
+            });
+        }
+        decode_observations(&batches, &req.temperature_unit)
+    }
 
-        // Use raw SQL with UNION ALL BY NAME to handle schema differences
-        // Old parquet files may not have wind_direction, dewpoint_value, precip_in, or wx_string
-        // Humidity is derived from temperature and dewpoint using the Magnus formula
-        // Precipitation is split into rain/snow/ice by PRECIP_TYPE_SQL
-        // precip_in is liquid equivalent; snow inches = precip_in * snow_ratio (default 10)
-        let precip_type = PRECIP_TYPE_SQL;
-        let dedup = DEDUP_OBSERVATIONS_SQL;
-        let normalized = NORMALIZE_OBSERVATIONS_SQL;
-        let query_sql = format!(
-            r#"
-            WITH parquet_data AS (
-                SELECT * FROM (
-                    SELECT NULL::VARCHAR AS station_id, NULL::VARCHAR AS generated_at,
-                           NULL::DOUBLE AS temperature_value, NULL::BIGINT AS wind_speed,
-                           NULL::BIGINT AS wind_direction,
-                           NULL::DOUBLE AS dewpoint_value, NULL::DOUBLE AS precip_in,
-                           NULL::VARCHAR AS temperature_unit_code,
-                           NULL::VARCHAR AS wx_string, NULL::VARCHAR AS filename,
-                           NULL::VARCHAR AS dewpoint_unit_code
-                    WHERE false
-                    UNION ALL BY NAME
-                    SELECT * FROM read_parquet([{}], union_by_name = true, filename = true)
-                )
-                {} {}
-            ),
-            deduped AS ({dedup}),
-            normalized AS ({normalized}),
-            -- Classify each observation's precipitation type
-            classified AS (
-                SELECT *, {precip_type} AS precip_type
-                FROM normalized
-            )
-            SELECT
-                station_id::VARCHAR AS station_id,
-                ({})::VARCHAR AS start_time,
-                ({})::VARCHAR AS end_time,
-                MIN(temperature_value)::DOUBLE AS temp_low,
-                MAX(temperature_value)::DOUBLE AS temp_high,
-                -- Keep the latest usable temperature, its timestamp, and its
-                -- source unit from the same report. A newer report without a
-                -- temperature must not make an older reading look fresh.
-                FIRST(temperature_value ORDER BY generated_at::TIMESTAMPTZ DESC,
-                      temperature_value DESC, temperature_unit_code DESC)
-                    FILTER (WHERE temperature_value IS NOT NULL AND isfinite(temperature_value))::DOUBLE AS latest_temp,
-                FIRST(generated_at ORDER BY generated_at::TIMESTAMPTZ DESC,
-                      temperature_value DESC, temperature_unit_code DESC)
-                    FILTER (WHERE temperature_value IS NOT NULL AND isfinite(temperature_value))::VARCHAR AS latest_temp_time,
-                FIRST(temperature_unit_code ORDER BY generated_at::TIMESTAMPTZ DESC,
-                      temperature_value DESC, temperature_unit_code DESC)
-                    FILTER (WHERE temperature_value IS NOT NULL AND isfinite(temperature_value))::VARCHAR AS latest_temp_unit_code,
-                (MAX(wind_speed) FILTER (WHERE wind_speed IS NOT NULL AND wind_speed >= 0 AND wind_speed <= 500))::BIGINT AS wind_speed,
-                MAX(temperature_unit_code)::VARCHAR AS temperature_unit_code,
-                FIRST(wind_direction ORDER BY wind_speed DESC, generated_at::TIMESTAMPTZ DESC)
-                    FILTER (WHERE wind_speed IS NOT NULL AND wind_speed >= 0 AND wind_speed <= 500)::BIGINT AS wind_direction,
-                -- Derive humidity from temperature and dewpoint using Magnus formula
-                CASE
-                    WHEN AVG(dewpoint_value) IS NOT NULL AND AVG(temperature_value) IS NOT NULL
-                    THEN ROUND(100.0 * EXP((17.625 * AVG(dewpoint_value)) / (243.04 + AVG(dewpoint_value)))
-                         / EXP((17.625 * AVG(temperature_value)) / (243.04 + AVG(temperature_value))))::BIGINT
-                    ELSE NULL
-                END::BIGINT AS humidity,
-                -- Rain: sum precip_in where type is rain (already liquid inches)
-                SUM(CASE WHEN precip_type = 'rain' THEN precip_in ELSE 0 END)
-                    FILTER (WHERE precip_in IS NOT NULL AND isfinite(precip_in) AND precip_in >= 0)::DOUBLE AS rain_amt,
-                -- Snow: precip_in * 10 (default snow ratio) to convert liquid equivalent to snow inches
-                SUM(CASE WHEN precip_type = 'snow' THEN precip_in * 10.0 ELSE 0 END)
-                    FILTER (WHERE precip_in IS NOT NULL AND isfinite(precip_in) AND precip_in >= 0)::DOUBLE AS snow_amt,
-                -- Ice: liquid equivalent inches (roughly 1:1)
-                SUM(CASE WHEN precip_type = 'ice' THEN precip_in ELSE 0 END)
-                    FILTER (WHERE precip_in IS NOT NULL AND isfinite(precip_in) AND precip_in >= 0)::DOUBLE AS ice_amt
-            FROM classified
-            GROUP BY station_id
-            "#,
-            sql_string_list(&file_paths),
-            station_filter,
-            time_filter,
-            utc_timestamp_sql(&start_time_expr),
-            utc_timestamp_sql(&end_time_expr),
-        );
-
-        let unit = req.temperature_unit;
-        self.query(query_sql, move |batches| {
-            decode_observations(batches, &unit)
-        })
-        .await
+    async fn observation_quality(
+        &self,
+        req: &ObservationRequest,
+        station_ids: Vec<String>,
+    ) -> Result<ObservationQuality, Error> {
+        decode_quality(&self.observation_batches(req, station_ids, None).await?)
     }
 
     async fn daily_observations(
@@ -971,7 +1363,7 @@ impl WeatherData for WeatherAccess {
         if let Some(start) = &req.start {
             time_filters.push(format!(
                 "generated_at::TIMESTAMPTZ >= '{}'::TIMESTAMPTZ",
-                start.format(&Rfc3339)?
+                start.saturating_sub(Duration::hours(2)).format(&Rfc3339)?
             ));
         }
         if let Some(end) = &req.end {
@@ -981,6 +1373,15 @@ impl WeatherData for WeatherAccess {
             ));
         }
 
+        let result_time_filter = req
+            .start
+            .map(|start| {
+                start.format(&Rfc3339).map(|start| {
+                    format!("WHERE generated_at::TIMESTAMPTZ >= '{start}'::TIMESTAMPTZ")
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
         let time_filter = if time_filters.is_empty() {
             String::new()
         } else if station_filter.is_empty() {
@@ -1004,7 +1405,11 @@ impl WeatherData for WeatherAccess {
                            NULL::DOUBLE AS dewpoint_value, NULL::DOUBLE AS precip_in,
                            NULL::VARCHAR AS temperature_unit_code,
                            NULL::VARCHAR AS wx_string, NULL::VARCHAR AS filename,
-                           NULL::VARCHAR AS dewpoint_unit_code
+                           NULL::VARCHAR AS dewpoint_unit_code,
+                           NULL::VARCHAR AS quality_status, NULL::VARCHAR AS quality_reason,
+                           NULL::VARCHAR AS validation_version, NULL::VARCHAR AS raw_text,
+                           NULL::VARCHAR AS wind_speed_unit_code, NULL::VARCHAR AS wind_direction_unit_code,
+                           NULL::VARCHAR AS precip_unit_code, NULL::VARCHAR AS metar_type
                     WHERE false
                     UNION ALL BY NAME
                     SELECT * FROM read_parquet([{}], union_by_name = true, filename = true)
@@ -1040,6 +1445,7 @@ impl WeatherData for WeatherAccess {
                 SUM(CASE WHEN precip_type = 'ice' THEN precip_in ELSE 0 END)
                     FILTER (WHERE precip_in IS NOT NULL AND isfinite(precip_in) AND precip_in >= 0)::DOUBLE AS ice_amt
             FROM classified
+            {result_time_filter}
             GROUP BY station_id, {date}
             "#,
             sql_string_list(&file_paths),
@@ -1299,6 +1705,26 @@ fn decode_forecasts(
         }
     }
     Ok(forecasts)
+}
+
+/// Counts describe the selected latest publications, before removing unusable values.
+#[derive(Default, Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ObservationQuality {
+    pub rejected_reports: u64,
+    pub unverified_reports: u64,
+}
+
+fn decode_quality(batches: &[RecordBatch]) -> Result<ObservationQuality, Error> {
+    let mut quality = ObservationQuality::default();
+    for batch in batches {
+        let rejected = integers(batch, "rejected_reports")?;
+        let unverified = integers(batch, "unverified_reports")?;
+        for row in 0..batch.num_rows() {
+            quality.rejected_reports += integer(rejected, row).unwrap_or(0).max(0) as u64;
+            quality.unverified_reports += integer(unverified, row).unwrap_or(0).max(0) as u64;
+        }
+    }
+    Ok(quality)
 }
 
 fn decode_observations(
@@ -1602,6 +2028,359 @@ mod tests {
         )))
     }
 
+    // Quality fixtures must not inherit unrelated station reports from the
+    // multi-station historical compatibility file.
+    fn quality_data_dir(extra: &[(&str, &str)]) -> tempfile::TempDir {
+        let directory = data_dir(extra);
+        std::fs::remove_file(
+            directory
+                .path()
+                .join("2026-01-17/observations_2026-01-17T17:16:19.76658783Z.parquet"),
+        )
+        .unwrap();
+        directory
+    }
+
+    #[tokio::test]
+    async fn rounded_half_degree_dewpoint_difference_has_float_tolerance() {
+        let directory = quality_data_dir(&[(
+            "observations_2026-01-17T21:00:00Z.parquet",
+            "SELECT 'K40B' AS station_id, '2026-01-17T18:51:00Z' AS generated_at,
+                    -1.1::DOUBLE AS temperature_value, -0.6::DOUBLE AS dewpoint_value,
+                    'celsius' AS temperature_unit_code, 'celsius' AS dewpoint_unit_code,
+                    'validated' AS quality_status, 'metar-consistency-v1' AS validation_version,
+                    'K40B 171851Z M01/M01' AS raw_text",
+        )]);
+        let request = ObservationRequest {
+            station_ids: "K40B".into(),
+            ..day_request()
+        };
+        assert_eq!(
+            access(&directory)
+                .observation_quality(&request, request.station_ids())
+                .await
+                .unwrap()
+                .rejected_reports,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn validation_labels_cannot_hide_missing_temperature_or_wrong_metric_units() {
+        let directory = quality_data_dir(&[(
+            "observations_2026-01-17T21:00:00Z.parquet",
+            "SELECT station_id, '2026-01-17T18:51:00Z' AS generated_at,
+                    temperature_value::DOUBLE AS temperature_value, 'celsius' AS temperature_unit_code,
+                    10::BIGINT AS wind_speed, wind_speed_unit_code, 1.0::DOUBLE AS precip_in, precip_unit_code,
+                    'validated' AS quality_status, 'metar-consistency-v1' AS validation_version,
+                    'METAR 171851Z 20/10' AS raw_text
+             FROM (VALUES
+                 ('KMISS', NULL, 'knots', 'inches'),
+                 ('KWIND', 20.0, 'meters_per_second', 'inches'),
+                 ('KRAIN', 20.0, 'knots', 'millimeters')
+             ) AS reports(station_id, temperature_value, wind_speed_unit_code, precip_unit_code)",
+        )]);
+        let request = ObservationRequest {
+            station_ids: "KMISS,KWIND,KRAIN".into(),
+            ..day_request()
+        };
+        let weather = access(&directory);
+        assert_eq!(
+            weather
+                .observation_quality(&request, request.station_ids())
+                .await
+                .unwrap()
+                .rejected_reports,
+            3
+        );
+        assert!(matches!(
+            weather
+                .settlement_observations(&request, request.station_ids(), request.end.unwrap())
+                .await,
+            Err(Error::DataQuality {
+                rejected_reports: 3,
+                ..
+            })
+        ));
+        assert!(
+            weather
+                .observation_data(&request, request.station_ids())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_consistent_spike_is_flagged_using_reports_before_window_start() {
+        let directory = quality_data_dir(&[(
+            "observations_2026-01-17T21:00:00Z.parquet",
+            "SELECT 'KS24' AS station_id, generated_at,
+                    temperature_value::DOUBLE AS temperature_value,
+                    'celsius' AS temperature_unit_code,
+                    'validated' AS quality_status, 'metar-consistency-v1' AS validation_version,
+                    raw_text
+             FROM (VALUES
+                 ('2026-01-17T17:51:00Z', 19.0, 'KS24 171751Z 19/10'),
+                 ('2026-01-17T18:51:00Z', 1.0, 'KS24 171851Z 01/01')
+             ) AS reports(generated_at, temperature_value, raw_text)",
+        )]);
+        let request = ObservationRequest {
+            station_ids: "KS24".into(),
+            start: Some(time::macros::datetime!(2026-01-17 18:00 UTC)),
+            ..day_request()
+        };
+        let weather = access(&directory);
+        assert_eq!(
+            weather
+                .observation_quality(&request, request.station_ids())
+                .await
+                .unwrap()
+                .rejected_reports,
+            1
+        );
+        assert!(
+            weather
+                .observation_data(&request, request.station_ids())
+                .await
+                .unwrap()
+                .is_empty(),
+            "context report must not leak into the requested window"
+        );
+        assert!(matches!(
+            weather
+                .settlement_observations(&request, request.station_ids(), request.end.unwrap())
+                .await,
+            Err(Error::DataQuality {
+                rejected_reports: 1,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn same_publication_conflict_requires_review_even_when_values_are_plausible() {
+        let directory = quality_data_dir(&[(
+            "observations_2026-01-17T21:00:00Z.parquet",
+            "SELECT 'KPWM' AS station_id, '2026-01-17T18:51:00Z' AS generated_at,
+                    temperature_value::DOUBLE AS temperature_value, 'celsius' AS temperature_unit_code,
+                    'validated' AS quality_status, 'metar-consistency-v1' AS validation_version,
+                    'KPWM 171851Z 19/06' AS raw_text
+             FROM (VALUES (19.0), (18.0)) AS reports(temperature_value)",
+        )]);
+        let request = ObservationRequest {
+            station_ids: "KPWM".into(),
+            ..day_request()
+        };
+        assert!(matches!(
+            access(&directory)
+                .settlement_observations(&request, request.station_ids(), request.end.unwrap())
+                .await,
+            Err(Error::DataQuality {
+                rejected_reports: 1,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn portland_extreme_is_visible_in_quality_and_blocked_from_settlement() {
+        let directory = quality_data_dir(&[(
+            "observations_2026-01-17T21:00:00Z.parquet",
+            "SELECT 'KPWM' AS station_id, generated_at,
+                    temperature_value::DOUBLE AS temperature_value,
+                    'celsius' AS temperature_unit_code,
+                    quality_status, 'metar-consistency-v1' AS validation_version,
+                    'METAR KPWM 171851Z 19/06 RMK T01890056' AS raw_text
+             FROM (VALUES
+                 ('2026-01-17T17:51:00Z', 18.3, 'validated'),
+                 ('2026-01-17T18:51:00Z', 60.0, 'rejected')
+             ) AS reports(generated_at, temperature_value, quality_status)",
+        )]);
+        let request = ObservationRequest {
+            station_ids: "KPWM".into(),
+            ..day_request()
+        };
+        let weather = access(&directory);
+        let values = weather
+            .observation_data(&request, request.station_ids())
+            .await
+            .unwrap();
+        assert!((values[0].temp_high - 64.94).abs() < 1e-6);
+        assert_eq!(
+            values[0].latest_temp_time.as_deref(),
+            Some("2026-01-17T17:51:00Z")
+        );
+        let daily = weather
+            .daily_observations(&request, request.station_ids())
+            .await
+            .unwrap();
+        assert!((daily[0].temp_high - 64.94).abs() < 1e-6);
+        let quality = weather
+            .observation_quality(&request, request.station_ids())
+            .await
+            .unwrap();
+        assert_eq!(quality.rejected_reports, 1);
+        assert_eq!(quality.unverified_reports, 0);
+        assert!(matches!(
+            weather
+                .settlement_observations(&request, request.station_ids(), request.end.unwrap())
+                .await,
+            Err(Error::DataQuality {
+                rejected_reports: 1,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn all_rejected_reports_do_not_become_a_clean_empty_window() {
+        let directory = quality_data_dir(&[(
+            "observations_2026-01-17T21:00:00Z.parquet",
+            "SELECT 'KPWM' AS station_id, '2026-01-17T18:51:00Z' AS generated_at,
+                    60.0::DOUBLE AS temperature_value, 'celcius' AS temperature_unit_code",
+        )]);
+        let request = ObservationRequest {
+            station_ids: "KPWM".into(),
+            ..day_request()
+        };
+        let weather = access(&directory);
+        assert!(
+            weather
+                .observation_data(&request, request.station_ids())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            weather
+                .settlement_observations(&request, request.station_ids(), request.end.unwrap())
+                .await,
+            Err(Error::DataQuality {
+                rejected_reports: 1,
+                ..
+            })
+        ));
+        assert_eq!(
+            weather
+                .observation_quality(&request, request.station_ids())
+                .await
+                .unwrap()
+                .rejected_reports,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn plausible_legacy_reports_are_not_silently_verified() {
+        let directory = quality_data_dir(&[(
+            "observations_2026-01-17T21:00:00Z.parquet",
+            "SELECT 'KPWM' AS station_id, '2026-01-17T18:51:00Z' AS generated_at,
+                    18.9::DOUBLE AS temperature_value, 'celcius' AS temperature_unit_code",
+        )]);
+        let request = ObservationRequest {
+            station_ids: "KPWM".into(),
+            ..day_request()
+        };
+        let weather = access(&directory);
+        assert_eq!(
+            weather
+                .observation_data(&request, request.station_ids())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(matches!(
+            weather
+                .settlement_observations(&request, request.station_ids(), request.end.unwrap())
+                .await,
+            Err(Error::DataQuality {
+                rejected_reports: 0,
+                unverified_reports: 1
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn newer_rejected_publication_cannot_fall_back_to_older_valid_report() {
+        let good = "SELECT 'KPWM' AS station_id, '2026-01-17T18:51:00Z' AS generated_at,
+                   18.9::DOUBLE AS temperature_value, 'celsius' AS temperature_unit_code,
+                   'validated' AS quality_status, 'metar-consistency-v1' AS validation_version,
+                   'METAR KPWM 171851Z 19/06 RMK T01890056' AS raw_text";
+        let bad = good
+            .replace("18.9::DOUBLE", "60.0::DOUBLE")
+            .replace("'validated'", "'rejected'");
+        let directory = quality_data_dir(&[
+            ("observations_2026-01-17T19:00:00Z.parquet", good),
+            ("observations_2026-01-17T20:00:00Z.parquet", &bad),
+        ]);
+        let request = ObservationRequest {
+            station_ids: "KPWM".into(),
+            ..day_request()
+        };
+        let weather = access(&directory);
+        assert!(matches!(
+            weather
+                .settlement_observations(&request, request.station_ids(), request.end.unwrap())
+                .await,
+            Err(Error::DataQuality {
+                rejected_reports: 1,
+                ..
+            })
+        ));
+        // A later explicitly validated correction replaces the bad publication.
+        let corrected = quality_data_dir(&[
+            ("observations_2026-01-17T19:00:00Z.parquet", &bad),
+            ("observations_2026-01-17T20:00:00Z.parquet", good),
+        ]);
+        assert_eq!(
+            access(&corrected)
+                .observation_quality(&request, request.station_ids())
+                .await
+                .unwrap()
+                .rejected_reports,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_unverified_reports_and_unproven_empty_stations_cannot_settle() {
+        let directory = quality_data_dir(&[(
+            "observations_2026-01-17T21:00:00Z.parquet",
+            "SELECT 'KPWM' AS station_id, '2026-01-17T18:51:00Z' AS generated_at,
+                    18.9::DOUBLE AS temperature_value, 'celsius' AS temperature_unit_code,
+                    'unverified' AS quality_status, 'metar-consistency-v1' AS validation_version",
+        )]);
+        let request = ObservationRequest {
+            station_ids: "KPWM".into(),
+            ..day_request()
+        };
+        let weather = access(&directory);
+        assert!(
+            weather
+                .observation_data(&request, request.station_ids())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            weather
+                .settlement_observations(&request, request.station_ids(), request.end.unwrap())
+                .await,
+            Err(Error::DataQuality {
+                unverified_reports: 1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            weather
+                .settlement_observations(&request, vec!["KABSENT".into()], request.end.unwrap())
+                .await,
+            Err(Error::ObservationCoverage { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn historical_and_current_observation_files_query_together() {
         // A newer file: adds precip_in and wx_string, plus a trailing column
@@ -1645,8 +2424,8 @@ mod tests {
                     temperature_value::DOUBLE AS temperature_value,
                     'celcius' AS temperature_unit_code
              FROM (VALUES
-                 ('2026-01-17T18:00:00Z', 30.0),
-                 ('2026-01-17T19:00:00Z', 20.0),
+                 ('2026-01-17T18:00:00Z', 0.0),
+                 ('2026-01-17T19:00:00Z', -5.0),
                  ('2026-01-17T20:00:00Z', NULL)
              ) AS reports(generated_at, temperature_value)",
         )]);
@@ -1660,10 +2439,10 @@ mod tests {
             .find(|observation| observation.station_id == "KORD")
             .unwrap();
 
-        assert_eq!(kord.latest_temp, Some(68.0));
+        assert_eq!(kord.latest_temp, Some(23.0));
         assert_ne!(kord.latest_temp, Some(kord.temp_low));
         assert_ne!(kord.latest_temp, Some(kord.temp_high));
-        assert_eq!(kord.temp_high, 86.0);
+        assert_eq!(kord.temp_high, 32.0);
         assert_eq!(
             kord.latest_temp_time.as_deref(),
             Some("2026-01-17T19:00:00Z")
@@ -2781,7 +3560,10 @@ mod tests {
             ),
             70
         );
-        let root = directory.path().join("derived").join("folds-v1");
+        let root = directory
+            .path()
+            .join("derived")
+            .join("folds-v2-native-intervals");
         let before: Vec<_> = std::fs::read_dir(&root)
             .unwrap()
             .flatten()

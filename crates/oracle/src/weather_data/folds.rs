@@ -41,7 +41,7 @@ use time::{Date, OffsetDateTime};
 
 /// Names the folds' layout. Change it whenever their columns, types or
 /// order change; folds of other versions are then deleted.
-const VERSION: &str = "folds-v1";
+const VERSION: &str = "folds-v2-native-intervals";
 
 /// Rows per row group, as in the copies: a station's periods of one span
 /// are one or two groups.
@@ -488,7 +488,7 @@ fn fold_rows(connection: &Connection, inputs: &[String], scratch: &Path) -> Resu
                     SELECT station_id, begin_ts, end_ts,
                         FIRST(STRUCT_PACK(generated_ts, published_ts, source, min_temp, max_temp,
                             wind_speed, wind_direction, relative_humidity_max, relative_humidity_min,
-                            precip_chance, liquid_precipitation_amt, snow_amt, snow_ratio, ice_amt)
+                            precip_chance, liquid_precipitation_amt, snow_amt, snow_ratio, ice_amt, forecast_interval_version, interval_kind, source_url, source_received_at, source_xml_sha256, source_location, source_layouts, quality_status, quality_reason)
                             ORDER BY {DEDUPE_ORDER}) AS picked
                     FROM (SELECT {FORECAST_ROW_COLUMNS} FROM read_parquet([{inputs}]) WHERE {stations})
                     GROUP BY station_id, begin_ts, end_ts

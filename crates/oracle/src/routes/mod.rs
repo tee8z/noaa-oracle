@@ -6,6 +6,7 @@ pub mod files;
 pub mod health;
 pub mod stations;
 pub mod ui;
+pub mod window_compatibility;
 
 pub use events::{
     Base64Pubkey, Pubkey, add_event_entries, create_event, get_event, get_event_entry, get_npub,

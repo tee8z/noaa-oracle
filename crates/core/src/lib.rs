@@ -7,6 +7,7 @@
 
 mod config;
 pub mod fs;
+pub mod shef;
 
 pub use config::{
     ConfigSource, find_config_file, get_xdg_cache_dir, get_xdg_data_dir, load_config,

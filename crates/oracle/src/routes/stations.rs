@@ -219,6 +219,29 @@ fn bounded_observation_request(
     Ok((req, stations))
 }
 
+/// Quality counts use the same row selection and validation rules as settlement.
+#[utoipa::path(
+    get,
+    path = "/stations/observation-quality",
+    params(ObservationRequest),
+    responses(
+        (status = OK, description = "Quality counts for the observation window", body = crate::weather_data::ObservationQuality),
+        (status = BAD_REQUEST, description = "Invalid station list or time window"),
+        (status = SERVICE_UNAVAILABLE, description = "Quality verification unavailable")
+    )
+)]
+pub async fn observation_quality(
+    State(state): State<Arc<AppState>>,
+    Query(mut req): Query<ObservationRequest>,
+) -> Result<Json<crate::weather_data::ObservationQuality>, AppError> {
+    let stations = checked_stations(&req.station_ids)?;
+    let (start, end) = bounded_window(req.start, req.end, OffsetDateTime::now_utc())?;
+    (req.start, req.end) = (Some(start), Some(end));
+    Ok(Json(
+        state.weather_db.observation_quality(&req, stations).await?,
+    ))
+}
+
 #[utoipa::path(
     get,
     path = "/stations/daily-observations",

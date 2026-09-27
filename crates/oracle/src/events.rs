@@ -355,6 +355,7 @@ impl EventRecord {
             source: self.source,
             locations: self.locations,
             unlisted: self.unlisted,
+            settlement_block: None,
         }
     }
 
@@ -377,6 +378,7 @@ impl EventRecord {
             source: self.source,
             locations: self.locations,
             unlisted: self.unlisted,
+            settlement_block: None,
         }
     }
 }
@@ -593,6 +595,15 @@ impl std::fmt::Display for EventStatus {
     }
 }
 
+/// A failed settlement or source check. The event is retried automatically.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+pub struct SettlementBlock {
+    pub code: String,
+    pub message: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub checked_at: OffsetDateTime,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
 pub struct EventSummary {
     pub id: Uuid,
@@ -626,6 +637,9 @@ pub struct EventSummary {
     /// Left off the oracle's events list unless asked for
     #[serde(default)]
     pub unlisted: bool,
+    /// Latest persisted reason that unsigned settlement could not proceed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_block: Option<SettlementBlock>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
@@ -670,6 +684,9 @@ pub struct Event {
     /// Left off the oracle's events list unless asked for
     #[serde(default)]
     pub unlisted: bool,
+    /// Latest persisted reason that unsigned settlement could not proceed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_block: Option<SettlementBlock>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
