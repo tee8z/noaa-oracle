@@ -4,6 +4,7 @@ mod daemon_contract;
 mod events;
 mod helpers;
 mod lifecycle;
+mod lines_from_event;
 mod metrics;
 mod perf;
 mod ui_fragments;

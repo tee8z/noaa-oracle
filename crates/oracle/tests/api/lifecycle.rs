@@ -2,7 +2,7 @@
 //! mocked NOAA data. The attestation must unlock exactly the locking point
 //! of the winning outcome, and never change once published.
 
-use crate::helpers::{MockWeatherAccess, TestApp, event_at, metric, spawn_app};
+use crate::helpers::{MockWeatherAccess, TestApp, event_at, fitted_line, metric, spawn_app};
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -852,35 +852,6 @@ async fn verified_precipitation_remains_eligible_for_scoring() {
     assert_eq!(summary.failed, 0);
     assert_eq!(summary.attested, 1);
     assert_attests(&app, &fetch(&app, event.id).await, &[0]);
-}
-
-fn fitted_line(
-    now: time::OffsetDateTime,
-    target: &str,
-    metric: &str,
-    lower: f64,
-    upper: f64,
-) -> oracle::lines::Line {
-    use oracle::lines::{Line, LineLevel};
-    Line {
-        target: target.into(),
-        metric: metric.into(),
-        lower,
-        upper,
-        level: if target.is_empty() {
-            LineLevel::Pooled
-        } else {
-            LineLevel::Station
-        },
-        window_hours: 24,
-        windows: 60,
-        over: 20,
-        par: 20,
-        under: 20,
-        first_window: now - Duration::days(60),
-        last_window: now - Duration::days(1),
-        fitted_at: now,
-    }
 }
 
 /// A `lines` event copies the current lines when it is created and keeps

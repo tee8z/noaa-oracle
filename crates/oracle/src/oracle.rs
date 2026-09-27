@@ -171,6 +171,30 @@ impl Oracle {
         Ok(lines::current(&self.db, &self.lines, source, window, targets, metrics).await?)
     }
 
+    /// The lines `earlier` froze that `new_event`, created with
+    /// `lines_from_event`, copies instead of the current fit (see
+    /// [`NewEvent::lines_from`]).
+    async fn lines_from_event(
+        &self,
+        new_event: &NewEvent,
+        earlier: Uuid,
+        window: ObservationWindow,
+    ) -> Result<Vec<Line>, Error> {
+        let record = self
+            .db
+            .get_event(earlier)
+            .await?
+            .ok_or(EventRejection::LinesSourceEventNotFound(earlier))?;
+        let frozen = self
+            .db
+            .event_lines(&[earlier])
+            .await?
+            .remove(&earlier)
+            .unwrap_or_default();
+        let window_hours = self.lines.window_hours_for(window.end - window.start);
+        Ok(new_event.lines_from(&record, &frozen, window_hours)?)
+    }
+
     /// The oracle's current time.
     pub fn now(&self) -> OffsetDateTime {
         (self.clock)()
@@ -274,6 +298,7 @@ impl Oracle {
     ) -> Result<Event, Error> {
         let sources = self.sources.clone();
         let key = self.key.clone();
+        let lines_from_event = event.lines_from_event;
         // Building the announcement is bounded (MAX_OUTCOMES) but CPU heavy.
         let mut new_event = tokio::task::spawn_blocking(move || {
             NewEvent::build(event, &sources, &key, coordinator)
@@ -284,15 +309,18 @@ impl Oracle {
                 start: new_event.start_observation_date,
                 end: new_event.end_observation_date,
             };
-            new_event.lines = self
-                .current_lines(
-                    &new_event.source,
-                    window,
-                    &new_event.locations,
-                    &new_event.metrics,
-                )
-                .await?
-                .map_err(|missing| EventRejection::LinesUnavailable(missing.join(", ")))?;
+            new_event.lines = match lines_from_event {
+                Some(earlier) => self.lines_from_event(&new_event, earlier, window).await?,
+                None => self
+                    .current_lines(
+                        &new_event.source,
+                        window,
+                        &new_event.locations,
+                        &new_event.metrics,
+                    )
+                    .await?
+                    .map_err(|missing| EventRejection::LinesUnavailable(missing.join(", ")))?,
+            };
         }
         self.db.add_event(&new_event).await?;
         info!(

@@ -15,7 +15,7 @@
 //! posts the coordinator's exact JSON.
 //!
 //! Every rule for a new event or its entries lives here, in
-//! [`NewEvent::build`] and [`validate_entries`].
+//! [`NewEvent::build`], [`NewEvent::lines_from`], and [`validate_entries`].
 
 use dlctix::{
     EventLockingConditions,
@@ -29,7 +29,7 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::{
-    lines::Line,
+    lines::{self, Line},
     scoring::{self, Pick, ScoringRules},
     signing::{EventNonce, SigningKey},
     sources::{OutcomeSource, Reading, SourceError, Sources, noaa},
@@ -90,6 +90,13 @@ pub struct CreateEvent {
     /// metric's Par rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scoring_rules: Option<ScoringRules>,
+    /// Freeze this event's lines by copying them from an earlier event instead of the current fit,
+    /// so several events created at different times score against the same lines. Needs `lines`
+    /// scoring rules. The earlier event must be this coordinator's, use `lines` rules and the same
+    /// source, and hold a line fitted on this event's window length for every target and metric
+    /// this event scores; only those lines are copied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines_from_event: Option<Uuid>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -124,6 +131,24 @@ pub enum EventRejection {
     NotCalibrated(String),
     #[error("no line has been fitted yet for {0}; use fixed scoring rules or try later")]
     LinesUnavailable(String),
+    #[error("lines_from_event needs lines scoring rules")]
+    LinesFromEventNeedsLines,
+    #[error("lines_from_event {0} is not an event on this oracle")]
+    LinesSourceEventNotFound(Uuid),
+    #[error("lines_from_event {0} was created by another coordinator")]
+    LinesSourceEventOtherCoordinator(Uuid),
+    #[error("lines_from_event {0} does not use lines scoring rules")]
+    LinesSourceEventNotLines(Uuid),
+    #[error("lines_from_event {event} uses source {earlier:?}, not {requested:?}")]
+    LinesSourceEventOtherSource {
+        event: Uuid,
+        earlier: String,
+        requested: String,
+    },
+    #[error(
+        "lines_from_event {event} has no line fitted on this event's window length for {missing}"
+    )]
+    LinesSourceEventMissingLines { event: Uuid, missing: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -264,6 +289,9 @@ impl NewEvent {
         {
             return Err(EventRejection::NotCalibrated(metric.clone()));
         }
+        if event.lines_from_event.is_some() && scoring_rules != ScoringRules::Lines {
+            return Err(EventRejection::LinesFromEventNeedsLines);
+        }
         let max_values = event.locations.len() * metrics.len();
         if !(1..=max_values).contains(&event.number_of_values_per_entry) {
             return Err(EventRejection::ValuesPerEntry {
@@ -307,6 +335,39 @@ impl NewEvent {
             scoring_rules,
             lines: vec![],
         })
+    }
+
+    /// Copies of the lines `earlier` froze, for this event created with
+    /// `lines_from_event` naming it: one per target and metric this event
+    /// scores, fitted on `window_hours` windows, the length this event would
+    /// use. `earlier` must be this coordinator's, on this source, with
+    /// `lines` rules.
+    pub fn lines_from(
+        &self,
+        earlier: &EventRecord,
+        earlier_lines: &[Line],
+        window_hours: Option<i64>,
+    ) -> Result<Vec<Line>, EventRejection> {
+        let event = earlier.id;
+        if earlier.coordinator_pubkey != self.coordinator_pubkey {
+            return Err(EventRejection::LinesSourceEventOtherCoordinator(event));
+        }
+        if earlier.scoring_rules != ScoringRules::Lines {
+            return Err(EventRejection::LinesSourceEventNotLines(event));
+        }
+        if earlier.source != self.source {
+            return Err(EventRejection::LinesSourceEventOtherSource {
+                event,
+                earlier: earlier.source.clone(),
+                requested: self.source.clone(),
+            });
+        }
+        lines::copy_frozen(earlier_lines, window_hours, &self.locations, &self.metrics).map_err(
+            |missing| EventRejection::LinesSourceEventMissingLines {
+                event,
+                missing: missing.join(", "),
+            },
+        )
     }
 }
 
@@ -1109,6 +1170,7 @@ mod tests {
             scoring_fields: None,
             unlisted: false,
             scoring_rules: None,
+            lines_from_event: None,
         }
     }
 
@@ -1216,6 +1278,95 @@ mod tests {
         assert!(matches!(
             rejected(|e| e.source = Some("space_weather".into())),
             EventRejection::UnknownSource(_)
+        ));
+        assert!(matches!(
+            rejected(|e| e.lines_from_event = Some(Uuid::now_v7())),
+            EventRejection::LinesFromEventNeedsLines
+        ));
+    }
+
+    fn frozen_line(target: &str, metric: &str, window_hours: i64, lower: f64) -> Line {
+        let fitted_at = OffsetDateTime::from_unix_timestamp(1_790_000_000).unwrap();
+        Line {
+            target: target.into(),
+            metric: metric.into(),
+            lower,
+            upper: lower + 1.1,
+            level: lines::LineLevel::Pooled,
+            window_hours,
+            windows: 61,
+            over: 20,
+            par: 21,
+            under: 20,
+            first_window: fitted_at - Duration::days(60),
+            last_window: fitted_at - Duration::days(1),
+            fitted_at,
+        }
+    }
+
+    #[test]
+    fn events_copy_only_the_lines_they_need_from_an_earlier_event() {
+        let mut request = event(3, 1);
+        request.scoring_rules = Some(ScoringRules::Lines);
+        request.scoring_fields = Some(vec![noaa::TEMP_HIGH.into()]);
+        request.number_of_values_per_entry = 1;
+        // Each build signs as a new coordinator.
+        let earlier = || record(build(request.clone()).unwrap());
+        let new = build(CreateEvent {
+            id: Uuid::now_v7(),
+            lines_from_event: Some(earlier().id),
+            ..request.clone()
+        })
+        .unwrap();
+        let mine = |mut earlier: EventRecord| {
+            earlier.coordinator_pubkey = new.coordinator_pubkey.clone();
+            earlier
+        };
+        let kord = frozen_line("KORD", noaa::TEMP_HIGH, 24, 0.1 + 0.2);
+        let ksaw = frozen_line("KSAW", noaa::TEMP_HIGH, 24, -1.0 / 3.0);
+        let frozen = vec![
+            kord.clone(),
+            frozen_line("KORD", noaa::TEMP_LOW, 24, -2.5),
+            ksaw.clone(),
+        ];
+
+        let copied = new.lines_from(&mine(earlier()), &frozen, Some(24)).unwrap();
+        assert_eq!(copied, vec![kord, ksaw], "temp_low is not scored");
+        assert_eq!(copied[0].lower.to_bits(), (0.1 + 0.2_f64).to_bits());
+
+        let missing = |result: Result<Vec<Line>, EventRejection>| match result {
+            Err(EventRejection::LinesSourceEventMissingLines { missing, .. }) => missing,
+            other => panic!("expected missing lines, got {other:?}"),
+        };
+        assert_eq!(
+            missing(new.lines_from(&mine(earlier()), &frozen, Some(48))),
+            "KORD/temp_high, KSAW/temp_high",
+            "lines of another window length do not count"
+        );
+        assert_eq!(
+            missing(new.lines_from(&mine(earlier()), &frozen, None)),
+            "KORD/temp_high, KSAW/temp_high"
+        );
+        assert_eq!(
+            missing(new.lines_from(&mine(earlier()), &frozen[..2], Some(24))),
+            "KSAW/temp_high"
+        );
+
+        assert!(matches!(
+            new.lines_from(&earlier(), &frozen, Some(24)),
+            Err(EventRejection::LinesSourceEventOtherCoordinator(_))
+        ));
+        let mut fixed = mine(earlier());
+        fixed.scoring_rules = ScoringRules::Fixed;
+        assert!(matches!(
+            new.lines_from(&fixed, &frozen, Some(24)),
+            Err(EventRejection::LinesSourceEventNotLines(_))
+        ));
+        let mut tides = mine(earlier());
+        tides.source = "tides".into();
+        assert!(matches!(
+            new.lines_from(&tides, &frozen, Some(24)),
+            Err(EventRejection::LinesSourceEventOtherSource { .. })
         ));
     }
 

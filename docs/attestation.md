@@ -128,8 +128,9 @@ Limits: 2–25 entries, 1–5 places and fewer places than entries, at most
 20,000 outcomes, 1–50 distinct targets, start < end ≤ signing date.
 `scoring_rules` is `fixed` (the default) or `lines`; see [Scoring](#scoring).
 A `lines` event is refused when a metric is not `calibrated`, or when a
-target and metric has no line yet. The event response carries
-`scoring_rules`, and a `lines` event its `lines`.
+target and metric has no line yet. `lines_from_event` copies an earlier
+event's lines instead of the current ones (see [Scoring](#scoring)). The
+event response carries `scoring_rules`, and a `lines` event its `lines`.
 
 Before funding, coordinators can check proposed station, metric, and window combinations through
 [`GET /stations/window-compatibility`](settlement-operations.md#check-a-window-before-funding).
@@ -189,6 +190,16 @@ only. Each line carries its history: how many windows, how many fell Over,
 Par, and Under it, the first and last window, and when it was fitted.
 `GET /oracle/lines?targets=KORD,KSAW&metrics=temp_high` shows the lines an
 event created now would copy, and any target and metric without one.
+
+Lines refit about twice a day, so events created hours apart would copy
+different lines. A coordinator that splits one competition into several
+events can create each with `"lines_from_event": "<earlier event id>"` so
+they all score against the lines the first one froze. The oracle then copies
+that event's lines, every field unchanged, instead of the current fit. The
+new event must use `lines` rules, and the earlier event must be the same
+coordinator's, use `lines` rules and the same source, and hold a line fitted
+on the new event's window length for each of its targets and metrics; only
+those lines are copied. Otherwise the event is refused with `400`.
 
 An entry's base score is the sum over its picks. Its total score is
 `max(1, base) × 10,000`. Entries rank by descending base score, then ascending

@@ -21,8 +21,9 @@
 //! window runs, for windows that start at 00:00 UTC. Each pass reads a few
 //! windows that have ended, newest first, and refits when it read any, or
 //! once a UTC day, so lines follow the forecasts as they drift. An event
-//! copies the current lines when it is created and is scored against that
-//! copy, so a line never changes under an event.
+//! copies the current lines when it is created, or an earlier event's copy
+//! ([`copy_frozen`]), and is scored against that copy, so a line never
+//! changes under an event.
 
 use std::collections::BTreeMap;
 
@@ -339,6 +340,37 @@ pub fn resolve(
                     target: target.clone(),
                     ..line.clone()
                 }),
+                None => missing.push(format!("{target}/{metric}")),
+            }
+        }
+    }
+    if missing.is_empty() {
+        Ok(lines)
+    } else {
+        Err(missing)
+    }
+}
+
+/// Copies of the lines an earlier event froze, `frozen`, for `targets` and
+/// `metrics`: for each pair, the frozen line fitted on `window_hours`
+/// windows, exactly as stored. Errors with the pairs that have none; with no
+/// `window_hours`, that is every pair.
+pub fn copy_frozen(
+    frozen: &[Line],
+    window_hours: Option<i64>,
+    targets: &[String],
+    metrics: &[String],
+) -> Result<Vec<Line>, Vec<String>> {
+    let mut lines = vec![];
+    let mut missing = vec![];
+    for target in targets {
+        for metric in metrics {
+            match frozen.iter().find(|line| {
+                &line.target == target
+                    && &line.metric == metric
+                    && Some(line.window_hours) == window_hours
+            }) {
+                Some(line) => lines.push(line.clone()),
                 None => missing.push(format!("{target}/{metric}")),
             }
         }
