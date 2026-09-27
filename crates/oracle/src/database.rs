@@ -44,7 +44,8 @@ use crate::{
         Entry, EventCounts, EventListQuery, EventRecord, EventStatus, NewEvent, SettlementBlock,
         ValueOptions,
     },
-    scoring::Pick,
+    lines::{Line, LineLevel},
+    scoring::{Pick, ScoringRules},
     signing::EventNonce,
     sources::Reading,
 };
@@ -249,20 +250,23 @@ impl Database {
         .transpose()
     }
 
+    /// Stores a new event with its lines, together.
     pub async fn add_event(&self, event: &NewEvent) -> Result<(), WriteError> {
         let row = EventInsert::encode(event)?;
+        let lines = event.lines.clone();
         self.write(move |connection| {
             Box::pin(async move {
+                let mut transaction = connection.begin().await?;
                 sqlx::query(
                     "INSERT INTO events (
                         id, source, total_allowed_entries, number_of_places_win,
                         number_of_values_per_entry, signing_date,
                         start_observation_date, end_observation_date,
                         nonce_salt, nonce_point, event_announcement,
-                        locations, metrics, coordinator_pubkey, unlisted
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        locations, metrics, coordinator_pubkey, unlisted, scoring_rules
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
-                .bind(row.id)
+                .bind(row.id.clone())
                 .bind(row.source)
                 .bind(row.total_allowed_entries)
                 .bind(row.number_of_places_win)
@@ -277,12 +281,66 @@ impl Database {
                 .bind(row.metrics)
                 .bind(row.coordinator_pubkey)
                 .bind(row.unlisted)
-                .execute(connection)
+                .bind(row.scoring_rules)
+                .execute(&mut *transaction)
                 .await?;
-                Ok(())
+                for line in &lines {
+                    sqlx::query(
+                        "INSERT INTO event_lines (
+                            event_id, target, metric, lower, upper, level, window_hours,
+                            windows, over, par, under, first_window, last_window, fitted_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(&row.id)
+                    .bind(&line.target)
+                    .bind(&line.metric)
+                    .bind(line.lower)
+                    .bind(line.upper)
+                    .bind(line.level.as_str())
+                    .bind(line.window_hours)
+                    .bind(line.windows)
+                    .bind(line.over)
+                    .bind(line.par)
+                    .bind(line.under)
+                    .bind(line.first_window.unix_timestamp())
+                    .bind(line.last_window.unix_timestamp())
+                    .bind(line.fitted_at.unix_timestamp())
+                    .execute(&mut *transaction)
+                    .await?;
+                }
+                transaction.commit().await
             })
         })
         .await
+    }
+
+    /// Lines of each of `event_ids` that has them, in target and metric order.
+    pub async fn event_lines(
+        &self,
+        event_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<Line>>, sqlx::Error> {
+        if event_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ids = serde_json::to_string(&event_ids.iter().map(Uuid::to_string).collect::<Vec<_>>())
+            .expect("UUIDs serialize");
+        let rows = sqlx::query(
+            "SELECT event_id, target, metric, lower, upper, level, window_hours, windows,
+                    over, par, under, first_window, last_window, fitted_at
+             FROM event_lines WHERE event_id IN (SELECT value FROM json_each(?))
+             ORDER BY event_id, target, metric",
+        )
+        .bind(ids)
+        .fetch_all(&self.readers)
+        .await?;
+        let mut lines: HashMap<Uuid, Vec<Line>> = HashMap::new();
+        for row in &rows {
+            lines
+                .entry(uuid_column(row, "event_id")?)
+                .or_default()
+                .push(line_from_row(row)?);
+        }
+        Ok(lines)
     }
 
     /// Stores a full set of entries. Returns `false`, writing nothing, when
@@ -970,7 +1028,7 @@ pub struct EntryScore {
 const EVENT_SELECT: &str = "SELECT e.id, e.source, e.signing_date, e.start_observation_date,
         e.end_observation_date, e.locations, e.metrics, e.total_allowed_entries,
         e.number_of_places_win, e.number_of_values_per_entry, e.nonce_salt,
-        e.nonce_point, e.coordinator_pubkey, e.attestation, e.unlisted,
+        e.nonce_point, e.coordinator_pubkey, e.attestation, e.unlisted, e.scoring_rules,
         COUNT(ee.id) AS total_entries
      FROM events e
      LEFT JOIN events_entries ee ON ee.event_id = e.id";
@@ -1011,6 +1069,7 @@ struct EventInsert {
     metrics: String,
     coordinator_pubkey: String,
     unlisted: bool,
+    scoring_rules: &'static str,
 }
 
 impl EventInsert {
@@ -1036,6 +1095,7 @@ impl EventInsert {
             metrics: serde_json::to_string(&event.metrics).map_err(encode_error)?,
             coordinator_pubkey: event.coordinator_pubkey.clone(),
             unlisted: event.unlisted,
+            scoring_rules: event.scoring_rules.as_str(),
         })
     }
 }
@@ -1076,6 +1136,33 @@ fn event_from_row(row: &SqliteRow) -> Result<EventRecord, sqlx::Error> {
             })
             .transpose()?,
         unlisted: row.try_get("unlisted")?,
+        scoring_rules: {
+            let rules: String = row.try_get("scoring_rules")?;
+            ScoringRules::from_storage(&rules).ok_or_else(|| {
+                decode_error("scoring_rules", format!("unknown scoring rules {rules:?}"))
+            })?
+        },
+    })
+}
+
+/// A [`Line`] from a row with the `event_lines` or `line_fits` columns.
+fn line_from_row(row: &SqliteRow) -> Result<Line, sqlx::Error> {
+    let level: String = row.try_get("level")?;
+    Ok(Line {
+        target: row.try_get("target")?,
+        metric: row.try_get("metric")?,
+        lower: row.try_get("lower")?,
+        upper: row.try_get("upper")?,
+        level: LineLevel::from_storage(&level)
+            .ok_or_else(|| decode_error("level", format!("unknown line level {level:?}")))?,
+        window_hours: row.try_get("window_hours")?,
+        windows: row.try_get("windows")?,
+        over: row.try_get("over")?,
+        par: row.try_get("par")?,
+        under: row.try_get("under")?,
+        first_window: timestamp(row.try_get("first_window")?, "first_window")?,
+        last_window: timestamp(row.try_get("last_window")?, "last_window")?,
+        fitted_at: timestamp(row.try_get("fitted_at")?, "fitted_at")?,
     })
 }
 
@@ -1112,6 +1199,7 @@ fn json_column<T: DeserializeOwned>(row: &SqliteRow, column: &str) -> Result<T, 
     serde_json::from_slice(&bytes).map_err(|error| decode_error(column, error))
 }
 
+mod lines;
 #[cfg(test)]
 mod tests;
 

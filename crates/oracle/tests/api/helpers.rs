@@ -290,6 +290,7 @@ pub fn event_at(now: OffsetDateTime) -> CreateEvent {
         number_of_places_win: 1,
         scoring_fields: None,
         unlisted: false,
+        scoring_rules: None,
     }
 }
 

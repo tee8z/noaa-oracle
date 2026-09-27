@@ -127,8 +127,10 @@ oracle reads them, scores entries against a baseline, and attests the
 ranking. To attest something other than NOAA weather, implement
 `OutcomeSource` (`crates/oracle/src/sources/`) for the oracle side: valid
 targets, metrics with their "par" rules, and baseline/observed readings for
-an observation window. Scoring, ranking, announcements, and attestation are
-shared. On the daemon side, implement its `Source` trait to fetch and write
+an observation window. To offer `lines` scoring, mark metrics `calibrated`
+and list the tracked targets in `line_targets`; the oracle then reads the
+source's history and fits lines itself. Scoring, ranking, announcements, and
+attestation are shared. On the daemon side, implement its `Source` trait to fetch and write
 the parquet datasets. The event, entry, and attestation contract is the same for
 every source; see [docs/attestation.md](docs/attestation.md).
 

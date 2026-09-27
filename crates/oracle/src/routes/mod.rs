@@ -9,8 +9,8 @@ pub mod ui;
 pub mod window_compatibility;
 
 pub use events::{
-    Base64Pubkey, Pubkey, add_event_entries, create_event, get_event, get_event_entry, get_npub,
-    get_pubkey, list_events, list_sources, update_data,
+    Base64Pubkey, Pubkey, add_event_entries, create_event, current_lines, get_event,
+    get_event_entry, get_npub, get_pubkey, list_events, list_sources, update_data,
 };
 pub use files::{Files, download, files, upload};
 pub use health::{health, healthy, ready};

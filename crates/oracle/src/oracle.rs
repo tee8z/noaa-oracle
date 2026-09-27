@@ -18,7 +18,8 @@ use crate::{
         EventListQuery, EventRecord, EventRejection, EventStatus, EventSummary, NewEvent,
         SettlementBlock, WeatherEntry, validate_entries,
     },
-    scoring::{self, NotUuidV7, Scored},
+    lines::{self, Line, LinePass, LineSettings},
+    scoring::{self, NotUuidV7, PickRule, Scored, ScoringRules},
     signing::{AttestError, KeyError, SigningKey},
     sources::{ObservationWindow, OutcomeSource, Reading, SourceError, Sources},
 };
@@ -85,6 +86,7 @@ pub struct Oracle {
     sources: Sources,
     key: Arc<SigningKey>,
     clock: Clock,
+    lines: LineSettings,
 }
 
 impl Oracle {
@@ -103,6 +105,7 @@ impl Oracle {
             sources,
             key: Arc::new(key),
             clock,
+            lines: LineSettings::default(),
         };
         oracle.check_stored_key().await?;
         Ok(oracle)
@@ -135,6 +138,36 @@ impl Oracle {
 
     pub fn sources(&self) -> &Sources {
         &self.sources
+    }
+
+    /// One line pass for every source (see [`lines::run_pass`]). A failing
+    /// source is logged and does not stop the others.
+    pub async fn run_line_pass(&self) -> LinePass {
+        let now = self.now();
+        let mut total = LinePass::default();
+        for source in self.sources.all() {
+            match lines::run_pass(&self.db, source.as_ref(), &self.lines, now).await {
+                Ok(pass) => {
+                    total.windows += pass.windows;
+                    total.pairs += pass.pairs;
+                    total.lines += pass.lines;
+                }
+                Err(error) => warn!("line pass for {} failed: {error:#}", source.id()),
+            }
+        }
+        total
+    }
+
+    /// The lines an event on `source` over `window` would copy if it were
+    /// created now, or the target and metric pairs that have none.
+    pub async fn current_lines(
+        &self,
+        source: &str,
+        window: ObservationWindow,
+        targets: &[String],
+        metrics: &[String],
+    ) -> Result<Result<Vec<Line>, Vec<String>>, Error> {
+        Ok(lines::current(&self.db, &self.lines, source, window, targets, metrics).await?)
     }
 
     /// The oracle's current time.
@@ -220,7 +253,13 @@ impl Oracle {
             .remove(&id)
             .unwrap_or_default();
         let block = self.db.settlement_blocks(&[id]).await?.remove(&id);
-        let mut event = record.into_event(self.now(), announcement, entries, &readings);
+        let lines = self
+            .db
+            .event_lines(&[id])
+            .await?
+            .remove(&id)
+            .unwrap_or_default();
+        let mut event = record.into_event(self.now(), announcement, entries, &readings, lines);
         event.settlement_block = block;
         Ok(event)
     }
@@ -233,10 +272,25 @@ impl Oracle {
         let sources = self.sources.clone();
         let key = self.key.clone();
         // Building the announcement is bounded (MAX_OUTCOMES) but CPU heavy.
-        let new_event = tokio::task::spawn_blocking(move || {
+        let mut new_event = tokio::task::spawn_blocking(move || {
             NewEvent::build(event, &sources, &key, coordinator)
         })
         .await??;
+        if new_event.scoring_rules == ScoringRules::Lines {
+            let window = ObservationWindow {
+                start: new_event.start_observation_date,
+                end: new_event.end_observation_date,
+            };
+            new_event.lines = self
+                .current_lines(
+                    &new_event.source,
+                    window,
+                    &new_event.locations,
+                    &new_event.metrics,
+                )
+                .await?
+                .map_err(|missing| EventRejection::LinesUnavailable(missing.join(", ")))?;
+        }
         self.db.add_event(&new_event).await?;
         info!(
             "created event {} for {} with {} outcomes",
@@ -357,13 +411,23 @@ impl Oracle {
             return Ok(false);
         }
         let entries = self.db.event_entries(event.id).await?;
+        let lines = self.scoring_lines(event).await?;
+        if signing_due {
+            validate_lines(event, &lines)?;
+        }
+        let rule = |target: &str, metric: &str| match event.scoring_rules {
+            ScoringRules::Fixed => source
+                .metric(metric)
+                .map(|metric| PickRule::Fixed(metric.par)),
+            ScoringRules::Lines => lines
+                .iter()
+                .find(|line| line.target == target && line.metric == metric)
+                .map(|line| PickRule::Line(line.band())),
+        };
         let scored = entries
             .iter()
             .map(|entry| {
-                let base_score =
-                    scoring::base_score(&entry.picks, &readings, &event.metrics, |id| {
-                        source.metric(id)
-                    });
+                let base_score = scoring::base_score(&entry.picks, &readings, &event.metrics, rule);
                 Ok(Scored {
                     id: entry.id,
                     base_score,
@@ -386,6 +450,19 @@ impl Oracle {
             );
         }
         Ok(false)
+    }
+
+    /// The lines a `lines` event scores against; empty for `fixed` events.
+    async fn scoring_lines(&self, event: &EventRecord) -> Result<Vec<Line>, Error> {
+        Ok(match event.scoring_rules {
+            ScoringRules::Fixed => vec![],
+            ScoringRules::Lines => self
+                .db
+                .event_lines(&[event.id])
+                .await?
+                .remove(&event.id)
+                .unwrap_or_default(),
+        })
     }
 
     /// Signs the outcome for `scored`. The attestation is computed from the
@@ -441,6 +518,35 @@ fn entry_scores(scored: &[Scored]) -> Vec<EntryScore> {
             base_score: i64::try_from(scored.base_score).unwrap_or(i64::MAX),
         })
         .collect()
+}
+
+/// A `lines` event needs its line for every enabled pair; they are stored
+/// with the event, so a missing one means the record is damaged.
+fn validate_lines(event: &EventRecord, lines: &[Line]) -> Result<(), SourceError> {
+    if event.scoring_rules != ScoringRules::Lines {
+        return Ok(());
+    }
+    let missing: Vec<String> = event
+        .locations
+        .iter()
+        .flat_map(|target| event.metrics.iter().map(move |metric| (target, metric)))
+        .filter(|(target, metric)| {
+            lines
+                .iter()
+                .filter(|line| &&line.target == target && &&line.metric == metric)
+                .count()
+                != 1
+        })
+        .map(|(target, metric)| format!("{target}/{metric}"))
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(SourceError::SettlementBlocked(format!(
+            "the event's line is missing for: {}",
+            missing.join(", ")
+        )))
+    }
 }
 
 /// Every enabled pair must occur exactly once with finite values. An absent

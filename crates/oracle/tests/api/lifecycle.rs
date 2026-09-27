@@ -853,3 +853,186 @@ async fn verified_precipitation_remains_eligible_for_scoring() {
     assert_eq!(summary.attested, 1);
     assert_attests(&app, &fetch(&app, event.id).await, &[0]);
 }
+
+fn fitted_line(
+    now: time::OffsetDateTime,
+    target: &str,
+    metric: &str,
+    lower: f64,
+    upper: f64,
+) -> oracle::lines::Line {
+    use oracle::lines::{Line, LineLevel};
+    Line {
+        target: target.into(),
+        metric: metric.into(),
+        lower,
+        upper,
+        level: if target.is_empty() {
+            LineLevel::Pooled
+        } else {
+            LineLevel::Station
+        },
+        window_hours: 24,
+        windows: 60,
+        over: 20,
+        par: 20,
+        under: 20,
+        first_window: now - Duration::days(60),
+        last_window: now - Duration::days(1),
+        fitted_at: now,
+    }
+}
+
+/// A `lines` event copies the current lines when it is created and keeps
+/// them. Each pick has one right answer, worth 10 points, and equal totals
+/// go to the earlier entry.
+#[tokio::test]
+async fn lines_events_score_against_the_lines_they_were_created_with() {
+    use oracle::{CreateEvent, lines::LineLevel, scoring::ScoringRules};
+    let test_app = app_with_weather().await;
+    let now = test_app.clock.now();
+    let database = &test_app.state.database;
+    database
+        .replace_line_fits(
+            "noaa_weather",
+            24,
+            vec![
+                fitted_line(now, "KORD", "temp_high", -1.5, 1.5),
+                fitted_line(now, "", "temp_high", -2.5, 0.5),
+                fitted_line(now, "", "temp_low", -0.5, 2.5),
+                fitted_line(now, "", "wind_speed", -1.5, 1.5),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let current: Value = test_app.get_json("/oracle/lines?targets=KORD,KSAW").await;
+    assert_eq!(current["lines"].as_array().unwrap().len(), 6);
+    assert_eq!(current["missing"], json!([]));
+
+    let rain = CreateEvent {
+        scoring_fields: Some(vec!["rain_amt".into()]),
+        scoring_rules: Some(ScoringRules::Lines),
+        ..event_at(now)
+    };
+    let (status, body) = test_app.create_event(&rain).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&body).contains("rain_amt cannot be scored against lines"));
+
+    let create = CreateEvent {
+        scoring_rules: Some(ScoringRules::Lines),
+        ..event_at(now)
+    };
+    let (status, body) = test_app.create_event(&create).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let event: Event = serde_json::from_slice(&body).unwrap();
+    assert_eq!(event.scoring_rules, ScoringRules::Lines);
+    assert_eq!(event.lines.len(), 6);
+    let kord_high = event
+        .lines
+        .iter()
+        .find(|line| line.target == "KORD" && line.metric == "temp_high")
+        .unwrap();
+    assert_eq!(kord_high.level, LineLevel::Station);
+    let ksaw_high = event
+        .lines
+        .iter()
+        .find(|line| line.target == "KSAW" && line.metric == "temp_high")
+        .unwrap();
+    assert_eq!(ksaw_high.level, LineLevel::Pooled);
+    assert_eq!((ksaw_high.lower, ksaw_high.upper), (-2.5, 0.5));
+
+    // Refitting afterwards does not move the event's lines.
+    database
+        .replace_line_fits(
+            "noaa_weather",
+            24,
+            vec![fitted_line(now, "", "temp_high", -9.5, 9.5)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(fetch(&test_app, event.id).await.lines, event.lines);
+
+    // KORD misses +5 / 0 / 0 and KSAW 0 / -0.6 / +3 (high / low / wind).
+    let ids: Vec<Uuid> = (0..3).map(|_| Uuid::now_v7()).collect();
+    let picks = [
+        // 10 (+5 is over 1.5) + 10 (-0.6 is under -0.5) = 20
+        vec![
+            pick("KORD", "temp_high", "Over"),
+            pick("KSAW", "temp_low", "Under"),
+        ],
+        // 0 (not par) + 10 (0 is par) = 10
+        vec![
+            pick("KORD", "temp_high", "Par"),
+            pick("KORD", "wind_speed", "Par"),
+        ],
+        // 10 + 10 = 20, the same as the first, which entered earlier
+        vec![
+            pick("KSAW", "wind_speed", "Over"),
+            pick("KSAW", "temp_high", "Par"),
+        ],
+    ];
+    let entries: Vec<Value> = ids
+        .iter()
+        .zip(picks)
+        .map(|(id, picks)| json!({"id": id, "event_id": event.id, "picks": picks}))
+        .collect();
+    let (status, body) = test_app
+        .submit_entries(event.id, json!({"event_id": event.id, "entries": entries}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+    test_app
+        .clock
+        .set(event.start_observation_date + Duration::hours(1));
+    test_app.run_etl().await;
+    let running = fetch(&test_app, event.id).await;
+    let base_scores: Vec<Option<i64>> = running.entries.iter().map(|e| e.base_score).collect();
+    assert_eq!(base_scores, vec![Some(20), Some(10), Some(20)]);
+
+    test_app.clock.set(event.signing_date);
+    test_app.run_etl().await;
+    let signed = fetch(&test_app, event.id).await;
+    assert_eq!(signed.status, EventStatus::Signed);
+    assert_attests(&test_app, &signed, &[0]);
+}
+
+/// Without a fitted line, and no pooled one, a `lines` event is refused
+/// rather than scored some other way.
+#[tokio::test]
+async fn lines_events_need_a_line_for_every_pick() {
+    use oracle::{CreateEvent, scoring::ScoringRules};
+    let test_app = app_with_weather().await;
+    let now = test_app.clock.now();
+    test_app
+        .state
+        .database
+        .replace_line_fits(
+            "noaa_weather",
+            24,
+            vec![fitted_line(now, "", "temp_high", -1.5, 1.5)],
+        )
+        .await
+        .unwrap();
+    let create = CreateEvent {
+        scoring_rules: Some(ScoringRules::Lines),
+        ..event_at(now)
+    };
+    let (status, body) = test_app.create_event(&create).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("KORD/temp_low"), "{body}");
+    assert!(!body.contains("temp_high"), "{body}");
+
+    let current: Value = test_app
+        .get_json("/oracle/lines?targets=KORD&metrics=temp_high,wind_speed")
+        .await;
+    assert_eq!(current["missing"], json!(["KORD/wind_speed"]));
+
+    // Events that do not ask for lines keep the fixed rules.
+    let (status, body) = test_app.create_event(&event_at(now)).await;
+    assert_eq!(status, StatusCode::OK);
+    let event: Event = serde_json::from_slice(&body).unwrap();
+    assert_eq!(event.scoring_rules, ScoringRules::Fixed);
+    assert!(event.lines.is_empty());
+}

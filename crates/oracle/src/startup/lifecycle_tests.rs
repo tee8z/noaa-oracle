@@ -64,6 +64,8 @@ fn event_data() -> NewEvent {
         },
         coordinator_pubkey: "npub1coordinator".into(),
         unlisted: false,
+        scoring_rules: crate::scoring::ScoringRules::Fixed,
+        lines: vec![],
     }
 }
 
