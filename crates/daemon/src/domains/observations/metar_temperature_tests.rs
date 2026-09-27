@@ -255,6 +255,7 @@ fn stations() -> CityWeather {
         elevation_m: Some(23.0),
         latitude: "43.65".into(),
         longitude: "-70.31".into(),
+        reports_metar: true,
     };
     CityWeather {
         city_data: [(station.station_id.clone(), station)]
