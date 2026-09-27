@@ -25,8 +25,8 @@ use duckdb::{
 use log::debug;
 use serde::{Deserialize, Serialize};
 use std::{
-    path::Path,
-    sync::{Arc, Mutex, PoisonError},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     time::Instant,
 };
 use time::{Duration, OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
@@ -181,6 +181,25 @@ const DATABASE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(24
 /// Limits of each background copy or fold, in its own database.
 const QUERY_MEMORY_LIMIT: &str = "512MB";
 const QUERY_THREADS: usize = 2;
+
+/// Where DuckDB writes what a query cannot hold within its memory limit.
+/// Its default, `.tmp` in the working directory, is read-only where the
+/// oracle runs, so a query that outgrew its limit failed instead ("Failed to
+/// create directory .tmp"). Set once, by [`WeatherAccess::with_derived_forecasts`].
+static SPILL_DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
+
+/// The `SET temp_directory` statement for [`SPILL_DIRECTORY`], if set.
+fn spill_setting() -> String {
+    SPILL_DIRECTORY
+        .get()
+        .map(|directory| {
+            format!(
+                " SET temp_directory = '{}';",
+                directory.to_string_lossy().replace('\'', "''")
+            )
+        })
+        .unwrap_or_default()
+}
 
 pub struct WeatherAccess {
     file_access: Arc<dyn FileData>,
@@ -1031,7 +1050,23 @@ impl WeatherAccess {
     /// Also keeps query-ready copies of recent forecast files and folds of
     /// them in `directory` (see [`DerivedForecasts`] and [`Folds`]) and
     /// reads them instead.
+    ///
+    /// Queries that outgrow their memory limit spill to a directory of this
+    /// process's own under `directory`, which copy and fold pruning leave
+    /// alone.
     pub fn with_derived_forecasts(file_access: Arc<dyn FileData>, directory: &Path) -> Self {
+        let spill = directory
+            .join("duckdb-spill")
+            .join(std::process::id().to_string());
+        match std::fs::create_dir_all(&spill) {
+            Ok(()) => {
+                let _ = SPILL_DIRECTORY.set(spill);
+            }
+            Err(error) => log::warn!(
+                "cannot create the query spill directory {}: {error}",
+                spill.display()
+            ),
+        }
         Self {
             derived: Some(DerivedForecasts::new(directory)),
             folds: Some(Folds::new(directory)),
@@ -1150,7 +1185,8 @@ fn open_database() -> Result<Connection, duckdb::Error> {
     let connection = Connection::open_in_memory()?;
     connection.execute_batch(&format!(
         "SET memory_limit = '{QUERIES_MEMORY_LIMIT}'; SET threads = {QUERIES_THREADS};
-         INSTALL parquet; LOAD parquet; SET parquet_metadata_cache = true;"
+         INSTALL parquet; LOAD parquet; SET parquet_metadata_cache = true;{}",
+        spill_setting()
     ))?;
     Ok(connection)
 }
@@ -1161,7 +1197,8 @@ fn open_connection() -> Result<Connection, duckdb::Error> {
     let connection = Connection::open_in_memory()?;
     connection.execute_batch(&format!(
         "SET memory_limit = '{QUERY_MEMORY_LIMIT}'; SET threads = {QUERY_THREADS};
-         INSTALL parquet; LOAD parquet;"
+         INSTALL parquet; LOAD parquet;{}",
+        spill_setting()
     ))?;
     Ok(connection)
 }
@@ -1955,6 +1992,33 @@ pub struct Station {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Queries that outgrow their memory limit spill under the derived
+    /// directory, not `.tmp` in a working directory that may be read-only.
+    #[test]
+    fn queries_spill_to_a_directory_of_their_own() {
+        let directory = tempfile::tempdir().unwrap();
+        let _ = WeatherAccess::with_derived_forecasts(
+            Arc::new(crate::file_access::FileAccess::new(
+                directory.path().to_string_lossy().into_owned(),
+            )),
+            &directory.path().join("derived"),
+        );
+        // Another test may have set the process's spill directory first,
+        // in a temporary directory that is gone by now; DuckDB creates it
+        // again when it spills.
+        let spill = SPILL_DIRECTORY.get().expect("spill directory set");
+        assert!(spill.ends_with(std::process::id().to_string()));
+        assert_eq!(spill.parent().unwrap().file_name().unwrap(), "duckdb-spill");
+        for connection in [open_connection().unwrap(), open_database().unwrap()] {
+            let setting: String = connection
+                .query_row("SELECT current_setting('temp_directory')", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(std::path::Path::new(&setting), spill.as_path());
+        }
+    }
 
     #[test]
     fn station_ids_are_validated_before_reaching_sql() {
