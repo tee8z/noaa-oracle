@@ -7,8 +7,14 @@ use axum::{
     body::{Body, to_bytes},
     http::{Method, Request, StatusCode, header},
 };
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use dlctix::musig2::secp256k1::PublicKey;
 use nostr::key::Keys;
-use oracle::{CreateEvent, Event, EventStatus, EventSummary, WeatherEntry};
+use oracle::{
+    CreateEvent, Event, EventStatus, EventSummary, WeatherEntry,
+    scoring::ScoringRules,
+    statement::{Outcomes, Terms},
+};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use time::Duration;
@@ -131,6 +137,73 @@ async fn entries_accept_picks_or_weather_choices_once() {
     assert_eq!(
         test_app.submit_entries(event.id, again).await.0,
         StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+async fn the_oracle_signs_an_event_statement_once_every_entry_is_in() {
+    let test_app = app().await;
+    let event = created(&test_app).await;
+    assert_eq!(event.statement, None, "no statement before the entries");
+    let body = json!({
+        "event_id": event.id,
+        "entries": [
+            picks_entry(event.id, "KORD", "Over"),
+            picks_entry(event.id, "KSAW", "Par"),
+            picks_entry(event.id, "KORD", "Under"),
+        ]
+    });
+    let (status, response) = test_app.submit_entries(event.id, body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+
+    let fetched: Event = test_app
+        .get_json(&format!("/oracle/events/{}", event.id))
+        .await;
+    let signed = fetched
+        .statement
+        .clone()
+        .expect("a statement once every entry is in");
+    let statement = &signed.statement;
+    assert_eq!(statement.event_id, event.id);
+    assert_eq!(statement.nonce_point, fetched.nonce_point);
+    assert_eq!(Some(statement.expiry), fetched.event_announcement.expiry);
+    assert_eq!(
+        statement.signing_date,
+        fetched.signing_date.unix_timestamp()
+    );
+    let Outcomes::Ranking(ranking) = &statement.outcomes else {
+        panic!("competitions rank their entries");
+    };
+    assert_eq!(ranking.entry_ids, fetched.entry_ids, "entries in id order");
+    assert_eq!(ranking.number_of_places_win, 1);
+    let Terms::Observation(terms) = &statement.terms else {
+        panic!("weather events are observation events");
+    };
+    assert_eq!(terms.source, "noaa_weather");
+    assert_eq!(terms.targets, fetched.locations);
+    assert_eq!(terms.scoring_fields, fetched.scoring_fields);
+    assert_eq!(terms.scoring_rules, ScoringRules::Fixed);
+    assert!(terms.lines.is_empty(), "fixed events have no lines");
+    assert_eq!(
+        terms.start_observation_date,
+        fetched.start_observation_date.unix_timestamp()
+    );
+
+    let pubkey: Value = test_app.get_json("/oracle/pubkey").await;
+    let key = PublicKey::from_slice(&BASE64.decode(pubkey["key"].as_str().unwrap()).unwrap())
+        .unwrap()
+        .x_only_public_key()
+        .0;
+    assert_eq!(signed.verify(&key), Ok(()));
+    assert_eq!(
+        statement.locking_points(test_app.oracle.public_key()),
+        fetched.event_announcement.locking_points,
+        "the statement alone reproduces the announcement"
     );
 }
 

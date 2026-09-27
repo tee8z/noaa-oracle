@@ -21,6 +21,7 @@ pub mod scoring;
 pub mod signing;
 pub mod sources;
 mod startup;
+pub mod statement;
 mod templates;
 pub mod weather_data;
 

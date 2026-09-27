@@ -22,6 +22,7 @@ use crate::{
     scoring::{self, NotUuidV7, PickRule, Scored, ScoringRules},
     signing::{AttestError, KeyError, SigningKey},
     sources::{ObservationWindow, OutcomeSource, Reading, SourceError, Sources},
+    statement::Statement,
 };
 
 /// The current time. Injected so tests can move through an event's
@@ -261,6 +262,8 @@ impl Oracle {
             .unwrap_or_default();
         let mut event = record.into_event(self.now(), announcement, entries, &readings, lines);
         event.settlement_block = block;
+        event.statement =
+            Statement::for_event(&event).map(|statement| self.key.sign_statement(statement));
         Ok(event)
     }
 

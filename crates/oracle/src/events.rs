@@ -33,6 +33,7 @@ use crate::{
     scoring::{self, Pick, ScoringRules},
     signing::{EventNonce, SigningKey},
     sources::{OutcomeSource, Reading, SourceError, Sources, noaa},
+    statement::SignedStatement,
 };
 
 /// Entries an event may hold. Outcome enumeration grows as
@@ -388,6 +389,7 @@ impl EventRecord {
             settlement_block: None,
             scoring_rules: self.scoring_rules,
             lines,
+            statement: None,
         }
     }
 
@@ -730,6 +732,10 @@ pub struct Event {
     /// against, fixed when the event was created
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lines: Vec<Line>,
+    /// The oracle's signed statement of this event's outcomes and terms, once every entry is in.
+    /// Lets a party that never saw the event check a contract built on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statement: Option<SignedStatement>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
