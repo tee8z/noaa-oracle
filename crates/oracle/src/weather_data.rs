@@ -178,8 +178,10 @@ const QUERIES_MEMORY_LIMIT: &str = "2GB";
 const QUERIES_THREADS: usize = 4;
 /// How long queries share one database before a new one replaces it.
 const DATABASE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
-/// Limits of each background copy or fold, in its own database.
-const QUERY_MEMORY_LIMIT: &str = "512MB";
+/// Limits of each background copy or fold, in its own database. Copying one
+/// forecast file sorts all of its rows, source layouts included: a
+/// 415,000-row, 87 MB file (September 2026) needs about 1 GB.
+const QUERY_MEMORY_LIMIT: &str = "1536MB";
 const QUERY_THREADS: usize = 2;
 
 /// Where DuckDB writes what a query cannot hold within its memory limit.
