@@ -71,17 +71,21 @@ fn past_week(comparisons: &[ForecastComparison], days: &str) -> Markup {
             p class="forecast-note" {
                 "By day (" (days) "). Each forecast was issued the day before. Differences are observed − forecast; + means it came in higher."
             }
-            div class="table-container" {
+            p class="forecast-note history-scroll-hint" {
+                "Scroll sideways for humidity, rain and snow."
+            }
+            div class="table-container past-table-scroll" tabindex="0"
+                role="region" aria-label="Past week weather comparison; scroll horizontally for all measurements" {
                 table class="table is-narrow is-fullwidth past-table" {
                     thead {
                         tr {
-                            th { "Day" }
-                            th { "High" }
-                            th { "Low" }
-                            th { "Max wind" }
-                            th title="Forecast range; observed is estimated from temperature and dew point" { "Humidity" }
-                            th { "Rain" }
-                            th title="Observed snow is estimated from liquid precipitation at 10:1" { "Snow" }
+                            th scope="col" { "Day" }
+                            th scope="col" { "High" }
+                            th scope="col" { "Low" }
+                            th scope="col" { "Max wind" }
+                            th scope="col" title="Forecast range; observed is estimated from temperature and dew point" { "Humidity" }
+                            th scope="col" { "Rain" }
+                            th scope="col" title="Observed snow is estimated from liquid precipitation at 10:1" { "Snow" }
                         }
                     }
                     tbody {

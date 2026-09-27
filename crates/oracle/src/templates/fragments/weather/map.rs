@@ -4,7 +4,7 @@
 
 use maud::{Markup, html};
 
-use super::{WeatherContext, WeatherDisplay, list::no_data, place};
+use super::{INTERACTIVE, WeatherContext, WeatherDisplay, WeatherView, list::no_data, place};
 use crate::templates::{
     assets,
     components::{time as when, values::whole_degrees},
@@ -114,9 +114,13 @@ pub(super) fn weather_map(weather: &[WeatherDisplay], context: &WeatherContext) 
     html! {
         div class="wx-map" {
             div class="map-wrapper" {
-                img src=(assets::USA_MAP_SVG.url) alt="" class="usa-map";
+                // External use keeps the geometry cached while inheriting
+                // this page's theme colours. An img cannot inherit them.
+                svg class="usa-map" viewBox="0 0 599.96 327.28" aria-hidden="true" {
+                    use href=(format!("{}#Layer_1", assets::USA_MAP_SVG.url)) {}
+                }
                 svg class="station-markers" viewBox="0 0 599.96 327.28" preserveAspectRatio="none"
-                    role="group" aria-label="Stations by latest temperature" {
+                    role="group" aria-label="Stations by latest temperature" aria-describedby="map-help" {
                     // Wider invisible circles are easier to hit. They sit
                     // under every dot, so a neighbour's never covers a dot.
                     g aria-hidden="true" {
@@ -133,14 +137,17 @@ pub(super) fn weather_map(weather: &[WeatherDisplay], context: &WeatherContext) 
                         // A link, so it takes focus and opens with Enter
                         // without a script; without htmx it opens the list.
                         a class={ "pin " (band(station.latest_temp)) }
+                          data-station=(&station.station_id)
                           href=(list_url(&station.station_id))
                           aria-label=(summary(station, context).replace('\n', ", "))
+                          aria-controls="map-station"
                           hx-get=(station_url(&station.station_id))
                           hx-target="#map-station"
                           hx-swap=(PANEL_SWAP)
                           hx-sync="#map-station:replace"
                           hx-indicator="#map-station-loading" {
                             title { (summary(station, context)) }
+                            circle class="pin-halo" cx=(x) cy=(y) r="8.5" {}
                             circle class="pin-dot" cx=(x) cy=(y) r="4.5" {}
                         }
                     }
@@ -151,6 +158,17 @@ pub(super) fn weather_map(weather: &[WeatherDisplay], context: &WeatherContext) 
                     li { span class={ "swatch " (class) } {} (label) }
                 }
                 li { span class="swatch t-none" {} "No report" }
+            }
+            p class="map-help" id="map-help" {
+                "Select a station for its forecast and history. "
+                a href=(context.page_url(WeatherView::List))
+                  hx-get=(context.fragment_url(WeatherView::List))
+                  hx-target="#weather-table-container"
+                  hx-swap="outerHTML"
+                  hx-sync=(INTERACTIVE)
+                  hx-push-url=(context.page_url(WeatherView::List)) {
+                    "Search the list"
+                }
             }
             @if !off_map.is_empty() {
                 p class="map-off" {

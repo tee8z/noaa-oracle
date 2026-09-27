@@ -4,7 +4,7 @@
 //! attributes or `eval`. htmx 4 has no setting that stops it evaluating
 //! `hx-on` or running scripts in swapped HTML, so this policy is what stops
 //! them. Pages also require Trusted Types: only the `htmx` policy
-//! (`layouts/head.js`) may turn strings into HTML. The API and its docs are
+//! (`layouts/htmx_security.js`) may turn strings into HTML. The API and its docs are
 //! not covered.
 
 use axum::{
@@ -18,15 +18,12 @@ pub const PAGE_POLICY: &str = "script-src 'self'; object-src 'none'; base-uri 'n
      frame-ancestors 'none'; form-action 'self'; \
      require-trusted-types-for 'script'; trusted-types htmx";
 
-/// The raw data page also runs DuckDB-WASM from jsdelivr: the module and the
-/// three modules it imports, the worker it starts from a `blob:` URL (which
-/// loads DuckDB's worker script), and WebAssembly. DuckDB creates its worker
-/// from a string, so this page does not require Trusted Types.
+/// The raw data page imports its pinned DuckDB/Arrow module from this site.
+/// DuckDB still loads its pinned worker script and WebAssembly from jsDelivr.
+/// It starts that worker from a `blob:` URL containing importScripts, so this
+/// page does not require Trusted Types.
 pub const RAW_DATA_POLICY: &str = "script-src 'self' 'wasm-unsafe-eval' \
-     https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/ \
-     https://cdn.jsdelivr.net/npm/apache-arrow@17.0.0/+esm \
-     https://cdn.jsdelivr.net/npm/flatbuffers@24.3.25/+esm \
-     https://cdn.jsdelivr.net/npm/tslib@2.6.3/+esm; \
+     https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/; \
      worker-src blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; \
      form-action 'self'";
 

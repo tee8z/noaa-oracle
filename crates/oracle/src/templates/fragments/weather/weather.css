@@ -212,27 +212,41 @@
 
 /* ---------- Map ---------- */
 .map-wrapper {
+    --map-land: #d8e3ee;
+    --map-border: #74879b;
+    --map-focus: #142a46;
     position: relative;
     width: 100%;
+    padding: 0.5rem;
+    border: 1px solid #9aadc0;
+    border-radius: 0.65rem;
+    background: #f2f6fb;
+}
+
+[data-theme="dark"] .map-wrapper {
+    --map-land: #3d5168;
+    --map-border: #a5b6c8;
+    --map-focus: #ffffff;
+    border-color: #637b96;
+    background: #162538;
 }
 
 .usa-map {
     display: block;
     width: 100%;
     height: auto;
-    opacity: 0.55;
-}
-
-[data-theme="dark"] .usa-map {
-    filter: invert(1) brightness(0.8);
-    opacity: 0.35;
+    /* Paint inherited by the external geometry in every browser. Keeping
+       these in the SVG asset's stylesheet loses them in Safari/Firefox. */
+    fill: var(--map-land);
+    stroke: var(--map-border);
+    stroke-width: 0.75;
 }
 
 .station-markers {
     position: absolute;
-    inset: 0;
-    width: 100%;
-    height: 100%;
+    inset: 0.5rem;
+    width: calc(100% - 1rem);
+    height: calc(100% - 1rem);
 }
 
 .pin {
@@ -248,18 +262,43 @@
 .pin-dot {
     stroke: var(--pin-ring);
     stroke-width: 1.2;
+    vector-effect: non-scaling-stroke;
     transition: r 0.1s ease;
 }
 
 .pin:hover .pin-dot,
-.pin:focus-visible .pin-dot {
+.pin:focus-visible .pin-dot,
+.pin[aria-current="true"] .pin-dot {
     r: 7;
-    stroke: var(--bulma-text-strong);
 }
 
-/* Diverging bands; no report is an open ring, not a colour. Every fill
-   is at least 3:1 against the light map (#f1f1f1): 7.1, 4.0, 3.6, 3.7 and
-   6.4. On the dark map the light ring gives each pin 14:1. */
+.pin-halo {
+    fill: none;
+    stroke: var(--map-focus);
+    stroke-width: 2;
+    vector-effect: non-scaling-stroke;
+    pointer-events: none;
+    visibility: hidden;
+}
+
+.pin:hover .pin-halo,
+.pin:focus-visible .pin-halo,
+.pin[aria-current="true"] .pin-halo {
+    visibility: visible;
+}
+
+/* Expand the transparent targets on touch screens without covering any
+   visible dot: all targets are painted beneath all station links. */
+@media (pointer: coarse) {
+    .pin-target {
+        stroke: transparent;
+        stroke-width: 18px;
+        vector-effect: non-scaling-stroke;
+    }
+}
+
+/* Diverging bands; no report is an open ring, not a colour. The light
+   outline remains visible when the map scales down on a phone. */
 .t-cold { --pin: #1d4f99; }
 .t-cool { --pin: #3a78c2; }
 .t-mild { --pin: #827d70; }
@@ -310,8 +349,19 @@
     color: var(--muted);
 }
 
+.map-help {
+    font-size: 0.8rem;
+    color: var(--muted);
+    margin-top: 0.5rem;
+}
+
 #map-station {
     scroll-margin-top: 0.75rem;
+}
+
+#map-station .station-detail-head h3:focus-visible {
+    outline: 2px solid var(--bulma-link);
+    outline-offset: 3px;
 }
 
 #map-station:not(:empty) {

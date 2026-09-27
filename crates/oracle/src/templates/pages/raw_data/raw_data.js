@@ -1,11 +1,12 @@
 // Raw Data Page - DuckDB-based parquet file analyzer
 // Only initializes when on the /raw page
 
-// DuckDB-WASM is large, so only this page loads it, and only once.
-const DUCKDB_MODULE =
-  "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm";
+// Only this page imports the pinned same-origin DuckDB/Arrow module.
+// CDN +esm preload headers resolve against the wrong origin in WebKit.
 let db = null;
 let duckdb = null;
+let rawDataBusy = false;
+let datasetUsable = true;
 
 async function initRawDataPage() {
   // Only run on the raw data page, once per visit.
@@ -16,7 +17,7 @@ async function initRawDataPage() {
   page.dataset.ready = "true";
 
   try {
-    duckdb = duckdb || (await import(DUCKDB_MODULE));
+    duckdb = duckdb || (await import(page.dataset.duckdbModule));
   } catch (error) {
     console.error("DuckDB could not be loaded:", error);
     setStatus("DuckDB could not be loaded, so queries are unavailable.");
@@ -76,37 +77,71 @@ function setStatus(text) {
   if (status) status.textContent = text;
 }
 
-async function submitDownloadRequest(event, autoRunQuery = false) {
-  if (event !== null) {
-    event.preventDefault();
+function setRawDataBusy(busy) {
+  rawDataBusy = busy;
+  document.querySelectorAll("#raw-data [data-needs-db], #raw-data [data-query], #clearQuery, #start, #end, #observations, #forecasts").forEach((control) => {
+    const query = control.id === "runQuery" || control.hasAttribute("data-query");
+    control.disabled = busy || (query && !datasetUsable);
+  });
+  const download = document.getElementById("downloadCsv");
+  if (download) download.disabled = busy || !lastResult;
+}
+
+// A new selection replaces the previous dataset, including when no files match.
+// Clear results and schemas too, so no value from the old window looks current.
+async function resetDataset() {
+  clearQuerys();
+  for (const table of ["forecasts", "observations"]) {
+    const schema = document.getElementById(`${table}-schema`);
+    if (schema) schema.value = "";
+    updateSchemaStatus(table, "empty");
   }
+  const conn = await db.connect();
   try {
-    // Show loading states
+    await conn.query("DROP TABLE IF EXISTS observations; DROP TABLE IF EXISTS forecasts;");
+  } finally {
+    await conn.close();
+  }
+}
+
+async function submitDownloadRequest(event, autoRunQuery = false) {
+  if (event) event.preventDefault();
+  if (rawDataBusy) return;
+  setRawDataBusy(true);
+  let loaded = false;
+  datasetUsable = false;
+  try {
+    await resetDataset();
     showSchemaLoading("forecasts", true);
     showSchemaLoading("observations", true);
-
     const fileNames = await fetchFileNames();
     setStatus(`Loading ${fileNames.length} files…`);
     await loadFiles(fileNames);
-    setStatus(`Loaded ${fileNames.length} files. Run a query below.`);
-
-    // Hide loading states
-    showSchemaLoading("forecasts", false);
-    showSchemaLoading("observations", false);
-
-    // Auto-run the sample query after initial load
-    if (autoRunQuery) {
-      await runQuery(null);
-    }
+    datasetUsable = true;
+    setStatus(fileNames.length
+      ? `Loaded ${fileNames.length} files. Run a query below.`
+      : "No files match this window and selection. Previous data has been cleared.");
+    loaded = fileNames.length > 0;
   } catch (error) {
     console.error("Error downloading files:", error);
-    setStatus("The files could not be loaded.");
-    // Hide loading on error
-    showSchemaLoading("forecasts", false);
-    showSchemaLoading("observations", false);
+    // A partially downloaded selection must not appear to be a complete dataset.
+    try {
+      await resetDataset();
+      datasetUsable = true;
+    } catch (resetError) {
+      console.error("Error clearing files:", resetError);
+    }
+    setStatus(datasetUsable
+      ? "The files could not be loaded. Choose a window and try again."
+      : "The files could not be cleared. Reload this page before querying data.");
     updateSchemaStatus("forecasts", "error");
     updateSchemaStatus("observations", "error");
+  } finally {
+    showSchemaLoading("forecasts", false);
+    showSchemaLoading("observations", false);
+    setRawDataBusy(false);
   }
+  if (autoRunQuery && loaded) await runQuery(null);
 }
 
 async function fetchFileNames() {
@@ -136,52 +171,53 @@ async function loadFiles(fileNames) {
   let observation_files = [];
   let forecast_files = [];
 
-  for (const fileName of fileNames) {
-    let url = `${apiBase}/file/${fileName}`;
-    if (fileName.includes("observations")) {
-      observation_files.push(url);
-    } else {
-      forecast_files.push(url);
+  try {
+    for (const fileName of fileNames) {
+      const url = `${apiBase}/file/${fileName}`;
+      if (fileName.includes("observations")) {
+        observation_files.push(url);
+      } else {
+        forecast_files.push(url);
+      }
+      await db.registerFileURL(fileName, url, duckdb.DuckDBDataProtocol.HTTP, false);
     }
-    await db.registerFileURL(
-      fileName,
-      url,
-      duckdb.DuckDBDataProtocol.HTTP,
-      false,
-    );
-  }
 
-  if (Array.isArray(observation_files) && observation_files.length > 0) {
-    await conn.query(`
-            CREATE OR REPLACE TABLE observations AS
-            SELECT * FROM read_parquet(['${observation_files.join("', '")}'], union_by_name = true);
-        `);
-    const observations = await conn.query(
-      `SELECT * FROM observations LIMIT 1;`,
-    );
-    loadSchema("observations", observations);
+    for (const [table, files] of [["observations", observation_files], ["forecasts", forecast_files]]) {
+      if (!files.length) {
+        updateSchemaStatus(table, "empty");
+        continue;
+      }
+      const urls = files.map((url) => "'" + url.replaceAll("'", "''") + "'").join(", ");
+      await conn.query(`CREATE OR REPLACE TABLE ${table} AS
+        SELECT * FROM read_parquet([${urls}], union_by_name = true);`);
+      const sample = await conn.query(`SELECT * FROM ${table} LIMIT 1;`);
+      loadSchema(table, sample);
+    }
+  } finally {
+    await conn.close();
   }
-
-  if (Array.isArray(forecast_files) && forecast_files.length > 0) {
-    await conn.query(`
-            CREATE OR REPLACE TABLE forecasts AS
-            SELECT * FROM read_parquet(['${forecast_files.join("', '")}'], union_by_name = true);
-        `);
-    const forecasts = await conn.query(`SELECT * FROM forecasts LIMIT 1;`);
-    loadSchema("forecasts", forecasts);
-  }
-  await conn.close();
 }
 
 async function runQuery(event) {
+  if (event) event.preventDefault();
+  if (rawDataBusy) return;
+  if (!datasetUsable) return;
   const rawQuery = document.getElementById("customQuery").value;
+  clearQuerys();
+  setRawDataBusy(true);
+  let conn;
   try {
-    const conn = await db.connect();
+    conn = await db.connect();
     const queryResult = await conn.query(rawQuery);
     loadTable("queryResult", queryResult);
-    await conn.close();
   } catch (error) {
     displayQueryErr(error);
+  } finally {
+    try {
+      if (conn) await conn.close();
+    } finally {
+      setRawDataBusy(false);
+    }
   }
 }
 
@@ -432,7 +468,7 @@ function setupDragScroll(containerId) {
 // it from the .sql files beside this script).
 document.addEventListener("click", function (event) {
   const example = event.target.closest("[data-query]");
-  if (!example || !db) return;
+  if (!example || !db || rawDataBusy || !datasetUsable) return;
   const textarea = document.getElementById("customQuery");
   if (textarea) textarea.value = example.dataset.query;
   runQuery(null);
