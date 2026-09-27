@@ -190,6 +190,33 @@ const QUERY_THREADS: usize = 2;
 /// create directory .tmp"). Set once, by [`WeatherAccess::with_derived_forecasts`].
 static SPILL_DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
 
+/// Spill directories of earlier processes untouched this long are left
+/// over from a crash; a running query's spill files are fresh.
+const STALE_SPILL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Removes other processes' spill directories under `spills` that have not
+/// changed for [`STALE_SPILL`], keeping `own`.
+fn remove_stale_spills(spills: &Path, own: &Path) {
+    let Ok(entries) = std::fs::read_dir(spills) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= STALE_SPILL);
+        if path != own && stale {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => log::info!("removed stale query spill directory {}", path.display()),
+                Err(error) => log::warn!("cannot remove {}: {error}", path.display()),
+            }
+        }
+    }
+}
+
 /// The `SET temp_directory` statement for [`SPILL_DIRECTORY`], if set.
 fn spill_setting() -> String {
     SPILL_DIRECTORY
@@ -1057,9 +1084,9 @@ impl WeatherAccess {
     /// process's own under `directory`, which copy and fold pruning leave
     /// alone.
     pub fn with_derived_forecasts(file_access: Arc<dyn FileData>, directory: &Path) -> Self {
-        let spill = directory
-            .join("duckdb-spill")
-            .join(std::process::id().to_string());
+        let spills = directory.join("duckdb-spill");
+        let spill = spills.join(std::process::id().to_string());
+        remove_stale_spills(&spills, &spill);
         match std::fs::create_dir_all(&spill) {
             Ok(()) => {
                 let _ = SPILL_DIRECTORY.set(spill);
@@ -2020,6 +2047,29 @@ mod tests {
                 .unwrap();
             assert_eq!(std::path::Path::new(&setting), spill.as_path());
         }
+    }
+
+    #[test]
+    fn stale_spill_directories_of_other_processes_are_removed() {
+        let spills = tempfile::tempdir().unwrap();
+        let own = spills.path().join("100");
+        let fresh = spills.path().join("200");
+        let stale = spills.path().join("300");
+        for directory in [&own, &fresh, &stale] {
+            std::fs::create_dir_all(directory).unwrap();
+            std::fs::write(directory.join("duckdb_temp_block"), b"x").unwrap();
+        }
+        let old = std::time::SystemTime::now() - STALE_SPILL - std::time::Duration::from_secs(60);
+        for directory in [&own, &stale] {
+            std::fs::File::open(directory)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        remove_stale_spills(spills.path(), &own);
+        assert!(own.exists(), "this process's directory stays, however old");
+        assert!(fresh.exists(), "another process's recent spills stay");
+        assert!(!stale.exists());
     }
 
     #[test]
