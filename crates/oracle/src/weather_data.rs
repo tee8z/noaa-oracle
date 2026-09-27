@@ -2004,9 +2004,10 @@ mod tests {
             )),
             &directory.path().join("derived"),
         );
-        // Another test may have set the process's spill directory first.
+        // Another test may have set the process's spill directory first,
+        // in a temporary directory that is gone by now; DuckDB creates it
+        // again when it spills.
         let spill = SPILL_DIRECTORY.get().expect("spill directory set");
-        assert!(spill.is_dir());
         assert!(spill.ends_with(std::process::id().to_string()));
         assert_eq!(spill.parent().unwrap().file_name().unwrap(), "duckdb-spill");
         for connection in [open_connection().unwrap(), open_database().unwrap()] {
