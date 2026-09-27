@@ -152,6 +152,18 @@ pub trait OutcomeSource: Send + Sync {
         ))
     }
 
+    /// Whether an event over `window` scoring `metrics` can be attested from
+    /// whole source periods, or why not. By default, windows of at least a
+    /// day.
+    fn check_window(&self, window: ObservationWindow, metrics: &[String]) -> Result<(), String> {
+        let _ = metrics;
+        if window.end - window.start >= time::Duration::DAY {
+            Ok(())
+        } else {
+            Err("the observation window must be at least 24 hours".into())
+        }
+    }
+
     /// Every target the source tracks, for fitting lines. Empty when the
     /// source has no line history.
     async fn line_targets(&self) -> Result<Vec<String>, SourceError> {

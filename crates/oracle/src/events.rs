@@ -107,6 +107,10 @@ pub enum EventRejection {
     UnknownSource(String),
     #[error("observation start must be before its end, and the end no later than the signing date")]
     DatesOutOfOrder,
+    /// The source cannot attest this window from whole periods (see
+    /// [`OutcomeSource::check_window`]).
+    #[error("{0}")]
+    Window(String),
     #[error("signing date is outside the DLC expiry range")]
     ExpiryOutOfRange,
     #[error("total_allowed_entries must be between 2 and {MAX_ENTRIES}, requested {0}")]
@@ -279,6 +283,15 @@ impl NewEvent {
         {
             return Err(EventRejection::ScoringFields);
         }
+        source
+            .check_window(
+                crate::sources::ObservationWindow {
+                    start: event.start_observation_date,
+                    end: event.end_observation_date,
+                },
+                &metrics,
+            )
+            .map_err(EventRejection::Window)?;
         let scoring_rules = event.scoring_rules.unwrap_or_default();
         if scoring_rules == ScoringRules::Lines
             && let Some(metric) = metrics.iter().find(|metric| {
@@ -1159,9 +1172,9 @@ mod tests {
         let start = OffsetDateTime::now_utc();
         CreateEvent {
             id: Uuid::now_v7(),
-            signing_date: start + Duration::hours(3),
+            signing_date: start + Duration::hours(26),
             start_observation_date: start,
-            end_observation_date: start + Duration::hours(1),
+            end_observation_date: start + Duration::hours(24),
             locations: vec!["KORD".into(), "KSAW".into()],
             number_of_values_per_entry: 3,
             total_allowed_entries: entries,
@@ -1232,6 +1245,14 @@ mod tests {
             rejected(|e| e.signing_date = e.end_observation_date - Duration::hours(1)),
             EventRejection::DatesOutOfOrder
         ));
+        assert!(matches!(
+            rejected(|e| e.end_observation_date = e.start_observation_date + Duration::hours(23)),
+            EventRejection::Window(_)
+        ));
+        assert!(
+            build(event(3, 1)).is_ok(),
+            "a 24-hour window is long enough"
+        );
         assert!(matches!(
             rejected(|e| e.number_of_places_win = 3),
             EventRejection::Places(3)

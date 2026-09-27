@@ -4,13 +4,13 @@
 //! percent.
 
 use async_trait::async_trait;
-use std::{collections::BTreeMap, sync::Arc};
-use time::{Date, Duration, OffsetDateTime, UtcOffset, macros::format_description};
+use std::sync::Arc;
+use time::{Duration, OffsetDateTime};
 
 use super::{Metric, ObservationWindow, OutcomeSource, ParRule, Reading, SourceError, SourceId};
 use crate::{
     routes::{ForecastRequest, ObservationRequest, TemperatureUnit},
-    weather_data::{self, Forecast, Observation, WeatherData, validate_station_id},
+    weather_data::{self, Observation, WeatherData, validate_station_id},
 };
 
 pub const NOAA_WEATHER: SourceId = SourceId::new("noaa_weather");
@@ -23,8 +23,13 @@ pub const RAIN_AMT: &str = "rain_amt";
 pub const SNOW_AMT: &str = "snow_amt";
 pub const HUMIDITY: &str = "humidity";
 
-/// NOAA publishes up to a week of forecast periods per issue.
+/// NOAA publishes up to a week of forecast periods per issue. Settlement
+/// looks this far back for the latest publication before an event.
 const BASELINE_LOOKBACK: Duration = Duration::days(7);
+/// Provisional readings (and the line history) look back only this far. The
+/// daemon publishes hourly; a longer gap leaves the baseline missing until a
+/// publication arrives, where settlement would still find an older one.
+const PROVISIONAL_LOOKBACK: Duration = Duration::hours(3);
 
 /// Fixed Par rules: temperatures compare whole degrees; wind speed is exact
 /// knots; direction is par within 22° either way; rain within 0.1", snow
@@ -93,6 +98,46 @@ impl OutcomeSource for NoaaWeather {
 
     fn default_metrics(&self) -> Vec<&'static str> {
         vec![TEMP_HIGH, TEMP_LOW, WIND_SPEED]
+    }
+
+    /// Full days, or a day or night half. NOAA forecasts one daytime high
+    /// (7am-7pm local) and one overnight low (7pm-8am) a day, scored in the
+    /// window holding their midpoint. A window of at least 24 hours holds one
+    /// of each. For every US state, in summer and winter time, highs are
+    /// centred from 17:00 to 23:00 UTC and lows from 05:30 to 11:30 UTC, so
+    /// 12:00-24:00 UTC holds every station's high and 00:00-12:00 UTC every
+    /// station's low. Relative humidity periods don't follow those halves.
+    fn check_window(&self, window: ObservationWindow, metrics: &[String]) -> Result<(), String> {
+        let length = window.end - window.start;
+        if length >= Duration::DAY {
+            return Ok(());
+        }
+        let start = window.start.to_offset(time::UtcOffset::UTC);
+        let half = (length == Duration::hours(12)
+            && start.time().minute() == 0
+            && start.time().second() == 0
+            && start.time().nanosecond() == 0)
+            .then_some(start.hour())
+            .and_then(|hour| match hour {
+                12 => Some(("day", "12:00-24:00 UTC", TEMP_LOW)),
+                0 => Some(("night", "00:00-12:00 UTC", TEMP_HIGH)),
+                _ => None,
+            });
+        let Some((name, hours, missing)) = half else {
+            return Err(
+                "the observation window must be at least 24 hours, or a day (12:00-24:00 UTC) or night (00:00-12:00 UTC) half"
+                    .into(),
+            );
+        };
+        match metrics
+            .iter()
+            .find(|metric| *metric == missing || *metric == HUMIDITY)
+        {
+            Some(metric) => Err(format!(
+                "a {name} window ({hours}) cannot score {metric}; it holds no whole {metric} period"
+            )),
+            None => Ok(()),
+        }
     }
 
     fn validate_target(&self, target: &str) -> Result<(), SourceError> {
@@ -196,9 +241,17 @@ impl NoaaWeather {
                 })
                 .collect());
         }
-        let forecasts = self
+        // The same whole-period baseline settlement uses, from the latest
+        // publication before the window (or before now, until it opens).
+        // Reading only recent publications keeps each refresh cheap.
+        let issued_before = window.start.min(OffsetDateTime::now_utc());
+        let forecast_request = ForecastRequest {
+            generated_start: Some(issued_before.saturating_sub(PROVISIONAL_LOOKBACK)),
+            ..forecast_request
+        };
+        let baselines = self
             .weather
-            .forecasts_data(&forecast_request, targets.to_vec())
+            .forecast_assessment(&forecast_request, targets.to_vec())
             .await
             .map_err(unavailable)?;
         let observations = self
@@ -206,10 +259,20 @@ impl NoaaWeather {
             .observation_data(&observation_request, targets.to_vec())
             .await
             .map_err(unavailable)?;
-
-        Ok(targets
-            .iter()
-            .flat_map(|target| station_readings(target, window, &forecasts, &observations))
+        Ok(baselines
+            .into_iter()
+            .map(|baseline| {
+                let observation = observations
+                    .iter()
+                    .filter(|row| row.station_id == baseline.station_id)
+                    .min_by(|a, b| a.start_time.cmp(&b.start_time));
+                Reading {
+                    observed: observation.and_then(|row| observed_metric(row, &baseline.metric)),
+                    target: baseline.station_id,
+                    metric: baseline.metric,
+                    baseline: baseline.value,
+                }
+            })
             .collect())
     }
 }
@@ -240,314 +303,169 @@ fn unavailable(error: weather_data::Error) -> SourceError {
     }
 }
 
-/// Readings for one station over the event's UTC days. Every day must have
-/// a forecast before an aggregate can be compared with the full observed
-/// window. Missing metrics on any day keep that metric's baseline missing.
-///
-/// Missing values stay missing. They earn no provisional points and block
-/// settlement when the event enables that metric:
-/// - NDFD/DWML forecasts mark missing values with `xsi:nil="true"`; nil is
-///   "no forecast", not zero
-///   (<https://graphical.weather.gov/xml/mdl/XML/Design/MDL_XML_Design.htm>).
-/// - METAR fields are all optional, and `wind_dir_degrees` may be `VRB`
-///   (variable); calm is reported explicitly as 0° at 0 kt, so an absent
-///   direction is not north (<https://aviationweather.gov/data/schema/metar2_0.xsd>).
-/// - METAR has no humidity; the parquet query derives it from temperature
-///   and dewpoint, so a missing dewpoint means unknown humidity.
-/// - Hourly precipitation is omitted when none fell at AO2 stations only;
-///   the daemon records that as 0 and leaves other stations missing.
-fn station_readings(
-    target: &str,
-    window: ObservationWindow,
-    forecasts: &[Forecast],
-    observations: &[Observation],
-) -> Vec<Reading> {
-    if window.start >= window.end {
-        return vec![];
-    }
-    let first_day = window.start.to_offset(UtcOffset::UTC).date();
-    let last_day = (window.end - Duration::nanoseconds(1))
-        .to_offset(UtcOffset::UTC)
-        .date();
-    let expected_days = (last_day - first_day).whole_days() + 1;
-    let mut daily = BTreeMap::new();
-    let mut unique = true;
-    for forecast in forecasts.iter().filter(|row| row.station_id == target) {
-        let Some(date) = forecast
-            .date
-            .get(..10)
-            .and_then(|date| Date::parse(date, format_description!("[year]-[month]-[day]")).ok())
-        else {
-            continue;
-        };
-        if date >= first_day && date <= last_day {
-            // A duplicate daily result is ambiguous. Do not make scoring
-            // depend on which row happened to arrive last.
-            unique &= daily.insert(date, forecast).is_none();
-        }
-    }
-    if daily.is_empty() {
-        return vec![];
-    }
-    let complete = unique && daily.len() as i64 == expected_days;
-    let daily: Vec<&Forecast> = daily.into_values().collect();
-    let observation = observations
-        .iter()
-        .filter(|observation| observation.station_id == target)
-        .min_by(|a, b| a.start_time.cmp(&b.start_time));
-    let observed = |value: fn(&Observation) -> Option<f64>| observation.and_then(value);
-    let reading = |metric: &str, baseline: Option<f64>, observed: Option<f64>| Reading {
-        target: target.to_owned(),
-        metric: metric.to_owned(),
-        baseline,
-        observed,
-    };
-    let aggregate = |field: fn(&Forecast) -> Option<f64>, reduce: fn(f64, f64) -> f64| {
-        if !complete {
-            return None;
-        }
-        daily
-            .iter()
-            .map(|forecast| field(forecast).filter(|value| value.is_finite()))
-            .collect::<Option<Vec<_>>>()?
-            .into_iter()
-            .reduce(reduce)
-            .filter(|value| value.is_finite())
-    };
-    let wind_speed = aggregate(
-        |forecast| forecast.wind_speed.map(|value| value as f64),
-        f64::max,
-    );
-    // Daily query directions belong to that day's maximum wind. Use the
-    // same pair across the event, breaking equal-speed ties by latest UTC
-    // day. A missing direction at the peak stays missing.
-    let wind_direction = wind_speed
-        .and_then(|speed| {
-            daily
-                .iter()
-                .rev()
-                .find(|forecast| forecast.wind_speed.map(|value| value as f64) == Some(speed))
-        })
-        .and_then(|forecast| forecast.wind_direction)
-        .map(|direction| direction as f64);
-    vec![
-        reading(
-            TEMP_HIGH,
-            aggregate(|forecast| Some(forecast.temp_high as f64), f64::max),
-            observed(|o| Some(o.temp_high)),
-        ),
-        reading(
-            TEMP_LOW,
-            aggregate(|forecast| Some(forecast.temp_low as f64), f64::min),
-            observed(|o| Some(o.temp_low)),
-        ),
-        reading(
-            WIND_SPEED,
-            wind_speed,
-            observed(|o| o.wind_speed.map(|value| value as f64)),
-        ),
-        reading(
-            WIND_DIRECTION,
-            wind_direction,
-            observed(|o| o.wind_direction.map(|value| value as f64)),
-        ),
-        reading(
-            RAIN_AMT,
-            aggregate(|forecast| forecast.rain_amt, |a, b| a + b),
-            observed(|o| o.rain_amt),
-        ),
-        reading(
-            SNOW_AMT,
-            aggregate(|forecast| forecast.snow_amt, |a, b| a + b),
-            observed(|o| o.snow_amt),
-        ),
-        reading(
-            HUMIDITY,
-            aggregate(
-                |forecast| forecast.humidity_max.map(|value| value as f64),
-                f64::max,
-            ),
-            observed(|o| o.humidity.map(|value| value as f64)),
-        ),
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+    use crate::weather_data::{DailyObservation, Error, Forecast, ForecastAssessment, Station};
+    use std::sync::Mutex;
+    use time::macros::datetime;
 
-    fn window(start: &str, end: &str) -> ObservationWindow {
-        ObservationWindow {
-            start: OffsetDateTime::parse(start, &Rfc3339).unwrap(),
-            end: OffsetDateTime::parse(end, &Rfc3339).unwrap(),
+    /// Whole-period baselines for every station: a high of 70 and no low.
+    #[derive(Default)]
+    struct Weather {
+        requests: Mutex<Vec<ForecastRequest>>,
+    }
+
+    #[async_trait]
+    impl WeatherData for Weather {
+        async fn forecasts_data(
+            &self,
+            _: &ForecastRequest,
+            _: Vec<String>,
+        ) -> Result<Vec<Forecast>, Error> {
+            unreachable!("readings use the whole-period baseline")
+        }
+        async fn forecast_assessment(
+            &self,
+            request: &ForecastRequest,
+            stations: Vec<String>,
+        ) -> Result<Vec<ForecastAssessment>, Error> {
+            self.requests.lock().unwrap().push(request.clone());
+            Ok(stations
+                .iter()
+                .flat_map(|station| {
+                    [(TEMP_HIGH, Some(70.0)), (TEMP_LOW, None)].map(|(metric, value)| {
+                        ForecastAssessment {
+                            station_id: station.clone(),
+                            metric: metric.into(),
+                            value,
+                            reason: value.is_none().then(|| "no forecast".into()),
+                            native_intervals: vec![],
+                        }
+                    })
+                })
+                .collect())
+        }
+        async fn observation_data(
+            &self,
+            _: &ObservationRequest,
+            _: Vec<String>,
+        ) -> Result<Vec<Observation>, Error> {
+            Ok(vec![Observation {
+                station_id: "KORD".into(),
+                start_time: "2026-01-01T00:00:00Z".into(),
+                end_time: "2026-01-01T23:00:00Z".into(),
+                temp_low: 50.0,
+                temp_high: 72.4,
+                latest_temp: None,
+                latest_temp_time: None,
+                wind_speed: Some(9),
+                temp_unit_code: "fahrenheit".into(),
+                wind_direction: None,
+                humidity: None,
+                rain_amt: None,
+                snow_amt: None,
+                ice_amt: None,
+            }])
+        }
+        async fn daily_observations(
+            &self,
+            _: &ObservationRequest,
+            _: Vec<String>,
+        ) -> Result<Vec<DailyObservation>, Error> {
+            Ok(vec![])
+        }
+        async fn stations(&self) -> Result<Vec<Station>, Error> {
+            Ok(vec![])
         }
     }
 
-    fn baseline(readings: &[Reading], metric: &str) -> Option<f64> {
-        readings
-            .iter()
-            .find(|reading| reading.metric == metric)
-            .unwrap()
-            .baseline
-    }
-
-    fn forecast(station: &str, date: &str, temp_high: i64) -> Forecast {
-        Forecast {
-            station_id: station.into(),
-            date: date.into(),
-            start_time: String::new(),
-            end_time: String::new(),
-            temp_low: 40,
-            temp_high,
-            wind_speed: None,
-            wind_direction: None,
-            humidity_max: Some(80),
-            humidity_min: None,
-            temp_unit_code: "fahrenheit".into(),
-            precip_chance: None,
-            rain_amt: None,
-            snow_amt: None,
-            ice_amt: None,
-        }
-    }
-
     #[test]
-    fn only_forecast_days_inside_the_utc_window_are_compared() {
-        let window = window("2030-01-01T02:00:00+02:00", "2030-01-02T02:00:00+02:00");
-        let forecasts = vec![
-            forecast("KORD", "2030-01-02", 55),
-            forecast("KORD", "2030-01-01 00:00:00", 50),
-            forecast("KORD", "2029-12-31", 90),
-            forecast("KSAW", "2030-01-01", 10),
-        ];
-        let readings = station_readings("KORD", window, &forecasts, &[]);
-        let temp_high = readings.iter().find(|r| r.metric == TEMP_HIGH).unwrap();
-        assert_eq!(temp_high.baseline, Some(50.0));
-        assert_eq!(temp_high.observed, None);
-        let wind = readings.iter().find(|r| r.metric == WIND_SPEED).unwrap();
-        assert_eq!(wind.baseline, None, "a nil forecast is not calm");
-        assert!(station_readings("KMSP", window, &forecasts, &[]).is_empty());
-    }
-
-    #[test]
-    fn multi_day_baselines_aggregate_the_same_days_as_observations() {
-        let window = window("2030-01-01T00:00:00Z", "2030-01-03T00:00:00Z");
-        let mut first = forecast("KORD", "2030-01-01", 50);
-        first.wind_speed = Some(10);
-        first.rain_amt = Some(0.25);
-        first.snow_amt = Some(0.0);
-        let mut second = forecast("KORD", "2030-01-02", 70);
-        second.temp_low = 30;
-        second.wind_speed = Some(15);
-        second.humidity_max = Some(90);
-        second.rain_amt = Some(0.5);
-        second.snow_amt = Some(1.0);
-        let forecasts = [second, first];
-        let readings = station_readings("KORD", window, &forecasts, &[]);
-        assert_eq!(baseline(&readings, TEMP_HIGH), Some(70.0));
-        assert_eq!(baseline(&readings, TEMP_LOW), Some(30.0));
-        assert_eq!(baseline(&readings, WIND_SPEED), Some(15.0));
-        assert_eq!(baseline(&readings, HUMIDITY), Some(90.0));
-        assert_eq!(baseline(&readings, RAIN_AMT), Some(0.75));
-        assert_eq!(baseline(&readings, SNOW_AMT), Some(1.0));
-    }
-
-    #[test]
-    fn missing_daily_coverage_never_becomes_a_partial_baseline() {
-        let window = window("2030-01-01T12:00:00Z", "2030-01-03T12:00:00Z");
-        let forecasts = [
-            forecast("KORD", "2030-01-01", 50),
-            forecast("KORD", "2030-01-03", 70),
-        ];
-        let readings = station_readings("KORD", window, &forecasts, &[]);
-        assert!(!readings.is_empty());
-        assert!(readings.iter().all(|reading| reading.baseline.is_none()));
-    }
-
-    #[test]
-    fn missing_daily_precipitation_does_not_erase_other_complete_metrics() {
-        let window = window("2030-01-01T00:00:00Z", "2030-01-03T00:00:00Z");
-        let mut first = forecast("KORD", "2030-01-01", 50);
-        first.rain_amt = Some(0.25);
-        first.snow_amt = Some(0.0);
-        let mut second = forecast("KORD", "2030-01-02", 70);
-        second.snow_amt = Some(0.0);
-        let readings = station_readings("KORD", window, &[first, second], &[]);
-        assert_eq!(baseline(&readings, RAIN_AMT), None);
-        assert_eq!(baseline(&readings, SNOW_AMT), Some(0.0));
-        assert_eq!(baseline(&readings, TEMP_HIGH), Some(70.0));
-    }
-
-    #[test]
-    fn wind_direction_belongs_to_the_strongest_wind_not_the_largest_bearing() {
-        let window = window("2030-01-01T00:00:00Z", "2030-01-03T00:00:00Z");
-        let mut first = forecast("KORD", "2030-01-01", 50);
-        first.wind_speed = Some(5);
-        first.wind_direction = Some(350);
-        let mut second = forecast("KORD", "2030-01-02", 70);
-        second.wind_speed = Some(20);
-        second.wind_direction = Some(10);
-        let mut forecasts = [second, first];
-        let readings = station_readings("KORD", window, &forecasts, &[]);
-        assert_eq!(baseline(&readings, WIND_SPEED), Some(20.0));
-        assert_eq!(baseline(&readings, WIND_DIRECTION), Some(10.0));
-
-        forecasts[0].wind_direction = None;
-        let missing = station_readings("KORD", window, &forecasts, &[]);
-        assert_eq!(baseline(&missing, WIND_DIRECTION), None);
-
-        forecasts[0].wind_direction = Some(10);
-        forecasts[1].wind_speed = None;
-        let incomplete = station_readings("KORD", window, &forecasts, &[]);
-        assert_eq!(baseline(&incomplete, WIND_SPEED), None);
-        assert_eq!(baseline(&incomplete, WIND_DIRECTION), None);
-    }
-
-    #[test]
-    fn equal_peak_winds_use_the_latest_day_even_when_its_direction_is_missing() {
-        let window = window("2030-01-01T00:00:00Z", "2030-01-03T00:00:00Z");
-        let mut first = forecast("KORD", "2030-01-01", 50);
-        first.wind_speed = Some(20);
-        first.wind_direction = Some(350);
-        let mut second = forecast("KORD", "2030-01-02", 70);
-        second.wind_speed = Some(20);
-        second.wind_direction = Some(10);
-        let mut forecasts = [second, first];
-        let readings = station_readings("KORD", window, &forecasts, &[]);
-        assert_eq!(baseline(&readings, WIND_DIRECTION), Some(10.0));
-        forecasts.reverse();
-        let reordered = station_readings("KORD", window, &forecasts, &[]);
-        assert_eq!(readings, reordered);
-        forecasts[1].wind_direction = None;
-        let missing = station_readings("KORD", window, &forecasts, &[]);
-        assert_eq!(baseline(&missing, WIND_DIRECTION), None);
-    }
-
-    #[test]
-    fn duplicate_daily_forecasts_cannot_make_scoring_depend_on_query_order() {
-        let window = window("2030-01-01T00:00:00Z", "2030-01-02T00:00:00Z");
-        let mut forecasts = [
-            forecast("KORD", "2030-01-01", 50),
-            forecast("KORD", "2030-01-01", 70),
-        ];
-        let first = station_readings("KORD", window, &forecasts, &[]);
-        forecasts.reverse();
-        let second = station_readings("KORD", window, &forecasts, &[]);
-        assert_eq!(first, second);
-        assert!(first.iter().all(|reading| reading.baseline.is_none()));
-    }
-
-    #[test]
-    fn every_metric_has_a_reading() {
-        let readings = station_readings(
-            "KORD",
-            window("2030-01-01T00:00:00Z", "2030-01-02T00:00:00Z"),
-            &[forecast("KORD", "2030-01-01", 50)],
-            &[],
+    fn full_days_and_day_or_night_halves_can_be_attested() {
+        let noaa = NoaaWeather::new(Arc::new(Weather::default()));
+        let window = |start: OffsetDateTime, hours| ObservationWindow {
+            start,
+            end: start + Duration::hours(hours),
+        };
+        let metrics = |ids: &[&str]| ids.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+        let full = metrics(&[TEMP_HIGH, TEMP_LOW, WIND_SPEED]);
+        let noon = datetime!(2026-01-01 12:00 UTC);
+        let midnight = datetime!(2026-01-01 00:00 UTC);
+        assert!(
+            noaa.check_window(window(datetime!(2026-01-01 05:17 UTC), 24), &full)
+                .is_ok()
         );
-        for metric in METRICS {
-            assert!(readings.iter().any(|reading| reading.metric == metric.id));
+        assert!(noaa.check_window(window(midnight, 72), &full).is_ok());
+        assert!(
+            noaa.check_window(window(noon, 12), &metrics(&[TEMP_HIGH, WIND_SPEED]))
+                .is_ok()
+        );
+        assert!(
+            noaa.check_window(
+                window(midnight, 12),
+                &metrics(&[TEMP_LOW, WIND_SPEED, RAIN_AMT])
+            )
+            .is_ok()
+        );
+        let day = noaa.check_window(window(noon, 12), &full).unwrap_err();
+        assert!(
+            day.contains("day window") && day.contains(TEMP_LOW),
+            "{day}"
+        );
+        let night = noaa.check_window(window(midnight, 12), &full).unwrap_err();
+        assert!(
+            night.contains("night window") && night.contains(TEMP_HIGH),
+            "{night}"
+        );
+        assert!(
+            noaa.check_window(window(noon, 12), &metrics(&[HUMIDITY]))
+                .is_err()
+        );
+        for (start, hours) in [
+            (datetime!(2026-01-01 13:00 UTC), 12),
+            (noon, 13),
+            (noon, 2),
+            (datetime!(2026-01-01 12:00:30 UTC), 12),
+        ] {
+            assert!(
+                noaa.check_window(window(start, hours), &metrics(&[WIND_SPEED]))
+                    .is_err(),
+                "{start} for {hours} h"
+            );
         }
+    }
+
+    /// Provisional readings (and so the line history) score against the
+    /// baseline settlement uses, read from the last few hours of publications.
+    #[tokio::test]
+    async fn readings_use_the_whole_period_baseline_from_recent_publications() {
+        let weather = Arc::new(Weather::default());
+        let noaa = NoaaWeather::new(weather.clone());
+        let start = datetime!(2026-01-01 00:00 UTC);
+        let window = ObservationWindow {
+            start,
+            end: start + Duration::DAY,
+        };
+        let readings = noaa
+            .readings(window, &["KORD".into(), "KDEN".into()])
+            .await
+            .unwrap();
+        let find = |target: &str, metric: &str| {
+            readings
+                .iter()
+                .find(|reading| reading.target == target && reading.metric == metric)
+                .unwrap()
+                .clone()
+        };
+        let high = find("KORD", TEMP_HIGH);
+        assert_eq!((high.baseline, high.observed), (Some(70.0), Some(72.4)));
+        assert_eq!(find("KORD", TEMP_LOW).baseline, None);
+        assert_eq!(find("KDEN", TEMP_HIGH).observed, None);
+        let request = weather.requests.lock().unwrap()[0].clone();
+        assert_eq!(request.generated_start, Some(start - PROVISIONAL_LOOKBACK));
+        assert_eq!(
+            request.generated_end,
+            Some(start - Duration::nanoseconds(1))
+        );
     }
 }

@@ -1055,11 +1055,29 @@ impl StationLookup {
     }
 }
 
-/// The NDFD request for a batch: the coming week, starting at the nearest
-/// hour.
+/// The NDFD request for a batch: the coming week.
 fn get_url(city_weather: &CityWeather) -> Result<String, Error> {
-    let now = OffsetDateTime::now_utc() + Duration::minutes(30);
-    let begin = now
+    let (begin, end) = request_window(OffsetDateTime::now_utc())?;
+    Ok(format!(
+        "https://graphical.weather.gov/xml/sample_products/browser_interface/ndfdXMLclient.php?listLatLon={}&product=time-series&begin={begin}&end={end}&Unit=e&maxt=maxt&mint=mint&wspd=wspd&wdir=wdir&pop12=pop12&qpf=qpf&snow=snow&snowratio=snowratio&iceaccum=iceaccum&maxrh=maxrh&minrh=minrh",
+        city_weather.get_coordinates_url(),
+    ))
+}
+
+/// How far before the fetch a request's `begin` is written.
+const REQUEST_LEAD: Duration = Duration::hours(6);
+
+/// `begin` and `end` for a request made at `now`.
+///
+/// NDFD reads both as US Eastern local time; they carry no offset. Writing
+/// them as UTC made each file's hourly values (wind) start four or five
+/// hours after the fetch, so the newest file before an event never covered
+/// its start and settlement could not form a wind baseline. `begin` is
+/// written six hours before the fetch, on the hour: read as Eastern (UTC-4
+/// or UTC-5) it falls one to two hours before the fetch all year, and read as
+/// UTC it would only start earlier.
+fn request_window(now: OffsetDateTime) -> Result<(String, String), Error> {
+    let begin = (now - REQUEST_LEAD)
         .replace_minute(0)
         .and_then(|time| time.replace_second(0))
         .and_then(|time| time.replace_nanosecond(0))
@@ -1067,12 +1085,52 @@ fn get_url(city_weather: &CityWeather) -> Result<String, Error> {
     let format = format_description!(
         "[year]-[month padding:zero]-[day padding:zero]T[hour padding:zero]:[minute padding:zero]:[second padding:zero]"
     );
-    Ok(format!(
-        "https://graphical.weather.gov/xml/sample_products/browser_interface/ndfdXMLclient.php?listLatLon={}&product=time-series&begin={}&end={}&Unit=e&maxt=maxt&mint=mint&wspd=wspd&wdir=wdir&pop12=pop12&qpf=qpf&snow=snow&snowratio=snowratio&iceaccum=iceaccum&maxrh=maxrh&minrh=minrh",
-        city_weather.get_coordinates_url(),
+    Ok((
         begin.format(&format)?,
         (begin + Duration::weeks(1)).format(&format)?,
     ))
+}
+
+#[cfg(test)]
+mod request_window_tests {
+    use super::*;
+    use time::{PrimitiveDateTime, UtcOffset, macros::datetime};
+
+    /// The instant NDFD reads `text` as, at a US Eastern offset.
+    fn as_eastern(text: &str, hours: i8) -> OffsetDateTime {
+        let format = format_description!(
+            "[year]-[month padding:zero]-[day padding:zero]T[hour padding:zero]:[minute padding:zero]:[second padding:zero]"
+        );
+        PrimitiveDateTime::parse(text, &format)
+            .unwrap()
+            .assume_offset(UtcOffset::from_hms(hours, 0, 0).unwrap())
+    }
+
+    #[test]
+    fn hourly_values_start_before_the_fetch_in_either_eastern_offset() {
+        for now in [
+            datetime!(2026-09-27 22:31:47 UTC),
+            datetime!(2026-01-15 00:05:00 UTC),
+            datetime!(2026-03-08 06:59:59 UTC),
+        ] {
+            let (begin, end) = request_window(now).unwrap();
+            for offset in [-4, -5] {
+                let first = as_eastern(&begin, offset);
+                assert!(
+                    first <= now - Duration::hours(1),
+                    "{now} {begin} at {offset}"
+                );
+                assert!(
+                    first >= now - Duration::hours(3),
+                    "{now} {begin} at {offset}"
+                );
+            }
+            assert_eq!(
+                as_eastern(&end, -4) - as_eastern(&begin, -4),
+                Duration::weeks(1)
+            );
+        }
+    }
 }
 
 #[cfg(test)]

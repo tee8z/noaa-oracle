@@ -104,7 +104,7 @@ fn rain_row(begin: i64, finish: i64, amount: f64) -> Row {
 }
 
 #[test]
-fn precipitation_requires_the_entire_exact_nonoverlapping_window() {
+fn precipitation_sums_the_periods_centred_in_the_window_without_gaps() {
     let complete = [
         rain_row(start(), start() + 6 * HOUR, 0.25),
         rain_row(start() + 6 * HOUR, start() + 12 * HOUR, 0.5),
@@ -119,8 +119,13 @@ fn precipitation_requires_the_entire_exact_nonoverlapping_window() {
     );
     assert_eq!(
         result(&complete, "rain_amt", start() + 11 * HOUR),
-        None,
-        "no partial period proration"
+        Some(0.75),
+        "a period counts whole in the window that holds its midpoint"
+    );
+    assert_eq!(
+        result(&complete, "rain_amt", start() + 8 * HOUR),
+        Some(0.25),
+        "the second period is centred in the next window"
     );
     assert_eq!(
         result(&complete[..1], "rain_amt", start() + 12 * HOUR),
@@ -295,8 +300,17 @@ fn native_extrema_stay_inside_window_and_opposite_half_day_gaps_are_allowed() {
             "temp_high",
             start() + 36 * HOUR
         ),
+        Some(65.0),
+        "the next day's high is centred at the window's end, in the next window"
+    );
+    assert_eq!(
+        result(
+            std::slice::from_ref(&high),
+            "temp_high",
+            start() + 40 * HOUR
+        ),
         None,
-        "missing trailing period cannot be an opposing half-day gap"
+        "the next day's high is centred in the window but missing"
     );
     assert_eq!(
         result(
@@ -305,7 +319,16 @@ fn native_extrema_stay_inside_window_and_opposite_half_day_gaps_are_allowed() {
             start() + 12 * HOUR
         ),
         None,
-        "cannot include beyond event end"
+        "a period centred at the window's end belongs to the next window"
+    );
+    assert_eq!(
+        result(
+            std::slice::from_ref(&high),
+            "temp_high",
+            start() + 13 * HOUR
+        ),
+        Some(65.0),
+        "a period counts in the window that holds its midpoint"
     );
     assert_eq!(
         result(&[high], "temp_high", start() + 24 * HOUR),
@@ -907,4 +930,52 @@ fn compatibility_never_suggests_a_malformed_or_shifted_native_boundary() {
             .iter()
             .all(|metric| metric.native_intervals.is_empty())
     );
+}
+
+/// A 24-hour window starting at any hour holds exactly one daytime high and
+/// one overnight low, whichever time zone the station's periods follow.
+#[test]
+fn any_day_long_window_holds_one_high_and_one_low() {
+    // Daytime highs 13:00-01:00 UTC and overnight lows 01:00-14:00 UTC, as for
+    // a US Central station, for three days.
+    let mut rows = vec![];
+    for day in 0..3 {
+        let noon = start() + day * 24 * HOUR;
+        rows.push(row(
+            noon + 13 * HOUR,
+            noon + 25 * HOUR,
+            &[("max_temp", Some(70.0 + day as f64))],
+        ));
+        rows.push(row(
+            noon + HOUR,
+            noon + 14 * HOUR,
+            &[("min_temp", Some(50.0 - day as f64))],
+        ));
+    }
+    for offset in 0..24 {
+        let window_start = start() + 12 * HOUR + offset * HOUR;
+        let window_end = window_start + 24 * HOUR;
+        let assessed = evaluate(
+            &rows,
+            &documents(&rows),
+            &["KPWM".into()],
+            window_start,
+            window_end,
+        );
+        let value = |metric: &str| {
+            assessed
+                .iter()
+                .find(|value| value.metric == metric)
+                .unwrap()
+                .value
+        };
+        assert!(
+            value("temp_high").is_some(),
+            "high for a window {offset} h in"
+        );
+        assert!(
+            value("temp_low").is_some(),
+            "low for a window {offset} h in"
+        );
+    }
 }
