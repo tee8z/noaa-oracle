@@ -1,6 +1,8 @@
 use super::*;
 use crate::{Time, parse_xml};
+use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, SerializedFileReader};
+use std::fs::File;
 use time::macros::datetime;
 use tokio::io::AsyncReadExt;
 
