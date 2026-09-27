@@ -15,7 +15,7 @@
 
 use dlctix::{
     attestation_locking_point, attestation_secret,
-    musig2::secp256k1::{PublicKey, Secp256k1, SecretKey, XOnlyPublicKey},
+    musig2::secp256k1::{Keypair, PublicKey, Secp256k1, SecretKey, XOnlyPublicKey},
     secp::{MaybePoint, MaybeScalar, Point, Scalar},
 };
 use nostr::{key::PublicKey as NostrPublicKey, nips::nip19::ToBech32};
@@ -28,6 +28,8 @@ use std::{
 };
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+use crate::statement::{SignedStatement, Statement};
 
 const PEM_LABEL: &str = "EC PRIVATE KEY";
 const NONCE_TAG: &[u8] = b"noaa-oracle/event-nonce/v1";
@@ -171,6 +173,20 @@ impl SigningKey {
         let key = NostrPublicKey::from_byte_array(self.x_only_public_key().serialize());
         let Ok(npub) = key.to_bech32();
         npub
+    }
+
+    /// Signs `statement` with BIP340 over its tagged digest. No auxiliary randomness, so the
+    /// same statement always gets the same signature. The tag keeps these signatures apart from
+    /// attestations and nostr events made with the same key.
+    pub fn sign_statement(&self, statement: Statement) -> SignedStatement {
+        let secp = Secp256k1::signing_only();
+        let mut keypair = Keypair::from_secret_key(&secp, &self.secret);
+        let signature = secp.sign_schnorr_no_aux_rand(&statement.digest(), &keypair);
+        keypair.non_secure_erase();
+        SignedStatement {
+            statement,
+            signature: signature.to_string(),
+        }
     }
 
     /// Picks nonce material for a new event.

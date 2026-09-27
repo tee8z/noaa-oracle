@@ -214,6 +214,96 @@ The event response carries `nonce_point` `R` and
 `R`, and the outcome list. `event_announcement.expiry` is one day after the
 signing date.
 
+## Signed event statement
+
+A locking point depends only on `P`, `R`, and the outcome's message; a message
+names no event. So a party that checks a contract without seeing its event,
+such as a verifier inside an enclave, needs proof that `R` belongs to an event
+with the outcomes and terms it expects. Otherwise it could be handed the nonce
+point of another event, for example one already attested.
+
+Once every entry is in, `GET /oracle/events/{id}` carries `statement`:
+
+```json
+{"statement": {
+  "event_id": "<id>",
+  "signing_date": 1790172800, "expiry": 1790259200,
+  "nonce_point": "<R, compressed hex>",
+  "outcomes": {
+    "kind": "ranking", "number_of_places_win": 1,
+    "entry_ids": ["<entry 0>", "<entry 1>", "<entry 2>"]
+  },
+  "terms": {
+    "kind": "observation", "source": "noaa_weather",
+    "start_observation_date": 1790000000, "end_observation_date": 1790086400,
+    "targets": ["KORD", "KSAW"], "scoring_fields": ["temp_high", "temp_low", "wind_speed"],
+    "number_of_values_per_entry": 3,
+    "scoring_rules": "lines",
+    "lines": [
+      {"target": "KORD", "metric": "temp_high", "lower": -2.5, "upper": -0.5, "window_hours": 24}
+    ]
+  }
+ },
+ "signature": "<BIP340 signature, hex>"}
+```
+
+A statement has three layers:
+
+- **Core**, which every DLC on the event needs: the event, when it is attested,
+  its expiry, and its nonce point.
+- **`outcomes`**: how the outcomes are listed and which message each attests.
+  Every event ranks its entries today (`ranking`): `entry_ids` are in ascending
+  id order, so entry `i` is outcome index `i`, and the outcomes are those of
+  [Outcomes and announcement](#outcomes-and-announcement).
+- **`terms`**: what the event measures and how it is judged. Every event is an
+  `observation` event today: predictions scored against a source's observed
+  values over a window. Its `scoring_rules` and, for `lines` events, the lines
+  frozen at creation (sorted by target, then metric) decide every pick; see
+  [Scoring](#scoring). A `fixed` event has no lines and scores by the source's
+  rules.
+
+Each of `outcomes` and `terms` is tagged by `kind`. Later kinds extend a
+statement, for example tiers of a measured value for parametric cover, or
+other sources such as tides or space weather. A client must refuse a kind or
+field it does not know. Dates are UNIX seconds, rounded down.
+
+The signature is BIP340 by the oracle key `P` over the tagged hash
+`SHA256(SHA256(tag) || SHA256(tag) || message)` with tag
+`noaa-oracle/statement/v1`. `message` is the core, then each part's kind and
+fields:
+
+| Field | Encoding |
+| --- | --- |
+| `event_id` | 16 bytes |
+| `signing_date` | 8-byte big-endian signed integer |
+| `expiry` | 4-byte big-endian |
+| `nonce_point` | 33 bytes, compressed |
+| `outcomes.kind` | string |
+| `ranking`: `number_of_places_win` | 4-byte big-endian |
+| `ranking`: `entry_ids` | 2-byte big-endian count, then 16 bytes each |
+| `terms.kind` | string |
+| `observation`: `source` | string |
+| `observation`: `start_observation_date`, `end_observation_date` | 8-byte big-endian signed integers each |
+| `observation`: `targets`, `scoring_fields` | 2-byte big-endian count, then each string |
+| `observation`: `number_of_values_per_entry` | 4-byte big-endian |
+| `observation`: `scoring_rules` | string: `fixed` or `lines` |
+| `observation`: `lines` | 2-byte big-endian count, then each line |
+| each line: `target`, `metric` | strings |
+| each line: `lower`, `upper` | 8-byte big-endian IEEE 754 doubles, the exact values the event scores against |
+| each line: `window_hours` | 4-byte big-endian |
+
+A string is its UTF-8 length as a 2-byte big-endian integer, then its bytes.
+A new kind adds its own fields after its name; an existing kind's encoding
+never changes, and a changed one gets a new kind name. The oracle signs
+without auxiliary randomness, so a statement always carries the same
+signature. The tag keeps these signatures apart from attestations and nostr
+events made with the same key.
+
+A verifier checks the signature against `P`, checks every field against what
+it expects, and derives the locking points from `P`, `R`, and the outcome
+messages. The Rust type `oracle::statement::Statement` does this with
+`locking_points`.
+
 ## Attestation
 
 After the signing date, the oracle rereads validated forecasts and observations.
