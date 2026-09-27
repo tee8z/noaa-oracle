@@ -425,13 +425,16 @@ mod tests {
     #[test]
     fn actual_positive_hourly_source_is_replayed_and_cut_windows_are_unavailable() {
         let data = fixture();
-        assert_eq!(total(&[data.clone()], &requirement()), Some(Some(0.14)));
+        assert_eq!(
+            total(std::slice::from_ref(&data), &requirement()),
+            Some(Some(0.14))
+        );
         let mut req = requirement();
         req.start += Duration::minutes(10);
-        assert_eq!(total(&[data.clone()], &req), Some(None));
+        assert_eq!(total(std::slice::from_ref(&data), &req), Some(None));
         req = requirement();
         req.end += Duration::HOUR;
-        assert_eq!(total(&[data.clone()], &req), Some(None));
+        assert_eq!(total(std::slice::from_ref(&data), &req), Some(None));
         req = requirement();
         req.collected_after += Duration::HOUR;
         assert_eq!(total(&[data], &req), Some(None));
@@ -518,7 +521,7 @@ mod tests {
         let path = day.join("observations_2026-09-26T09:01:00Z.parquet");
         let receipt = json!({"version":"awc-history-v1","interval":"closed","batches":[{
             "station_ids":["KMCI"],"window_start":"2026-09-26T06:00:00Z","window_end":"2026-09-26T08:59:59Z",
-            "requested_at":"2026-09-26T08:59:00Z","completed_at":"2026-09-26T09:01:00Z","status":"complete",
+            "requested_at":"2026-09-26T09:00:00Z","completed_at":"2026-09-26T09:01:00Z","status":"complete",
             "source_url":"https://aviationweather.gov/api/data/metar?ids=KMCI&format=xml","source_sha256":"a".repeat(64),
             "response_status":200,"response_count":3,"report_count":3,"error":null}]}).to_string().replace('\'',"''");
         let shef = mci_fixture().to_string().replace('\'', "''");
