@@ -45,11 +45,6 @@ pub const MAX_PLACES: usize = 5;
 pub const MAX_OUTCOMES: usize = 20_000;
 pub const MAX_LOCATIONS: usize = 50;
 pub const MAX_LIST_LIMIT: usize = 100;
-/// Shortest observation window an event may watch. NOAA forecasts one
-/// daytime high and one overnight low a day; a window of at least a day holds
-/// one whole period of each, whatever its start or its stations' time zones,
-/// so every metric can be attested against a complete forecast.
-pub const MIN_WINDOW: Duration = Duration::DAY;
 /// Participants can claim a refund this long after the signing date if the
 /// oracle has not attested.
 const EXPIRY_AFTER_SIGNING: Duration = Duration::DAY;
@@ -112,10 +107,10 @@ pub enum EventRejection {
     UnknownSource(String),
     #[error("observation start must be before its end, and the end no later than the signing date")]
     DatesOutOfOrder,
-    #[error(
-        "the observation window must be at least 24 hours, so every forecast period it scores is whole"
-    )]
-    WindowTooShort,
+    /// The source cannot attest this window from whole periods (see
+    /// [`OutcomeSource::check_window`]).
+    #[error("{0}")]
+    Window(String),
     #[error("signing date is outside the DLC expiry range")]
     ExpiryOutOfRange,
     #[error("total_allowed_entries must be between 2 and {MAX_ENTRIES}, requested {0}")]
@@ -249,9 +244,6 @@ impl NewEvent {
         {
             return Err(EventRejection::DatesOutOfOrder);
         }
-        if event.end_observation_date - event.start_observation_date < MIN_WINDOW {
-            return Err(EventRejection::WindowTooShort);
-        }
         let entries = event.total_allowed_entries;
         let places = event.number_of_places_win;
         if !(2..=MAX_ENTRIES).contains(&entries) {
@@ -291,6 +283,15 @@ impl NewEvent {
         {
             return Err(EventRejection::ScoringFields);
         }
+        source
+            .check_window(
+                crate::sources::ObservationWindow {
+                    start: event.start_observation_date,
+                    end: event.end_observation_date,
+                },
+                &metrics,
+            )
+            .map_err(EventRejection::Window)?;
         let scoring_rules = event.scoring_rules.unwrap_or_default();
         if scoring_rules == ScoringRules::Lines
             && let Some(metric) = metrics.iter().find(|metric| {
@@ -1246,7 +1247,7 @@ mod tests {
         ));
         assert!(matches!(
             rejected(|e| e.end_observation_date = e.start_observation_date + Duration::hours(23)),
-            EventRejection::WindowTooShort
+            EventRejection::Window(_)
         ));
         assert!(
             build(event(3, 1)).is_ok(),

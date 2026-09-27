@@ -126,6 +126,14 @@ and dashboard counts unless the reader chooses "Show unlisted"; its page,
 `/events/{id}`, and the API still serve it, and responses carry the flag.
 Limits: 2–25 entries, 1–5 places and fewer places than entries, at most
 20,000 outcomes, 1–50 distinct targets, start < end ≤ signing date.
+Windows: the source must be able to attest the window from whole source
+periods. For NOAA that is a window of at least 24 hours (any start; one
+daytime high and one overnight low per day), or a 12-hour half: day,
+12:00–24:00 UTC, which cannot score `temp_low`, or night, 00:00–12:00 UTC,
+which cannot score `temp_high`. Neither half can score `humidity`. A
+forecast period counts in the window that holds its midpoint: NOAA's
+daytime highs are centred 17:00–23:00 UTC and overnight lows 05:30–11:30 UTC
+for every US state.
 `scoring_rules` is `fixed` (the default) or `lines`; see [Scoring](#scoring).
 A `lines` event is refused when a metric is not `calibrated`, or when a
 target and metric has no line yet. `lines_from_event` copies an earlier

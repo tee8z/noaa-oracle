@@ -100,6 +100,46 @@ impl OutcomeSource for NoaaWeather {
         vec![TEMP_HIGH, TEMP_LOW, WIND_SPEED]
     }
 
+    /// Full days, or a day or night half. NOAA forecasts one daytime high
+    /// (7am-7pm local) and one overnight low (7pm-8am) a day, scored in the
+    /// window holding their midpoint. A window of at least 24 hours holds one
+    /// of each. For every US state, in summer and winter time, highs are
+    /// centred from 17:00 to 23:00 UTC and lows from 05:30 to 11:30 UTC, so
+    /// 12:00-24:00 UTC holds every station's high and 00:00-12:00 UTC every
+    /// station's low. Relative humidity periods don't follow those halves.
+    fn check_window(&self, window: ObservationWindow, metrics: &[String]) -> Result<(), String> {
+        let length = window.end - window.start;
+        if length >= Duration::DAY {
+            return Ok(());
+        }
+        let start = window.start.to_offset(time::UtcOffset::UTC);
+        let half = (length == Duration::hours(12)
+            && start.time().minute() == 0
+            && start.time().second() == 0
+            && start.time().nanosecond() == 0)
+            .then_some(start.hour())
+            .and_then(|hour| match hour {
+                12 => Some(("day", "12:00-24:00 UTC", TEMP_LOW)),
+                0 => Some(("night", "00:00-12:00 UTC", TEMP_HIGH)),
+                _ => None,
+            });
+        let Some((name, hours, missing)) = half else {
+            return Err(
+                "the observation window must be at least 24 hours, or a day (12:00-24:00 UTC) or night (00:00-12:00 UTC) half"
+                    .into(),
+            );
+        };
+        match metrics
+            .iter()
+            .find(|metric| *metric == missing || *metric == HUMIDITY)
+        {
+            Some(metric) => Err(format!(
+                "a {name} window ({hours}) cannot score {metric}; it holds no whole {metric} period"
+            )),
+            None => Ok(()),
+        }
+    }
+
     fn validate_target(&self, target: &str) -> Result<(), SourceError> {
         validate_station_id(target).map_err(|error| SourceError::InvalidTarget {
             target: target.to_owned(),
@@ -337,6 +377,61 @@ mod tests {
         }
         async fn stations(&self) -> Result<Vec<Station>, Error> {
             Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn full_days_and_day_or_night_halves_can_be_attested() {
+        let noaa = NoaaWeather::new(Arc::new(Weather::default()));
+        let window = |start: OffsetDateTime, hours| ObservationWindow {
+            start,
+            end: start + Duration::hours(hours),
+        };
+        let metrics = |ids: &[&str]| ids.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+        let full = metrics(&[TEMP_HIGH, TEMP_LOW, WIND_SPEED]);
+        let noon = datetime!(2026-01-01 12:00 UTC);
+        let midnight = datetime!(2026-01-01 00:00 UTC);
+        assert!(
+            noaa.check_window(window(datetime!(2026-01-01 05:17 UTC), 24), &full)
+                .is_ok()
+        );
+        assert!(noaa.check_window(window(midnight, 72), &full).is_ok());
+        assert!(
+            noaa.check_window(window(noon, 12), &metrics(&[TEMP_HIGH, WIND_SPEED]))
+                .is_ok()
+        );
+        assert!(
+            noaa.check_window(
+                window(midnight, 12),
+                &metrics(&[TEMP_LOW, WIND_SPEED, RAIN_AMT])
+            )
+            .is_ok()
+        );
+        let day = noaa.check_window(window(noon, 12), &full).unwrap_err();
+        assert!(
+            day.contains("day window") && day.contains(TEMP_LOW),
+            "{day}"
+        );
+        let night = noaa.check_window(window(midnight, 12), &full).unwrap_err();
+        assert!(
+            night.contains("night window") && night.contains(TEMP_HIGH),
+            "{night}"
+        );
+        assert!(
+            noaa.check_window(window(noon, 12), &metrics(&[HUMIDITY]))
+                .is_err()
+        );
+        for (start, hours) in [
+            (datetime!(2026-01-01 13:00 UTC), 12),
+            (noon, 13),
+            (noon, 2),
+            (datetime!(2026-01-01 12:00:30 UTC), 12),
+        ] {
+            assert!(
+                noaa.check_window(window(start, hours), &metrics(&[WIND_SPEED]))
+                    .is_err(),
+                "{start} for {hours} h"
+            );
         }
     }
 
