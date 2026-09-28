@@ -1,5 +1,5 @@
-//! A station's forecast detail: the past week's forecasts against what was
-//! observed, and the coming days, in the reader's calendar days (see
+//! A station's forecast detail: today's and the past week's forecasts against
+//! what was observed, and the coming days, in the reader's calendar days (see
 //! [`super::local_day`]). Built when a reader opens a station, or ahead of
 //! time for the default airports in UTC days, and cached per calendar and
 //! day for known stations.
@@ -202,8 +202,8 @@ async fn coming_days(
     Ok(days)
 }
 
-/// The seven complete days before today: each period's latest retained
-/// forecast against calendar observations. Newest first.
+/// Today so far and the seven complete days before it: each period's latest
+/// retained forecast against calendar observations. Newest first.
 async fn past_week(
     state: &Arc<AppState>,
     station_id: &str,
@@ -212,7 +212,10 @@ async fn past_week(
     calendar: Calendar,
 ) -> Result<Vec<ForecastComparison>, weather_data::Error> {
     let first = today - Duration::days(7);
-    let (start, end) = (calendar.start_of(first), calendar.start_of(today));
+    let (start, end) = (
+        calendar.start_of(first),
+        calendar.start_of(today + Duration::days(1)),
+    );
     let forecasts = ForecastRequest {
         start: Some(start),
         end: Some(end),
@@ -223,7 +226,7 @@ async fn past_week(
     };
     let observations = ObservationRequest {
         start: Some(start),
-        end: Some(end - Duration::nanoseconds(1)),
+        end: Some(now.min(end - Duration::nanoseconds(1))),
         station_ids: station_id.to_string(),
         temperature_unit: TemperatureUnit::Fahrenheit,
     };
@@ -240,13 +243,14 @@ async fn past_week(
     let mut days: Vec<_> = forecasts
         .into_iter()
         .filter(|forecast| {
-            day(&forecast.date).is_some_and(|date| date >= start.as_str() && date < today.as_str())
+            day(&forecast.date).is_some_and(|date| date >= start.as_str() && date <= today.as_str())
         })
         .map(|forecast| {
             let observed = observed
                 .iter()
                 .find(|observed| day(&observed.date) == day(&forecast.date));
-            comparison(forecast, observed)
+            let so_far = day(&forecast.date) == Some(today.as_str());
+            comparison(forecast, observed, so_far)
         })
         .collect();
     days.sort_by(|a, b| b.date.cmp(&a.date));
@@ -273,7 +277,11 @@ fn display(forecast: Forecast) -> ForecastDisplay {
     }
 }
 
-fn comparison(forecast: Forecast, observed: Option<&DailyObservation>) -> ForecastComparison {
+fn comparison(
+    forecast: Forecast,
+    observed: Option<&DailyObservation>,
+    so_far: bool,
+) -> ForecastComparison {
     ForecastComparison {
         date: forecast.date,
         forecast_high: forecast.temp_high,
@@ -289,5 +297,6 @@ fn comparison(forecast: Forecast, observed: Option<&DailyObservation>) -> Foreca
         actual_humidity: observed.and_then(|observed| observed.humidity),
         actual_rain: observed.and_then(|observed| observed.rain_amt),
         actual_snow: observed.and_then(|observed| observed.snow_amt),
+        so_far,
     }
 }
