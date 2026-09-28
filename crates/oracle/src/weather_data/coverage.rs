@@ -151,33 +151,25 @@ impl Requirement {
                 continue;
             }
             for station in &self.stations {
-                if defect.station_ids.contains(station)
-                    && !successes.get(station.as_str()).is_some_and(|receipts| {
-                        receipts.iter().any(|(from, to, requested)| {
-                            *from <= start && *to >= end && *requested >= completed
-                        })
-                    })
-                {
+                // Requests made after the failure, together, must cover what it missed.
+                let later: Vec<_> = successes
+                    .get(station.as_str())
+                    .into_iter()
+                    .flatten()
+                    .filter(|(_, _, requested)| *requested >= completed)
+                    .map(|(from, to, _)| (*from, *to))
+                    .collect();
+                if defect.station_ids.contains(station) && !covers(later, start, end) {
                     return Err(Error::ObservationCoverage {
                         stations: vec![station.clone()],
-                        reason: "a received source response failed validation; a later successful request must cover the affected interval".into(),
+                        reason: "a received source response failed validation; later successful requests must cover the affected interval".into(),
                     });
                 }
             }
         }
         for station in &self.stations {
-            let mut station_spans = spans.remove(station.as_str()).unwrap_or_default();
-            station_spans.sort_unstable();
-            let mut through = self.start;
-            let mut covered_start = false;
-            for (start, end) in station_spans {
-                if end < self.start || start > through {
-                    continue;
-                }
-                covered_start = true;
-                through = through.max(end);
-            }
-            if !covered_start || through < self.end {
+            let station_spans = spans.remove(station.as_str()).unwrap_or_default();
+            if !covers(station_spans, self.start, self.end) {
                 return Err(Error::ObservationCoverage {
                     stations: vec![station.clone()],
                     reason: "successful source-history requests do not cover the full observation window".into(),
@@ -192,6 +184,25 @@ impl Requirement {
         }
         Ok(())
     }
+}
+
+/// Whether `spans` together cover `start` to `end` without a gap.
+fn covers(
+    mut spans: Vec<(OffsetDateTime, OffsetDateTime)>,
+    start: OffsetDateTime,
+    end: OffsetDateTime,
+) -> bool {
+    spans.sort_unstable();
+    let mut through = start;
+    let mut covered_start = false;
+    for (from, to) in spans {
+        if to < start || from > through {
+            continue;
+        }
+        covered_start = true;
+        through = through.max(to);
+    }
+    covered_start && through >= end
 }
 
 #[cfg(test)]
@@ -315,5 +326,46 @@ mod tests {
                 .verify_receipts(&[receipt(vec![fresh, defect])])
                 .is_ok()
         );
+    }
+
+    /// The daemon looks back four hours, so no single later request may span a long failed
+    /// interval; several that overlap do.
+    #[test]
+    fn several_later_requests_together_cover_a_failed_interval() {
+        let mut defect = batch(
+            "2026-01-17T00:00:00Z",
+            "2026-01-17T06:00:00Z",
+            "2026-01-17T06:17:00Z",
+        );
+        defect["status"] = json!("failed");
+        defect["failure_kind"] = json!("response");
+        defect["error"] = json!("truncated body");
+        let later = |start: &str, end: &str| batch(start, end, "2026-01-17T06:20:00Z");
+        let pieces = vec![
+            later("2026-01-17T00:00:00Z", "2026-01-17T02:00:00Z"),
+            later("2026-01-17T02:00:00Z", "2026-01-17T04:10:00Z"),
+            later("2026-01-17T04:00:00Z", "2026-01-17T06:15:00Z"),
+        ];
+        let mut with_defect = pieces.clone();
+        with_defect.push(defect.clone());
+        assert!(
+            requirement()
+                .verify_receipts(&[receipt(with_defect)])
+                .is_ok()
+        );
+        // A gap between the later requests leaves the failure uncovered.
+        let mut gapped = vec![pieces[0].clone(), pieces[2].clone(), defect.clone()];
+        gapped.push(batch(
+            "2026-01-17T02:00:00Z",
+            "2026-01-17T04:10:00Z",
+            "2026-01-17T06:16:00Z",
+        ));
+        assert!(requirement().verify_receipts(&[receipt(gapped)]).is_err());
+        // Requests made before the failure do not count toward covering it.
+        let mut early = pieces.clone();
+        early[1]["requested_at"] = json!("2026-01-17T06:16:00Z");
+        early[1]["completed_at"] = json!("2026-01-17T06:16:00Z");
+        early.push(defect);
+        assert!(requirement().verify_receipts(&[receipt(early)]).is_err());
     }
 }

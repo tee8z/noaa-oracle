@@ -42,6 +42,8 @@ pub struct ForecastComparison {
     pub actual_humidity: Option<i64>,
     pub actual_rain: Option<f64>,
     pub actual_snow: Option<f64>,
+    /// Today, which isn't over: its observations so far.
+    pub so_far: bool,
 }
 
 /// A station's recent forecasts against what was observed, and its coming
@@ -69,9 +71,12 @@ pub fn forecast_detail(
 fn past_week(comparisons: &[ForecastComparison], days: &str) -> Markup {
     html! {
         section class="past-performance" {
-            h4 class="title is-6" { "Past week: forecast vs observed" }
+            h4 class="title is-6" { "Today and the past week: forecast vs observed" }
             p class="forecast-note" {
                 "By day (" (days) "). Forecast summaries can include later revisions. Differences are observed − forecast; + means it came in higher."
+                @if comparisons.first().is_some_and(|day| day.so_far) {
+                    " Today isn't over, so its differences stay grey."
+                }
             }
             p class="forecast-note" {
                 "Calendar summaries are provisional. Observed rain and snow are report-based estimates; snow uses a 10:1 conversion from liquid precipitation. Humidity uses daily average temperature and dew point. Event scoring checks source data for the actual event window separately."
@@ -94,7 +99,7 @@ fn past_week(comparisons: &[ForecastComparison], days: &str) -> Markup {
                         }
                     }
                     tbody {
-                        @for comparison in comparisons.iter().take(7) {
+                        @for comparison in comparisons.iter().take(8) {
                             (past_day(comparison))
                         }
                     }
@@ -105,26 +110,33 @@ fn past_week(comparisons: &[ForecastComparison], days: &str) -> Markup {
     }
 }
 
-/// One completed calendar day. Its comparisons remain provisional summaries.
+/// One calendar day: a completed one, or today so far. Its comparisons remain
+/// provisional summaries.
 fn past_day(day: &ForecastComparison) -> Markup {
     let (forecast_high, forecast_low) = (day.forecast_high as f64, day.forecast_low as f64);
+    let settled = if day.so_far {
+        Settled::SoFar
+    } else {
+        Settled::Final
+    };
     let degrees = |observed: Option<f64>, forecast: f64| {
-        observed.map(|_| values::difference(observed, Some(forecast), "°F", Settled::Final))
+        observed.map(|_| values::difference(observed, Some(forecast), "°F", settled))
     };
     let wind = day
         .actual_wind
         .zip(day.forecast_wind)
         .map(|(observed, forecast)| {
-            values::difference(
-                Some(observed as f64),
-                Some(forecast as f64),
-                " kt",
-                Settled::Final,
-            )
+            values::difference(Some(observed as f64), Some(forecast as f64), " kt", settled)
         });
     html! {
         tr {
-            th scope="row" { (when::calendar_day(&day.date)) }
+            th scope="row" {
+                @if day.so_far {
+                    "Today so far"
+                } @else {
+                    (when::calendar_day(&day.date))
+                }
+            }
             td {
                 (pair(values::temperature(day.actual_high, "temp-high"),
                       values::temperature(Some(forecast_high), "temp-high"),
@@ -253,6 +265,7 @@ mod tests {
             actual_humidity: None,
             actual_rain: None,
             actual_snow: None,
+            so_far: false,
         };
         let html = forecast_detail("KPWM", &[comparison], &[], "UTC").into_string();
         assert_eq!(html.matches("55°F").count(), 2);
@@ -261,6 +274,49 @@ mod tests {
         assert!(!html.contains("-2°F"));
         // Equal after rounding: the difference reads +0.
         assert!(html.contains("+0°F"));
+    }
+
+    #[test]
+    fn today_so_far_leads_with_grey_differences() {
+        let day = |date: &str, so_far: bool| ForecastComparison {
+            date: date.into(),
+            forecast_high: 75,
+            forecast_low: 60,
+            forecast_wind: Some(10),
+            forecast_humidity_max: None,
+            forecast_humidity_min: None,
+            forecast_rain: None,
+            forecast_snow: None,
+            actual_high: Some(70.0),
+            actual_low: Some(62.0),
+            actual_wind: Some(8),
+            actual_humidity: None,
+            actual_rain: None,
+            actual_snow: None,
+            so_far,
+        };
+        let mut days = vec![day("2026-09-28", true)];
+        days.extend(
+            (20..=27)
+                .rev()
+                .map(|date| day(&format!("2026-09-{date}"), false)),
+        );
+        let html = forecast_detail("KJFK", &days, &[], "New York time").into_string();
+        let today = html.find("Today so far").expect("today's row");
+        assert!(
+            today < html.find("delta is-").unwrap(),
+            "today leads the table"
+        );
+        assert_eq!(
+            html.matches("is-provisional").count(),
+            3,
+            "today's high, low and wind"
+        );
+        assert!(html.contains("Today isn't over"));
+        // Today and seven complete days; the eighth complete day is left out.
+        assert_eq!(html.matches("<tr>").count() - 1, 8);
+        let html = forecast_detail("KJFK", &days[1..], &[], "UTC").into_string();
+        assert!(!html.contains("Today so far") && !html.contains("is-provisional"));
     }
 
     #[test]
@@ -280,6 +336,7 @@ mod tests {
             actual_humidity: None,
             actual_rain: None,
             actual_snow: None,
+            so_far: false,
         };
         let html = forecast_detail("KPWM", &[comparison], &[], "UTC").into_string();
         assert!(html.contains("+5°F"), "{html}");
