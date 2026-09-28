@@ -32,14 +32,6 @@ impl ForecastQuality {
         }
     }
 
-    pub fn merge(&mut self, other: Self) {
-        self.rejected_rows += other.rejected_rows;
-        self.unverified_rows += other.unverified_rows;
-        self.unavailable |= other.unavailable;
-        self.range_issues.extend(other.range_issues);
-        self.daily_counts.extend(other.daily_counts);
-    }
-
     /// A source period can cross the requested midnight. Match the calendar
     /// rows the caller actually displays before combining past/future panels.
     pub fn retain_days(&mut self, start: &str, end: &str) {
