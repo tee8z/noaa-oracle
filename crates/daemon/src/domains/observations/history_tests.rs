@@ -208,6 +208,25 @@ async fn malformed_count_station_and_time_never_certify_coverage() {
     }
 }
 
+/// Runs start about 40 s after stations file their :53 reports, and AWC
+/// returns the whole starting minute, so those reports come back. They are
+/// dropped and the batch still certifies its window; a report further out
+/// still fails it.
+#[tokio::test]
+async fn reports_in_the_minute_around_the_window_are_dropped_not_rejected() {
+    let body = response(&[
+        report("KPWM", "METAR", "2026-09-24T15:59:20Z", "241559Z"),
+        report("KPWM", "METAR", "2026-09-24T16:53:00Z", "241653Z"),
+    ]);
+    let history = run(&Mock::new(vec![Ok((200, body))]), &["KPWM"], 10).await;
+    assert_eq!(history.coverage.batches[0].status, "complete");
+    assert_eq!(history.coverage.batches[0].report_count, 1);
+
+    let early = response(&[report("KPWM", "METAR", "2026-09-24T15:58:30Z", "241558Z")]);
+    let history = run(&Mock::new(vec![Ok((200, early))]), &["KPWM"], 10).await;
+    assert_eq!(history.coverage.batches[0].status, "failed");
+}
+
 #[tokio::test]
 async fn cap_queries_split_and_only_successful_children_certify() {
     let one = report("KPWM", "METAR", "2026-09-24T18:51:00Z", "241851Z");
