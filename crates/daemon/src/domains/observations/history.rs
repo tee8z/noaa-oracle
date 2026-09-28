@@ -24,11 +24,6 @@ const MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 const COLLECTION_BUDGET: StdDuration = StdDuration::from_secs(20 * 60);
 const REQUEST_SPACING: StdDuration = StdDuration::from_millis(750);
 
-/// AWC filters `date` and `hours` to the minute, so a response can hold
-/// reports from the minute around either end of the requested interval. Those
-/// are dropped; a report further out means the source answered another query.
-const SOURCE_MINUTE_SLACK: Duration = Duration::seconds(60);
-
 #[derive(Clone, Debug)]
 pub struct HistoryConfig {
     pub hours: u32,
@@ -302,7 +297,8 @@ async fn collect(
         next_request = tokio::time::Instant::now() + spacing;
         let response =
             tokio::time::timeout_at(deadline, fetcher.request(&receipt.source_url)).await;
-        receipt.completed_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
+        let fetched_at = OffsetDateTime::now_utc();
+        receipt.completed_at = fetched_at.format(&Rfc3339)?;
         let (status, body) = match response {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
@@ -340,7 +336,7 @@ async fn collect(
             encoding: "gzip+base64",
             body: STANDARD.encode(compressed),
         });
-        let parsed = parse_response(status, &body, &query);
+        let parsed = parse_response(status, &body, &query, fetched_at);
         let (reports, response_count) = match parsed {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -400,7 +396,12 @@ async fn collect(
     Ok(collection)
 }
 
-fn parse_response(status: u16, body: &str, query: &Query) -> Result<(Vec<Metar>, usize)> {
+fn parse_response(
+    status: u16,
+    body: &str,
+    query: &Query,
+    fetched_at: OffsetDateTime,
+) -> Result<(Vec<Metar>, usize)> {
     if status == 204 {
         ensure!(
             body.trim().is_empty(),
@@ -443,10 +444,12 @@ fn parse_response(status: u16, body: &str, query: &Query) -> Result<(Vec<Metar>,
             &Rfc3339,
         )?;
         ensure!(
-            timestamp >= query.start - SOURCE_MINUTE_SLACK
-                && timestamp <= query.end + SOURCE_MINUTE_SLACK,
-            "source returned a report outside the requested interval"
+            timestamp <= fetched_at,
+            "source returned a report timestamped after the request"
         );
+        // AWC answers in whole minutes, so a response can hold reports outside
+        // the window. They are not part of this batch's claim, and say nothing
+        // about the reports inside it.
         if timestamp >= query.start && timestamp <= query.end {
             reports.push(report);
         }

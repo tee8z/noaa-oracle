@@ -14,6 +14,21 @@ use tokio_util::sync::CancellationToken;
 /// A run that takes longer than this is abandoned and retried next tick.
 const RUN_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 
+/// Runs start this long past each interval of the clock (for the hourly
+/// interval, at :05, after stations file their routine reports at :51 to :56),
+/// whenever the daemon started. The first run starts at once, so a deploy
+/// leaves no gap.
+const RUN_OFFSET: Duration = Duration::from_secs(5 * 60);
+
+/// How long from `now` until the next run: the next multiple of `interval`
+/// since the Unix epoch, plus [`RUN_OFFSET`] (at most half the interval).
+fn until_next_run(now: OffsetDateTime, interval: Duration) -> Duration {
+    let interval = interval.as_nanos().max(1) as i128;
+    let offset = (RUN_OFFSET.as_nanos() as i128).min(interval / 2);
+    let since_slot = (now.unix_timestamp_nanos() - offset).rem_euclid(interval);
+    Duration::from_nanos((interval - since_slot) as u64)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let configuration = Cli::load()?.configuration()?;
@@ -76,13 +91,12 @@ async fn main() -> anyhow::Result<()> {
 
     let stop = CancellationToken::new();
     tokio::spawn(stop_on_signal(stop.clone(), logger.clone()));
-    let mut ticks = tokio::time::interval(configuration.interval);
-    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut wait = Duration::ZERO;
     loop {
         tokio::select! {
             biased;
             () = stop.cancelled() => break,
-            _ = ticks.tick() => {}
+            () = tokio::time::sleep(wait) => {}
         }
         for source in &sources {
             tokio::select! {
@@ -106,6 +120,8 @@ async fn main() -> anyhow::Result<()> {
         if pruned > 0 {
             info!(logger, "pruned {} published files past retention", pruned);
         }
+        wait = until_next_run(OffsetDateTime::now_utc(), configuration.interval);
+        info!(logger, "next run in {}s", wait.as_secs());
     }
     info!(logger, "NOAA Daemon stopped");
     Ok(())
@@ -202,4 +218,35 @@ async fn stop_on_signal(stop: CancellationToken, logger: Logger) {
     }
     info!(logger, "stop requested");
     stop.cancel();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(value: &str) -> OffsetDateTime {
+        OffsetDateTime::parse(value, &Rfc3339).unwrap()
+    }
+
+    #[test]
+    fn runs_keep_to_five_past_the_hour_whenever_the_daemon_started() {
+        let hour = Duration::from_secs(3600);
+        // Started at 23:53:41: the next run is at 00:05.
+        assert_eq!(
+            until_next_run(at("2026-09-27T23:53:41Z"), hour),
+            Duration::from_secs(11 * 60 + 19)
+        );
+        // A run that ends at 00:19 waits for 01:05.
+        assert_eq!(
+            until_next_run(at("2026-09-28T00:19:00Z"), hour),
+            Duration::from_secs(46 * 60)
+        );
+        // At the slot itself, the next one is an interval away.
+        assert_eq!(until_next_run(at("2026-09-28T01:05:00Z"), hour), hour);
+        // A short interval keeps its offset within half the interval.
+        assert_eq!(
+            until_next_run(at("2026-09-28T01:00:00Z"), Duration::from_secs(60)),
+            Duration::from_secs(30)
+        );
+    }
 }
