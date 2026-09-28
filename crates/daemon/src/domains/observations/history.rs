@@ -24,6 +24,11 @@ const MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 const COLLECTION_BUDGET: StdDuration = StdDuration::from_secs(20 * 60);
 const REQUEST_SPACING: StdDuration = StdDuration::from_millis(750);
 
+/// AWC filters `date` and `hours` to the minute, so a response can hold
+/// reports from the minute around either end of the requested interval. Those
+/// are dropped; a report further out means the source answered another query.
+const SOURCE_MINUTE_SLACK: Duration = Duration::seconds(60);
+
 #[derive(Clone, Debug)]
 pub struct HistoryConfig {
     pub hours: u32,
@@ -438,8 +443,8 @@ fn parse_response(status: u16, body: &str, query: &Query) -> Result<(Vec<Metar>,
             &Rfc3339,
         )?;
         ensure!(
-            timestamp >= query.start - Duration::seconds(1)
-                && timestamp <= query.end + Duration::seconds(1),
+            timestamp >= query.start - SOURCE_MINUTE_SLACK
+                && timestamp <= query.end + SOURCE_MINUTE_SLACK,
             "source returned a report outside the requested interval"
         );
         if timestamp >= query.start && timestamp <= query.end {
