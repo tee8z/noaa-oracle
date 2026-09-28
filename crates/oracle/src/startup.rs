@@ -1004,7 +1004,8 @@ fn spawn_lease_release(state: &Arc<AppState>) {
 /// Runs a line pass every [`LINES_INTERVAL`] once the first preparation of
 /// forecast files has ended, while this process holds the lines lease. A
 /// pass reads a few past windows, so history fills over the first passes
-/// after a deploy, then keeps up with one window a day.
+/// after a deploy, then keeps up with one window a day. On shutdown the
+/// running pass stops and the lease is released.
 fn spawn_line_schedule(state: &Arc<AppState>) {
     let state = state.clone();
     let stopping = state.background.stopping.clone();
@@ -1039,6 +1040,15 @@ fn spawn_line_schedule(state: &Arc<AppState>) {
                 () = stopping.cancelled() => break,
                 _ = state.oracle.run_line_pass() => {}
             }
+        }
+        // The pass has stopped, so the next process can take the lease at
+        // once instead of waiting out its time to live.
+        if let Err(e) = state
+            .database
+            .release_lease(LINES_LEASE, &state.instance)
+            .await
+        {
+            warn!("cannot release the lines lease: {e}");
         }
     });
 }
