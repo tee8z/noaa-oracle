@@ -4,13 +4,13 @@
 //! percent.
 
 use async_trait::async_trait;
-use std::sync::Arc;
-use time::{Duration, OffsetDateTime};
+use std::{collections::BTreeMap, sync::Arc};
+use time::{Date, Duration, OffsetDateTime, UtcOffset, macros::format_description};
 
 use super::{Metric, ObservationWindow, OutcomeSource, ParRule, Reading, SourceError, SourceId};
 use crate::{
     routes::{ForecastRequest, ObservationRequest, TemperatureUnit},
-    weather_data::{self, Observation, WeatherData, validate_station_id},
+    weather_data::{self, Forecast, Observation, WeatherData, validate_station_id},
 };
 
 pub const NOAA_WEATHER: SourceId = SourceId::new("noaa_weather");
@@ -155,6 +155,41 @@ impl OutcomeSource for NoaaWeather {
         self.load_readings(window, targets, None).await
     }
 
+    /// Forecasts published before the daemon recorded native intervals have
+    /// no whole-period baseline, and 2.5.0 reset the line history, so lines
+    /// had nothing left to fit. Where a window has no native baseline, line
+    /// history falls back to the daily roll-up it read before 2.5.0.
+    async fn line_readings(
+        &self,
+        window: ObservationWindow,
+        targets: &[String],
+    ) -> Result<Vec<Reading>, SourceError> {
+        let mut readings = self.load_readings(window, targets, None).await?;
+        if window.start >= window.end || readings.iter().all(|r| r.baseline.is_some()) {
+            return Ok(readings);
+        }
+        let request = ForecastRequest {
+            start: Some(window.start),
+            end: Some(window.end),
+            generated_start: Some(window.start.saturating_sub(BASELINE_LOOKBACK)),
+            generated_end: Some(window.start.saturating_sub(Duration::nanoseconds(1))),
+            station_ids: targets.join(","),
+            temperature_unit: TemperatureUnit::Fahrenheit,
+        };
+        let forecasts = self
+            .weather
+            .forecasts_data(&request, targets.to_vec())
+            .await
+            .map_err(unavailable)?;
+        for reading in &mut readings {
+            if reading.baseline.is_none() {
+                reading.baseline =
+                    rolled_up_baseline(&reading.target, &reading.metric, window, &forecasts);
+            }
+        }
+        Ok(readings)
+    }
+
     async fn settlement_readings(
         &self,
         window: ObservationWindow,
@@ -275,6 +310,50 @@ impl NoaaWeather {
             })
             .collect())
     }
+}
+
+/// The baseline line history used before 2.5.0: over the window's UTC days,
+/// the forecast highs' maximum, lows' minimum or wind speeds' maximum, and
+/// only when each day has exactly one forecast. Other metrics have none.
+fn rolled_up_baseline(
+    target: &str,
+    metric: &str,
+    window: ObservationWindow,
+    forecasts: &[Forecast],
+) -> Option<f64> {
+    let first_day = window.start.to_offset(UtcOffset::UTC).date();
+    let last_day = (window.end - Duration::nanoseconds(1))
+        .to_offset(UtcOffset::UTC)
+        .date();
+    let mut daily = BTreeMap::new();
+    for forecast in forecasts.iter().filter(|row| row.station_id == target) {
+        let Some(date) = forecast
+            .date
+            .get(..10)
+            .and_then(|date| Date::parse(date, format_description!("[year]-[month]-[day]")).ok())
+        else {
+            continue;
+        };
+        // A duplicate day is ambiguous.
+        if date >= first_day && date <= last_day && daily.insert(date, forecast).is_some() {
+            return None;
+        }
+    }
+    if daily.len() as i64 != (last_day - first_day).whole_days() + 1 {
+        return None;
+    }
+    let days = daily.values();
+    let value = match metric {
+        TEMP_HIGH => days.map(|day| day.temp_high as f64).reduce(f64::max),
+        TEMP_LOW => days.map(|day| day.temp_low as f64).reduce(f64::min),
+        WIND_SPEED => days
+            .map(|day| day.wind_speed.map(|speed| speed as f64))
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .reduce(f64::max),
+        _ => None,
+    };
+    value.filter(|value| value.is_finite())
 }
 
 fn observed_metric(observation: &Observation, metric: &str) -> Option<f64> {

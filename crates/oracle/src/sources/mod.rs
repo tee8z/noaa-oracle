@@ -139,6 +139,16 @@ pub trait OutcomeSource: Send + Sync {
         targets: &[String],
     ) -> Result<Vec<Reading>, SourceError>;
 
+    /// Readings a line pass fits history from: the provisional ones, unless
+    /// the source can give history a baseline they lack.
+    async fn line_readings(
+        &self,
+        window: ObservationWindow,
+        targets: &[String],
+    ) -> Result<Vec<Reading>, SourceError> {
+        self.readings(window, targets).await
+    }
+
     /// Fresh, validated readings suitable for an irreversible signature.
     /// Implementations must verify provenance and complete collection coverage.
     async fn settlement_readings(

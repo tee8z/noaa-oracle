@@ -456,7 +456,7 @@ pub async fn run_pass(
             };
             let mut pairs = vec![];
             for chunk in targets.chunks(settings.targets_per_query.max(1)) {
-                for reading in source.readings(window, chunk).await? {
+                for reading in source.line_readings(window, chunk).await? {
                     if !metrics.contains(&reading.metric.as_str()) {
                         continue;
                     }
