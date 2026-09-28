@@ -297,13 +297,14 @@
     }
 }
 
-/* Diverging bands; no report is an open ring, not a colour. The light
-   outline remains visible when the map scales down on a phone. */
-.t-cold { --pin: #1d4f99; }
-.t-cool { --pin: #3a78c2; }
-.t-mild { --pin: #827d70; }
-.t-warm { --pin: #cc5a2e; }
-.t-hot { --pin: #a8231c; }
+/* Thermal bands, violet through yellow: brighter is hotter. No band is blue
+   or grey, so none blends into the slate map; no report is an open ring, not
+   a colour. The outline remains visible when the map scales down on a phone. */
+.t-cold { --pin: #8b2fc9; }
+.t-cool { --pin: #d94d9b; }
+.t-mild { --pin: #f47a5a; }
+.t-warm { --pin: #fbb03b; }
+.t-hot { --pin: #f7f35a; }
 .t-none { --pin: transparent; }
 
 .pin-dot,
