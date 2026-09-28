@@ -40,7 +40,7 @@ use std::{
 use time::{Date, OffsetDateTime};
 
 /// Names the folds' layout. Change it whenever their columns, types or
-/// order change; folds of other versions are then deleted.
+/// order change; folds of other versions are then deleted once idle.
 const VERSION: &str = "folds-v2-native-intervals";
 
 /// Rows per row group, as in the copies: a station's periods of one span
@@ -397,17 +397,10 @@ impl Folds {
         Ok(true)
     }
 
-    /// Deletes folds of days before `oldest`, folds of other versions,
+    /// Deletes folds of days before `oldest`, idle folds of other versions,
     /// retired fold files and temporary files of interrupted folds.
     pub fn prune(&self, oldest: Date) -> io::Result<()> {
-        if let Ok(versions) = fs::read_dir(&self.parent) {
-            for version in versions.flatten() {
-                let folds = version.file_name().to_string_lossy().starts_with("folds-");
-                if folds && version.path() != self.root && version.file_type()?.is_dir() {
-                    fs::remove_dir_all(version.path())?;
-                }
-            }
-        }
+        super::derived::prune_other_versions(&self.parent, "folds-", &self.root)?;
         let Ok(entries) = fs::read_dir(&self.root) else {
             return Ok(());
         };

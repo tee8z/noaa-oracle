@@ -23,12 +23,54 @@ use log::{info, warn};
 use std::{
     fs, io,
     path::{Path, PathBuf},
+    time::{Duration, SystemTime},
 };
 use time::Date;
 
 /// Names the copies' layout. Change it whenever their columns, types or
-/// order change; copies of other versions are then ignored and deleted.
+/// order change; copies of other versions are then ignored, and deleted
+/// once idle (see [`prune_other_versions`]).
 pub(super) const VERSION: &str = "forecasts-v2-native-intervals";
+
+/// How long another version's copies or folds go untouched before they are
+/// deleted. A running oracle touches its own version's directories on every
+/// preparation pass, at least every ten minutes, so two versions can serve
+/// side by side during a blue/green deploy without deleting each other's.
+const OTHER_VERSION_IDLE: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Marks `own` as in use, then deletes the directories under `parent` whose
+/// names start with `prefix`, other than `own`, that no oracle has touched
+/// for [`OTHER_VERSION_IDLE`].
+pub(super) fn prune_other_versions(parent: &Path, prefix: &str, own: &Path) -> io::Result<()> {
+    if own.is_dir()
+        && let Err(error) = fs::File::open(own).and_then(|dir| dir.set_modified(SystemTime::now()))
+    {
+        warn!("cannot mark {} in use: {error}", own.display());
+    }
+    let Ok(versions) = fs::read_dir(parent) else {
+        return Ok(());
+    };
+    for version in versions.flatten() {
+        let path = version.path();
+        if path == own
+            || !version.file_name().to_string_lossy().starts_with(prefix)
+            || !version.file_type()?.is_dir()
+        {
+            continue;
+        }
+        let idle = version
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= OTHER_VERSION_IDLE);
+        if idle {
+            info!("deleting {} of another version", path.display());
+            fs::remove_dir_all(path)?;
+        }
+    }
+    Ok(())
+}
 
 /// Rows per row group: about 26 stations' periods, so a query for one
 /// station reads one or two groups of each file.
@@ -168,24 +210,11 @@ impl DerivedForecasts {
         Ok(Copied::Refused)
     }
 
-    /// Deletes copies of files published before `oldest`, copies of other
-    /// versions, and temporary files of interrupted copies older than an
-    /// hour.
+    /// Deletes copies of files published before `oldest`, idle copies of
+    /// other versions, and temporary files of interrupted copies older than
+    /// an hour.
     pub fn prune(&self, oldest: Date) -> io::Result<()> {
-        let Ok(versions) = fs::read_dir(&self.parent) else {
-            return Ok(());
-        };
-        for version in versions.flatten() {
-            let path = version.path();
-            let copies = version
-                .file_name()
-                .to_string_lossy()
-                .starts_with("forecasts-");
-            if copies && path != self.root && version.file_type()?.is_dir() {
-                info!("deleting derived forecasts {}", path.display());
-                fs::remove_dir_all(path)?;
-            }
-        }
+        prune_other_versions(&self.parent, "forecasts-", &self.root)?;
         let Ok(days) = fs::read_dir(&self.root) else {
             return Ok(());
         };
@@ -214,5 +243,50 @@ impl DerivedForecasts {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn age(path: &Path, by: Duration) {
+        fs::File::open(path)
+            .and_then(|dir| dir.set_modified(SystemTime::now() - by))
+            .unwrap();
+    }
+
+    /// During a blue/green deploy between versions, each oracle keeps the
+    /// other's copies; a version no oracle runs any more goes once idle.
+    #[test]
+    fn other_versions_are_deleted_only_once_idle() {
+        let parent = tempfile::tempdir().unwrap();
+        let own = parent.path().join("forecasts-v3");
+        let serving = parent.path().join("forecasts-v2");
+        let abandoned = parent.path().join("forecasts-v1");
+        let folds = parent.path().join("folds-v1");
+        for dir in [&own, &serving, &abandoned, &folds] {
+            fs::create_dir_all(dir.join("2026-09-27")).unwrap();
+        }
+        age(&own, OTHER_VERSION_IDLE * 2);
+        age(&serving, OTHER_VERSION_IDLE / 2);
+        age(&abandoned, OTHER_VERSION_IDLE + Duration::from_secs(60));
+        age(&folds, OTHER_VERSION_IDLE * 2);
+
+        prune_other_versions(parent.path(), "forecasts-", &own).unwrap();
+
+        assert!(own.exists() && serving.exists());
+        assert!(!abandoned.exists());
+        assert!(
+            folds.exists(),
+            "another cache's prefix is left to its own prune"
+        );
+        // Marked in use, so another version keeps it.
+        let idle = fs::metadata(&own)
+            .and_then(|metadata| metadata.modified())
+            .unwrap()
+            .elapsed()
+            .unwrap();
+        assert!(idle < Duration::from_secs(60));
     }
 }
