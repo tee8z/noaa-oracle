@@ -10,7 +10,7 @@
     --delta-close: #15803d;
     --delta-off: #8a5a00;
     --delta-far: #b91c1c;
-    /* Dark on the pale map, so the bright bands keep an edge. */
+    /* Dark on the pale map, so the light bands keep an edge. */
     --pin-ring: #2b3440;
     --key: #6b21a8;
 }

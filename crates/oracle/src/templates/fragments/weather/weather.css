@@ -297,14 +297,15 @@
     }
 }
 
-/* Thermal bands, violet through yellow: brighter is hotter. No band is blue
-   or grey, so none blends into the slate map; no report is an open ring, not
-   a colour. The outline remains visible when the map scales down on a phone. */
-.t-cold { --pin: #8b2fc9; }
-.t-cool { --pin: #d94d9b; }
-.t-mild { --pin: #f47a5a; }
-.t-warm { --pin: #fbb03b; }
-.t-hot { --pin: #f7f35a; }
+/* Cool bands, periwinkle through sky, teal and green to pale lime. Each is
+   light enough to stand off the slate map, and none is red; no report is an
+   open ring, not a colour. The outline remains visible when the map scales
+   down on a phone. */
+.t-cold { --pin: #a78bfa; }
+.t-cool { --pin: #38bdf8; }
+.t-mild { --pin: #2dd4bf; }
+.t-warm { --pin: #4ade80; }
+.t-hot { --pin: #d9f99d; }
 .t-none { --pin: transparent; }
 
 .pin-dot,
