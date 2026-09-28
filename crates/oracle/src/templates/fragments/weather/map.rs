@@ -10,7 +10,7 @@ use crate::templates::{
     components::{time as when, values::whole_degrees},
 };
 
-/// Diverging bands, cold blue through a neutral middle to hot red.
+/// Cool bands, periwinkle through teal to pale lime (`weather.css`).
 const BANDS: [(&str, &str); 5] = [
     ("t-cold", "Below 40°F"),
     ("t-cool", "40–59°F"),

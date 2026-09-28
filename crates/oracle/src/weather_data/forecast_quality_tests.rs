@@ -769,19 +769,25 @@ async fn audited_kc07_daily_humidity_inversion_is_hidden_with_its_native_periods
                 && parsed(&period.start) == Some(start() + 18 * HOUR)
                 && period.end.as_deref().and_then(parsed) == Some(start() + 30 * HOUR))
     );
-    let html = crate::templates::fragments::forecast_detail(
-        "KC07",
-        &[],
-        &[],
-        "UTC",
-        &Default::default(),
-        &quality,
-    )
-    .into_string();
-    assert!(html.contains("Forecast data warning"));
-    assert!(html.contains("daily humidity range hidden"));
-    assert!(html.contains("2026-01-17T18:00:00Z to 2026-01-18T06:00:00Z"));
+    // The station page shows the day without the inverted range, and leaves
+    // the issue to operators.
+    let forecast = &forecasts[0];
+    let day = crate::templates::fragments::ForecastDisplay {
+        date: forecast.date.clone(),
+        temp_high: forecast.temp_high,
+        temp_low: forecast.temp_low,
+        wind_speed: forecast.wind_speed,
+        wind_direction: forecast.wind_direction,
+        humidity_max: forecast.humidity_max,
+        humidity_min: forecast.humidity_min,
+        precip_chance: forecast.precip_chance,
+        rain_amt: forecast.rain_amt,
+        snow_amt: forecast.snow_amt,
+    };
+    let html =
+        crate::templates::fragments::forecast_detail("KC07", &[], &[day], "UTC").into_string();
     assert!(!html.contains("90–83%"));
+    assert!(!html.contains("warning"));
 }
 
 #[tokio::test]

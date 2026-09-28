@@ -297,13 +297,15 @@
     }
 }
 
-/* Diverging bands; no report is an open ring, not a colour. The light
-   outline remains visible when the map scales down on a phone. */
-.t-cold { --pin: #1d4f99; }
-.t-cool { --pin: #3a78c2; }
-.t-mild { --pin: #827d70; }
-.t-warm { --pin: #cc5a2e; }
-.t-hot { --pin: #a8231c; }
+/* Cool bands, periwinkle through sky, teal and green to pale lime. Each is
+   light enough to stand off the slate map, and none is red; no report is an
+   open ring, not a colour. The outline remains visible when the map scales
+   down on a phone. */
+.t-cold { --pin: #a78bfa; }
+.t-cool { --pin: #38bdf8; }
+.t-mild { --pin: #2dd4bf; }
+.t-warm { --pin: #4ade80; }
+.t-hot { --pin: #d9f99d; }
 .t-none { --pin: transparent; }
 
 .pin-dot,

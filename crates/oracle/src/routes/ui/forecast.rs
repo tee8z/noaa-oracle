@@ -166,29 +166,11 @@ async fn build(
     // Forecasts and comparison observations use complete calendar days.
     let now = OffsetDateTime::now_utc();
     let today = calendar.date_of(now);
-    let quality_request = ObservationRequest {
-        start: Some(calendar.start_of(today - Duration::days(7))),
-        end: Some(now),
-        station_ids: station_id.to_string(),
-        temperature_unit: TemperatureUnit::Fahrenheit,
-    };
-    let ((coming, mut forecast_quality), (past, past_forecast_quality), quality) = tokio::try_join!(
+    let (coming, past) = tokio::try_join!(
         coming_days(state, station_id, today, calendar),
         past_week(state, station_id, today, now, calendar),
-        state
-            .weather_db
-            .observation_quality(&quality_request, vec![station_id.to_string()])
     )?;
-    forecast_quality.merge(past_forecast_quality);
-    Ok(forecast_detail(
-        station_id,
-        &past,
-        &coming,
-        &calendar.place(),
-        &quality,
-        &forecast_quality,
-    )
-    .into_string())
+    Ok(forecast_detail(station_id, &past, &coming, &calendar.place()).into_string())
 }
 
 /// The latest forecast for today and the next six days, oldest first.
@@ -197,7 +179,7 @@ async fn coming_days(
     station_id: &str,
     today: Date,
     calendar: Calendar,
-) -> Result<(Vec<ForecastDisplay>, weather_data::ForecastQuality), weather_data::Error> {
+) -> Result<Vec<ForecastDisplay>, weather_data::Error> {
     let request = ForecastRequest {
         start: Some(calendar.start_of(today)),
         end: Some(calendar.start_of(today + Duration::days(7))),
@@ -206,11 +188,10 @@ async fn coming_days(
         station_ids: station_id.to_string(),
         temperature_unit: TemperatureUnit::Fahrenheit,
     };
-    let (forecasts, mut quality) = state
+    let forecasts = state
         .weather_db
-        .calendar_forecasts_with_quality(&request, vec![station_id.to_string()], calendar)
+        .calendar_forecasts(&request, vec![station_id.to_string()], calendar)
         .await?;
-    quality.retain_days(&today.to_string(), &(today + Duration::days(7)).to_string());
     let today = today.to_string();
     let mut days: Vec<_> = forecasts
         .into_iter()
@@ -218,7 +199,7 @@ async fn coming_days(
         .map(display)
         .collect();
     days.sort_by(|a, b| a.date.cmp(&b.date));
-    Ok((days, quality))
+    Ok(days)
 }
 
 /// The seven complete days before today: each period's latest retained
@@ -229,7 +210,7 @@ async fn past_week(
     today: Date,
     now: OffsetDateTime,
     calendar: Calendar,
-) -> Result<(Vec<ForecastComparison>, weather_data::ForecastQuality), weather_data::Error> {
+) -> Result<Vec<ForecastComparison>, weather_data::Error> {
     let first = today - Duration::days(7);
     let (start, end) = (calendar.start_of(first), calendar.start_of(today));
     let forecasts = ForecastRequest {
@@ -247,16 +228,15 @@ async fn past_week(
         temperature_unit: TemperatureUnit::Fahrenheit,
     };
     let stations = vec![station_id.to_string()];
-    let ((forecasts, mut quality), observed) = tokio::try_join!(
+    let (forecasts, observed) = tokio::try_join!(
         state
             .weather_db
-            .calendar_forecasts_with_quality(&forecasts, stations.clone(), calendar),
+            .calendar_forecasts(&forecasts, stations.clone(), calendar),
         state
             .weather_db
             .calendar_daily_observations(&observations, stations, calendar)
     )?;
     let (start, today) = (first.to_string(), today.to_string());
-    quality.retain_days(&start, &today);
     let mut days: Vec<_> = forecasts
         .into_iter()
         .filter(|forecast| {
@@ -270,7 +250,7 @@ async fn past_week(
         })
         .collect();
     days.sort_by(|a, b| b.date.cmp(&a.date));
-    Ok((days, quality))
+    Ok(days)
 }
 
 /// The `YYYY-MM-DD` a forecast or observation date starts with.
