@@ -9,6 +9,7 @@ use nostr::{key::PublicKey as NostrPublicKey, nips::nip19::ToBech32};
 use std::{path::Path, sync::Arc};
 use time::OffsetDateTime;
 use tokio::task::JoinError;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
@@ -373,10 +374,31 @@ impl Oracle {
     /// date has passed. Safe to repeat: attestation happens at most once per
     /// event. A failing event is logged and does not stop the others.
     pub async fn etl_data(&self, etl_process_id: u64) -> Result<EtlSummary, Error> {
+        self.etl_data_until(etl_process_id, &CancellationToken::new())
+            .await
+    }
+
+    /// As [`Self::etl_data`], but stops between events once `stop` is cancelled. A process
+    /// shutting down then releases its processing lease without waiting out a long pass, which
+    /// its stop timeout could cut short, leaving the next process locked out until the lease
+    /// expires. The events left over are read on the next pass.
+    pub async fn etl_data_until(
+        &self,
+        etl_process_id: u64,
+        stop: &CancellationToken,
+    ) -> Result<EtlSummary, Error> {
         let events = self.db.events_to_settle(self.now()).await?;
         info!("etl {etl_process_id}: {} events to settle", events.len());
         let mut summary = EtlSummary::default();
-        for event in events {
+        let total = events.len();
+        for (done, event) in events.into_iter().enumerate() {
+            if stop.is_cancelled() {
+                info!(
+                    "etl {etl_process_id}: stopping; {} events left for the next pass",
+                    total - done
+                );
+                break;
+            }
             let id = event.id;
             match self.process_event(event).await {
                 Ok(true) => summary.attested += 1,
