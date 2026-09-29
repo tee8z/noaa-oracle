@@ -608,9 +608,16 @@ impl<'a> Station<'a> {
             }
             times.insert(time);
         }
+        // NDFD starts a series at the next whole hour it holds, up to an hour
+        // after the fetch, whatever the request's `begin`. A publication taken
+        // just before an event can therefore start its winds shortly after the
+        // event does; that hour's peak still comes from the forecast's own
+        // hourly values, so accept one hourly step at the leading edge.
+        const LEADING_SLACK: i64 = 3_600_000_000;
         let first = times
             .range(..=start)
             .next_back()
+            .or_else(|| times.range(start..=start + LEADING_SLACK).next())
             .copied()
             .ok_or("wind source horizon begins after the event")?;
         let last = times

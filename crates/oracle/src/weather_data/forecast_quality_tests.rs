@@ -985,3 +985,39 @@ fn any_day_long_window_holds_one_high_and_one_low() {
         );
     }
 }
+
+/// NDFD starts a publication's winds at the next whole hour it holds, so one
+/// fetched just before an event can begin shortly after the event does. One
+/// hourly step at the leading edge is accepted; a later start is not.
+#[test]
+fn wind_series_may_begin_within_an_hour_after_the_event_starts() {
+    let from = |offset: i64| {
+        [
+            row(
+                start() + offset,
+                start() + offset,
+                &[("wind_speed", Some(15.0)), ("wind_direction", Some(200.0))],
+            ),
+            row(
+                start() + offset + HOUR,
+                start() + offset + HOUR,
+                &[("wind_speed", Some(18.0)), ("wind_direction", Some(210.0))],
+            ),
+            row(
+                start() + offset + 6 * HOUR,
+                start() + offset + 6 * HOUR,
+                &[("wind_speed", Some(99.0)), ("wind_direction", Some(300.0))],
+            ),
+        ]
+    };
+    let late = from(HOUR / 2);
+    assert_eq!(result(&late, "wind_speed", start() + 6 * HOUR), Some(18.0));
+    assert_eq!(
+        result(&late, "wind_direction", start() + 6 * HOUR),
+        Some(210.0)
+    );
+    assert_eq!(
+        result(&from(2 * HOUR), "wind_speed", start() + 6 * HOUR),
+        None
+    );
+}
