@@ -373,8 +373,8 @@ impl Oracle {
     /// date has passed. Safe to repeat: attestation happens at most once per
     /// event. A failing event is logged and does not stop the others.
     pub async fn etl_data(&self, etl_process_id: u64) -> Result<EtlSummary, Error> {
-        let events = self.db.unattested_events().await?;
-        info!("etl {etl_process_id}: {} unattested events", events.len());
+        let events = self.db.events_to_settle(self.now()).await?;
+        info!("etl {etl_process_id}: {} events to settle", events.len());
         let mut summary = EtlSummary::default();
         for event in events {
             let id = event.id;

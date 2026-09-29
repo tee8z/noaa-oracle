@@ -45,14 +45,24 @@ fn response(reports: &[String]) -> String {
     )
 }
 async fn run(mock: &Mock, stations: &[&str], max_requests: usize) -> HistoryCollection {
+    run_at(mock, stations, start(), vec![], max_requests).await
+}
+async fn run_at(
+    mock: &Mock,
+    stations: &[&str],
+    started: OffsetDateTime,
+    retry: Vec<HistoryQuery>,
+    max_requests: usize,
+) -> HistoryCollection {
     collect(
         mock,
         stations.iter().map(|s| s.to_string()).collect(),
-        start(),
+        started,
         &HistoryConfig {
             hours: 3,
             ..HistoryConfig::default()
         },
+        retry,
         StdDuration::ZERO,
         StdDuration::from_secs(5),
         max_requests,
@@ -316,17 +326,88 @@ fn invalid_history_config_and_catalog_failure_cannot_claim_empty_coverage() {
     );
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("observations.parquet");
+    let mut retry = vec![];
     service()
         .write_unavailable_history(
             path.to_str().unwrap(),
             start(),
             &HistoryConfig::default(),
             "station catalog unavailable".into(),
+            &mut retry,
         )
         .unwrap();
     let coverage = metadata(&path, "observation_coverage");
     assert_eq!(coverage["batches"][0]["status"], "failed");
     assert_eq!(coverage["batches"][0]["station_ids"], serde_json::json!([]));
+    assert_eq!(retry.len(), 1, "the lost window is requested next run");
+}
+
+/// Each run reaches back only `hours`. A batch that fails is requested again
+/// after the next run's window, so its oldest hour is not lost for good and
+/// cannot block settlement of the events it overlaps.
+#[tokio::test]
+async fn failed_intervals_are_requested_again_after_the_next_window() {
+    let failed = run(&Mock::new(vec![Ok((503, "busy".into()))]), &["KPWM"], 10).await;
+    assert_eq!(failed.coverage.batches[0].status, "failed");
+    assert_eq!(failed.retry.len(), 1);
+    let one = report("KPWM", "METAR", "2026-09-24T16:51:00Z", "241651Z");
+    let mock = Mock::new(vec![Ok((204, String::new())), Ok((200, response(&[one])))]);
+    let next = run_at(
+        &mock,
+        &["KPWM"],
+        time("2026-09-24T20:00:01Z"),
+        failed.retry,
+        10,
+    )
+    .await;
+    let windows: Vec<_> = next
+        .coverage
+        .batches
+        .iter()
+        .map(|batch| {
+            (
+                batch.window_start.as_str(),
+                batch.window_end.as_str(),
+                batch.status.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        windows,
+        [
+            ("2026-09-24T17:00:00Z", "2026-09-24T20:00:00Z", "empty"),
+            // Only the hour the new window no longer reaches.
+            ("2026-09-24T16:00:00Z", "2026-09-24T17:00:00Z", "complete"),
+        ]
+    );
+    assert_eq!(next.reports.len(), 1);
+    assert!(next.retry.is_empty(), "a success clears the interval");
+}
+
+#[tokio::test]
+async fn catalog_failures_retry_every_station_and_old_intervals_are_dropped() {
+    let lost = HistoryCollection::unavailable(start(), &HistoryConfig::default(), "down".into())
+        .unwrap()
+        .retry;
+    let stale = HistoryQuery {
+        stations: vec!["KPWM".into()],
+        start: time("2026-09-22T10:00:00Z"),
+        end: time("2026-09-22T11:00:00Z"),
+    };
+    let retry = retries(
+        [lost.clone(), lost, vec![stale]].concat(),
+        &["KJFK".into(), "KORD".into(), "KPWM".into()],
+        2,
+        time("2026-09-24T17:00:00Z"),
+        time("2026-09-24T20:00:00Z"),
+    );
+    let stations: Vec<_> = retry.iter().map(|query| query.stations.clone()).collect();
+    assert_eq!(stations, [vec!["KJFK", "KORD"], vec!["KPWM"]]);
+    assert!(
+        retry
+            .iter()
+            .all(|query| query.end == time("2026-09-24T17:00:00Z"))
+    );
 }
 
 // Official AWC history response retrieved 2026-09-27 with ids=KPWM,KJFK,

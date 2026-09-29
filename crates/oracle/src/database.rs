@@ -41,8 +41,8 @@ use uuid::Uuid;
 
 use crate::{
     events::{
-        Entry, EventCounts, EventListQuery, EventRecord, EventStatus, NewEvent, SettlementBlock,
-        ValueOptions,
+        EXPIRY_AFTER_SIGNING, Entry, EventCounts, EventListQuery, EventRecord, EventStatus,
+        NewEvent, SettlementBlock, ValueOptions,
     },
     lines::{Line, LineLevel},
     scoring::{Pick, ScoringRules},
@@ -507,23 +507,28 @@ impl Database {
     /// Events, listed or not, whose observation window has ended and that
     /// have entries but no attestation yet, with the earliest signing date
     /// among them. Events without entries are never attested, so they are
-    /// left out.
+    /// left out. Those past their DLC expiry can no longer be attested and
+    /// are counted apart.
     pub async fn awaiting_attestation(
         &self,
         now: OffsetDateTime,
     ) -> Result<AwaitingAttestation, sqlx::Error> {
         let row = sqlx::query(
-            "SELECT COUNT(*) AS awaiting, MIN(e.signing_date) AS oldest_signing_date
+            "SELECT COALESCE(SUM(e.signing_date + ?1 > ?2), 0) AS awaiting,
+                COALESCE(SUM(e.signing_date + ?1 <= ?2), 0) AS expired,
+                MIN(CASE WHEN e.signing_date + ?1 > ?2 THEN e.signing_date END) AS oldest_signing_date
              FROM events e
-             WHERE e.attestation IS NULL AND e.end_observation_date <= ?
+             WHERE e.attestation IS NULL AND e.end_observation_date <= ?2
                AND EXISTS (SELECT 1 FROM events_entries x WHERE x.event_id = e.id)",
         )
+        .bind(EXPIRY_AFTER_SIGNING.whole_seconds())
         .bind(now.unix_timestamp())
         .fetch_one(&self.readers)
         .await?;
         let oldest: Option<i64> = row.try_get("oldest_signing_date")?;
         Ok(AwaitingAttestation {
             count: count_column(&row, "awaiting")?,
+            expired: count_column(&row, "expired")?,
             oldest_signing_date: oldest
                 .map(OffsetDateTime::from_unix_timestamp)
                 .transpose()
@@ -531,11 +536,28 @@ impl Database {
         })
     }
 
-    /// Events without an attestation, oldest first.
-    pub async fn unattested_events(&self) -> Result<Vec<EventRecord>, sqlx::Error> {
+    /// Unsigned events the ETL should read now. An event past its DLC expiry
+    /// is left alone: its contract refunds through the expiry path, and an
+    /// event that could never settle would otherwise be read every pass
+    /// forever. A blocked event waits [`BLOCKED_RETRY`] between checks,
+    /// except for its first check once its signing date has passed.
+    pub async fn events_to_settle(
+        &self,
+        now: OffsetDateTime,
+    ) -> Result<Vec<EventRecord>, sqlx::Error> {
         // Only constant SQL is interpolated.
-        let sql = format!("{EVENT_SELECT} WHERE e.attestation IS NULL GROUP BY e.id ORDER BY e.id");
+        let sql = format!(
+            "{EVENT_SELECT} WHERE e.attestation IS NULL AND e.signing_date + ? > ?
+             AND NOT EXISTS (SELECT 1 FROM event_settlement_blocks b WHERE b.event_id = e.id
+                AND b.checked_at > ? AND (b.checked_at >= e.signing_date OR e.signing_date > ?))
+             GROUP BY e.id ORDER BY e.id"
+        );
+        let now = now.unix_timestamp();
         let rows = sqlx::query(AssertSqlSafe(sql))
+            .bind(EXPIRY_AFTER_SIGNING.whole_seconds())
+            .bind(now)
+            .bind(now - BLOCKED_RETRY.whole_seconds())
+            .bind(now)
             .fetch_all(&self.readers)
             .await?;
         rows.iter().map(event_from_row).collect()
@@ -1012,6 +1034,8 @@ where
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AwaitingAttestation {
     pub count: usize,
+    /// Unsigned events with entries past their DLC expiry.
+    pub expired: usize,
     pub oldest_signing_date: Option<OffsetDateTime>,
 }
 
@@ -1025,6 +1049,10 @@ pub struct EntryScore {
 
 /// Columns every [`EventRecord`] query selects; callers add `WHERE`,
 /// `GROUP BY e.id`, and ordering.
+/// How long a blocked event waits before the ETL reads it again. New
+/// observations arrive hourly, so checking more often only costs CPU.
+const BLOCKED_RETRY: time::Duration = time::Duration::minutes(15);
+
 const EVENT_SELECT: &str = "SELECT e.id, e.source, e.signing_date, e.start_observation_date,
         e.end_observation_date, e.locations, e.metrics, e.total_allowed_entries,
         e.number_of_places_win, e.number_of_values_per_entry, e.nonce_salt,

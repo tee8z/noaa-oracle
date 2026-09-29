@@ -23,6 +23,12 @@ const MAX_REQUESTS: usize = 512;
 const MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 const COLLECTION_BUDGET: StdDuration = StdDuration::from_secs(20 * 60);
 const REQUEST_SPACING: StdDuration = StdDuration::from_millis(750);
+/// A failed interval is requested again on later runs until it succeeds or
+/// falls this far behind: an event expires a day after its signing date, so
+/// an older interval can no longer settle anything.
+const RETRY_HORIZON: Duration = Duration::hours(26);
+/// Retries run after the run's own window, within the same request budget.
+const MAX_RETRIES: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct HistoryConfig {
@@ -95,6 +101,8 @@ pub struct HistoryCollection {
     pub coverage: ObservationCoverage,
     pub sources: BTreeMap<String, ArchivedResponse>,
     pub precipitation: Option<super::shef::ShefCollection>,
+    /// Intervals this run failed to certify, for the next run to request again.
+    pub retry: Vec<HistoryQuery>,
 }
 
 impl HistoryCollection {
@@ -121,6 +129,12 @@ impl HistoryCollection {
             reports: Vec::new(),
             sources: BTreeMap::new(),
             precipitation: None,
+            // No station list: the next run requests this window for its whole catalog.
+            retry: vec![HistoryQuery {
+                stations: Vec::new(),
+                start,
+                end,
+            }],
             coverage: ObservationCoverage {
                 version: "awc-history-v1".into(),
                 interval: "closed".into(),
@@ -145,12 +159,14 @@ impl HistoryFetcher for XmlFetcher {
     }
 }
 
-#[derive(Clone)]
-struct Query {
+/// One AWC history request: a station batch over a closed interval.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoryQuery {
     stations: Vec<String>,
     start: OffsetDateTime,
     end: OffsetDateTime,
 }
+type Query = HistoryQuery;
 
 impl Query {
     fn url(&self) -> Result<String> {
@@ -222,12 +238,14 @@ pub async fn collect_history(
     station_ids: Vec<String>,
     end: OffsetDateTime,
     config: &HistoryConfig,
+    retry: Vec<HistoryQuery>,
 ) -> Result<HistoryCollection> {
     collect(
         fetcher.as_ref(),
         station_ids,
         end,
         config,
+        retry,
         REQUEST_SPACING,
         COLLECTION_BUDGET,
         MAX_REQUESTS,
@@ -235,11 +253,13 @@ pub async fn collect_history(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn collect(
     fetcher: &dyn HistoryFetcher,
     mut station_ids: Vec<String>,
     run_started_at: OffsetDateTime,
     config: &HistoryConfig,
+    retry: Vec<HistoryQuery>,
     spacing: StdDuration,
     budget: StdDuration,
     max_requests: usize,
@@ -266,10 +286,12 @@ async fn collect(
             end,
         })
         .collect();
+    pending.extend(retries(retry, &station_ids, config.batch_size, start, end));
     let mut collection = HistoryCollection {
         reports: Vec::new(),
         sources: BTreeMap::new(),
         precipitation: None,
+        retry: Vec::new(),
         coverage: ObservationCoverage {
             version: "awc-history-v1".into(),
             interval: "closed".into(),
@@ -289,6 +311,7 @@ async fn collect(
             receipt.error = Some("history collection request/time budget exhausted".into());
             receipt.failure_kind = Some("budget".into());
             collection.coverage.batches.push(receipt);
+            collection.retry.push(query);
             continue;
         }
         tokio::time::sleep_until(next_request).await;
@@ -305,12 +328,14 @@ async fn collect(
                 receipt.error = Some(format!("history request failed: {error:#}"));
                 receipt.failure_kind = Some("transport".into());
                 collection.coverage.batches.push(receipt);
+                collection.retry.push(query);
                 continue;
             }
             Err(_) => {
                 receipt.error = Some("history request exceeded collection deadline".into());
                 receipt.failure_kind = Some("transport".into());
                 collection.coverage.batches.push(receipt);
+                collection.retry.push(query);
                 continue;
             }
         };
@@ -322,6 +347,7 @@ async fn collect(
             receipt.error = Some("history raw-evidence size budget exhausted".into());
             receipt.failure_kind = Some("budget".into());
             collection.coverage.batches.push(receipt);
+            collection.retry.push(query);
             // No later response may restart a partially exhausted evidence budget.
             attempts = max_requests;
             continue;
@@ -350,6 +376,7 @@ async fn collect(
                     .into(),
                 );
                 collection.coverage.batches.push(receipt);
+                collection.retry.push(query);
                 continue;
             }
         };
@@ -381,6 +408,7 @@ async fn collect(
         if let Some(error) = representation_failure {
             receipt.error = Some(error);
             receipt.failure_kind = Some("representation".into());
+            collection.retry.push(query);
         } else {
             receipt.status = if response_count == 0 {
                 "empty"
@@ -394,6 +422,44 @@ async fn collect(
     }
     collection.coverage.completed_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
     Ok(collection)
+}
+
+/// Earlier runs' failed intervals, to request after this run's own window.
+/// A failure inside the window is requested again anyway; one older than
+/// [`RETRY_HORIZON`] can no longer matter. A run whose station catalog failed
+/// left no stations, so its interval is requested for today's catalog.
+fn retries(
+    retry: Vec<HistoryQuery>,
+    station_ids: &[String],
+    batch_size: usize,
+    start: OffsetDateTime,
+    end: OffsetDateTime,
+) -> Vec<HistoryQuery> {
+    let mut queries: Vec<HistoryQuery> = retry
+        .into_iter()
+        .filter(|query| query.end >= end - RETRY_HORIZON && query.start < start)
+        .flat_map(|query| {
+            let query = HistoryQuery {
+                end: query.end.min(start),
+                ..query
+            };
+            if !query.stations.is_empty() {
+                return vec![query];
+            }
+            station_ids
+                .chunks(batch_size)
+                .map(|stations| HistoryQuery {
+                    stations: stations.to_vec(),
+                    ..query.clone()
+                })
+                .collect()
+        })
+        .collect();
+    // The newest intervals first: they can still block the most events.
+    queries.sort_by(|a, b| (b.end, a.start, &a.stations).cmp(&(a.end, b.start, &b.stations)));
+    queries.dedup();
+    queries.truncate(MAX_RETRIES);
+    queries
 }
 
 fn parse_response(

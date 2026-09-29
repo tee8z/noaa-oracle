@@ -111,6 +111,10 @@ pub struct NoaaObservations {
     fetcher: Arc<XmlFetcher>,
     history: crate::HistoryConfig,
     logger: Logger,
+    /// Intervals earlier runs failed to certify. Each run's window reaches
+    /// back only `history.hours`, so without these a failure in its oldest
+    /// hour would never be requested again and could block settlement.
+    retry: std::sync::Mutex<Vec<crate::HistoryQuery>>,
 }
 
 impl NoaaObservations {
@@ -119,6 +123,7 @@ impl NoaaObservations {
             fetcher,
             history,
             logger,
+            retry: Default::default(),
         }
     }
 }
@@ -132,16 +137,21 @@ impl Source for NoaaObservations {
     async fn collect(&self, run: &Run) -> anyhow::Result<Vec<Artifact>> {
         let observations = run.artifact("observations");
         let service = ObservationService::new(self.logger.clone(), self.fetcher.clone());
+        // A copy: a run cut short by its timeout keeps the earlier list.
+        let mut retry = self.retry.lock().unwrap().clone();
         let (stations, catalog) =
             match crate::coordinates::get_coordinates_with_evidence(self.fetcher.clone()).await {
                 Ok(stations) => stations,
                 Err(error) => {
-                    service.write_unavailable_history(
+                    let written = service.write_unavailable_history(
                         &observations.path.to_string_lossy(),
                         run.started_at,
                         &self.history,
                         format!("station catalog failed: {error:#}"),
-                    )?;
+                        &mut retry,
+                    );
+                    *self.retry.lock().unwrap() = retry;
+                    written?;
                     return Ok(vec![observations]);
                 }
             };
@@ -152,8 +162,18 @@ impl Source for NoaaObservations {
                 run.started_at,
                 &self.history,
                 &catalog,
+                &mut retry,
             )
-            .await?;
+            .await;
+        if !retry.is_empty() {
+            info!(
+                self.logger,
+                "{} failed observation intervals to request next run",
+                retry.len()
+            );
+        }
+        *self.retry.lock().unwrap() = retry;
+        let observed = observed?;
         info!(
             self.logger,
             "noaa observation history: {} rows ({} rejected, {} unverified, {} unrepresentable)",
