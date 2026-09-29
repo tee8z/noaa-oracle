@@ -438,7 +438,9 @@ impl AppState {
                 }
             };
             let result = tokio::select! {
-                result = state.oracle.etl_data(etl_process_id) => result,
+                result = state
+                    .oracle
+                    .etl_data_until(etl_process_id, &state.background.stopping) => result,
                 () = renewal => unreachable!("lease renewal never ends"),
             };
             match result {

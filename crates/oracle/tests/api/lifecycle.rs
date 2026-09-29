@@ -320,6 +320,30 @@ async fn the_best_entry_is_attested_after_the_signing_date() {
     );
 }
 
+/// A pass told to stop leaves its events for the next one, so a shutting-down process can
+/// release the processing lease at once.
+#[tokio::test]
+async fn a_stopped_pass_leaves_its_events_for_the_next() {
+    let test_app = app_with_weather().await;
+    let (event, _) = event_with_entries(
+        &test_app,
+        vec![
+            vec![pick("KORD", "temp_high", "Over")],
+            vec![pick("KORD", "temp_high", "Under")],
+            vec![pick("KORD", "temp_high", "Par")],
+        ],
+    )
+    .await;
+    test_app.clock.set(event.signing_date);
+    let stop = tokio_util::sync::CancellationToken::new();
+    stop.cancel();
+    let summary = test_app.oracle.etl_data_until(1, &stop).await.unwrap();
+    assert_eq!((summary.attested, summary.failed), (0, 0));
+    assert!(fetch(&test_app, event.id).await.attestation.is_none());
+    test_app.run_etl().await;
+    assert!(fetch(&test_app, event.id).await.attestation.is_some());
+}
+
 #[tokio::test]
 async fn metrics_follow_an_event_to_its_attestation() {
     let test_app = app_with_weather().await;
