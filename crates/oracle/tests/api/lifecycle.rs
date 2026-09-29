@@ -330,6 +330,7 @@ async fn a_stopped_pass_leaves_its_events_for_the_next() {
         vec![
             vec![pick("KORD", "temp_high", "Over")],
             vec![pick("KORD", "temp_high", "Under")],
+            vec![pick("KORD", "temp_high", "Par")],
         ],
     )
     .await;
