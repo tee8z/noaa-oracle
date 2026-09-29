@@ -219,11 +219,19 @@ fn bounded_observation_request(
     Ok((req, stations))
 }
 
+#[derive(Deserialize, IntoParams)]
+pub struct QualityMetrics {
+    /// Comma-separated metrics (such as `temp_high,wind_speed`) whose
+    /// report problems to count. Every metric when absent.
+    #[serde(default)]
+    pub metrics: Option<String>,
+}
+
 /// Quality counts use the same row selection and validation rules as settlement.
 #[utoipa::path(
     get,
     path = "/stations/observation-quality",
-    params(ObservationRequest),
+    params(ObservationRequest, QualityMetrics),
     responses(
         (status = OK, description = "Quality counts for the observation window", body = crate::weather_data::ObservationQuality),
         (status = BAD_REQUEST, description = "Invalid station list or time window"),
@@ -233,12 +241,24 @@ fn bounded_observation_request(
 pub async fn observation_quality(
     State(state): State<Arc<AppState>>,
     Query(mut req): Query<ObservationRequest>,
+    Query(quality): Query<QualityMetrics>,
 ) -> Result<Json<crate::weather_data::ObservationQuality>, AppError> {
     let stations = checked_stations(&req.station_ids)?;
     let (start, end) = bounded_window(req.start, req.end, OffsetDateTime::now_utc())?;
     (req.start, req.end) = (Some(start), Some(end));
+    let metrics: Vec<String> = quality
+        .metrics
+        .iter()
+        .flat_map(|metrics| metrics.split(','))
+        .map(str::trim)
+        .filter(|metric| !metric.is_empty())
+        .map(String::from)
+        .collect();
     Ok(Json(
-        state.weather_db.observation_quality(&req, stations).await?,
+        state
+            .weather_db
+            .observation_quality(&req, stations, &metrics)
+            .await?,
     ))
 }
 

@@ -75,7 +75,8 @@ const DEDUP_OBSERVATIONS_SQL: &str = r#"
             dew := dewpoint_value, dew_unit := dewpoint_unit_code,
             wind := wind_speed, wind_unit := wind_speed_unit_code, direction := wind_direction, direction_unit := wind_direction_unit_code,
             precip := precip_in, precip_unit := precip_unit_code, weather := wx_string,
-            quality := quality_status, raw := raw_text, version := validation_version, reason := quality_reason, report_type := metar_type
+            quality := quality_status, raw := raw_text, version := validation_version, reason := quality_reason, report_type := metar_type,
+            affected := quality_metrics
         )) OVER (PARTITION BY station_id, generated_at::TIMESTAMPTZ, filename) > 1 AS publication_conflict
     FROM parquet_data
     QUALIFY ROW_NUMBER() OVER (
@@ -125,10 +126,9 @@ const NORMALIZE_OBSERVATIONS_SQL: &str = r#"
             LAG(generated_at::TIMESTAMPTZ) OVER station_reports AS previous_time
         FROM converted
         WINDOW station_reports AS (PARTITION BY station_id ORDER BY generated_at::TIMESTAMPTZ)
-    ), assessed AS (
+    ), screened AS (
         SELECT *,
-            ((quality_status IS NOT NULL AND quality_status NOT IN ('validated', 'unverified'))
-             OR publication_conflict OR invalid_temperature OR invalid_dewpoint
+            (publication_conflict OR invalid_temperature OR invalid_dewpoint
              OR (wind_speed IS NOT NULL AND (COALESCE(quality_status = 'validated', false) OR wind_speed_unit_code IS NOT NULL)
                  AND (wind_speed_unit_code IS NULL OR lower(wind_speed_unit_code) != 'knots'))
              OR (wind_direction IS NOT NULL AND (COALESCE(quality_status = 'validated', false) OR wind_direction_unit_code IS NOT NULL)
@@ -142,20 +142,52 @@ const NORMALIZE_OBSERVATIONS_SQL: &str = r#"
              OR COALESCE(wind_direction < 0 OR wind_direction > 360, false)
              OR COALESCE(NOT isfinite(precip_in) OR precip_in < 0 OR precip_in > 5, false)
              OR COALESCE(ABS(temperature_value - previous_temperature) >= 15
-                AND generated_at::TIMESTAMPTZ - previous_time <= INTERVAL '2 hours', false)) AS qc_rejected,
+                AND generated_at::TIMESTAMPTZ - previous_time <= INTERVAL '2 hours', false)) AS qc_screened,
+            (quality_status IS NOT NULL AND quality_status NOT IN ('validated', 'unverified')) AS qc_source_rejected,
             (quality_status IS DISTINCT FROM 'validated'
              OR validation_version IS DISTINCT FROM 'metar-consistency-v1'
              OR COALESCE(trim(quality_reason) != '', false)
              OR raw_text IS NULL OR trim(raw_text) = '') AS qc_unverified
         FROM contextual
+    ), assessed AS (
+        SELECT * EXCLUDE (qc_source_rejected), qc_source_rejected OR qc_screened AS qc_rejected,
+            -- Metric groups a flagged report's problems affect. The daemon
+            -- tags its own problems in quality_metrics; the oracle's
+            -- screening, missing provenance, and untagged or unknown tags
+            -- affect every group.
+            CASE
+                WHEN NOT (qc_source_rejected OR qc_screened OR qc_unverified) THEN []::VARCHAR[]
+                WHEN qc_screened OR quality_metrics IS NULL
+                    OR validation_version IS DISTINCT FROM 'metar-consistency-v1'
+                    OR raw_text IS NULL OR trim(raw_text) = ''
+                    OR NOT list_has_all(['temperature', 'dewpoint', 'wind', 'precipitation', 'present_weather'],
+                                        string_split(quality_metrics, ','))
+                    THEN ['temperature', 'dewpoint', 'wind', 'precipitation', 'present_weather']
+                ELSE string_split(quality_metrics, ',')
+            END AS qc_groups
+        FROM screened
+    ), usable AS (
+        -- Values of groups a source flag affects, or of any screened report.
+        -- Legacy reports keep values; their counts hold settlement instead.
+        SELECT *,
+            NOT qc_screened AND NOT (COALESCE(quality_status != 'validated', false)
+                AND list_contains(qc_groups, 'temperature')) AS temperature_usable,
+            NOT qc_screened AND NOT (COALESCE(quality_status != 'validated', false)
+                AND list_contains(qc_groups, 'dewpoint')) AS dewpoint_usable,
+            NOT qc_screened AND NOT (COALESCE(quality_status != 'validated', false)
+                AND list_contains(qc_groups, 'wind')) AS wind_usable,
+            NOT qc_screened AND NOT (COALESCE(quality_status != 'validated', false)
+                AND list_contains(qc_groups, 'precipitation')) AS precip_usable
+        FROM assessed
     )
-    SELECT * EXCLUDE (temperature_value, dewpoint_value, wind_speed, wind_direction, precip_in),
-        CASE WHEN NOT qc_rejected AND COALESCE(quality_status, 'legacy') != 'unverified' THEN temperature_value END AS temperature_value,
-        CASE WHEN NOT qc_rejected AND COALESCE(quality_status, 'legacy') != 'unverified' THEN dewpoint_value END AS dewpoint_value,
-        CASE WHEN NOT qc_rejected AND COALESCE(quality_status, 'legacy') != 'unverified' THEN wind_speed END AS wind_speed,
-        CASE WHEN NOT qc_rejected AND COALESCE(quality_status, 'legacy') != 'unverified' THEN wind_direction END AS wind_direction,
-        CASE WHEN NOT qc_rejected AND COALESCE(quality_status, 'legacy') != 'unverified' AND metar_type IS DISTINCT FROM 'SPECI' THEN precip_in END AS precip_in
-    FROM assessed
+    SELECT * EXCLUDE (temperature_value, dewpoint_value, wind_speed, wind_direction, precip_in,
+                      temperature_usable, dewpoint_usable, wind_usable, precip_usable),
+        CASE WHEN temperature_usable THEN temperature_value END AS temperature_value,
+        CASE WHEN dewpoint_usable THEN dewpoint_value END AS dewpoint_value,
+        CASE WHEN wind_usable THEN wind_speed END AS wind_speed,
+        CASE WHEN wind_usable THEN wind_direction END AS wind_direction,
+        CASE WHEN precip_usable AND metar_type IS DISTINCT FROM 'SPECI' THEN precip_in END AS precip_in
+    FROM usable
 "#;
 
 /// A report or forecast issue can reach a snapshot after its validity window.
@@ -254,6 +286,10 @@ pub enum Error {
     ForecastQuality { reason: String },
     #[error("observation quality verification is unavailable")]
     QualityUnavailable,
+    #[error(
+        "observation quality verification is unavailable: {legacy_reports} reports come from files that predate the daemon's quality fields"
+    )]
+    LegacyObservations { legacy_reports: u64 },
     #[error(
         "observations require review: {rejected_reports} rejected reports, {unverified_reports} unverified reports"
     )]
@@ -397,18 +433,24 @@ pub trait WeatherData: Sync + Send {
     ) -> Result<Vec<Observation>, Error>;
     /// Settlement must validate and aggregate the same selected publications.
     /// Implementations without this guarantee cannot authorize an attestation.
+    ///
+    /// Only report problems that affect `metrics`, the metrics the caller
+    /// scores, hold settlement; no metrics means every metric.
     async fn settlement_observations(
         &self,
         _req: &ObservationRequest,
         _station_ids: Vec<String>,
         _required_collected_after: OffsetDateTime,
+        _metrics: &[String],
     ) -> Result<Vec<Observation>, Error> {
         Err(Error::QualityUnavailable)
     }
+    /// Counts reports whose problems affect `metrics` (every metric when empty).
     async fn observation_quality(
         &self,
         _req: &ObservationRequest,
         _station_ids: Vec<String>,
+        _metrics: &[String],
     ) -> Result<ObservationQuality, Error> {
         Err(Error::QualityUnavailable)
     }
@@ -848,13 +890,25 @@ fn empty_publication_window(params: &FileParams) -> bool {
 }
 
 impl WeatherAccess {
+    /// Quality counts and settlement's report verification consider
+    /// problems that affect `metrics` (every metric when empty).
     async fn observation_batches(
         &self,
         req: &ObservationRequest,
         station_ids: Vec<String>,
         coverage: Option<coverage::Requirement>,
+        metrics: &[String],
     ) -> Result<Vec<RecordBatch>, Error> {
         let station_filter = station_filter(&station_ids)?;
+        let groups = format!(
+            "[{}]",
+            sql_string_list(
+                &quality_groups(metrics)
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            )
+        );
         let file_params = observation_file_params(req, OffsetDateTime::now_utc());
         if empty_publication_window(&file_params) {
             if let Some(coverage) = &coverage {
@@ -961,7 +1015,8 @@ impl WeatherAccess {
                            NULL::VARCHAR AS quality_status, NULL::VARCHAR AS quality_reason,
                            NULL::VARCHAR AS validation_version, NULL::VARCHAR AS raw_text,
                            NULL::VARCHAR AS wind_speed_unit_code, NULL::VARCHAR AS wind_direction_unit_code,
-                           NULL::VARCHAR AS precip_unit_code, NULL::VARCHAR AS metar_type
+                           NULL::VARCHAR AS precip_unit_code, NULL::VARCHAR AS metar_type,
+                           NULL::VARCHAR AS quality_metrics
                     WHERE false
                     UNION ALL BY NAME
                     SELECT * FROM read_parquet([{}], union_by_name = true, filename = true)
@@ -977,8 +1032,11 @@ impl WeatherAccess {
             )
             SELECT
                 station_id::VARCHAR AS station_id,
-                COUNT(*) FILTER (WHERE qc_rejected)::BIGINT AS rejected_reports,
-                COUNT(*) FILTER (WHERE NOT qc_rejected AND qc_unverified)::BIGINT AS unverified_reports,
+                COUNT(*) FILTER (WHERE qc_rejected AND list_has_any(qc_groups, {groups}))::BIGINT AS rejected_reports,
+                COUNT(*) FILTER (WHERE NOT qc_rejected AND qc_unverified
+                    AND list_has_any(qc_groups, {groups}))::BIGINT AS unverified_reports,
+                COUNT(*) FILTER (WHERE NOT qc_rejected AND quality_status IS NULL
+                    AND raw_text IS NULL)::BIGINT AS legacy_reports,
                 ({})::VARCHAR AS start_time,
                 ({})::VARCHAR AS end_time,
                 MIN(temperature_value)::DOUBLE AS temp_low,
@@ -1035,7 +1093,7 @@ impl WeatherAccess {
                 .unwrap();
             format!(
                 "{prefix} SELECT station_id, generated_at, metar_type, raw_text, source_precip_in, \
-                (NOT qc_rejected AND NOT qc_unverified) AS verified, \
+                NOT ((qc_rejected OR qc_unverified) AND list_has_any(qc_groups, {groups})) AS verified, \
                 wind_speed IS NOT NULL, wind_direction IS NOT NULL, \
                 ROUND(100.0 * EXP((17.625 * dewpoint_value) / (243.04 + dewpoint_value)) / \
                     EXP((17.625 * temperature_value) / (243.04 + temperature_value)))::BIGINT \
@@ -1044,13 +1102,7 @@ impl WeatherAccess {
         });
         self.query_with_connection(query_sql, move |connection, batches| {
             if let Some(coverage) = coverage {
-                let quality = decode_quality(batches)?;
-                if quality.rejected_reports > 0 || quality.unverified_reports > 0 {
-                    return Err(Error::DataQuality {
-                        rejected_reports: quality.rejected_reports,
-                        unverified_reports: quality.unverified_reports,
-                    });
-                }
+                decode_quality(batches)?.settleable()?;
                 coverage.verify(connection, &file_paths)?;
                 return precipitation::apply(
                     connection,
@@ -1357,7 +1409,9 @@ impl WeatherData for WeatherAccess {
         req: &ObservationRequest,
         station_ids: Vec<String>,
     ) -> Result<Vec<Observation>, Error> {
-        let batches = self.observation_batches(req, station_ids, None).await?;
+        let batches = self
+            .observation_batches(req, station_ids, None, &[])
+            .await?;
         decode_observations(&batches, &req.temperature_unit)
     }
 
@@ -1366,12 +1420,14 @@ impl WeatherData for WeatherAccess {
         req: &ObservationRequest,
         station_ids: Vec<String>,
         required_collected_after: OffsetDateTime,
+        metrics: &[String],
     ) -> Result<Vec<Observation>, Error> {
         let coverage = coverage::Requirement {
             start: req.start.ok_or(Error::QualityUnavailable)?,
             end: req.end.ok_or(Error::QualityUnavailable)?,
             stations: station_ids.clone(),
             collected_after: required_collected_after,
+            groups: quality_groups(metrics),
         };
         let point_request = ObservationRequest {
             start: req.start,
@@ -1380,15 +1436,9 @@ impl WeatherData for WeatherAccess {
             temperature_unit: req.temperature_unit,
         };
         let batches = self
-            .observation_batches(&point_request, station_ids, Some(coverage))
+            .observation_batches(&point_request, station_ids, Some(coverage), metrics)
             .await?;
-        let quality = decode_quality(&batches)?;
-        if quality.rejected_reports > 0 || quality.unverified_reports > 0 {
-            return Err(Error::DataQuality {
-                rejected_reports: quality.rejected_reports,
-                unverified_reports: quality.unverified_reports,
-            });
-        }
+        decode_quality(&batches)?.settleable()?;
         decode_observations(&batches, &req.temperature_unit)
     }
 
@@ -1396,8 +1446,13 @@ impl WeatherData for WeatherAccess {
         &self,
         req: &ObservationRequest,
         station_ids: Vec<String>,
+        metrics: &[String],
     ) -> Result<ObservationQuality, Error> {
-        decode_quality(&self.observation_batches(req, station_ids, None).await?)
+        decode_quality(
+            &self
+                .observation_batches(req, station_ids, None, metrics)
+                .await?,
+        )
     }
 
     async fn daily_observations(
@@ -1484,7 +1539,8 @@ impl WeatherData for WeatherAccess {
                            NULL::VARCHAR AS quality_status, NULL::VARCHAR AS quality_reason,
                            NULL::VARCHAR AS validation_version, NULL::VARCHAR AS raw_text,
                            NULL::VARCHAR AS wind_speed_unit_code, NULL::VARCHAR AS wind_direction_unit_code,
-                           NULL::VARCHAR AS precip_unit_code, NULL::VARCHAR AS metar_type
+                           NULL::VARCHAR AS precip_unit_code, NULL::VARCHAR AS metar_type,
+                           NULL::VARCHAR AS quality_metrics
                     WHERE false
                     UNION ALL BY NAME
                     SELECT * FROM read_parquet([{}], union_by_name = true, filename = true)
@@ -1787,6 +1843,64 @@ fn decode_forecasts(
 pub struct ObservationQuality {
     pub rejected_reports: u64,
     pub unverified_reports: u64,
+    /// Unverified reports from files that predate the daemon's quality
+    /// fields: no check ever ran on them.
+    #[serde(default)]
+    pub legacy_reports: u64,
+}
+
+impl ObservationQuality {
+    /// Whether settlement may use the reports, or why not.
+    fn settleable(&self) -> Result<(), Error> {
+        if self.rejected_reports == 0 && self.unverified_reports == 0 {
+            Ok(())
+        } else if self.rejected_reports == 0 && self.legacy_reports == self.unverified_reports {
+            Err(Error::LegacyObservations {
+                legacy_reports: self.legacy_reports,
+            })
+        } else {
+            Err(Error::DataQuality {
+                rejected_reports: self.rejected_reports,
+                unverified_reports: self.unverified_reports,
+            })
+        }
+    }
+}
+
+/// Metric groups the daemon tags report problems with (`quality_metrics`).
+/// `NORMALIZE_OBSERVATIONS_SQL` repeats this list.
+const QUALITY_GROUPS: [&str; 5] = [
+    "temperature",
+    "dewpoint",
+    "wind",
+    "precipitation",
+    "present_weather",
+];
+
+/// The groups whose problems can change `metrics`. No metrics, or a metric
+/// not listed here, means every group, as before reports were tagged.
+pub fn quality_groups(metrics: &[String]) -> Vec<&'static str> {
+    let mut groups = Vec::new();
+    for metric in metrics {
+        let affected: &[&'static str] = match metric.as_str() {
+            "temp_high" | "temp_low" => &["temperature"],
+            "humidity" => &["temperature", "dewpoint"],
+            "wind_speed" | "wind_direction" => &["wind"],
+            // Phase comes from present weather, or from temperature without it.
+            "rain_amt" | "snow_amt" => &["precipitation", "present_weather", "temperature"],
+            _ => &QUALITY_GROUPS,
+        };
+        for group in affected {
+            if !groups.contains(group) {
+                groups.push(*group);
+            }
+        }
+    }
+    if groups.is_empty() {
+        QUALITY_GROUPS.to_vec()
+    } else {
+        groups
+    }
 }
 
 fn decode_quality(batches: &[RecordBatch]) -> Result<ObservationQuality, Error> {
@@ -1794,9 +1908,11 @@ fn decode_quality(batches: &[RecordBatch]) -> Result<ObservationQuality, Error> 
     for batch in batches {
         let rejected = integers(batch, "rejected_reports")?;
         let unverified = integers(batch, "unverified_reports")?;
+        let legacy = integers(batch, "legacy_reports")?;
         for row in 0..batch.num_rows() {
             quality.rejected_reports += integer(rejected, row).unwrap_or(0).max(0) as u64;
             quality.unverified_reports += integer(unverified, row).unwrap_or(0).max(0) as u64;
+            quality.legacy_reports += integer(legacy, row).unwrap_or(0).max(0) as u64;
         }
     }
     Ok(quality)
@@ -2182,7 +2298,7 @@ mod tests {
         };
         assert_eq!(
             access(&directory)
-                .observation_quality(&request, request.station_ids())
+                .observation_quality(&request, request.station_ids(), &[])
                 .await
                 .unwrap()
                 .rejected_reports,
@@ -2212,7 +2328,7 @@ mod tests {
         let weather = access(&directory);
         assert_eq!(
             weather
-                .observation_quality(&request, request.station_ids())
+                .observation_quality(&request, request.station_ids(), &[])
                 .await
                 .unwrap()
                 .rejected_reports,
@@ -2220,7 +2336,7 @@ mod tests {
         );
         assert!(matches!(
             weather
-                .settlement_observations(&request, request.station_ids(), request.end.unwrap())
+                .settlement_observations(&request, request.station_ids(), request.end.unwrap(), &[])
                 .await,
             Err(Error::DataQuality {
                 rejected_reports: 3,
@@ -2258,7 +2374,7 @@ mod tests {
         let weather = access(&directory);
         assert_eq!(
             weather
-                .observation_quality(&request, request.station_ids())
+                .observation_quality(&request, request.station_ids(), &[])
                 .await
                 .unwrap()
                 .rejected_reports,
@@ -2274,7 +2390,7 @@ mod tests {
         );
         assert!(matches!(
             weather
-                .settlement_observations(&request, request.station_ids(), request.end.unwrap())
+                .settlement_observations(&request, request.station_ids(), request.end.unwrap(), &[])
                 .await,
             Err(Error::DataQuality {
                 rejected_reports: 1,
@@ -2299,7 +2415,7 @@ mod tests {
         };
         assert!(matches!(
             access(&directory)
-                .settlement_observations(&request, request.station_ids(), request.end.unwrap())
+                .settlement_observations(&request, request.station_ids(), request.end.unwrap(), &[])
                 .await,
             Err(Error::DataQuality {
                 rejected_reports: 1,
@@ -2342,14 +2458,14 @@ mod tests {
             .unwrap();
         assert!((daily[0].temp_high - 64.94).abs() < 1e-6);
         let quality = weather
-            .observation_quality(&request, request.station_ids())
+            .observation_quality(&request, request.station_ids(), &[])
             .await
             .unwrap();
         assert_eq!(quality.rejected_reports, 1);
         assert_eq!(quality.unverified_reports, 0);
         assert!(matches!(
             weather
-                .settlement_observations(&request, request.station_ids(), request.end.unwrap())
+                .settlement_observations(&request, request.station_ids(), request.end.unwrap(), &[])
                 .await,
             Err(Error::DataQuality {
                 rejected_reports: 1,
@@ -2379,7 +2495,7 @@ mod tests {
         );
         assert!(matches!(
             weather
-                .settlement_observations(&request, request.station_ids(), request.end.unwrap())
+                .settlement_observations(&request, request.station_ids(), request.end.unwrap(), &[])
                 .await,
             Err(Error::DataQuality {
                 rejected_reports: 1,
@@ -2388,7 +2504,7 @@ mod tests {
         ));
         assert_eq!(
             weather
-                .observation_quality(&request, request.station_ids())
+                .observation_quality(&request, request.station_ids(), &[])
                 .await
                 .unwrap()
                 .rejected_reports,
@@ -2418,13 +2534,264 @@ mod tests {
         );
         assert!(matches!(
             weather
-                .settlement_observations(&request, request.station_ids(), request.end.unwrap())
+                .settlement_observations(&request, request.station_ids(), request.end.unwrap(), &[])
+                .await,
+            Err(Error::LegacyObservations { legacy_reports: 1 })
+        ));
+        let quality = weather
+            .observation_quality(&request, request.station_ids(), &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                quality.rejected_reports,
+                quality.unverified_reports,
+                quality.legacy_reports
+            ),
+            (0, 1, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_reports_mixed_with_checked_problems_still_count_as_unverified() {
+        let directory = quality_data_dir(&[
+            (
+                "observations_2026-01-17T19:00:00Z.parquet",
+                "SELECT 'KPWM' AS station_id, '2026-01-17T17:51:00Z' AS generated_at,
+                        18.9::DOUBLE AS temperature_value, 'celcius' AS temperature_unit_code",
+            ),
+            (
+                "observations_2026-01-17T21:00:00Z.parquet",
+                "SELECT 'KPWM' AS station_id, '2026-01-17T18:51:00Z' AS generated_at,
+                        18.9::DOUBLE AS temperature_value, 'celsius' AS temperature_unit_code,
+                        'unverified' AS quality_status, 'metar-consistency-v1' AS validation_version,
+                        'KPWM 171851Z 40/30 RMK T01890056' AS raw_text,
+                        'temperature,dewpoint' AS quality_metrics",
+            ),
+        ]);
+        let request = ObservationRequest {
+            station_ids: "KPWM".into(),
+            ..day_request()
+        };
+        assert!(matches!(
+            access(&directory)
+                .settlement_observations(&request, request.station_ids(), request.end.unwrap(), &[])
                 .await,
             Err(Error::DataQuality {
                 rejected_reports: 0,
-                unverified_reports: 1
+                unverified_reports: 2
             })
         ));
+    }
+
+    #[test]
+    fn metrics_map_onto_the_groups_the_daemon_tags() {
+        let groups = |metrics: &[&str]| {
+            quality_groups(&metrics.iter().map(|m| m.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(groups(&["temp_high", "temp_low"]), ["temperature"]);
+        assert_eq!(
+            groups(&["temp_high", "wind_speed", "humidity"]),
+            ["temperature", "wind", "dewpoint"]
+        );
+        assert_eq!(
+            groups(&["rain_amt"]),
+            ["precipitation", "present_weather", "temperature"]
+        );
+        assert_eq!(groups(&[]), QUALITY_GROUPS);
+        assert_eq!(groups(&["temp_high", "a_new_metric"]).len(), 5);
+        // The SQL fallback list must match the groups the oracle knows.
+        let listed = format!(
+            "[{}]",
+            QUALITY_GROUPS.map(|group| format!("'{group}'")).join(", ")
+        );
+        assert_eq!(NORMALIZE_OBSERVATIONS_SQL.matches(&listed).count(), 2);
+    }
+
+    /// Hourly KORD reports with a collection receipt, so settlement can
+    /// succeed. The 19:00 report carries the highest temperature and wind
+    /// and is flagged with `status` and `tags`.
+    fn tagged_settlement_dir(status: &str, tags: Option<&str>) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        let day = directory.path().join("2026-01-17");
+        std::fs::create_dir_all(&day).unwrap();
+        let path = day.join("observations_2026-01-17T20:30:00Z.parquet");
+        let receipt = serde_json::json!({
+            "version":"awc-history-v1", "interval":"closed", "batches":[{
+                "station_ids":["KORD"], "window_start":"2026-01-17T17:00:00Z",
+                "window_end":"2026-01-17T20:29:59Z", "requested_at":"2026-01-17T20:30:00Z",
+                "completed_at":"2026-01-17T20:31:00Z", "status":"complete",
+                "source_url":"https://aviationweather.gov/api/data/metar?ids=KORD&format=xml",
+                "source_sha256":"a".repeat(64),"response_status":200,"response_count":4,"report_count":4,"error":null
+            }]
+        })
+        .to_string()
+        .replace('\'', "''");
+        let tags = tags.map_or("NULL".into(), |tags| format!("'{tags}'"));
+        open_connection()
+            .unwrap()
+            .execute_batch(&format!(
+                r#"
+            COPY (
+                SELECT 'KORD' AS station_id, generated_at, temperature_value::DOUBLE AS temperature_value,
+                    'celsius' AS temperature_unit_code, 'METAR' AS metar_type, raw_text,
+                    0.0::DOUBLE AS precip_in, 'inches' AS precip_unit_code, '' AS wx_string,
+                    wind_speed::BIGINT AS wind_speed, 'knots' AS wind_speed_unit_code,
+                    90::BIGINT AS wind_direction, 'degrees true' AS wind_direction_unit_code,
+                    (temperature_value-2)::DOUBLE AS dewpoint_value, 'celsius' AS dewpoint_unit_code,
+                    quality_status, 'metar-consistency-v1' AS validation_version,
+                    CASE WHEN quality_status = 'validated' THEN NULL ELSE 'flagged' END AS quality_reason,
+                    CASE WHEN quality_status = 'validated' THEN NULL ELSE {tags} END AS quality_metrics
+                FROM (VALUES
+                    ('2026-01-17T17:00:00Z',10,8,'validated','METAR KORD 171700Z 09008KT 10SM 10/08 RMK AO2'),
+                    ('2026-01-17T18:00:00Z',11,8,'validated','METAR KORD 171800Z 09008KT 10SM 11/09 RMK AO2'),
+                    ('2026-01-17T19:00:00Z',14,20,'{status}','METAR KORD 171900Z 09020KT 10SM 14/12 RMK AO2 PNO'),
+                    ('2026-01-17T20:00:00Z',12,8,'validated','METAR KORD 172000Z 09008KT 10SM 12/10 RMK AO2')
+                ) AS reports(generated_at,temperature_value,wind_speed,quality_status,raw_text)
+            ) TO '{}' (FORMAT PARQUET, KV_METADATA {{observation_coverage:'{receipt}'}})
+        "#,
+                path.display()
+            ))
+            .unwrap();
+        directory
+    }
+
+    async fn settle(
+        directory: &tempfile::TempDir,
+        metrics: &[&str],
+    ) -> Result<Vec<Observation>, Error> {
+        let request = ObservationRequest {
+            start: Some(time::macros::datetime!(2026-01-17 18:00 UTC)),
+            end: Some(time::macros::datetime!(2026-01-17 20:00 UTC)),
+            station_ids: "KORD".into(),
+            temperature_unit: TemperatureUnit::Celsius,
+        };
+        let metrics: Vec<String> = metrics.iter().map(|m| m.to_string()).collect();
+        access(directory)
+            .settlement_observations(
+                &request,
+                vec!["KORD".into()],
+                time::macros::datetime!(2026-01-17 20:15 UTC),
+                &metrics,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn precipitation_only_problems_do_not_hold_temperature_or_wind_events() {
+        let directory = tagged_settlement_dir("rejected", Some("precipitation"));
+        let rows = settle(&directory, &["temp_high", "temp_low", "wind_speed"])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].temp_high, 14.0,
+            "a rain gauge outage leaves the report's temperature usable"
+        );
+        assert_eq!(rows[0].wind_speed, Some(20));
+        assert_eq!(rows[0].rain_amt, None, "unscored rain is not verified");
+        for metrics in [&["rain_amt"][..], &["temp_high", "snow_amt"], &[]] {
+            assert!(
+                matches!(
+                    settle(&directory, metrics).await,
+                    Err(Error::DataQuality {
+                        rejected_reports: 1,
+                        unverified_reports: 0
+                    })
+                ),
+                "{metrics:?}"
+            );
+        }
+        let present_weather = tagged_settlement_dir("rejected", Some("present_weather"));
+        assert!(
+            settle(&present_weather, &["temp_high", "wind_speed"])
+                .await
+                .is_ok()
+        );
+        assert!(settle(&present_weather, &["rain_amt"]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn temperature_problems_hold_temperature_and_humidity_but_not_wind_events() {
+        for status in ["rejected", "unverified"] {
+            let directory = tagged_settlement_dir(status, Some("temperature,dewpoint"));
+            for metrics in [
+                &["temp_high"][..],
+                &["humidity"],
+                &["temp_low", "wind_speed"],
+            ] {
+                assert!(
+                    matches!(
+                        settle(&directory, metrics).await,
+                        Err(Error::DataQuality { .. })
+                    ),
+                    "{status} {metrics:?}"
+                );
+            }
+            let rows = settle(&directory, &["wind_speed", "wind_direction"])
+                .await
+                .unwrap();
+            assert_eq!(rows[0].wind_speed, Some(20), "{status}");
+            assert_eq!(
+                rows[0].temp_high, 11.0,
+                "{status}: the flagged temperature stays out of every aggregate"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn untagged_or_unknown_problems_hold_every_event() {
+        for tags in [None, Some(""), Some("precipitation,sunshine")] {
+            let directory = tagged_settlement_dir("rejected", tags);
+            assert!(
+                matches!(
+                    settle(&directory, &["temp_high", "wind_speed"]).await,
+                    Err(Error::DataQuality {
+                        rejected_reports: 1,
+                        ..
+                    })
+                ),
+                "{tags:?}"
+            );
+            let values = access(&directory)
+                .observation_data(
+                    &ObservationRequest {
+                        start: Some(time::macros::datetime!(2026-01-17 18:00 UTC)),
+                        end: Some(time::macros::datetime!(2026-01-17 19:59 UTC)),
+                        station_ids: "KORD".into(),
+                        temperature_unit: TemperatureUnit::Celsius,
+                    },
+                    vec!["KORD".into()],
+                )
+                .await
+                .unwrap();
+            assert_eq!(values[0].temp_high, 11.0, "{tags:?}");
+            assert_eq!(values[0].wind_speed, Some(8), "{tags:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn quality_counts_follow_the_requested_metrics() {
+        let directory = tagged_settlement_dir("rejected", Some("precipitation"));
+        let request = ObservationRequest {
+            start: Some(time::macros::datetime!(2026-01-17 18:00 UTC)),
+            end: Some(time::macros::datetime!(2026-01-17 20:00 UTC)),
+            station_ids: "KORD".into(),
+            temperature_unit: TemperatureUnit::Celsius,
+        };
+        let weather = access(&directory);
+        for (metrics, expected) in [
+            (&["temp_high", "wind_direction"][..], 0),
+            (&["rain_amt"], 1),
+            (&[], 1),
+        ] {
+            let metrics: Vec<String> = metrics.iter().map(|m| m.to_string()).collect();
+            let quality = weather
+                .observation_quality(&request, vec!["KORD".into()], &metrics)
+                .await
+                .unwrap();
+            assert_eq!(quality.rejected_reports, expected, "{metrics:?}");
+        }
     }
 
     #[tokio::test]
@@ -2447,7 +2814,7 @@ mod tests {
         let weather = access(&directory);
         assert!(matches!(
             weather
-                .settlement_observations(&request, request.station_ids(), request.end.unwrap())
+                .settlement_observations(&request, request.station_ids(), request.end.unwrap(), &[])
                 .await,
             Err(Error::DataQuality {
                 rejected_reports: 1,
@@ -2461,7 +2828,7 @@ mod tests {
         ]);
         assert_eq!(
             access(&corrected)
-                .observation_quality(&request, request.station_ids())
+                .observation_quality(&request, request.station_ids(), &[])
                 .await
                 .unwrap()
                 .rejected_reports,
@@ -2491,7 +2858,7 @@ mod tests {
         );
         assert!(matches!(
             weather
-                .settlement_observations(&request, request.station_ids(), request.end.unwrap())
+                .settlement_observations(&request, request.station_ids(), request.end.unwrap(), &[])
                 .await,
             Err(Error::DataQuality {
                 unverified_reports: 1,
@@ -2500,7 +2867,12 @@ mod tests {
         ));
         assert!(matches!(
             weather
-                .settlement_observations(&request, vec!["KABSENT".into()], request.end.unwrap())
+                .settlement_observations(
+                    &request,
+                    vec!["KABSENT".into()],
+                    request.end.unwrap(),
+                    &[]
+                )
                 .await,
             Err(Error::ObservationCoverage { .. })
         ));

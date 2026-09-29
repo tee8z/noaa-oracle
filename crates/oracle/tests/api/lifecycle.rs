@@ -107,13 +107,14 @@ where
         + 'static,
 {
     weather.expect_observation_data().returning(result.clone());
-    weather
-        .expect_settlement_observations()
-        .returning(move |request, stations, cutoff| {
+    weather.expect_settlement_observations().returning(
+        move |request, stations, cutoff, metrics| {
             // All lifecycle fixtures configure a two-hour signing grace.
             assert_eq!(cutoff, request.end.unwrap() + Duration::hours(2));
+            assert!(!metrics.is_empty(), "settlement passes the event's metrics");
             result(request, stations)
-        });
+        },
+    );
 }
 
 fn forecast(station: &str, temp_high: i64, temp_low: i64, wind_speed: i64) -> Forecast {

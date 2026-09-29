@@ -415,6 +415,7 @@ mod tests {
             end: datetime!(2026-09-27 06:00 UTC),
             stations: vec!["KNYC".into()],
             collected_after: datetime!(2026-09-27 06:30 UTC),
+            groups: super::super::quality_groups(&[]),
         }
     }
     fn total(receipts: &[Value], req: &coverage::Requirement) -> Option<Option<f64>> {
@@ -549,7 +550,12 @@ mod tests {
             temperature_unit: TemperatureUnit::Celsius,
         };
         let rows = access
-            .settlement_observations(&req, vec!["KMCI".into()], datetime!(2026-09-26 08:30 UTC))
+            .settlement_observations(
+                &req,
+                vec!["KMCI".into()],
+                datetime!(2026-09-26 08:30 UTC),
+                &[],
+            )
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);

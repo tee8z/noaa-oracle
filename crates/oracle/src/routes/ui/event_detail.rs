@@ -44,9 +44,11 @@ pub async fn event_detail_handler(
                 };
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    state
-                        .weather_db
-                        .observation_quality(&request, event.locations.clone()),
+                    state.weather_db.observation_quality(
+                        &request,
+                        event.locations.clone(),
+                        &event.scoring_fields,
+                    ),
                 )
                 .await
                 {

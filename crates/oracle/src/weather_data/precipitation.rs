@@ -306,6 +306,13 @@ pub(super) fn apply(
         if let Some(fixed_total) = fixed_hours.total(&station, requirement) {
             apply_fixed_hours(&mut value, fixed_total, phase_known);
         }
+        // Reports were verified for the event's metrics only: a rain gauge
+        // outage cannot hold a temperature event, nor can its totals stand.
+        if !requirement.groups.contains(&"precipitation") {
+            value.rain = None;
+            value.snow = None;
+            value.ice = None;
+        }
         measured.insert(station, value);
     }
     let mut output = Vec::new();
@@ -671,6 +678,7 @@ mod tests {
                 &request,
                 vec!["KORD".into()],
                 datetime!(2026-01-17 20:15 UTC),
+                &[],
             )
             .await
             .unwrap();
@@ -691,6 +699,7 @@ mod tests {
                 &request,
                 vec!["KORD".into()],
                 datetime!(2026-01-17 20:15 UTC),
+                &[],
             )
             .await
             .unwrap();
@@ -792,6 +801,7 @@ mod tests {
                     &request,
                     vec!["KORD".into()],
                     datetime!(2026-01-17 19:35 UTC),
+                    &[],
                 )
                 .await
                 .unwrap();

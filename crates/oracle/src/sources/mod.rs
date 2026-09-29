@@ -151,11 +151,14 @@ pub trait OutcomeSource: Send + Sync {
 
     /// Fresh, validated readings suitable for an irreversible signature.
     /// Implementations must verify provenance and complete collection coverage.
+    /// Source problems that cannot affect `metrics`, the metrics the event
+    /// scores, need not hold settlement.
     async fn settlement_readings(
         &self,
         _window: ObservationWindow,
         _targets: &[String],
         _required_collected_after: OffsetDateTime,
+        _metrics: &[String],
     ) -> Result<Vec<Reading>, SourceError> {
         Err(SourceError::SettlementBlocked(
             "this source has no verified settlement reader".into(),

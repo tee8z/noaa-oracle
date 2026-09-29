@@ -13,6 +13,8 @@ pub(super) struct Requirement {
     pub end: OffsetDateTime,
     pub stations: Vec<String>,
     pub collected_after: OffsetDateTime,
+    /// Metric groups the event's metrics depend on (see `quality_groups`).
+    pub groups: Vec<&'static str>,
 }
 
 #[derive(Deserialize)]
@@ -217,6 +219,7 @@ mod tests {
             end: datetime!(2026-01-17 06:00 UTC),
             collected_after: datetime!(2026-01-17 06:15 UTC),
             stations: vec!["KPWM".into()],
+            groups: super::super::quality_groups(&[]),
         }
     }
 

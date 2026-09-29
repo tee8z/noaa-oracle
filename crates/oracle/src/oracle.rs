@@ -450,7 +450,7 @@ impl Oracle {
         let signing_due = event.status(now) == EventStatus::Completed && now >= event.signing_date;
         let readings = if signing_due {
             let readings = source
-                .settlement_readings(window, &event.locations, event.signing_date)
+                .settlement_readings(window, &event.locations, event.signing_date, &event.metrics)
                 .await?;
             validate_settlement_readings(event, &readings)?;
             readings
