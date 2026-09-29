@@ -39,7 +39,8 @@ impl IntoResponse for AppError {
                 error @ (weather_data::Error::DataQuality { .. }
                 | weather_data::Error::ObservationCoverage { .. }
                 | weather_data::Error::ForecastQuality { .. }
-                | weather_data::Error::QualityUnavailable),
+                | weather_data::Error::QualityUnavailable
+                | weather_data::Error::LegacyObservations { .. }),
             ) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
             AppError::WeatherData(
                 weather_data::Error::Query(_)

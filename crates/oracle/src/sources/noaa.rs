@@ -195,8 +195,9 @@ impl OutcomeSource for NoaaWeather {
         window: ObservationWindow,
         targets: &[String],
         required_collected_after: OffsetDateTime,
+        metrics: &[String],
     ) -> Result<Vec<Reading>, SourceError> {
-        self.load_readings(window, targets, Some(required_collected_after))
+        self.load_readings(window, targets, Some((required_collected_after, metrics)))
             .await
     }
 
@@ -221,7 +222,7 @@ impl NoaaWeather {
         &self,
         window: ObservationWindow,
         targets: &[String],
-        required_collected_after: Option<OffsetDateTime>,
+        settlement: Option<(OffsetDateTime, &[String])>,
     ) -> Result<Vec<Reading>, SourceError> {
         if window.start >= window.end {
             return Ok(vec![]);
@@ -240,7 +241,7 @@ impl NoaaWeather {
             station_ids: targets.join(","),
             temperature_unit: TemperatureUnit::Fahrenheit,
         };
-        if let Some(cutoff) = required_collected_after {
+        if let Some((cutoff, metrics)) = settlement {
             // The strict reader uses a half-open event window for point
             // values and also reads the ending accumulation report for rain.
             let observation_request = ObservationRequest {
@@ -254,7 +255,7 @@ impl NoaaWeather {
                 .map_err(unavailable)?;
             let observations = self
                 .weather
-                .settlement_observations(&observation_request, targets.to_vec(), cutoff)
+                .settlement_observations(&observation_request, targets.to_vec(), cutoff, metrics)
                 .await
                 .map_err(unavailable)?;
             // Strict forecasts already represent the full requested interval.

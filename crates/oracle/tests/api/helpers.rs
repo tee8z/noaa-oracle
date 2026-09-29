@@ -368,6 +368,7 @@ mock! {
             req: &oracle::ObservationRequest,
             station_ids: Vec<String>,
             required_collected_after: OffsetDateTime,
+            metrics: Vec<String>,
         ) -> Result<Vec<oracle::Observation>, oracle::weather_data::Error>;
         pub async fn daily_observations(
             &self,
@@ -427,15 +428,23 @@ impl WeatherData for MockWeatherAccess {
         req: &oracle::ObservationRequest,
         station_ids: Vec<String>,
         required_collected_after: OffsetDateTime,
+        metrics: &[String],
     ) -> Result<Vec<oracle::Observation>, oracle::weather_data::Error> {
-        MockWeatherAccess::settlement_observations(self, req, station_ids, required_collected_after)
-            .await
+        MockWeatherAccess::settlement_observations(
+            self,
+            req,
+            station_ids,
+            required_collected_after,
+            metrics.to_vec(),
+        )
+        .await
     }
 
     async fn observation_quality(
         &self,
         _req: &oracle::ObservationRequest,
         _station_ids: Vec<String>,
+        _metrics: &[String],
     ) -> Result<oracle::weather_data::ObservationQuality, oracle::weather_data::Error> {
         Ok(oracle::weather_data::ObservationQuality::default())
     }

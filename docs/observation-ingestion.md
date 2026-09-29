@@ -43,7 +43,19 @@ The audit's top-level `source_sha256` hashes the serialized source-document map.
 
 ## Report quality and precipitation
 
-The append-only observation schema retains `raw_text`, `quality_status`, `quality_reason`, `validation_version`, and `metar_type`. Convertible rejected reports keep their original decoded values. The daemon does not substitute a plausible reading for a contradictory source value. A report with unrepresentable required coordinates or time cannot become a parquet row; the archived response and failed batch receipt preserve the evidence.
+The append-only observation schema retains `raw_text`, `quality_status`, `quality_reason`, `validation_version`, `metar_type`, and `quality_metrics`. Convertible rejected reports keep their original decoded values. The daemon does not substitute a plausible reading for a contradictory source value. A report with unrepresentable required coordinates or time cannot become a parquet row; the archived response and failed batch receipt preserve the evidence.
+
+Any problem makes a report `rejected` (or `unverified` when no unambiguous raw temperature group exists). `quality_metrics` lists, comma-separated, the metric groups the report's problems affect:
+
+| Group | Problems |
+|---|---|
+| `temperature`, `dewpoint` | Invalid or missing decoded values, a conflict with the raw body or T group, or no unambiguous raw temperature evidence |
+| `wind` | Invalid, out-of-range, or raw-inconsistent sustained wind speed or direction |
+| `precipitation` | Rain gauge outage (`PNO`), unavailable or conflicting `P` groups, or SPECI amounts without one |
+| `present_weather` | Present-weather sensor outage (`PWINO`) |
+| all groups | A station, time, or report type that disagrees with the raw text |
+
+The column is null for validated reports and in files written before it existed. The oracle counts a flagged report against an event only when these groups overlap the event's metrics, and it drops only the affected values; see [settlement operations](settlement-operations.md#observation-quality-by-metric).
 
 `validated` means the configured source consistency checks passed. It does not certify a complete event window or rule out every physical or regional anomaly. The oracle must also apply its quality and coverage checks before signing.
 

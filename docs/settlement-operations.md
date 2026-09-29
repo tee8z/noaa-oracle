@@ -11,7 +11,7 @@ The source reader and lifecycle gate perform separate checks.
 | Check | Failure behavior |
 |---|---|
 | Forecast provenance and native intervals | Hold settlement when the baseline cannot be verified. |
-| Observation quality and archive readability | Hold settlement when reports are rejected, unverified, or unreadable. |
+| Observation quality and archive readability | Hold settlement when reports with problems affecting the event's metrics are rejected or unverified, or when the archive is unreadable. |
 | Station collection coverage | Hold settlement when successful collection intervals leave a gap. |
 | Collection after the signing deadline | Hold settlement until a fresh successful request covers the event end. |
 | Observation reporting cadence | Hold settlement when usable reports leave a gap exceeding 90 minutes. |
@@ -94,6 +94,26 @@ Concurrent finalizations and delayed provisional updates cannot modify an alread
 An unsigned legacy event without verifiable evidence stays blocked until adequate data becomes available.
 An unreadable archive must produce an error, not an empty response.
 
+### Observation quality by metric
+
+The daemon tags each rejected or unverified report with the metric groups its problems affect (`quality_metrics`, see [observation ingestion](observation-ingestion.md#report-quality-and-precipitation)).
+A report holds an event only when those groups overlap the groups its enabled metrics depend on:
+
+| Metric | Groups |
+|---|---|
+| `temp_high`, `temp_low` | `temperature` |
+| `humidity` | `temperature`, `dewpoint` |
+| `wind_speed`, `wind_direction` | `wind` |
+| `rain_amt`, `snow_amt` | `precipitation`, `present_weather`, `temperature` |
+
+A rain gauge (`PNO`) or present-weather sensor (`PWINO`) outage therefore holds rain and snow events but not temperature or wind events.
+The affected values of a flagged report never enter any aggregate; its other values do. Rain and snow totals are left out of settlement for events that do not score them.
+Every group applies, as before per-metric tags existed, when a report has no tags (files written before the column), an unknown or empty tag, missing provenance, or fails the oracle's own screening (units, physical bounds, temperature jumps, conflicting duplicates).
+`GET /stations/observation-quality` takes an optional `metrics` list and counts every group without one.
+
+Reports from files that predate the daemon's quality fields (no `quality_status` or `raw_text`) were never checked.
+When they are the only unverified reports, settlement fails with a `source_unavailable` block naming them rather than an unverified count; they cannot pass a quality check.
+
 ## Inspect a blocked event
 
 Read `GET /oracle/events/{id}` and inspect `settlement_block.code`, `message`, and `checked_at`.
@@ -103,7 +123,7 @@ Use the reason to select the next action.
 | Signal | Action |
 |---|---|
 | `incomplete_readings` | Check every named station and metric against the requested interval. |
-| `data_quality` | Inspect rejected and unverified reports before publishing a reviewed correction. |
+| `data_quality` | Inspect rejected and unverified reports whose problems affect the event's metrics before publishing a reviewed correction. |
 | `source_unavailable` | Inspect the reported coverage, forecast, file, or query failure. |
 | `processing_failed` | Inspect the event processing log and database writer health. |
 

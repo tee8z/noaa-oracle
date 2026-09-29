@@ -307,6 +307,10 @@ fn parquet_keeps_rejected_values_raw_provenance_and_durable_audit() {
     };
     assert_eq!(field("temperature_value"), Field::Double(60.0));
     assert_eq!(field("quality_status"), Field::Str("rejected".into()));
+    assert_eq!(
+        field("quality_metrics"),
+        Field::Str("temperature,dewpoint,wind".into())
+    );
     assert_eq!(field("raw_text"), Field::Str(KPWM.into()));
     assert_eq!(
         field("validation_version"),
@@ -398,6 +402,60 @@ fn gauge_outage_never_creates_zero_rain_and_sensor_outages_are_flagged() {
     let raw = format!("{KPWM} PWINO");
     let weather = CurrentWeather::try_from(metar(&raw, Some("18.9"), Some("5.6"))).unwrap();
     assert_eq!(weather.quality_status, "rejected");
+}
+
+#[test]
+fn sensor_outages_tag_only_the_metrics_they_affect() {
+    let clean = KPWM.replace("060/03", "06003KT");
+    let weather = CurrentWeather::try_from(metar(&clean, Some("18.9"), Some("5.6"))).unwrap();
+    assert_eq!(weather.quality_status, "validated");
+    assert_eq!(weather.quality_metrics, None);
+    for (remark, expected) in [
+        ("PNO", "precipitation"),
+        ("PWINO", "present_weather"),
+        ("PNO PWINO", "precipitation,present_weather"),
+    ] {
+        let raw = format!("{clean} {remark}");
+        let weather = CurrentWeather::try_from(metar(&raw, Some("18.9"), Some("5.6"))).unwrap();
+        assert_eq!(weather.quality_status, "rejected", "{remark}");
+        assert_eq!(
+            weather.quality_metrics.as_deref(),
+            Some(expected),
+            "{remark}"
+        );
+        assert_eq!(weather.temperature_value, Some(18.9), "{remark}");
+    }
+}
+
+#[test]
+fn temperature_wind_and_identity_problems_tag_their_metrics() {
+    let clean = KPWM.replace("060/03", "06003KT");
+    let tagged = |raw: &str, temperature: &str| {
+        CurrentWeather::try_from(metar(raw, Some(temperature), Some("5.6")))
+            .unwrap()
+            .quality_metrics
+    };
+    assert_eq!(
+        tagged(&clean, "60").as_deref(),
+        Some("temperature,dewpoint"),
+        "a decoded value contradicting the T group"
+    );
+    assert_eq!(tagged(KPWM, "18.9").as_deref(), Some("wind"));
+    assert_eq!(
+        tagged(&clean.replace("KPWM 241851Z", "KJFK 241851Z"), "18.9").as_deref(),
+        Some("temperature,dewpoint,wind,precipitation,present_weather")
+    );
+    let unverified = CurrentWeather::try_from(metar(
+        "METAR KPWM 241851Z 06003KT 10SM CLR 40/30 A3044 RMK AO2 T01890056",
+        Some("18.9"),
+        Some("5.6"),
+    ))
+    .unwrap();
+    assert_eq!(unverified.quality_status, "unverified");
+    assert_eq!(
+        unverified.quality_metrics.as_deref(),
+        Some("temperature,dewpoint")
+    );
 }
 
 #[test]

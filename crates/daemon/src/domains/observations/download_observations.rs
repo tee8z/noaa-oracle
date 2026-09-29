@@ -24,7 +24,7 @@ use crate::parquet_file::{self, PartialFile};
 use crate::{CityWeather, Metar, Units, XmlFetcher};
 #[cfg(test)]
 use crate::{ObservationData, parse_xml};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone)]
 pub struct CurrentWeather {
@@ -32,6 +32,8 @@ pub struct CurrentWeather {
     pub metar_type: Option<String>,
     pub quality_status: String,
     pub quality_reason: Option<String>,
+    /// Comma-separated [`MetricGroup`]s that the quality problems affect.
+    pub quality_metrics: Option<String>,
     pub station_id: String,
     pub latitude: f64,
     pub longitude: f64,
@@ -53,23 +55,39 @@ impl TryFrom<Metar> for CurrentWeather {
     type Error = anyhow::Error;
     fn try_from(val: Metar) -> Result<Self, Self::Error> {
         // Preserve malformed optional fields as rejected evidence, never as valid nulls.
-        let mut problems = Vec::new();
-        let temperature_value = checked_number(val.temp_c.as_deref(), "temperature", &mut problems);
-        let dewpoint_value = checked_number(val.dewpoint_c.as_deref(), "dewpoint", &mut problems);
-        let wind_speed = checked_integer(val.wind_speed_kt.as_deref(), "wind_speed", &mut problems);
+        let mut problems = Problems::default();
+        let temperature_value = checked_number(
+            val.temp_c.as_deref(),
+            "temperature",
+            TEMPERATURE,
+            &mut problems,
+        );
+        let dewpoint_value = checked_number(
+            val.dewpoint_c.as_deref(),
+            "dewpoint",
+            DEWPOINT,
+            &mut problems,
+        );
+        let wind_speed = checked_integer(
+            val.wind_speed_kt.as_deref(),
+            "wind_speed",
+            WIND,
+            &mut problems,
+        );
         let wind_direction = if val.wind_dir_degrees.as_deref() == Some("VRB") {
             None
         } else {
             checked_integer(
                 val.wind_dir_degrees.as_deref(),
                 "wind_direction",
+                WIND,
                 &mut problems,
             )
         };
         if let Err(reason) =
             super::wind_validation::validate_wind(&val.raw_text, wind_speed, wind_direction)
         {
-            problems.push(reason);
+            problems.push(WIND, reason);
         }
         let raw_type = val
             .raw_text
@@ -79,47 +97,58 @@ impl TryFrom<Metar> for CurrentWeather {
         if val.metar_type.as_deref().is_some_and(|kind| {
             !matches!(kind, "METAR" | "SPECI") || raw_type.is_some_and(|raw| raw != kind)
         }) {
-            problems.push("decoded metar_type conflicts with raw report type".into());
+            problems.push(ALL, "decoded metar_type conflicts with raw report type");
         }
         let metar_type = val
             .metar_type
             .clone()
             .or_else(|| raw_type.map(str::to_owned));
-        let decoded_precip = checked_number(val.precip_in.as_deref(), "precip_in", &mut problems);
+        let decoded_precip = checked_number(
+            val.precip_in.as_deref(),
+            "precip_in",
+            PRECIPITATION,
+            &mut problems,
+        );
         // An hourly P group is not mandatory in SPECI. Its absence cannot
         // establish zero accumulation, even when a decoder supplies zero.
         let special_without_precip = metar_type.as_deref() == Some("SPECI")
             && matches!(raw_precipitation(&val.raw_text), Ok(None));
         if special_without_precip && decoded_precip.is_some_and(|value| value != 0.0) {
-            problems.push("decoded SPECI precipitation has no raw hourly P group".into());
+            problems.push(
+                PRECIPITATION,
+                "decoded SPECI precipitation has no raw hourly P group",
+            );
         }
         if temperature_value.is_none() {
-            problems.push("missing usable decoded temperature".into());
+            problems.push(TEMPERATURE, "missing usable decoded temperature");
         }
         if wind_speed.is_some_and(|v| v < 0) {
-            problems.push("negative wind speed".into());
+            problems.push(WIND, "negative wind speed");
         }
         if wind_direction.is_some_and(|v| !(0..=360).contains(&v)) {
-            problems.push("wind direction outside 0..360 degrees".into());
+            problems.push(WIND, "wind direction outside 0..360 degrees");
         }
         if decoded_precip.is_some_and(|v| v < 0.0) {
-            problems.push("negative precipitation".into());
+            problems.push(PRECIPITATION, "negative precipitation");
         }
         if let Err(error) = validate_precipitation(&val.raw_text, decoded_precip) {
-            problems.push(error.to_string());
+            problems.push(PRECIPITATION, error.to_string());
         }
         if has_remark(&val.raw_text, "PNO") {
-            problems.push("rain gauge outage (PNO); precipitation cannot be verified".into());
+            problems.push(
+                PRECIPITATION,
+                "rain gauge outage (PNO); precipitation cannot be verified",
+            );
         }
         if has_remark(&val.raw_text, "PWINO") {
             problems.push(
-                "present weather sensor outage (PWINO); weather classification cannot be verified"
-                    .into(),
+                PRESENT_WEATHER,
+                "present weather sensor outage (PWINO); weather classification cannot be verified",
             );
         }
         if let Err(error) = validate_temperatures(&val.raw_text, temperature_value, dewpoint_value)
         {
-            problems.push(error.to_string());
+            problems.push(TEMPERATURES, error.to_string());
         }
         let latitude = required_coordinate(val.latitude.as_deref(), "latitude", -90.0, 90.0)?;
         let longitude = required_coordinate(val.longitude.as_deref(), "longitude", -180.0, 180.0)?;
@@ -132,21 +161,32 @@ impl TryFrom<Metar> for CurrentWeather {
         .map_err(|e| anyhow!("error parsing observation_time: {e}"))?
         .to_offset(time::UtcOffset::UTC);
         if let Err(error) = validate_report_identity(&val.raw_text, &val.station_id, generated_at) {
-            problems.push(error.to_string());
+            problems.push(ALL, error.to_string());
         }
-        let quality_status = if !problems.is_empty() {
+        let quality_status = if !problems.reasons.is_empty() {
             "rejected"
         } else if raw_temperatures(&val.raw_text).is_some() {
             "validated"
         } else {
-            problems.push("no unambiguous raw METAR temperature evidence".into());
+            problems.push(
+                TEMPERATURES,
+                "no unambiguous raw METAR temperature evidence",
+            );
             "unverified"
         };
         Ok(CurrentWeather {
             raw_text: val.raw_text.clone(),
             metar_type,
             quality_status: quality_status.into(),
-            quality_reason: (!problems.is_empty()).then(|| problems.join("; ")),
+            quality_reason: (!problems.reasons.is_empty()).then(|| problems.reasons.join("; ")),
+            quality_metrics: (!problems.groups.is_empty()).then(|| {
+                problems
+                    .groups
+                    .iter()
+                    .map(|group| group.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }),
             station_id: val.station_id,
             latitude,
             longitude,
@@ -174,6 +214,60 @@ impl TryFrom<Metar> for CurrentWeather {
 }
 
 const VALIDATION_VERSION: &str = "metar-consistency-v1";
+
+/// The measurements a quality problem can make wrong. The oracle maps its
+/// metrics onto these, so a problem outside an event's metrics, such as a
+/// rain gauge outage for a temperature event, does not hold its settlement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MetricGroup {
+    Temperature,
+    Dewpoint,
+    Wind,
+    Precipitation,
+    PresentWeather,
+}
+
+impl MetricGroup {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MetricGroup::Temperature => "temperature",
+            MetricGroup::Dewpoint => "dewpoint",
+            MetricGroup::Wind => "wind",
+            MetricGroup::Precipitation => "precipitation",
+            MetricGroup::PresentWeather => "present_weather",
+        }
+    }
+}
+
+const TEMPERATURE: &[MetricGroup] = &[MetricGroup::Temperature];
+const DEWPOINT: &[MetricGroup] = &[MetricGroup::Dewpoint];
+/// The body and T groups report temperature and dewpoint together.
+const TEMPERATURES: &[MetricGroup] = &[MetricGroup::Temperature, MetricGroup::Dewpoint];
+const WIND: &[MetricGroup] = &[MetricGroup::Wind];
+const PRECIPITATION: &[MetricGroup] = &[MetricGroup::Precipitation];
+const PRESENT_WEATHER: &[MetricGroup] = &[MetricGroup::PresentWeather];
+/// A report whose identity or type is in doubt cannot vouch for any value.
+const ALL: &[MetricGroup] = &[
+    MetricGroup::Temperature,
+    MetricGroup::Dewpoint,
+    MetricGroup::Wind,
+    MetricGroup::Precipitation,
+    MetricGroup::PresentWeather,
+];
+
+/// A report's quality problems and the metric groups they affect.
+#[derive(Default)]
+struct Problems {
+    reasons: Vec<String>,
+    groups: BTreeSet<MetricGroup>,
+}
+
+impl Problems {
+    fn push(&mut self, groups: &[MetricGroup], reason: impl Into<String>) {
+        self.reasons.push(reason.into());
+        self.groups.extend(groups);
+    }
+}
 #[cfg(test)]
 const OBSERVATION_SOURCE: &str = "https://aviationweather.gov/data/cache/metars.cache.xml.gz";
 
@@ -219,23 +313,33 @@ fn validate_report_identity(
     Ok(())
 }
 
-fn checked_number(value: Option<&str>, field: &str, problems: &mut Vec<String>) -> Option<f64> {
+fn checked_number(
+    value: Option<&str>,
+    field: &str,
+    groups: &[MetricGroup],
+    problems: &mut Problems,
+) -> Option<f64> {
     let value = value?;
     match value.trim().parse::<f64>() {
         Ok(number) if number.is_finite() => Some(number),
         _ => {
-            problems.push(format!("invalid {field}: {value:?}"));
+            problems.push(groups, format!("invalid {field}: {value:?}"));
             None
         }
     }
 }
 
-fn checked_integer(value: Option<&str>, field: &str, problems: &mut Vec<String>) -> Option<i64> {
+fn checked_integer(
+    value: Option<&str>,
+    field: &str,
+    groups: &[MetricGroup],
+    problems: &mut Problems,
+) -> Option<i64> {
     let value = value?;
     match value.trim().parse::<i64>() {
         Ok(number) => Some(number),
         Err(_) => {
-            problems.push(format!("invalid {field}: {value:?}"));
+            problems.push(groups, format!("invalid {field}: {value:?}"));
             None
         }
     }
@@ -522,6 +626,7 @@ pub struct Observation {
     pub quality_reason: Option<String>,
     pub validation_version: Option<String>,
     pub metar_type: Option<String>,
+    pub quality_metrics: Option<String>,
 }
 
 impl TryFrom<CurrentWeather> for Observation {
@@ -558,6 +663,7 @@ impl TryFrom<CurrentWeather> for Observation {
             quality_reason: val.quality_reason,
             validation_version: Some(VALIDATION_VERSION.into()),
             metar_type: val.metar_type,
+            quality_metrics: val.quality_metrics,
         };
         Ok(parquet)
     }
@@ -703,6 +809,7 @@ pub fn create_observation_schema() -> Type {
             optional_text("quality_reason"),
             optional_text("validation_version"),
             optional_text("metar_type"),
+            optional_text("quality_metrics"),
         ])
         .build()
         .unwrap()
