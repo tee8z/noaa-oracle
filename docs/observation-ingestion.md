@@ -15,9 +15,11 @@ Observation collection and publication run before the independent forecast task.
 | 20 minutes per history run | Stop requests and record remaining intervals as failed. |
 | 64 MiB of received source bodies per run | Stop collection and record a size-budget failure. |
 | 750 ms minimum between request starts | Apply this spacing in addition to the configured shared rate limiter. |
-| 60 seconds per physical request | Record a transport failure. Retry through the next overlapping collection run. |
+| 60 seconds per physical request | Record a transport failure. Retry the interval in the next collection run. |
 
-History requests do not use automatic retry middleware. Each physical request passes through the rate limiter. The four-hour default accommodates a two-hour signing grace, hourly collection, and normal collection latency. Longer signing grace requires a larger lookback. An outage longer than the lookback can leave a permanent coverage gap in the local retained history. The oracle must hold settlement for that gap. It must not infer zero weather activity from missing collection.
+History requests do not use automatic retry middleware. Each physical request passes through the rate limiter. The four-hour default accommodates a two-hour signing grace, hourly collection, and normal collection latency. Longer signing grace requires a larger lookback.
+
+The next run's lookback no longer reaches the oldest hour of a failed batch. The daemon therefore keeps every failed query interval, except a capped parent, and requests it again after the next run's own window. It requests only the part before that window. A station catalog failure is retried for the next run's whole catalog. An interval leaves the list when it succeeds or when it ends more than 26 hours before the run. At most 64 retries run per collection, newest first, within the same request and time budget. The list is held in memory, so a daemon restart forgets it. An outage longer than the lookback, or a failure the retries never repair, can leave a permanent coverage gap in the local retained history. The oracle must hold settlement for that gap. It must not infer zero weather activity from missing collection.
 
 The requested inner interval is closed at both ends. It ends one second before the collection run starts, rounded to a whole second. The HTTP query includes one extra second at each end because the API does not document boundary inclusivity. Rows outside the inner interval do not expand the certified coverage. Overlapping runs can contain the same report; consumers must deduplicate before aggregation.
 

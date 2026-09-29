@@ -47,7 +47,7 @@ pub const MAX_LOCATIONS: usize = 50;
 pub const MAX_LIST_LIMIT: usize = 100;
 /// Participants can claim a refund this long after the signing date if the
 /// oracle has not attested.
-const EXPIRY_AFTER_SIGNING: Duration = Duration::DAY;
+pub(crate) const EXPIRY_AFTER_SIGNING: Duration = Duration::DAY;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateEvent {

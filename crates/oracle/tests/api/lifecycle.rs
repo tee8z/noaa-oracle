@@ -530,6 +530,12 @@ async fn quality_failure_blocks_stale_scores(rejected_reports: u64, unverified_r
     phase.store(1, Ordering::SeqCst);
     app.clock.set(event.signing_date);
     for pass in 1..=2 {
+        if pass == 2 {
+            // A blocked event rests between checks, then is read again.
+            let resting = app.oracle.etl_data(pass).await.unwrap();
+            assert_eq!((resting.failed, resting.attested), (0, 0));
+            app.clock.set(event.signing_date + Duration::minutes(15));
+        }
         let summary = app.oracle.etl_data(pass).await.unwrap();
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.attested, 0);
@@ -547,6 +553,7 @@ async fn quality_failure_blocks_stale_scores(rejected_reports: u64, unverified_r
     // A later audited result must be scored again before signing. The
     // formerly losing Under entry now wins; old provisional scores cannot.
     phase.store(2, Ordering::SeqCst);
+    app.clock.set(event.signing_date + Duration::minutes(30));
     let summary = app.oracle.etl_data(3).await.unwrap();
     assert_eq!(summary.failed, 0);
     assert_eq!(summary.attested, 1);

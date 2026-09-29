@@ -17,8 +17,8 @@ use std::sync::Arc;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339, macros::format_description};
 
 use super::history::{
-    ArchivedResponse, HISTORY_SOURCE, HistoryCollection, HistoryConfig, ObservationCoverage,
-    collect_history,
+    ArchivedResponse, HISTORY_SOURCE, HistoryCollection, HistoryConfig, HistoryQuery,
+    ObservationCoverage, collect_history,
 };
 use crate::parquet_file::{self, PartialFile};
 use crate::{CityWeather, Metar, Units, XmlFetcher};
@@ -772,6 +772,8 @@ impl ObservationService {
 
     /// Collect all reports in a bounded history window, preserving successful,
     /// empty and failed query receipts in the same published artifact.
+    /// `retry` holds earlier runs' failed intervals, requested after the
+    /// window; it is replaced with the intervals this run failed.
     pub async fn get_observations_to_file(
         &self,
         city_weather: &CityWeather,
@@ -779,26 +781,36 @@ impl ObservationService {
         started_at: OffsetDateTime,
         config: &HistoryConfig,
         catalog: &crate::coordinates::StationCatalogEvidence,
+        retry: &mut Vec<HistoryQuery>,
     ) -> Result<ObservationReport, Error> {
         info!(
             self.logger,
-            "fetching {} hours of observation history", config.hours
+            "fetching {} hours of observation history and {} earlier failed intervals",
+            config.hours,
+            retry.len()
         );
+        let earlier = std::mem::take(retry);
         let mut history = match collect_history(
             self.fetcher.clone(),
             city_weather.city_data.keys().cloned().collect(),
             started_at,
             config,
+            earlier.clone(),
         )
         .await
         {
             Ok(history) => history,
-            Err(error) => HistoryCollection::unavailable(
-                started_at,
-                config,
-                format!("history collection failed: {error:#}"),
-            )?,
+            Err(error) => {
+                let mut history = HistoryCollection::unavailable(
+                    started_at,
+                    config,
+                    format!("history collection failed: {error:#}"),
+                )?;
+                history.retry.extend(earlier);
+                history
+            }
         };
+        retry.clone_from(&history.retry);
         let complete = history
             .coverage
             .batches
@@ -829,14 +841,17 @@ impl ObservationService {
         self.write_history(city_weather, output_path, &history)
     }
 
+    /// Adds the whole window to `retry`, since no station was requested.
     pub fn write_unavailable_history(
         &self,
         output_path: &str,
         started_at: OffsetDateTime,
         config: &HistoryConfig,
         error: String,
+        retry: &mut Vec<HistoryQuery>,
     ) -> Result<ObservationReport, Error> {
         let history = HistoryCollection::unavailable(started_at, config, error)?;
+        retry.extend(history.retry.iter().cloned());
         self.write_history(
             &CityWeather {
                 city_data: Default::default(),

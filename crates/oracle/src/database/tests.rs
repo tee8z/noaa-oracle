@@ -250,7 +250,10 @@ async fn waiting_writes_queue_behind_capacity_instead_of_failing() {
     assert!(bounded(waiting).await.unwrap());
     let signed = database.get_event(event.id).await.unwrap().unwrap();
     assert_eq!(signed.attestation, Some(MaybeScalar::Zero));
-    let unattested = database.unattested_events().await.unwrap();
+    let unattested = database
+        .events_to_settle(OffsetDateTime::now_utc())
+        .await
+        .unwrap();
     assert!(unattested.iter().all(|active| active.id != event.id));
     assert_eq!(unattested.len(), 1, "the queued event is still unattested");
     shutdown.cancel();
@@ -863,6 +866,52 @@ async fn settlement_blocks_survive_restart_and_cannot_modify_signed_events() {
             .attestation,
         Some(MaybeScalar::Zero)
     );
+    shutdown.cancel();
+    bounded(task).await.unwrap().unwrap();
+}
+
+/// The ETL stops reading an event at its DLC expiry, and reads a blocked
+/// event again only after a pause, except right after its signing date.
+#[tokio::test]
+async fn events_to_settle_skip_expired_and_recently_blocked_events() {
+    let (_directory, database, writer) = open(8).await;
+    let (shutdown, task) = start(writer);
+    let event = add(&database, 2).await;
+    let signing = event.signing_date;
+    let settle = |now: OffsetDateTime| {
+        let database = &database;
+        async move {
+            let events = bounded(database.events_to_settle(now)).await.unwrap();
+            events.iter().any(|candidate| candidate.id == event.id)
+        }
+    };
+    let block = |checked_at: OffsetDateTime| SettlementBlock {
+        code: "incomplete_readings".into(),
+        message: "waiting for source".into(),
+        checked_at,
+    };
+    assert!(settle(signing - TimeDuration::hours(1)).await);
+    assert!(settle(signing + TimeDuration::hours(23)).await);
+    assert!(
+        !settle(signing + EXPIRY_AFTER_SIGNING).await,
+        "an expired event refunds through its contract"
+    );
+
+    let before = signing - TimeDuration::minutes(5);
+    bounded(database.set_settlement_block(event.id, block(before)))
+        .await
+        .unwrap();
+    assert!(!settle(before + TimeDuration::minutes(1)).await);
+    assert!(
+        settle(signing + TimeDuration::minutes(1)).await,
+        "the first strict check runs as soon as signing is due"
+    );
+    let after = signing + TimeDuration::minutes(1);
+    bounded(database.set_settlement_block(event.id, block(after)))
+        .await
+        .unwrap();
+    assert!(!settle(after + TimeDuration::minutes(5)).await);
+    assert!(settle(after + TimeDuration::minutes(16)).await);
     shutdown.cancel();
     bounded(task).await.unwrap().unwrap();
 }

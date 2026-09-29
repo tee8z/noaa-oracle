@@ -39,7 +39,7 @@ Provisional humidity display statistics remain unchanged.
 flowchart TD
   A[Unsigned event reaches signing date] --> B[Read validated forecasts and observations]
   B --> C{Coverage and every enabled pair complete?}
-  C -- No --> D[Persist blocked reason and retry]
+  C -- No --> D[Persist blocked reason; retry after 15 minutes until expiry]
   C -- Yes --> E[Compute scores and announced outcome]
   E --> F[Atomically save readings, scores, signature and clear block]
 ```
@@ -108,8 +108,11 @@ Use the reason to select the next action.
 | `processing_failed` | Inspect the event processing log and database writer health. |
 
 The next successful processing pass uses fresh validated readings and recomputes the result.
+A blocked event is read again 15 minutes after its last check, because new observations arrive hourly. Its first check after the signing date is never delayed.
 Do not clear a block manually to force signing. Clearing a displayed reason cannot repair missing evidence.
 An event can remain unsigned through its announced expiry; the coordinator must handle the contract's expiry path.
+The oracle stops processing an unsigned event at its announced expiry, one day after the signing date, and keeps its last block reason.
+`oracle_events_expired_unsigned` counts such events with entries. `oracle_events_awaiting_attestation` counts only events that can still be signed.
 
 ## Reproducibility limit
 

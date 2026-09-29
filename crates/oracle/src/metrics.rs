@@ -49,6 +49,7 @@ pub struct Metrics {
     events: IntGaugeVec,
     awaiting_attestation: IntGauge,
     oldest_awaiting_age: IntGauge,
+    expired_unsigned: IntGauge,
     latest_forecast: IntGauge,
     latest_observation: IntGauge,
     /// When the scrape-time gauges were last read.
@@ -118,6 +119,12 @@ impl Metrics {
                  0 while none is due",
             )
             .expect("valid metric"),
+            expired_unsigned: IntGauge::new(
+                "oracle_events_expired_unsigned",
+                "Events with entries that reached their DLC expiry without an attestation; \
+                 their contracts refund through the expiry path",
+            )
+            .expect("valid metric"),
             latest_forecast: IntGauge::new(
                 "oracle_latest_forecast_timestamp_seconds",
                 "Generation time of the newest forecast file; 0 if there is none",
@@ -148,7 +155,7 @@ impl Metrics {
         for state in EVENT_STATES {
             metrics.events.with_label_values(&[state]);
         }
-        let collectors: [Box<dyn prometheus::core::Collector>; 12] = [
+        let collectors: [Box<dyn prometheus::core::Collector>; 13] = [
             Box::new(build_info),
             Box::new(metrics.etl_runs.clone()),
             Box::new(metrics.events_attested.clone()),
@@ -159,6 +166,7 @@ impl Metrics {
             Box::new(metrics.events.clone()),
             Box::new(metrics.awaiting_attestation.clone()),
             Box::new(metrics.oldest_awaiting_age.clone()),
+            Box::new(metrics.expired_unsigned.clone()),
             Box::new(metrics.latest_forecast.clone()),
             Box::new(metrics.latest_observation.clone()),
         ];
@@ -240,6 +248,8 @@ impl Metrics {
             Ok(awaiting) => {
                 self.awaiting_attestation
                     .set(i64::try_from(awaiting.count).unwrap_or(i64::MAX));
+                self.expired_unsigned
+                    .set(i64::try_from(awaiting.expired).unwrap_or(i64::MAX));
                 let now = state.oracle.now().unix_timestamp();
                 let age = awaiting
                     .oldest_signing_date

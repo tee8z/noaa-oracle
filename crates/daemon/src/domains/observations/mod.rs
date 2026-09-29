@@ -7,4 +7,4 @@ pub use xml_observation::*;
 pub mod history;
 pub mod shef;
 mod wind_validation;
-pub use history::{HistoryConfig, ObservationCoverage};
+pub use history::{HistoryConfig, HistoryQuery, ObservationCoverage};
