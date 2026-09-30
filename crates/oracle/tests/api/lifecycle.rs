@@ -14,7 +14,7 @@ use oracle::{
 use serde_json::{Value, json};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
 use time::{Duration, Time, UtcOffset, format_description::well_known::Rfc3339};
 use uuid::{NoContext, Timestamp, Uuid};
@@ -281,13 +281,13 @@ async fn the_best_entry_is_attested_after_the_signing_date() {
     )
     .await;
 
-    // Before the window nothing is scored, though forecasts are recorded.
+    // Before the window nothing is read or scored.
     test_app.run_etl().await;
     let live = fetch(&test_app, event.id).await;
     assert_eq!(live.status, EventStatus::Live);
     assert!(live.entries.iter().all(|entry| entry.score.is_none()));
-    assert_eq!(live.weather.len(), 2);
-    assert_eq!(live.weather[0].forecasted.temp_high, 70);
+    assert!(live.readings.is_empty());
+    assert!(live.weather.is_empty());
 
     // Inside the window entries are scored but nothing is signed.
     test_app
@@ -561,6 +561,7 @@ async fn quality_failure_blocks_stale_scores(
             // A blocked event rests between checks, then is read again.
             let resting = app.oracle.etl_data(pass).await.unwrap();
             assert_eq!((resting.failed, resting.attested), (0, 0));
+            assert_eq!((resting.skipped_backed_off, resting.refreshed), (1, 0));
             app.clock.set(event.signing_date + Duration::minutes(15));
         }
         let summary = app.oracle.etl_data(pass).await.unwrap();
@@ -578,8 +579,13 @@ async fn quality_failure_blocks_stale_scores(
 
     // A later audited result must be scored again before signing. The
     // formerly losing Under entry now wins; old provisional scores cannot.
+    // The second failure doubled the rest, so the event is read 30 minutes
+    // after it, not sooner.
     phase.store(2, Ordering::SeqCst);
-    app.clock.set(event.signing_date + Duration::minutes(30));
+    app.clock.set(event.signing_date + Duration::minutes(44));
+    let resting = app.oracle.etl_data(3).await.unwrap();
+    assert_eq!((resting.skipped_backed_off, resting.refreshed), (1, 0));
+    app.clock.set(event.signing_date + Duration::minutes(45));
     let summary = app.oracle.etl_data(3).await.unwrap();
     assert_eq!(summary.failed, 0);
     assert_eq!(summary.attested, 1);
@@ -868,17 +874,207 @@ async fn an_unverified_report_drops_out_of_the_metrics_it_affects() {
     assert!(!block.message.contains("KSAW"), "{}", block.message);
 }
 
+/// Fixture weather that counts how often a pass reads it.
+async fn app_with_counted_weather() -> (TestApp, Arc<AtomicUsize>) {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let mut weather = MockWeatherAccess::new();
+    let forecast_reads = reads.clone();
+    set_forecasts(&mut weather, move |request, _| {
+        forecast_reads.fetch_add(1, Ordering::SeqCst);
+        Ok(forecasts_in_window(
+            request,
+            &[("KORD", 70, 50, 10), ("KSAW", 40, 30, 5)],
+        ))
+    });
+    let observation_reads = reads.clone();
+    set_observations(&mut weather, move |_, _| {
+        observation_reads.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![
+            observation("KORD", 75.0, 50.0, 10),
+            observation("KSAW", 40.0, 29.4, 8),
+        ])
+    });
+    (spawn_app(Arc::new(weather)).await, reads)
+}
+
+/// An event that reaches its signing date without entries is closed once,
+/// with a null attestation, and no later pass reads it.
 #[tokio::test]
-async fn events_without_entries_are_never_signed() {
-    let test_app = app_with_weather().await;
+async fn events_without_entries_are_settled_once_and_never_signed() {
+    let (test_app, reads) = app_with_counted_weather().await;
     let (status, body) = test_app.create_event(&event_at(test_app.clock.now())).await;
     assert_eq!(status, StatusCode::OK);
     let event: Event = serde_json::from_slice(&body).unwrap();
+    assert!(event.settled_without_entries_at.is_none());
     test_app.clock.set(event.signing_date);
-    test_app.run_etl().await;
+    let summary = test_app.oracle.etl_data(1).await.unwrap();
+    assert_eq!(summary.settled_without_entries, 1);
+    assert_eq!((summary.attested, summary.failed), (0, 0));
     let unsigned = fetch(&test_app, event.id).await;
     assert!(unsigned.attestation.is_none());
     assert_eq!(unsigned.status, EventStatus::Completed);
+    assert_eq!(
+        unsigned
+            .settled_without_entries_at
+            .map(|at| at.unix_timestamp()),
+        Some(event.signing_date.unix_timestamp())
+    );
+    assert_eq!(unsigned.weather.len(), 2, "the last readings stay on show");
+    // The coordinator's poll reads a null attestation, as before.
+    let (_, body) = test_app.get(&format!("/oracle/events/{}", event.id)).await;
+    let raw: Value = serde_json::from_slice(&body).unwrap();
+    assert!(raw["attestation"].is_null());
+    assert_eq!(raw["status"], "Completed");
+    assert!(raw["settled_without_entries_at"].is_string());
+    let (_, body) = test_app.get(&format!("/events/{}", event.id)).await;
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains("Not signed."), "{html}");
+
+    let read = reads.load(Ordering::SeqCst);
+    test_app.clock.set(event.signing_date + Duration::hours(1));
+    let summary = test_app.oracle.etl_data(2).await.unwrap();
+    assert_eq!(summary, oracle::oracle::EtlSummary::default());
+    assert_eq!(reads.load(Ordering::SeqCst), read);
+}
+
+/// A source that cannot be read does not keep a no-entry event open.
+#[tokio::test]
+async fn a_failing_source_does_not_keep_an_event_without_entries_open() {
+    let mut weather = MockWeatherAccess::new();
+    set_forecasts(&mut weather, |_, _| {
+        Err(oracle::weather_data::Error::InvalidStationId("KORD".into()))
+    });
+    set_observations(&mut weather, |_, _| Ok(vec![]));
+    let test_app = spawn_app(Arc::new(weather)).await;
+    let (status, body) = test_app.create_event(&event_at(test_app.clock.now())).await;
+    assert_eq!(status, StatusCode::OK);
+    let event: Event = serde_json::from_slice(&body).unwrap();
+    test_app
+        .clock
+        .set(event.start_observation_date + Duration::hours(1));
+    let summary = test_app.oracle.etl_data(1).await.unwrap();
+    assert_eq!(summary.failed, 1);
+    assert!(fetch(&test_app, event.id).await.settlement_block.is_some());
+
+    test_app.clock.set(event.signing_date);
+    let summary = test_app.oracle.etl_data(2).await.unwrap();
+    assert_eq!((summary.settled_without_entries, summary.failed), (1, 0));
+    let settled = fetch(&test_app, event.id).await;
+    assert!(settled.settled_without_entries_at.is_some());
+    assert!(settled.attestation.is_none());
+    assert!(settled.settlement_block.is_none());
+}
+
+/// A live event costs a pass nothing: its source is not read until its
+/// observation window opens.
+#[tokio::test]
+async fn a_live_event_is_not_read_from_its_source() {
+    let (test_app, reads) = app_with_counted_weather().await;
+    let (event, _) = event_with_entries(
+        &test_app,
+        vec![
+            vec![pick("KORD", "temp_high", "Over")],
+            vec![pick("KORD", "temp_high", "Under")],
+            vec![pick("KORD", "temp_high", "Par")],
+        ],
+    )
+    .await;
+    let created = reads.load(Ordering::SeqCst);
+    test_app
+        .clock
+        .set(event.start_observation_date - Duration::SECOND);
+    let summary = test_app.oracle.etl_data(1).await.unwrap();
+    assert_eq!((summary.skipped_live, summary.refreshed), (1, 0));
+    assert_eq!(reads.load(Ordering::SeqCst), created);
+    assert!(fetch(&test_app, event.id).await.readings.is_empty());
+
+    test_app.clock.set(event.start_observation_date);
+    let summary = test_app.oracle.etl_data(2).await.unwrap();
+    assert_eq!((summary.skipped_live, summary.refreshed), (0, 1));
+    assert!(reads.load(Ordering::SeqCst) > created);
+    assert!(!fetch(&test_app, event.id).await.readings.is_empty());
+}
+
+/// A running event's readings are refreshed at most every 15 minutes,
+/// however often a pass runs.
+#[tokio::test]
+async fn a_running_event_is_refreshed_every_fifteen_minutes() {
+    let (test_app, reads) = app_with_counted_weather().await;
+    let (event, _) = event_with_entries(
+        &test_app,
+        vec![
+            vec![pick("KORD", "temp_high", "Over")],
+            vec![pick("KORD", "temp_high", "Under")],
+            vec![pick("KORD", "temp_high", "Par")],
+        ],
+    )
+    .await;
+    let running = event.start_observation_date + Duration::hours(1);
+    test_app.clock.set(running);
+    let summary = test_app.oracle.etl_data(1).await.unwrap();
+    assert_eq!((summary.refreshed, summary.skipped_fresh), (1, 0));
+    let refreshed = reads.load(Ordering::SeqCst);
+
+    test_app.clock.set(running + Duration::minutes(14));
+    let summary = test_app.oracle.etl_data(2).await.unwrap();
+    assert_eq!((summary.refreshed, summary.skipped_fresh), (0, 1));
+    assert_eq!(reads.load(Ordering::SeqCst), refreshed);
+
+    test_app.clock.set(running + Duration::minutes(15));
+    let summary = test_app.oracle.etl_data(3).await.unwrap();
+    assert_eq!((summary.refreshed, summary.skipped_fresh), (1, 0));
+    assert!(reads.load(Ordering::SeqCst) > refreshed);
+}
+
+/// Each failure in a row doubles an event's rest, and a success ends it.
+#[tokio::test]
+async fn a_failing_event_is_read_less_and_less_often() {
+    let failing = Arc::new(AtomicBool::new(true));
+    let mut weather = MockWeatherAccess::new();
+    let forecasts_failing = failing.clone();
+    set_forecasts(&mut weather, move |request, _| {
+        if forecasts_failing.load(Ordering::SeqCst) {
+            return Err(oracle::weather_data::Error::InvalidStationId("KORD".into()));
+        }
+        Ok(forecasts_in_window(
+            request,
+            &[("KORD", 70, 50, 10), ("KSAW", 40, 30, 5)],
+        ))
+    });
+    set_observations(&mut weather, |_, _| {
+        Ok(vec![
+            observation("KORD", 75.0, 50.0, 10),
+            observation("KSAW", 40.0, 29.4, 8),
+        ])
+    });
+    let test_app = spawn_app(Arc::new(weather)).await;
+    let (event, _) = event_with_entries(
+        &test_app,
+        vec![
+            vec![pick("KORD", "temp_high", "Over")],
+            vec![pick("KORD", "temp_high", "Under")],
+            vec![pick("KORD", "temp_high", "Par")],
+        ],
+    )
+    .await;
+    let mut now = event.signing_date;
+    for (pass, rest) in [15, 30, 60, 120].into_iter().enumerate() {
+        test_app.clock.set(now);
+        let summary = test_app.oracle.etl_data(pass as u64).await.unwrap();
+        assert_eq!((summary.failed, summary.skipped_backed_off), (1, 0));
+        test_app
+            .clock
+            .set(now + Duration::minutes(rest) - Duration::SECOND);
+        let resting = test_app.oracle.etl_data(pass as u64).await.unwrap();
+        assert_eq!((resting.failed, resting.skipped_backed_off), (0, 1));
+        now += Duration::minutes(rest);
+    }
+
+    failing.store(false, Ordering::SeqCst);
+    test_app.clock.set(now);
+    let summary = test_app.oracle.etl_data(9).await.unwrap();
+    assert_eq!((summary.attested, summary.failed), (1, 0));
+    assert!(fetch(&test_app, event.id).await.settlement_block.is_none());
 }
 
 #[tokio::test]
@@ -914,9 +1110,17 @@ async fn one_failing_event_does_not_block_the_others() {
         ],
     )
     .await;
-    test_app.clock.set(event.signing_date);
+    test_app
+        .clock
+        .set(event.start_observation_date + Duration::hours(1));
     let summary = test_app.oracle.etl_data(1).await.unwrap();
-    assert_eq!(summary.failed, 1);
+    assert_eq!((summary.failed, summary.refreshed), (1, 2));
+    let scored = fetch(&test_app, event.id).await;
+    assert_eq!(scored.entries[0].base_score, Some(10));
+    // The failing event has no entries, so it is closed rather than read.
+    test_app.clock.set(event.signing_date);
+    let summary = test_app.oracle.etl_data(2).await.unwrap();
+    assert_eq!(summary.failed, 0);
     assert_eq!(summary.attested, 1);
     assert_attests(&test_app, &fetch(&test_app, event.id).await, &[0]);
 }

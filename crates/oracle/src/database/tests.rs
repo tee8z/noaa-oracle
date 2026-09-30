@@ -870,10 +870,10 @@ async fn settlement_blocks_survive_restart_and_cannot_modify_signed_events() {
     bounded(task).await.unwrap().unwrap();
 }
 
-/// The ETL stops reading an event at its DLC expiry, and reads a blocked
-/// event again only after a pause, except right after its signing date.
+/// The ETL stops reading an event at its DLC expiry. A blocked event stays
+/// in the list: how long it waits between checks is the oracle's decision.
 #[tokio::test]
-async fn events_to_settle_skip_expired_and_recently_blocked_events() {
+async fn events_to_settle_skip_expired_events() {
     let (_directory, database, writer) = open(8).await;
     let (shutdown, task) = start(writer);
     let event = add(&database, 2).await;
@@ -885,11 +885,6 @@ async fn events_to_settle_skip_expired_and_recently_blocked_events() {
             events.iter().any(|candidate| candidate.id == event.id)
         }
     };
-    let block = |checked_at: OffsetDateTime| SettlementBlock {
-        code: "incomplete_readings".into(),
-        message: "waiting for source".into(),
-        checked_at,
-    };
     assert!(settle(signing - TimeDuration::hours(1)).await);
     assert!(settle(signing + TimeDuration::hours(23)).await);
     assert!(
@@ -897,21 +892,84 @@ async fn events_to_settle_skip_expired_and_recently_blocked_events() {
         "an expired event refunds through its contract"
     );
 
-    let before = signing - TimeDuration::minutes(5);
-    bounded(database.set_settlement_block(event.id, block(before)))
+    let block = SettlementBlock {
+        code: "incomplete_readings".into(),
+        message: "waiting for source".into(),
+        checked_at: signing,
+    };
+    bounded(database.set_settlement_block(event.id, block))
         .await
         .unwrap();
-    assert!(!settle(before + TimeDuration::minutes(1)).await);
+    assert!(settle(signing + TimeDuration::minutes(1)).await);
+    shutdown.cancel();
+    bounded(task).await.unwrap().unwrap();
+}
+
+/// An event settled without entries is finished: it leaves processing, keeps
+/// a null attestation, and cannot be settled, blocked, or signed afterwards.
+#[tokio::test]
+async fn an_event_settled_without_entries_leaves_processing() {
+    let (_directory, database, writer) = open(8).await;
+    let (shutdown, task) = start(writer);
+    let empty = add(&database, 2).await;
+    let entered = add(&database, 2).await;
+    bounded(database.add_event_entries(entered.id, vec![entry(entered.id, "KORD")]))
+        .await
+        .unwrap();
+    let block = |checked_at: OffsetDateTime| SettlementBlock {
+        code: "source_unavailable".into(),
+        message: "waiting for source".into(),
+        checked_at,
+    };
+    let at = empty.signing_date;
+    bounded(database.set_settlement_block(empty.id, block(at)))
+        .await
+        .unwrap();
+    let to_settle = |now: OffsetDateTime| {
+        let database = &database;
+        async move {
+            let events = bounded(database.events_to_settle(now)).await.unwrap();
+            events.iter().map(|event| event.id).collect::<Vec<_>>()
+        }
+    };
+    let listed = to_settle(at).await;
+    assert!(listed.contains(&empty.id) && listed.contains(&entered.id));
+
     assert!(
-        settle(signing + TimeDuration::minutes(1)).await,
-        "the first strict check runs as soon as signing is due"
+        !bounded(database.settle_without_entries(entered.id, at))
+            .await
+            .unwrap(),
+        "an event with entries has an outcome to sign"
     );
-    let after = signing + TimeDuration::minutes(1);
-    bounded(database.set_settlement_block(event.id, block(after)))
+    assert!(
+        bounded(database.settle_without_entries(empty.id, at))
+            .await
+            .unwrap()
+    );
+    assert_eq!(to_settle(at).await, vec![entered.id]);
+    let settled = database.get_event(empty.id).await.unwrap().unwrap();
+    assert_eq!(settled.settled_without_entries_at, Some(at));
+    assert!(settled.attestation.is_none());
+    assert_eq!(settled.status(at), EventStatus::Completed);
+    let blocks = database.settlement_blocks(&[empty.id]).await.unwrap();
+    assert!(blocks.is_empty(), "the blocked reason goes with the event");
+
+    // Settling is final: a later pass or a delayed failure changes nothing.
+    let later = at + TimeDuration::minutes(5);
+    assert!(
+        !bounded(database.settle_without_entries(empty.id, later))
+            .await
+            .unwrap()
+    );
+    bounded(database.set_settlement_block(empty.id, block(later)))
         .await
         .unwrap();
-    assert!(!settle(after + TimeDuration::minutes(5)).await);
-    assert!(settle(after + TimeDuration::minutes(16)).await);
+    let blocks = database.settlement_blocks(&[empty.id]).await.unwrap();
+    assert!(blocks.is_empty());
+    let settled = database.get_event(empty.id).await.unwrap().unwrap();
+    assert_eq!(settled.settled_without_entries_at, Some(at));
+    let unsettled = database.get_event(entered.id).await.unwrap().unwrap();
+    assert_eq!(unsettled.settled_without_entries_at, None);
     shutdown.cancel();
     bounded(task).await.unwrap().unwrap();
 }
