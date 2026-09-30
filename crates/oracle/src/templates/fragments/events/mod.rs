@@ -221,7 +221,7 @@ fn event_row(event: &EventView, now: OffsetDateTime) -> Markup {
             span class="ev-status" {
                 span class="is-sr-only" { "Status " }
                 (status_tag(event.status))
-                @if event.unlisted { " " span class="tag is-light" { "Unlisted" } }
+                @if event.unlisted { " " span class="tag" { "Unlisted" } }
             }
             span class="ev-window" {
                 span class="cell-label" { "Window: " }

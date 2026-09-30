@@ -115,19 +115,23 @@ fn event_problem(heading: &str, message: Markup) -> Markup {
     }
 }
 
-/// The attestation, a scalar, as hex like the API sends it; "Pending"
-/// until the event is signed. A signed event whose value can't be written
-/// out still reads "Signed", never "Pending". An event that reached its
-/// signing time without entries is never signed: it has no outcome.
+/// The attestation, a scalar, as hex like the API sends it; "Not signed"
+/// until the event is signed, as the notice above the grid says. A signed
+/// event whose value can't be written out still reads "Signed". An event
+/// that reached its signing time without entries is never signed: it has
+/// no outcome.
 fn attestation_value(event: &Event, now: OffsetDateTime) -> Markup {
     let Some(attestation) = event.attestation.as_ref() else {
         if event.entries.is_empty() && now >= event.signing_date {
             return html! {
-                span class="tag is-light" { "Not signed" }
+                span class="tag" { "Not signed" }
                 span class="muted" { " · no entries, so there is no outcome to sign" }
             };
         }
-        return html! { span class="tag is-warning is-light" { "Pending" } };
+        return html! {
+            span class="tag" { "Not signed" }
+            @if now < event.signing_date { span class="muted" { " · the signing time has not come" } }
+        };
     };
     let hex = serde_json::to_value(attestation)
         .ok()
@@ -142,7 +146,7 @@ fn quality_notice(quality: SettlementQuality) -> Markup {
     match quality {
         SettlementQuality::Signed => html! {},
         SettlementQuality::Unsigned => html! {
-            div class="notification is-light" role="status" {
+            div class="notification" role="status" {
                 strong { "Not signed. " }
                 "Readings and scores are provisional until the oracle signs the outcome."
             }
@@ -168,7 +172,7 @@ pub fn event_detail_content(
             h2 class="title is-4 mb-0" { "Event " code { (truncate_id(&event.id.to_string())) } }
             (status_tag(event.status))
             @if event.unlisted {
-                span class="tag is-light" title="Not on the events list; reachable by its link" {
+                span class="tag" title="Not on the events list; reachable by its link" {
                     "Unlisted"
                 }
             }
@@ -488,7 +492,7 @@ fn entries_list(
                         tr class=[paid.then_some("is-paid")] {
                             td {
                                 @if no_points && signed {
-                                    span class="tag is-light" title="No entry scored any points; the oracle signed the outcome for all entries" { "No score" }
+                                    span class="tag" title="No entry scored any points; the oracle signed the outcome for all entries" { "No score" }
                                 } @else if !show_ranks {
                                     span class="muted" { "—" }
                                 } @else if paid {
@@ -752,7 +756,7 @@ mod tests {
         assert!(
             attestation_value(&waiting, later)
                 .into_string()
-                .contains("Pending")
+                .contains("Not signed")
         );
 
         let empty = event(window, vec![], None);
@@ -760,7 +764,7 @@ mod tests {
         assert!(
             attestation_value(&empty, before)
                 .into_string()
-                .contains("Pending")
+                .contains("Not signed")
         );
         let html = attestation_value(&empty, later).into_string();
         assert!(html.contains("Not signed"), "{html}");
