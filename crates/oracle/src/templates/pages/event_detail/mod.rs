@@ -142,9 +142,17 @@ fn attestation_value(event: &Event, now: OffsetDateTime) -> Markup {
     }
 }
 
-fn quality_notice(quality: SettlementQuality) -> Markup {
+/// An event settled without entries is never signed, so its readings are not
+/// waiting on anything; the notice says so instead of promising a signature.
+fn quality_notice(quality: SettlementQuality, settled_without_entries: bool) -> Markup {
     match quality {
         SettlementQuality::Signed => html! {},
+        SettlementQuality::Unsigned if settled_without_entries => html! {
+            div class="notification" role="status" {
+                strong { "Not signed. " }
+                "No entries were made, so there is no outcome to sign."
+            }
+        },
         SettlementQuality::Unsigned => html! {
             div class="notification" role="status" {
                 strong { "Not signed. " }
@@ -178,7 +186,7 @@ pub fn event_detail_content(
             }
         }
 
-        (quality_notice(quality))
+        (quality_notice(quality, event.settled_without_entries_at.is_some()))
 
         div class="event-grid" {
             section class="box" {
@@ -739,6 +747,26 @@ mod tests {
         event.entries = entries;
         event.attestation = attestation;
         event
+    }
+
+    #[test]
+    fn the_notice_promises_a_signature_only_for_events_that_can_get_one() {
+        let waiting = quality_notice(SettlementQuality::Unsigned, false).into_string();
+        assert!(
+            waiting.contains("provisional until the oracle signs"),
+            "{waiting}"
+        );
+
+        let empty = quality_notice(SettlementQuality::Unsigned, true).into_string();
+        assert!(empty.contains("Not signed."), "{empty}");
+        assert!(empty.contains("no outcome to sign"), "{empty}");
+        assert!(!empty.contains("provisional"), "{empty}");
+
+        assert!(
+            quality_notice(SettlementQuality::Signed, true)
+                .into_string()
+                .is_empty()
+        );
     }
 
     #[test]
