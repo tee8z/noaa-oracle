@@ -24,6 +24,7 @@ struct Report {
     amount: Option<f64>,
     wind: bool,
     direction: bool,
+    temperature: bool,
     humidity: Option<i64>,
 }
 
@@ -64,6 +65,7 @@ fn chain(mut intervals: Vec<Interval>, start: OffsetDateTime, end: OffsetDateTim
     None
 }
 
+/// Whether `times`, the reports usable for one metric, sample the window.
 fn sampling_complete<'a>(
     times: impl Iterator<Item = &'a Report>,
     start: OffsetDateTime,
@@ -71,7 +73,7 @@ fn sampling_complete<'a>(
 ) -> bool {
     let mut previous = start;
     let mut count = 0;
-    for report in times.filter(|row| row.time >= start && row.time < end && row.verified) {
+    for report in times.filter(|row| row.time >= start && row.time < end) {
         if report.time - previous > MAX_REPORT_GAP {
             return false;
         }
@@ -226,7 +228,7 @@ fn phase_window(
 }
 
 fn phase_clear(reports: &[Report], (start, end): (OffsetDateTime, OffsetDateTime)) -> bool {
-    sampling_complete(reports.iter(), start, end)
+    sampling_complete(reports.iter().filter(|row| row.verified), start, end)
         && reports
             .iter()
             .filter(|row| row.time >= start && row.time <= end)
@@ -263,11 +265,23 @@ pub(super) fn apply(
             row.get::<_, bool>(6)?,
             row.get::<_, bool>(7)?,
             row.get::<_, Option<i64>>(8)?,
+            row.get::<_, bool>(9)?,
         ))
     })?;
     let mut by_station = BTreeMap::<String, Vec<Report>>::new();
     for row in rows {
-        let (station, timestamp, kind, raw, amount, verified, wind, direction, humidity) = row?;
+        let (
+            station,
+            timestamp,
+            kind,
+            raw,
+            amount,
+            verified,
+            wind,
+            direction,
+            humidity,
+            temperature,
+        ) = row?;
         let time = OffsetDateTime::parse(&timestamp, &Rfc3339)?;
         by_station.entry(station).or_default().push(Report {
             time,
@@ -277,6 +291,7 @@ pub(super) fn apply(
             amount,
             wind,
             direction,
+            temperature,
             humidity: humidity.filter(|value| (0..=100).contains(value)),
         });
     }
@@ -287,6 +302,35 @@ pub(super) fn apply(
             return Err(Error::ObservationCoverage {
                 stations: vec![station],
                 reason: "usable reports have a gap longer than 90 minutes, or no report inside the scoring window".into(),
+            });
+        }
+        // An unverified report drops out of the metrics its problems affect
+        // (the query removed those values); the rest must still sample the
+        // window. Wind and humidity gaps leave their values missing below.
+        let gaps: Vec<String> = ["temp_high", "temp_low"]
+            .into_iter()
+            .filter(|metric| requirement.scores(metric))
+            .map(|metric| format!("{station}/{metric}"))
+            .collect();
+        if !gaps.is_empty()
+            && !sampling_complete(
+                reports.iter().filter(|row| row.temperature),
+                requirement.start,
+                requirement.end,
+            )
+        {
+            let dropped = reports
+                .iter()
+                .filter(|row| {
+                    !row.verified && row.time >= requirement.start && row.time < requirement.end
+                })
+                .count();
+            return Err(Error::ObservationCoverage {
+                stations: vec![station],
+                reason: format!(
+                    "usable reports for {} have a gap longer than 90 minutes, or none inside the scoring window ({dropped} unverified reports left out)",
+                    gaps.join(", ")
+                ),
             });
         }
         let mut value = totals(&reports, requirement.start, requirement.end);
@@ -401,6 +445,7 @@ mod tests {
             raw: "METAR KORD 170000Z 18005KT 10SM RA 10/08 RMK AO2".into(),
             wind: true,
             direction: true,
+            temperature: true,
             humidity: Some(80),
         }
     }

@@ -15,6 +15,8 @@ pub(super) struct Requirement {
     pub collected_after: OffsetDateTime,
     /// Metric groups the event's metrics depend on (see `quality_groups`).
     pub groups: Vec<&'static str>,
+    /// The event's metrics; none means every metric.
+    pub metrics: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -43,6 +45,10 @@ struct Batch {
 }
 
 impl Requirement {
+    pub fn scores(&self, metric: &str) -> bool {
+        self.metrics.is_empty() || self.metrics.iter().any(|scored| scored == metric)
+    }
+
     pub fn unavailable(&self, reason: impl Into<String>) -> Error {
         Error::ObservationCoverage {
             stations: self.stations.clone(),
@@ -220,6 +226,7 @@ mod tests {
             collected_after: datetime!(2026-01-17 06:15 UTC),
             stations: vec!["KPWM".into()],
             groups: super::super::quality_groups(&[]),
+            metrics: vec![],
         }
     }
 
