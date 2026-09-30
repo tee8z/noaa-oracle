@@ -78,7 +78,7 @@ pub fn raw_data_content(now: OffsetDateTime) -> Markup {
                         div class="schema-box" {
                             div class="schema-header" {
                                 span class="schema-title" { (title) }
-                                span id=(format!("{table}-status")) class="tag is-light is-small ml-2" { "Empty" }
+                                span id=(format!("{table}-status")) class="tag is-small ml-2" { "Empty" }
                             }
                             div id=(format!("{table}-loading")) class="schema-loading" style="display: none;" {
                                 span class="loader mr-2" {}

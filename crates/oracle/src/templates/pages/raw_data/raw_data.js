@@ -260,7 +260,6 @@ function updateSchemaStatus(tableName, status, fieldCount = 0) {
   if (!statusTag) return;
 
   statusTag.classList.remove(
-    "is-light",
     "is-success",
     "is-warning",
     "is-danger",
@@ -277,7 +276,6 @@ function updateSchemaStatus(tableName, status, fieldCount = 0) {
     statusTag.classList.add("is-danger");
   } else {
     statusTag.textContent = "Empty";
-    statusTag.classList.add("is-light");
   }
 }
 
