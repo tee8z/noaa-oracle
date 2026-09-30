@@ -297,12 +297,12 @@
     }
 }
 
-/* Cool bands, periwinkle through sky, teal and green to pale lime. Each is
-   light enough to stand off the slate map, and none is red; no report is an
-   open ring, not a colour. The outline remains visible when the map scales
+/* Cool bands, periwinkle and pink, then teal and green to pale lime. Each is
+   light enough to stand off the slate map; none is red, and none is blue or
+   grey, which would sink into it. No report is an open ring, not a colour. The outline remains visible when the map scales
    down on a phone. */
 .t-cold { --pin: #a78bfa; }
-.t-cool { --pin: #38bdf8; }
+.t-cool { --pin: #f472b6; }
 .t-mild { --pin: #2dd4bf; }
 .t-warm { --pin: #4ade80; }
 .t-hot { --pin: #d9f99d; }
