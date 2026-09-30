@@ -173,16 +173,19 @@ async fn build(
     Ok(forecast_detail(station_id, &past, &coming, &calendar.place()).into_string())
 }
 
-/// The latest forecast for today and the next six days, oldest first.
+/// The latest forecast for the seven days after today, oldest first. Today's
+/// forecast sits in the past-week table's "Today so far" row, so it is not
+/// repeated here.
 async fn coming_days(
     state: &Arc<AppState>,
     station_id: &str,
     today: Date,
     calendar: Calendar,
 ) -> Result<Vec<ForecastDisplay>, weather_data::Error> {
+    let tomorrow = today + Duration::days(1);
     let request = ForecastRequest {
-        start: Some(calendar.start_of(today)),
-        end: Some(calendar.start_of(today + Duration::days(7))),
+        start: Some(calendar.start_of(tomorrow)),
+        end: Some(calendar.start_of(tomorrow + Duration::days(7))),
         generated_start: None,
         generated_end: None,
         station_ids: station_id.to_string(),
@@ -192,10 +195,10 @@ async fn coming_days(
         .weather_db
         .calendar_forecasts(&request, vec![station_id.to_string()], calendar)
         .await?;
-    let today = today.to_string();
+    let tomorrow = tomorrow.to_string();
     let mut days: Vec<_> = forecasts
         .into_iter()
-        .filter(|forecast| day(&forecast.date).is_some_and(|date| date >= today.as_str()))
+        .filter(|forecast| day(&forecast.date).is_some_and(|date| date >= tomorrow.as_str()))
         .map(display)
         .collect();
     days.sort_by(|a, b| a.date.cmp(&b.date));
