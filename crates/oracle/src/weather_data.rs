@@ -167,16 +167,17 @@ const NORMALIZE_OBSERVATIONS_SQL: &str = r#"
             END AS qc_groups
         FROM screened
     ), usable AS (
-        -- Values of groups a source flag affects, or of any screened report.
-        -- Legacy reports keep values; their counts hold settlement instead.
+        -- Values of groups a rejection or unverified check affects, or of
+        -- any screened report. Settlement treats them as missing. Legacy
+        -- reports keep values; their counts hold settlement instead.
         SELECT *,
-            NOT qc_screened AND NOT (COALESCE(quality_status != 'validated', false)
+            NOT qc_screened AND NOT (quality_status IS NOT NULL AND qc_unverified
                 AND list_contains(qc_groups, 'temperature')) AS temperature_usable,
-            NOT qc_screened AND NOT (COALESCE(quality_status != 'validated', false)
+            NOT qc_screened AND NOT (quality_status IS NOT NULL AND qc_unverified
                 AND list_contains(qc_groups, 'dewpoint')) AS dewpoint_usable,
-            NOT qc_screened AND NOT (COALESCE(quality_status != 'validated', false)
+            NOT qc_screened AND NOT (quality_status IS NOT NULL AND qc_unverified
                 AND list_contains(qc_groups, 'wind')) AS wind_usable,
-            NOT qc_screened AND NOT (COALESCE(quality_status != 'validated', false)
+            NOT qc_screened AND NOT (quality_status IS NOT NULL AND qc_unverified
                 AND list_contains(qc_groups, 'precipitation')) AS precip_usable
         FROM assessed
     )
@@ -1096,7 +1097,8 @@ impl WeatherAccess {
                 NOT ((qc_rejected OR qc_unverified) AND list_has_any(qc_groups, {groups})) AS verified, \
                 wind_speed IS NOT NULL, wind_direction IS NOT NULL, \
                 ROUND(100.0 * EXP((17.625 * dewpoint_value) / (243.04 + dewpoint_value)) / \
-                    EXP((17.625 * temperature_value) / (243.04 + temperature_value)))::BIGINT \
+                    EXP((17.625 * temperature_value) / (243.04 + temperature_value)))::BIGINT, \
+                temperature_value IS NOT NULL \
                 FROM classified ORDER BY station_id, generated_at::TIMESTAMPTZ"
             )
         });
@@ -1428,6 +1430,7 @@ impl WeatherData for WeatherAccess {
             stations: station_ids.clone(),
             collected_after: required_collected_after,
             groups: quality_groups(metrics),
+            metrics: metrics.to_vec(),
         };
         let point_request = ObservationRequest {
             start: req.start,
@@ -1850,9 +1853,12 @@ pub struct ObservationQuality {
 }
 
 impl ObservationQuality {
-    /// Whether settlement may use the reports, or why not.
+    /// Whether settlement may use the reports, or why not. Unverified
+    /// reports drop out of the metrics their problems affect, and coverage
+    /// then decides whether enough remain; rejected and legacy reports hold
+    /// settlement.
     fn settleable(&self) -> Result<(), Error> {
-        if self.rejected_reports == 0 && self.unverified_reports == 0 {
+        if self.rejected_reports == 0 && self.legacy_reports == 0 {
             Ok(())
         } else if self.rejected_reports == 0 && self.legacy_reports == self.unverified_reports {
             Err(Error::LegacyObservations {
@@ -2612,6 +2618,27 @@ mod tests {
     /// succeed. The 19:00 report carries the highest temperature and wind
     /// and is flagged with `status` and `tags`.
     fn tagged_settlement_dir(status: &str, tags: Option<&str>) -> tempfile::TempDir {
+        tagged_settlement_dir_with(status, tags, "")
+    }
+
+    /// As [`tagged_settlement_dir`], with validated reports at 18:30 and
+    /// 19:30 too, so the flagged report can drop out of a metric without
+    /// leaving a gap over 90 minutes.
+    fn half_hourly_settlement_dir(status: &str, tags: Option<&str>) -> tempfile::TempDir {
+        tagged_settlement_dir_with(
+            status,
+            tags,
+            ",
+            ('2026-01-17T18:30:00Z',11.5,8,'validated','METAR KORD 171830Z 09008KT 10SM 12/10 RMK AO2'),
+            ('2026-01-17T19:30:00Z',12.5,8,'validated','METAR KORD 171930Z 09008KT 10SM 13/10 RMK AO2')",
+        )
+    }
+
+    fn tagged_settlement_dir_with(
+        status: &str,
+        tags: Option<&str>,
+        more_reports: &str,
+    ) -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
         let day = directory.path().join("2026-01-17");
         std::fs::create_dir_all(&day).unwrap();
@@ -2622,7 +2649,7 @@ mod tests {
                 "window_end":"2026-01-17T20:29:59Z", "requested_at":"2026-01-17T20:30:00Z",
                 "completed_at":"2026-01-17T20:31:00Z", "status":"complete",
                 "source_url":"https://aviationweather.gov/api/data/metar?ids=KORD&format=xml",
-                "source_sha256":"a".repeat(64),"response_status":200,"response_count":4,"report_count":4,"error":null
+                "source_sha256":"a".repeat(64),"response_status":200,"response_count":6,"report_count":6,"error":null
             }]
         })
         .to_string()
@@ -2647,6 +2674,7 @@ mod tests {
                     ('2026-01-17T18:00:00Z',11,8,'validated','METAR KORD 171800Z 09008KT 10SM 11/09 RMK AO2'),
                     ('2026-01-17T19:00:00Z',14,20,'{status}','METAR KORD 171900Z 09020KT 10SM 14/12 RMK AO2 PNO'),
                     ('2026-01-17T20:00:00Z',12,8,'validated','METAR KORD 172000Z 09008KT 10SM 12/10 RMK AO2')
+                    {more_reports}
                 ) AS reports(generated_at,temperature_value,wind_speed,quality_status,raw_text)
             ) TO '{}' (FORMAT PARQUET, KV_METADATA {{observation_coverage:'{receipt}'}})
         "#,
@@ -2713,22 +2741,41 @@ mod tests {
 
     #[tokio::test]
     async fn temperature_problems_hold_temperature_and_humidity_but_not_wind_events() {
-        for status in ["rejected", "unverified"] {
-            let directory = tagged_settlement_dir(status, Some("temperature,dewpoint"));
-            for metrics in [
-                &["temp_high"][..],
-                &["humidity"],
-                &["temp_low", "wind_speed"],
-            ] {
-                assert!(
-                    matches!(
-                        settle(&directory, metrics).await,
-                        Err(Error::DataQuality { .. })
-                    ),
-                    "{status} {metrics:?}"
-                );
-            }
-            let rows = settle(&directory, &["wind_speed", "wind_direction"])
+        let rejected = tagged_settlement_dir("rejected", Some("temperature,dewpoint"));
+        for metrics in [
+            &["temp_high"][..],
+            &["humidity"],
+            &["temp_low", "wind_speed"],
+        ] {
+            assert!(
+                matches!(
+                    settle(&rejected, metrics).await,
+                    Err(Error::DataQuality { .. })
+                ),
+                "{metrics:?}"
+            );
+        }
+        // An unverified report drops out of temperature and humidity
+        // instead. Here that leaves two hours without a usable temperature.
+        let unverified = tagged_settlement_dir("unverified", Some("temperature,dewpoint"));
+        for metrics in [&["temp_high"][..], &["temp_low", "wind_speed"]] {
+            let Err(Error::ObservationCoverage { stations, reason }) =
+                settle(&unverified, metrics).await
+            else {
+                panic!("{metrics:?}: a gap over 90 minutes blocks");
+            };
+            assert_eq!(stations, ["KORD"]);
+            assert!(reason.contains(&format!("KORD/{}", metrics[0])), "{reason}");
+            assert!(!reason.contains("wind_speed"), "{reason}");
+            assert!(reason.contains("1 unverified reports"), "{reason}");
+        }
+        assert_eq!(
+            settle(&unverified, &["humidity"]).await.unwrap()[0].humidity,
+            None,
+            "humidity samples have the same gap"
+        );
+        for (status, directory) in [("rejected", &rejected), ("unverified", &unverified)] {
+            let rows = settle(directory, &["wind_speed", "wind_direction"])
                 .await
                 .unwrap();
             assert_eq!(rows[0].wind_speed, Some(20), "{status}");
@@ -2737,6 +2784,63 @@ mod tests {
                 "{status}: the flagged temperature stays out of every aggregate"
             );
         }
+    }
+
+    /// Event 01a0e83b was held by one report without unambiguous raw METAR
+    /// temperature evidence among many validated ones.
+    #[tokio::test]
+    async fn an_unverified_report_drops_out_of_the_metrics_it_affects() {
+        let directory = half_hourly_settlement_dir("unverified", Some("temperature"));
+        let metrics = ["temp_high", "temp_low", "wind_speed"];
+        let rows = settle(&directory, &metrics).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].temp_high, rows[0].temp_low),
+            (12.5, 11.0),
+            "the unverified 14 °C comes from no other report"
+        );
+        assert_eq!(rows[0].wind_speed, Some(20), "its wind is still used");
+        let request = ObservationRequest {
+            start: Some(time::macros::datetime!(2026-01-17 18:00 UTC)),
+            end: Some(time::macros::datetime!(2026-01-17 20:00 UTC)),
+            station_ids: "KORD".into(),
+            temperature_unit: TemperatureUnit::Celsius,
+        };
+        let quality = access(&directory)
+            .observation_quality(&request, vec!["KORD".into()], &metrics.map(String::from))
+            .await
+            .unwrap();
+        assert_eq!(
+            (quality.rejected_reports, quality.unverified_reports),
+            (0, 1),
+            "operators still see the report"
+        );
+
+        // Problems without tags affect every metric, wind included.
+        let untagged = half_hourly_settlement_dir("unverified", None);
+        let rows = settle(&untagged, &metrics).await.unwrap();
+        assert_eq!(rows[0].temp_high, 12.5);
+        assert_eq!(rows[0].wind_speed, Some(8));
+
+        // A wind problem leaves the temperature in, and a wind gap leaves
+        // wind missing, which the settlement check names.
+        let wind = tagged_settlement_dir("unverified", Some("wind"));
+        let rows = settle(&wind, &metrics).await.unwrap();
+        assert_eq!(rows[0].temp_high, 14.0);
+        assert_eq!(rows[0].wind_speed, None);
+
+        // Rejected reports still hold the event.
+        assert!(matches!(
+            settle(
+                &half_hourly_settlement_dir("rejected", Some("temperature")),
+                &metrics
+            )
+            .await,
+            Err(Error::DataQuality {
+                rejected_reports: 1,
+                unverified_reports: 0
+            })
+        ));
     }
 
     #[tokio::test]
@@ -2837,7 +2941,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_unverified_reports_and_unproven_empty_stations_cannot_settle() {
+    async fn explicit_unverified_reports_drop_out_and_unproven_empty_stations_cannot_settle() {
         let directory = quality_data_dir(&[(
             "observations_2026-01-17T21:00:00Z.parquet",
             "SELECT 'KPWM' AS station_id, '2026-01-17T18:51:00Z' AS generated_at,
@@ -2856,14 +2960,20 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert_eq!(
+            weather
+                .observation_quality(&request, request.station_ids(), &[])
+                .await
+                .unwrap()
+                .unverified_reports,
+            1
+        );
+        // The report drops out; nothing proves the station's coverage.
         assert!(matches!(
             weather
                 .settlement_observations(&request, request.station_ids(), request.end.unwrap(), &[])
                 .await,
-            Err(Error::DataQuality {
-                unverified_reports: 1,
-                ..
-            })
+            Err(Error::ObservationCoverage { .. })
         ));
         assert!(matches!(
             weather

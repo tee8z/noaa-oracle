@@ -416,6 +416,7 @@ mod tests {
             stations: vec!["KNYC".into()],
             collected_after: datetime!(2026-09-27 06:30 UTC),
             groups: super::super::quality_groups(&[]),
+            metrics: vec![],
         }
     }
     fn total(receipts: &[Value], req: &coverage::Requirement) -> Option<Option<f64>> {

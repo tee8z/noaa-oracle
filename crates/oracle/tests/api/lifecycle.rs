@@ -510,7 +510,11 @@ async fn an_empty_window_blocks_instead_of_attesting_a_refund() {
 
 /// A quality failure must preserve the previous provisional values without
 /// allowing those values, or an artificial no-data refund, to be signed.
-async fn quality_failure_blocks_stale_scores(rejected_reports: u64, unverified_reports: u64) {
+async fn quality_failure_blocks_stale_scores(
+    failure: fn() -> oracle::weather_data::Error,
+    code: &str,
+    message: &str,
+) {
     let phase = Arc::new(AtomicU8::new(0));
     let mut weather = MockWeatherAccess::new();
     set_forecasts(&mut weather, |request, _| {
@@ -526,10 +530,7 @@ async fn quality_failure_blocks_stale_scores(rejected_reports: u64, unverified_r
                 observation("KORD", 75.0, 50.0, 10),
                 observation("KSAW", 40.0, 29.4, 8),
             ]),
-            1 => Err(oracle::weather_data::Error::DataQuality {
-                rejected_reports,
-                unverified_reports,
-            }),
+            1 => Err(failure()),
             _ => Ok(vec![
                 observation("KORD", 65.0, 50.0, 10),
                 observation("KSAW", 40.0, 29.4, 8),
@@ -569,10 +570,9 @@ async fn quality_failure_blocks_stale_scores(rejected_reports: u64, unverified_r
         assert_eq!(blocked.status, EventStatus::Completed);
         assert_eq!(blocked.readings, provisional.readings);
         assert_eq!(blocked.entries, provisional.entries);
-        assert_eq!(
-            blocked.settlement_block.as_ref().unwrap().code,
-            "data_quality"
-        );
+        let block = blocked.settlement_block.as_ref().unwrap();
+        assert_eq!(block.code, code);
+        assert!(block.message.contains(message), "{}", block.message);
     }
 
     // A later audited result must be scored again before signing. The
@@ -589,12 +589,282 @@ async fn quality_failure_blocks_stale_scores(rejected_reports: u64, unverified_r
 
 #[tokio::test]
 async fn rejected_observations_block_attestation_and_stale_scores() {
-    quality_failure_blocks_stale_scores(1, 0).await;
+    quality_failure_blocks_stale_scores(
+        || oracle::weather_data::Error::DataQuality {
+            rejected_reports: 1,
+            unverified_reports: 1,
+        },
+        "data_quality",
+        "1 rejected reports, 1 unverified reports",
+    )
+    .await;
 }
 
+/// Unverified reports drop out of their metrics; only a gap they leave blocks.
 #[tokio::test]
-async fn unverified_observations_block_attestation_and_stale_scores() {
-    quality_failure_blocks_stale_scores(0, 1).await;
+async fn unverified_observations_that_leave_a_gap_block_attestation_and_stale_scores() {
+    quality_failure_blocks_stale_scores(
+        || oracle::weather_data::Error::ObservationCoverage {
+            stations: vec!["KORD".into()],
+            reason: "usable reports for KORD/temp_high have a gap longer than 90 minutes, or none inside the scoring window (1 unverified reports left out)".into(),
+        },
+        "source_unavailable",
+        "KORD/temp_high",
+    )
+    .await;
+}
+
+/// Forecasts from the fixture; observations read by the production reader
+/// from files laid out as the daemon publishes them.
+struct PublishedObservations {
+    forecasts: MockWeatherAccess,
+    observations: oracle::weather_data::WeatherAccess,
+    _directory: tempfile::TempDir,
+}
+
+#[async_trait::async_trait]
+impl oracle::WeatherData for PublishedObservations {
+    async fn forecasts_data(
+        &self,
+        req: &ForecastRequest,
+        station_ids: Vec<String>,
+    ) -> Result<Vec<Forecast>, oracle::weather_data::Error> {
+        self.forecasts.forecasts_data(req, station_ids).await
+    }
+
+    async fn settlement_forecasts(
+        &self,
+        req: &ForecastRequest,
+        station_ids: Vec<String>,
+    ) -> Result<Vec<oracle::weather_data::SettlementValue>, oracle::weather_data::Error> {
+        self.forecasts.settlement_forecasts(req, station_ids).await
+    }
+
+    async fn forecast_assessment(
+        &self,
+        req: &ForecastRequest,
+        station_ids: Vec<String>,
+    ) -> Result<Vec<oracle::weather_data::ForecastAssessment>, oracle::weather_data::Error> {
+        self.forecasts.forecast_assessment(req, station_ids).await
+    }
+
+    async fn observation_data(
+        &self,
+        req: &oracle::ObservationRequest,
+        station_ids: Vec<String>,
+    ) -> Result<Vec<Observation>, oracle::weather_data::Error> {
+        self.observations.observation_data(req, station_ids).await
+    }
+
+    async fn settlement_observations(
+        &self,
+        req: &oracle::ObservationRequest,
+        station_ids: Vec<String>,
+        required_collected_after: time::OffsetDateTime,
+        metrics: &[String],
+    ) -> Result<Vec<Observation>, oracle::weather_data::Error> {
+        self.observations
+            .settlement_observations(req, station_ids, required_collected_after, metrics)
+            .await
+    }
+
+    async fn observation_quality(
+        &self,
+        req: &oracle::ObservationRequest,
+        station_ids: Vec<String>,
+        metrics: &[String],
+    ) -> Result<oracle::weather_data::ObservationQuality, oracle::weather_data::Error> {
+        self.observations
+            .observation_quality(req, station_ids, metrics)
+            .await
+    }
+
+    async fn daily_observations(
+        &self,
+        req: &oracle::ObservationRequest,
+        station_ids: Vec<String>,
+    ) -> Result<Vec<oracle::DailyObservation>, oracle::weather_data::Error> {
+        self.observations.daily_observations(req, station_ids).await
+    }
+
+    async fn stations(&self) -> Result<Vec<oracle::Station>, oracle::weather_data::Error> {
+        self.observations.stations().await
+    }
+}
+
+/// An app whose event, created at `now`, is read from half-hourly
+/// validated KORD and KSAW reports with a collection receipt requested
+/// after signing. KORD reads 60 °F with a 70 °F high, a 50 °F low and 10 kt
+/// of wind, KSAW 35 °F with a 40 °F high, a 30 °F low and 5 kt, as
+/// forecast. Halfway through, the daemon could not verify KORD's
+/// temperature of 75 °F, reported with 25 kt of wind. With `gap`, the KORD
+/// reports half an hour either side of it are missing.
+async fn app_with_published_observations(now: time::OffsetDateTime, gap: bool) -> (TestApp, Event) {
+    let mut forecasts = MockWeatherAccess::new();
+    set_forecasts(&mut forecasts, |request, _| {
+        Ok(forecasts_in_window(
+            request,
+            &[("KORD", 70, 50, 10), ("KSAW", 40, 30, 5)],
+        ))
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let request = event_at(now);
+    let (start, end) = (request.start_observation_date, request.end_observation_date);
+    let mut rows = Vec::new();
+    for station in ["KORD", "KSAW"] {
+        let mut time = start - Duration::hours(1);
+        while time <= end + Duration::hours(1) {
+            let offset = time - start;
+            let (temperature, wind, status) = match (station, offset.whole_minutes()) {
+                ("KORD", 690 | 750) if gap => {
+                    time += Duration::minutes(30);
+                    continue;
+                }
+                ("KORD", 720) => (75, 25, "unverified"),
+                ("KORD", 360) => (70, 10, "validated"),
+                ("KORD", 1080) => (50, 10, "validated"),
+                ("KORD", _) => (60, 10, "validated"),
+                (_, 360) => (40, 5, "validated"),
+                (_, 1080) => (30, 5, "validated"),
+                _ => (35, 5, "validated"),
+            };
+            let (reason, metrics) = if status == "validated" {
+                ("NULL", "NULL")
+            } else {
+                (
+                    "'no unambiguous raw METAR temperature evidence'",
+                    "'temperature'",
+                )
+            };
+            rows.push(format!(
+                "('{station}', '{}', {temperature}, {wind}, '{status}', {reason}, {metrics})",
+                time.format(&Rfc3339).unwrap()
+            ));
+            time += Duration::minutes(30);
+        }
+    }
+    let requested = request.signing_date + Duration::minutes(1);
+    let receipt = json!({
+        "version": "awc-history-v1", "interval": "closed", "batches": [{
+            "station_ids": ["KORD", "KSAW"],
+            "window_start": (start - Duration::hours(2)).format(&Rfc3339).unwrap(),
+            "window_end": (end + Duration::hours(1)).format(&Rfc3339).unwrap(),
+            "requested_at": requested.format(&Rfc3339).unwrap(),
+            "completed_at": (requested + Duration::minutes(1)).format(&Rfc3339).unwrap(),
+            "status": "complete",
+            "source_url": "https://aviationweather.gov/api/data/metar?ids=KORD,KSAW&format=xml",
+            "source_sha256": "a".repeat(64), "response_status": 200,
+            "response_count": rows.len(), "report_count": rows.len(), "error": null
+        }]
+    });
+    let published = requested + Duration::minutes(2);
+    let day = directory.path().join(published.date().to_string());
+    std::fs::create_dir_all(&day).unwrap();
+    let path = day.join(format!(
+        "observations_{}.parquet",
+        published.format(&Rfc3339).unwrap()
+    ));
+    duckdb::Connection::open_in_memory()
+        .unwrap()
+        .execute_batch(&format!(
+            "COPY (
+                SELECT station_id, generated_at, temperature_value::DOUBLE AS temperature_value,
+                    'fahrenheit' AS temperature_unit_code, wind_speed::BIGINT AS wind_speed,
+                    'knots' AS wind_speed_unit_code, 'METAR' AS metar_type,
+                    'METAR ' || station_id || ' AUTO 10SM' AS raw_text,
+                    quality_status, 'metar-consistency-v1' AS validation_version,
+                    quality_reason, quality_metrics
+                FROM (VALUES {}) AS reports(station_id, generated_at, temperature_value,
+                    wind_speed, quality_status, quality_reason, quality_metrics)
+            ) TO '{}' (FORMAT PARQUET, KV_METADATA {{observation_coverage: '{receipt}'}})",
+            rows.join(", "),
+            path.display()
+        ))
+        .unwrap();
+    let observations = oracle::weather_data::WeatherAccess::new(Arc::new(
+        oracle::file_access::FileAccess::new(directory.path().to_string_lossy().into_owned()),
+    ));
+    let app = spawn_app(Arc::new(PublishedObservations {
+        forecasts,
+        observations,
+        _directory: directory,
+    }))
+    .await;
+    app.clock.set(now);
+    let (status, body) = app.create_event(&request).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    (app, serde_json::from_slice(&body).unwrap())
+}
+
+/// Picks that tell apart the unverified report's temperature and wind being
+/// used or left out: with the rule, 30, 20 and 10 points.
+fn temperature_and_wind_picks(event: &Event) -> Vec<Value> {
+    [
+        ("Par", "Over"),
+        // Wins if the report's wind were dropped too.
+        ("Par", "Par"),
+        // Wins if its 75 °F were the high.
+        ("Over", "Over"),
+    ]
+    .map(|(high, wind)| {
+        json!({
+            "id": Uuid::now_v7(), "event_id": event.id,
+            "picks": [pick("KORD", "temp_high", high), pick("KORD", "wind_speed", wind)]
+        })
+    })
+    .to_vec()
+}
+
+/// Event 01a0e83b was held past signing by one unverified report among
+/// many validated ones.
+#[tokio::test]
+async fn an_unverified_report_drops_out_of_the_metrics_it_affects() {
+    // Collection receipts must predate the real clock.
+    let now = (time::OffsetDateTime::now_utc() - Duration::days(3))
+        .replace_minute(0)
+        .unwrap()
+        .replace_second(0)
+        .unwrap()
+        .replace_nanosecond(0)
+        .unwrap();
+    let (app, event) = app_with_published_observations(now, false).await;
+    let entries = temperature_and_wind_picks(&event);
+    assert_eq!(
+        app.submit_entries(event.id, json!({"event_id": event.id, "entries": entries}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    app.clock.set(event.signing_date);
+    let summary = app.oracle.etl_data(1).await.unwrap();
+    assert_eq!((summary.failed, summary.attested), (0, 1));
+    let signed = fetch(&app, event.id).await;
+    let base_scores: Vec<Option<i64>> = signed.entries.iter().map(|e| e.base_score).collect();
+    assert_eq!(base_scores, vec![Some(30), Some(20), Some(10)]);
+    assert_attests(&app, &signed, &[0]);
+    assert!(signed.settlement_block.is_none());
+
+    // Without the reports either side, the drop-out leaves a two-hour gap
+    // in KORD's temperatures, and the block names it.
+    let (app, event) = app_with_published_observations(now, true).await;
+    let entries = temperature_and_wind_picks(&event);
+    assert_eq!(
+        app.submit_entries(event.id, json!({"event_id": event.id, "entries": entries}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    app.clock.set(event.signing_date);
+    let summary = app.oracle.etl_data(1).await.unwrap();
+    assert_eq!((summary.failed, summary.attested), (1, 0));
+    let blocked = fetch(&app, event.id).await;
+    assert!(blocked.attestation.is_none());
+    let block = blocked.settlement_block.unwrap();
+    assert_eq!(block.code, "source_unavailable");
+    for named in ["KORD/temp_high", "KORD/temp_low", "1 unverified reports"] {
+        assert!(block.message.contains(named), "{}", block.message);
+    }
+    assert!(!block.message.contains("KSAW"), "{}", block.message);
 }
 
 #[tokio::test]
