@@ -25,7 +25,6 @@ pub struct EventView {
     pub total_allowed_entries: i64,
     pub number_of_places_win: i64,
     pub unlisted: bool,
-    pub settlement_block: Option<String>,
 }
 
 /// Which events to show. Unlisted events are left out unless asked for.
@@ -222,9 +221,6 @@ fn event_row(event: &EventView, now: OffsetDateTime) -> Markup {
             span class="ev-status" {
                 span class="is-sr-only" { "Status " }
                 (status_tag(event.status))
-                @if let Some(reason) = &event.settlement_block {
-                    " " span class="tag is-danger is-light" title=(reason) { "Settlement blocked" }
-                }
                 @if event.unlisted { " " span class="tag is-light" { "Unlisted" } }
             }
             span class="ev-window" {
@@ -265,7 +261,6 @@ mod tests {
             total_allowed_entries: 3,
             number_of_places_win: 1,
             unlisted,
-            settlement_block: None,
         }
     }
 

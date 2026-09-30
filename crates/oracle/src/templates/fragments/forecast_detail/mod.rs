@@ -79,7 +79,7 @@ fn past_week(comparisons: &[ForecastComparison], days: &str) -> Markup {
                 }
             }
             p class="forecast-note" {
-                "Calendar summaries are provisional. Observed rain and snow are report-based estimates; snow uses a 10:1 conversion from liquid precipitation. Humidity uses daily average temperature and dew point. Event scoring checks source data for the actual event window separately."
+                "Observed rain and snow are estimated from reports; snow uses a 10:1 ratio from liquid precipitation. Humidity uses the day's average temperature and dew point."
             }
             p class="forecast-note history-scroll-hint" {
                 "Scroll sideways for humidity, rain and snow."
