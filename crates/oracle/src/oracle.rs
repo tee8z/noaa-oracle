@@ -6,8 +6,12 @@ use base64::{Engine, engine::general_purpose};
 use dlctix::secp::Point;
 use log::{error, info, warn};
 use nostr::{key::PublicKey as NostrPublicKey, nips::nip19::ToBech32};
-use std::{path::Path, sync::Arc};
-use time::OffsetDateTime;
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+};
+use time::{Duration, OffsetDateTime};
 use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -74,13 +78,115 @@ impl From<sqlx::Error> for Error {
     }
 }
 
+/// How long an unsigned event's provisional readings stay current. New
+/// observations arrive hourly, so reading more often only costs CPU.
+const PROVISIONAL_REFRESH: Duration = Duration::minutes(15);
+
+/// How long an event waits after its first failed read. Each further
+/// failure doubles the wait, up to [`LONGEST_RETRY`].
+const FIRST_RETRY: Duration = Duration::minutes(15);
+
+/// The longest wait between reads of an event that keeps failing. Well
+/// inside the day an event has between its signing date and its expiry.
+const LONGEST_RETRY: Duration = Duration::hours(6);
+
 /// What one processing pass did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EtlSummary {
-    /// Events whose processing failed; they are retried next pass.
+    /// Events whose processing failed; they are retried after a wait that
+    /// grows with every failure.
     pub failed: usize,
     /// Events attested in this pass.
     pub attested: usize,
+    /// Events read from their source in this pass, whatever came of it.
+    pub refreshed: usize,
+    /// Events left unread because their observation window has not started.
+    pub skipped_live: usize,
+    /// Events left unread because they wait out an earlier failure.
+    pub skipped_backed_off: usize,
+    /// Events left unread because their provisional readings are recent.
+    pub skipped_fresh: usize,
+    /// Events closed in this pass for having no entries at their signing date.
+    pub settled_without_entries: usize,
+}
+
+/// A failed read of an event, and how many in a row it makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Failure {
+    count: u32,
+    at: OffsetDateTime,
+}
+
+impl Failure {
+    /// When the event may be read again. `None` for a failure from before
+    /// the signing date once that date has passed: the first settlement
+    /// check is never delayed.
+    fn next_attempt(&self, event: &EventRecord, now: OffsetDateTime) -> Option<OffsetDateTime> {
+        let before_signing = self.at < event.signing_date && now >= event.signing_date;
+        (!before_signing).then(|| self.at + retry_delay(self.count))
+    }
+}
+
+/// The wait after `failures` failed reads in a row: 15 minutes, doubling
+/// to 30 and 60, and so on up to [`LONGEST_RETRY`].
+fn retry_delay(failures: u32) -> Duration {
+    // Bounded so the multiplication cannot overflow.
+    let doublings = failures.saturating_sub(1).min(16);
+    (FIRST_RETRY * 2_i32.pow(doublings)).min(LONGEST_RETRY)
+}
+
+/// What a processing pass remembers about unsigned events between passes.
+/// None of it is stored: a new process reads each event once more than it
+/// had to, and takes a failing event's wait from its settlement block.
+#[derive(Default)]
+struct EtlMemory {
+    /// When each event's readings were last refreshed.
+    refreshed: HashMap<Uuid, OffsetDateTime>,
+    /// Events whose latest read failed.
+    failures: HashMap<Uuid, Failure>,
+}
+
+/// What a pass does with one unsigned event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// The observation window has not started: there is nothing to score.
+    SkipLive,
+    /// The signing date passed without entries: there is no outcome to sign.
+    SettleWithoutEntries,
+    /// An earlier read failed and its wait is not over.
+    SkipBackedOff,
+    /// The provisional readings are recent.
+    SkipFresh,
+    Read,
+}
+
+/// Decides from the event's status before anything is read from its
+/// source. Settlement is never held back for fresh provisional readings.
+fn next_step(
+    event: &EventRecord,
+    now: OffsetDateTime,
+    refreshed: Option<OffsetDateTime>,
+    failure: Option<Failure>,
+) -> Step {
+    if event.status(now) == EventStatus::Live {
+        return Step::SkipLive;
+    }
+    let signing_due = signing_due(event, now);
+    if signing_due && event.total_entries == 0 {
+        return Step::SettleWithoutEntries;
+    }
+    let next_attempt = failure.and_then(|failure| failure.next_attempt(event, now));
+    if next_attempt.is_some_and(|next_attempt| now < next_attempt) {
+        return Step::SkipBackedOff;
+    }
+    if !signing_due && refreshed.is_some_and(|refreshed| now < refreshed + PROVISIONAL_REFRESH) {
+        return Step::SkipFresh;
+    }
+    Step::Read
+}
+
+fn signing_due(event: &EventRecord, now: OffsetDateTime) -> bool {
+    event.status(now) == EventStatus::Completed && now >= event.signing_date
 }
 
 pub struct Oracle {
@@ -89,6 +195,7 @@ pub struct Oracle {
     key: Arc<SigningKey>,
     clock: Clock,
     lines: LineSettings,
+    etl: Mutex<EtlMemory>,
 }
 
 impl Oracle {
@@ -108,6 +215,7 @@ impl Oracle {
             key: Arc::new(key),
             clock,
             lines: LineSettings::default(),
+            etl: Mutex::default(),
         };
         oracle.check_stored_key().await?;
         Ok(oracle)
@@ -372,7 +480,9 @@ impl Oracle {
 
     /// Refreshes readings, scores entries, and attests events whose signing
     /// date has passed. Safe to repeat: attestation happens at most once per
-    /// event. A failing event is logged and does not stop the others.
+    /// event. A failing event is logged and does not stop the others. An
+    /// event is read only when its status calls for it: not before its
+    /// observation window, and not while it waits out a failure.
     pub async fn etl_data(&self, etl_process_id: u64) -> Result<EtlSummary, Error> {
         self.etl_data_until(etl_process_id, &CancellationToken::new())
             .await
@@ -389,6 +499,9 @@ impl Oracle {
     ) -> Result<EtlSummary, Error> {
         let events = self.db.events_to_settle(self.now()).await?;
         info!("etl {etl_process_id}: {} events to settle", events.len());
+        let ids: Vec<Uuid> = events.iter().map(|event| event.id).collect();
+        let blocks = self.db.settlement_blocks(&ids).await?;
+        self.forget_all_but(&ids);
         let mut summary = EtlSummary::default();
         let total = events.len();
         for (done, event) in events.into_iter().enumerate() {
@@ -400,7 +513,32 @@ impl Oracle {
                 break;
             }
             let id = event.id;
-            match self.process_event(event).await {
+            let result = match self.step_for(&event, blocks.get(&id)) {
+                Step::SkipLive => {
+                    summary.skipped_live += 1;
+                    continue;
+                }
+                Step::SkipBackedOff => {
+                    summary.skipped_backed_off += 1;
+                    continue;
+                }
+                Step::SkipFresh => {
+                    summary.skipped_fresh += 1;
+                    continue;
+                }
+                Step::SettleWithoutEntries => {
+                    let settled = self.settle_without_entries(&event).await;
+                    if matches!(settled, Ok(true)) {
+                        summary.settled_without_entries += 1;
+                    }
+                    settled.map(|_| false)
+                }
+                Step::Read => {
+                    summary.refreshed += 1;
+                    self.process_event(event).await
+                }
+            };
+            match result {
                 Ok(true) => summary.attested += 1,
                 Ok(false) => {}
                 Err(error) => {
@@ -410,34 +548,134 @@ impl Oracle {
             }
         }
         info!(
-            "etl {etl_process_id}: done, {} attested, {} failed",
-            summary.attested, summary.failed
+            "etl {etl_process_id}: done, {} attested, {} failed, {} refreshed, \
+             {} skipped as live, {} skipped as backed off, {} skipped as recently refreshed, \
+             {} settled without entries",
+            summary.attested,
+            summary.failed,
+            summary.refreshed,
+            summary.skipped_live,
+            summary.skipped_backed_off,
+            summary.skipped_fresh,
+            summary.settled_without_entries
         );
         Ok(summary)
+    }
+
+    fn etl_memory(&self) -> MutexGuard<'_, EtlMemory> {
+        self.etl.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Drops what is remembered about events that left processing: signed,
+    /// expired, or settled without entries.
+    fn forget_all_but(&self, ids: &[Uuid]) {
+        let ids: HashSet<&Uuid> = ids.iter().collect();
+        let mut memory = self.etl_memory();
+        memory.refreshed.retain(|id, _| ids.contains(id));
+        memory.failures.retain(|id, _| ids.contains(id));
+    }
+
+    /// The step for `event` now. A new process remembers no failures, so a
+    /// stored `block` counts as the event's first.
+    fn step_for(&self, event: &EventRecord, block: Option<&SettlementBlock>) -> Step {
+        let now = self.now();
+        let memory = self.etl_memory();
+        let failure = memory.failures.get(&event.id).copied().or_else(|| {
+            block.map(|block| Failure {
+                count: 1,
+                at: block.checked_at,
+            })
+        });
+        next_step(
+            event,
+            now,
+            memory.refreshed.get(&event.id).copied(),
+            failure,
+        )
+    }
+
+    /// Counts a failed read at `now` and returns it. Failures from before
+    /// the signing date do not lengthen the wait between settlement checks.
+    fn remember_failure(&self, event: &EventRecord, now: OffsetDateTime) -> Failure {
+        let mut memory = self.etl_memory();
+        let earlier = memory
+            .failures
+            .get(&event.id)
+            .filter(|failure| failure.next_attempt(event, now).is_some())
+            .map_or(0, |failure| failure.count);
+        let failure = Failure {
+            count: earlier.saturating_add(1),
+            at: now,
+        };
+        memory.failures.insert(event.id, failure);
+        failure
+    }
+
+    fn remember_refresh(&self, event: Uuid, now: OffsetDateTime) {
+        let mut memory = self.etl_memory();
+        memory.failures.remove(&event);
+        memory.refreshed.insert(event, now);
     }
 
     /// Returns whether the event was attested.
     async fn process_event(&self, event: EventRecord) -> Result<bool, Error> {
         let result = self.refresh_event(&event).await;
-        if let Err(error) = &result {
-            let code = match error {
-                Error::Source(SourceError::DataQuality { .. }) => "data_quality",
-                Error::Source(SourceError::SettlementBlocked(_)) => "incomplete_readings",
-                Error::Source(_) => "source_unavailable",
-                _ => "processing_failed",
-            };
-            self.db
-                .set_settlement_block(
+        let now = self.now();
+        match &result {
+            Ok(_) => self.remember_refresh(event.id, now),
+            Err(error) => {
+                let failure = self.remember_failure(&event, now);
+                warn!(
+                    "event {}: failure {} in a row; next attempt at {}",
                     event.id,
-                    SettlementBlock {
-                        code: code.into(),
-                        message: error.to_string(),
-                        checked_at: self.now(),
-                    },
-                )
-                .await?;
+                    failure.count,
+                    now + retry_delay(failure.count)
+                );
+                let code = match error {
+                    Error::Source(SourceError::DataQuality { .. }) => "data_quality",
+                    Error::Source(SourceError::SettlementBlocked(_)) => "incomplete_readings",
+                    Error::Source(_) => "source_unavailable",
+                    _ => "processing_failed",
+                };
+                self.db
+                    .set_settlement_block(
+                        event.id,
+                        SettlementBlock {
+                            code: code.into(),
+                            message: error.to_string(),
+                            checked_at: now,
+                        },
+                    )
+                    .await?;
+            }
         }
         result
+    }
+
+    /// Closes an event that reached its signing date without entries. It
+    /// has no outcome to sign, so nothing about its source can hold this
+    /// back: the last readings are stored for display when they can be read.
+    /// Returns whether this call closed the event.
+    async fn settle_without_entries(&self, event: &EventRecord) -> Result<bool, Error> {
+        let window = ObservationWindow {
+            start: event.start_observation_date,
+            end: event.end_observation_date,
+        };
+        match self.source_for(event) {
+            Ok(source) => match source.readings(window, &event.locations).await {
+                Ok(readings) => self.db.replace_readings(event.id, readings).await?,
+                Err(error) => info!("event {} keeps its stored readings: {error:#}", event.id),
+            },
+            Err(error) => info!("event {} keeps its stored readings: {error:#}", event.id),
+        }
+        let settled = self.db.settle_without_entries(event.id, self.now()).await?;
+        if settled {
+            warn!(
+                "event {} reached its signing date without entries; settled without an outcome",
+                event.id
+            );
+        }
+        Ok(settled)
     }
 
     async fn refresh_event(&self, event: &EventRecord) -> Result<bool, Error> {
@@ -447,7 +685,7 @@ impl Oracle {
             end: event.end_observation_date,
         };
         let now = self.now();
-        let signing_due = event.status(now) == EventStatus::Completed && now >= event.signing_date;
+        let signing_due = signing_due(event, now);
         let readings = if signing_due {
             let readings = source
                 .settlement_readings(window, &event.locations, event.signing_date, &event.metrics)
@@ -459,10 +697,6 @@ impl Oracle {
         };
         // Neither stale saved readings nor progress scores can pass the strict
         // gate. Validation finishes before replacing either stored value.
-        if event.status(now) == EventStatus::Live {
-            self.db.replace_readings(event.id, readings).await?;
-            return Ok(false);
-        }
         let entries = self.db.event_entries(event.id).await?;
         let lines = self.scoring_lines(event).await?;
         if signing_due {
@@ -493,15 +727,6 @@ impl Oracle {
         }
         self.db.replace_readings(event.id, readings).await?;
         self.db.update_entry_scores(entry_scores(&scored)).await?;
-        // No-entry events have no outcome to sign. A successful strict
-        // refresh can still clear their block; provisional refreshes cannot.
-        if signing_due {
-            self.db.clear_settlement_block(event.id).await?;
-            warn!(
-                "event {} reached its signing date without entries",
-                event.id
-            );
-        }
         Ok(false)
     }
 
@@ -630,5 +855,129 @@ fn validate_settlement_readings(
             "verified baseline and observation required for every enabled pair; missing or ambiguous: {}",
             missing.join(", ")
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+
+    const START: OffsetDateTime = datetime!(2030-01-01 00:00 UTC);
+
+    /// An unsigned event observing a day from [`START`], signed two hours
+    /// after its window.
+    fn event(entries: usize) -> EventRecord {
+        let directory = tempfile::tempdir().unwrap();
+        let key = SigningKey::load_or_create(&directory.path().join("oracle.pem")).unwrap();
+        let id = Uuid::now_v7();
+        EventRecord {
+            id,
+            source: "noaa_weather".into(),
+            signing_date: START + Duration::hours(26),
+            start_observation_date: START,
+            end_observation_date: START + Duration::hours(24),
+            locations: vec!["KORD".into()],
+            metrics: vec!["temp_high".into()],
+            number_of_values_per_entry: 1,
+            total_allowed_entries: 3,
+            number_of_places_win: 1,
+            nonce: key.new_event_nonce(id),
+            coordinator_pubkey: "npub1coordinator".into(),
+            attestation: None,
+            total_entries: entries,
+            unlisted: false,
+            scoring_rules: ScoringRules::Fixed,
+            settled_without_entries_at: None,
+        }
+    }
+
+    fn failure(count: u32, at: OffsetDateTime) -> Option<Failure> {
+        Some(Failure { count, at })
+    }
+
+    #[test]
+    fn the_wait_after_a_failure_doubles_up_to_six_hours() {
+        let minutes: Vec<i64> = (1..=8)
+            .map(|failures| retry_delay(failures).whole_minutes())
+            .collect();
+        assert_eq!(minutes, vec![15, 30, 60, 120, 240, 360, 360, 360]);
+        assert_eq!(retry_delay(0), FIRST_RETRY);
+        assert_eq!(retry_delay(u32::MAX), LONGEST_RETRY);
+    }
+
+    #[test]
+    fn a_live_event_is_skipped_whatever_is_remembered_about_it() {
+        let event = event(3);
+        let before = START - Duration::SECOND;
+        assert_eq!(next_step(&event, before, None, None), Step::SkipLive);
+        let failed = failure(1, before - Duration::hours(1));
+        assert_eq!(next_step(&event, before, None, failed), Step::SkipLive);
+        assert_eq!(next_step(&event, START, None, None), Step::Read);
+    }
+
+    #[test]
+    fn a_running_event_is_read_again_once_its_readings_are_old() {
+        let event = event(3);
+        let refreshed = START + Duration::hours(1);
+        let step = |after: Duration| next_step(&event, refreshed + after, Some(refreshed), None);
+        assert_eq!(step(Duration::ZERO), Step::SkipFresh);
+        assert_eq!(step(Duration::minutes(14)), Step::SkipFresh);
+        assert_eq!(step(Duration::minutes(15)), Step::Read);
+    }
+
+    #[test]
+    fn settlement_does_not_wait_for_provisional_readings_to_age() {
+        let event = event(3);
+        let completed = event.end_observation_date + Duration::minutes(1);
+        assert_eq!(
+            next_step(&event, completed, Some(event.end_observation_date), None),
+            Step::SkipFresh
+        );
+        let refreshed = event.signing_date - Duration::minutes(1);
+        assert_eq!(
+            next_step(&event, event.signing_date, Some(refreshed), None),
+            Step::Read
+        );
+    }
+
+    #[test]
+    fn a_failing_event_waits_out_its_failures() {
+        let event = event(3);
+        let failed_at = event.signing_date + Duration::minutes(1);
+        let step = |count: u32, after: Duration| {
+            next_step(&event, failed_at + after, None, failure(count, failed_at))
+        };
+        assert_eq!(step(1, Duration::minutes(14)), Step::SkipBackedOff);
+        assert_eq!(step(1, Duration::minutes(15)), Step::Read);
+        assert_eq!(step(2, Duration::minutes(29)), Step::SkipBackedOff);
+        assert_eq!(step(2, Duration::minutes(30)), Step::Read);
+        assert_eq!(step(9, Duration::minutes(359)), Step::SkipBackedOff);
+        assert_eq!(step(9, Duration::hours(6)), Step::Read);
+    }
+
+    #[test]
+    fn the_first_settlement_check_is_not_delayed_by_earlier_failures() {
+        let event = event(3);
+        let failed = failure(6, event.signing_date - Duration::minutes(5));
+        let before = event.signing_date - Duration::minutes(1);
+        assert_eq!(next_step(&event, before, None, failed), Step::SkipBackedOff);
+        assert_eq!(
+            next_step(&event, event.signing_date, None, failed),
+            Step::Read
+        );
+    }
+
+    #[test]
+    fn an_event_without_entries_is_settled_at_its_signing_date() {
+        let event = event(0);
+        let before = event.signing_date - Duration::SECOND;
+        assert_eq!(next_step(&event, before, None, None), Step::Read);
+        // Nothing about its source can hold the event open.
+        let failed = failure(3, event.signing_date);
+        assert_eq!(
+            next_step(&event, event.signing_date, None, failed),
+            Step::SettleWithoutEntries
+        );
     }
 }

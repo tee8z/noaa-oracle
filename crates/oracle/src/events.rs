@@ -403,6 +403,9 @@ pub struct EventRecord {
     pub total_entries: usize,
     pub unlisted: bool,
     pub scoring_rules: ScoringRules,
+    /// When the oracle closed the event for having no entries at its
+    /// signing date. Such an event is never attested.
+    pub settled_without_entries_at: Option<OffsetDateTime>,
 }
 
 impl EventRecord {
@@ -461,6 +464,7 @@ impl EventRecord {
             locations: self.locations,
             unlisted: self.unlisted,
             settlement_block: None,
+            settled_without_entries_at: self.settled_without_entries_at,
             scoring_rules: self.scoring_rules,
             lines,
             statement: None,
@@ -487,6 +491,7 @@ impl EventRecord {
             locations: self.locations,
             unlisted: self.unlisted,
             settlement_block: None,
+            settled_without_entries_at: self.settled_without_entries_at,
             scoring_rules: self.scoring_rules,
         }
     }
@@ -749,6 +754,14 @@ pub struct EventSummary {
     /// Latest persisted reason that unsigned settlement could not proceed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settlement_block: Option<SettlementBlock>,
+    /// Set once the event reached its signing date without entries: it is
+    /// finished, has no outcome, and `attestation` stays null
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub settled_without_entries_at: Option<OffsetDateTime>,
     /// How picks score; the lines of a `lines` event are on the event itself
     #[serde(default)]
     pub scoring_rules: ScoringRules,
@@ -799,6 +812,14 @@ pub struct Event {
     /// Latest persisted reason that unsigned settlement could not proceed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settlement_block: Option<SettlementBlock>,
+    /// Set once the event reached its signing date without entries: it is
+    /// finished, has no outcome, and `attestation` stays null
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub settled_without_entries_at: Option<OffsetDateTime>,
     /// How picks score
     #[serde(default)]
     pub scoring_rules: ScoringRules,
@@ -1215,6 +1236,7 @@ mod tests {
             total_entries: 0,
             unlisted: new.unlisted,
             scoring_rules: new.scoring_rules,
+            settled_without_entries_at: None,
         }
     }
 

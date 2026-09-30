@@ -536,28 +536,24 @@ impl Database {
         })
     }
 
-    /// Unsigned events the ETL should read now. An event past its DLC expiry
-    /// is left alone: its contract refunds through the expiry path, and an
-    /// event that could never settle would otherwise be read every pass
-    /// forever. A blocked event waits [`BLOCKED_RETRY`] between checks,
-    /// except for its first check once its signing date has passed.
+    /// Unsigned events the ETL still has work for. An event past its DLC
+    /// expiry is left alone: its contract refunds through the expiry path,
+    /// and an event that could never settle would otherwise be read every
+    /// pass forever. An event settled without entries has no outcome left to
+    /// sign. Which of these a pass reads is the oracle's decision.
     pub async fn events_to_settle(
         &self,
         now: OffsetDateTime,
     ) -> Result<Vec<EventRecord>, sqlx::Error> {
         // Only constant SQL is interpolated.
         let sql = format!(
-            "{EVENT_SELECT} WHERE e.attestation IS NULL AND e.signing_date + ? > ?
-             AND NOT EXISTS (SELECT 1 FROM event_settlement_blocks b WHERE b.event_id = e.id
-                AND b.checked_at > ? AND (b.checked_at >= e.signing_date OR e.signing_date > ?))
+            "{EVENT_SELECT} WHERE e.attestation IS NULL AND e.settled_without_entries_at IS NULL
+             AND e.signing_date + ? > ?
              GROUP BY e.id ORDER BY e.id"
         );
-        let now = now.unix_timestamp();
         let rows = sqlx::query(AssertSqlSafe(sql))
             .bind(EXPIRY_AFTER_SIGNING.whole_seconds())
-            .bind(now)
-            .bind(now - BLOCKED_RETRY.whole_seconds())
-            .bind(now)
+            .bind(now.unix_timestamp())
             .fetch_all(&self.readers)
             .await?;
         rows.iter().map(event_from_row).collect()
@@ -692,7 +688,8 @@ impl Database {
             Box::pin(async move {
                 sqlx::query(
                     "INSERT INTO event_settlement_blocks (event_id, code, message, checked_at)
-                 SELECT id, ?, ?, ? FROM events WHERE id = ? AND attestation IS NULL
+                 SELECT id, ?, ?, ? FROM events
+                 WHERE id = ? AND attestation IS NULL AND settled_without_entries_at IS NULL
                  ON CONFLICT(event_id) DO UPDATE SET code = excluded.code,
                     message = excluded.message, checked_at = excluded.checked_at",
                 )
@@ -708,14 +705,37 @@ impl Database {
         .await
     }
 
-    pub async fn clear_settlement_block(&self, event_id: Uuid) -> Result<(), WriteError> {
+    /// Closes an unsigned event that has no entries, and so no outcome to
+    /// sign, and drops its blocked reason. False when the event has entries,
+    /// is signed, or was already settled this way.
+    pub async fn settle_without_entries(
+        &self,
+        event_id: Uuid,
+        at: OffsetDateTime,
+    ) -> Result<bool, WriteError> {
         self.write_waiting(move |connection| {
             Box::pin(async move {
+                let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
+                let event_id = event_id.to_string();
+                let result = sqlx::query(
+                    "UPDATE events SET settled_without_entries_at = ?, updated_at = unixepoch()
+                     WHERE id = ? AND attestation IS NULL AND settled_without_entries_at IS NULL
+                       AND NOT EXISTS (SELECT 1 FROM events_entries x WHERE x.event_id = events.id)",
+                )
+                .bind(at.unix_timestamp())
+                .bind(&event_id)
+                .execute(&mut *transaction)
+                .await?;
+                if result.rows_affected() == 0 {
+                    transaction.rollback().await?;
+                    return Ok(false);
+                }
                 sqlx::query("DELETE FROM event_settlement_blocks WHERE event_id = ?")
-                    .bind(event_id.to_string())
-                    .execute(connection)
+                    .bind(&event_id)
+                    .execute(&mut *transaction)
                     .await?;
-                Ok(())
+                transaction.commit().await?;
+                Ok(true)
             })
         })
         .await
@@ -1049,15 +1069,11 @@ pub struct EntryScore {
 
 /// Columns every [`EventRecord`] query selects; callers add `WHERE`,
 /// `GROUP BY e.id`, and ordering.
-/// How long a blocked event waits before the ETL reads it again. New
-/// observations arrive hourly, so checking more often only costs CPU.
-const BLOCKED_RETRY: time::Duration = time::Duration::minutes(15);
-
 const EVENT_SELECT: &str = "SELECT e.id, e.source, e.signing_date, e.start_observation_date,
         e.end_observation_date, e.locations, e.metrics, e.total_allowed_entries,
         e.number_of_places_win, e.number_of_values_per_entry, e.nonce_salt,
         e.nonce_point, e.coordinator_pubkey, e.attestation, e.unlisted, e.scoring_rules,
-        COUNT(ee.id) AS total_entries
+        e.settled_without_entries_at, COUNT(ee.id) AS total_entries
      FROM events e
      LEFT JOIN events_entries ee ON ee.event_id = e.id";
 
@@ -1132,6 +1148,7 @@ fn event_from_row(row: &SqliteRow) -> Result<EventRecord, sqlx::Error> {
     let salt: Vec<u8> = row.try_get("nonce_salt")?;
     let point: Vec<u8> = row.try_get("nonce_point")?;
     let attestation: Option<Vec<u8>> = row.try_get("attestation")?;
+    let settled_without_entries_at: Option<i64> = row.try_get("settled_without_entries_at")?;
     Ok(EventRecord {
         id: uuid_column(row, "id")?,
         source: row.try_get("source")?,
@@ -1164,6 +1181,9 @@ fn event_from_row(row: &SqliteRow) -> Result<EventRecord, sqlx::Error> {
             })
             .transpose()?,
         unlisted: row.try_get("unlisted")?,
+        settled_without_entries_at: settled_without_entries_at
+            .map(|seconds| timestamp(seconds, "settled_without_entries_at"))
+            .transpose()?,
         scoring_rules: {
             let rules: String = row.try_get("scoring_rules")?;
             ScoringRules::from_storage(&rules).ok_or_else(|| {

@@ -354,9 +354,12 @@ Unsigned event details and summaries can include `settlement_block`:
 ```
 
 The reason persists in SQLite and appears on the event page and events list.
-The processing job retries automatically. Stored readings and scores remain provisional while settlement is blocked.
+The processing job retries automatically, waiting longer after each failure in a row. Stored readings and scores remain provisional while settlement is blocked.
 A successful settlement check rereads the data, recomputes scores, and clears the reason.
 Signed events retain their stored readings, scores, and attestation.
+
+An event that reaches its signing date without entries has no outcome, and is never attested.
+Its details and summaries then carry `settled_without_entries_at`, the time the oracle closed it; `status` stays `Completed` and `attestation` stays null.
 
 An empty result is not proof that all predictions were wrong.
 A source outage or missing station therefore cannot produce a signed refund-all outcome.

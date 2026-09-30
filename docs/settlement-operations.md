@@ -39,7 +39,7 @@ Provisional humidity display statistics remain unchanged.
 flowchart TD
   A[Unsigned event reaches signing date] --> B[Read validated forecasts and observations]
   B --> C{Coverage and every enabled pair complete?}
-  C -- No --> D[Persist blocked reason; retry after 15 minutes until expiry]
+  C -- No --> D[Persist blocked reason; retry after 15 minutes, doubling to 6 hours, until expiry]
   C -- Yes --> E[Compute scores and announced outcome]
   E --> F[Atomically save readings, scores, signature and clear block]
 ```
@@ -128,11 +128,16 @@ Use the reason to select the next action.
 | `processing_failed` | Inspect the event processing log and database writer health. |
 
 The next successful processing pass uses fresh validated readings and recomputes the result.
-A blocked event is read again 15 minutes after its last check, because new observations arrive hourly. Its first check after the signing date is never delayed.
+A blocked event is read again 15 minutes after its first failed check, because new observations arrive hourly.
+Each further failure in a row doubles the wait (30 minutes, 1 hour, and so on) up to 6 hours; a successful check ends it.
+Its first check after the signing date is never delayed, and failures from before that date do not lengthen later waits.
+The count of failures is kept in memory: after a restart a blocked event waits 15 minutes from its stored `checked_at`, then starts over.
 Do not clear a block manually to force signing. Clearing a displayed reason cannot repair missing evidence.
 An event can remain unsigned through its announced expiry; the coordinator must handle the contract's expiry path.
 The oracle stops processing an unsigned event at its announced expiry, one day after the signing date, and keeps its last block reason.
 `oracle_events_expired_unsigned` counts such events with entries. `oracle_events_awaiting_attestation` counts only events that can still be signed.
+An event that reaches its signing date without entries has no outcome to sign. The next pass closes it: `settled_without_entries_at` is set, `attestation` stays null, its block reason is dropped, and no later pass reads it.
+A pass does not read an event before its observation window opens, and refreshes the provisional readings of an open event at most every 15 minutes.
 
 ## Reproducibility limit
 
