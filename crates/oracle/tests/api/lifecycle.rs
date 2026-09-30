@@ -472,19 +472,20 @@ async fn an_empty_window_blocks_instead_of_attesting_a_refund() {
     assert_eq!(block.code, "incomplete_readings");
     assert!(block.message.contains("KORD/temp_high"));
     assert!(block.message.contains("KSAW/wind_speed"));
+    // The public pages say the event is not signed, and nothing about why:
+    // the hold is the operator's, in the API and the logs.
     let (_, body) = app.get(&format!("/events/{}", event.id)).await;
     let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(html.contains("Settlement blocked"));
-    assert!(html.contains("KORD/temp_high"));
-    assert!(html.contains("role=\"alert\""));
-    assert!(html.find("Settlement blocked").unwrap() < html.find("KORD/temp_high").unwrap());
+    assert!(html.contains("Not signed."), "{html}");
+    assert!(html.contains("role=\"status\""));
     let (status, body) = app.get("/events").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(
-        String::from_utf8(body.to_vec())
-            .unwrap()
-            .contains("Settlement blocked")
-    );
+    let list = String::from_utf8(body.to_vec()).unwrap();
+    for (page, name) in [(&html, "detail"), (&list, "list")] {
+        for warning in ["Settlement blocked", "KORD/temp_high", "role=\"alert\""] {
+            assert!(!page.contains(warning), "{warning} on the {name} page");
+        }
+    }
     for (path, target) in [
         (format!("/events/{}", event.id), "main#main-content"),
         ("/events".to_string(), "div#events-list"),
@@ -501,8 +502,8 @@ async fn an_empty_window_blocks_instead_of_attesting_a_refund() {
         assert_eq!(status, StatusCode::OK);
         let fragment = String::from_utf8(body.to_vec()).unwrap();
         assert!(!fragment.contains("<!DOCTYPE html>"));
-        assert!(fragment.contains("Settlement blocked"));
-        assert!(fragment.contains("KORD/temp_high"));
+        assert!(!fragment.contains("Settlement blocked"));
+        assert!(!fragment.contains("KORD/temp_high"));
     }
     let summaries: Vec<oracle::EventSummary> = app.get_json("/oracle/events").await;
     assert_eq!(summaries[0].settlement_block, Some(block));

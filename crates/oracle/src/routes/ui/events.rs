@@ -97,6 +97,5 @@ fn view(event: EventSummary) -> EventView {
         total_allowed_entries: event.total_allowed_entries,
         number_of_places_win: event.number_of_places_win,
         unlisted: event.unlisted,
-        settlement_block: event.settlement_block.map(|block| block.message),
     }
 }

@@ -13,15 +13,13 @@ use crate::templates::{
     layouts::{CurrentPage, PageConfig, base, page_fragment},
 };
 
+/// Whether the event's outcome is signed. Why an unsigned event is waiting
+/// (a data hold, a retry) is for operators: the API's `settlement_block`
+/// and the logs carry it, the public page does not.
 #[derive(Clone, Copy)]
 pub enum SettlementQuality {
     Signed,
-    Clear,
-    Blocked {
-        rejected_reports: u64,
-        unverified_reports: u64,
-    },
-    Unavailable,
+    Unsigned,
 }
 
 fn config(event: &Event) -> (String, CurrentPage) {
@@ -143,26 +141,10 @@ fn attestation_value(event: &Event, now: OffsetDateTime) -> Markup {
 fn quality_notice(quality: SettlementQuality) -> Markup {
     match quality {
         SettlementQuality::Signed => html! {},
-        SettlementQuality::Clear => html! {
-            div class="notification is-warning is-light" role="status" {
+        SettlementQuality::Unsigned => html! {
+            div class="notification is-light" role="status" {
                 strong { "Not signed. " }
-                "Displayed readings and scores are provisional. The oracle checks data quality again before signing."
-            }
-        },
-        SettlementQuality::Blocked {
-            rejected_reports,
-            unverified_reports,
-        } => html! {
-            div class="notification is-danger is-light" role="alert" {
-                strong { "Settlement blocked: observation data needs review." }
-                p { "Rejected reports: " (rejected_reports) ". Unverified reports: " (unverified_reports) "." }
-                p { "Stored weather and scores below are from the last successful refresh. They are not approved for settlement." }
-            }
-        },
-        SettlementQuality::Unavailable => html! {
-            div class="notification is-danger is-light" role="alert" {
-                strong { "Settlement quality could not be verified." }
-                p { "Stored weather and scores below are provisional. The oracle must verify observation quality before signing." }
+                "Readings and scores are provisional until the oracle signs the outcome."
             }
         },
     }
@@ -192,16 +174,7 @@ pub fn event_detail_content(
             }
         }
 
-        @if let Some(block) = &event.settlement_block {
-            div class="notification is-danger is-light" role="alert" {
-                strong { "Settlement blocked" }
-                p { (block.message) }
-                p { "Last checked " (when::absolute(block.checked_at)) ". The oracle retries automatically." }
-                p { "Displayed readings and scores are provisional. No outcome has been signed." }
-            }
-        } @else {
-            (quality_notice(quality))
-        }
+        (quality_notice(quality))
 
         div class="event-grid" {
             section class="box" {
@@ -445,8 +418,9 @@ fn observed_and_forecast(
     }
 }
 
-/// Explain the all-entry outcome without confusing it with ranked ties or
-/// claiming that a contract has paid. Missing observations are only one cause.
+/// Explain the all-entry outcome without confusing it with ranked ties, and
+/// without a word about money: that is the competition's business. Missing
+/// observations are only one cause.
 fn no_score_reason(nothing_observed: bool, window: time::Duration) -> String {
     let why = if nothing_observed {
         format!(
@@ -456,9 +430,7 @@ fn no_score_reason(nothing_observed: bool, window: time::Duration) -> String {
     } else {
         "No entry scored any points.".into()
     };
-    format!(
-        "No-score outcome. {why} The oracle signed the outcome for all entries. Payments depend on the competition's signed contract."
-    )
+    format!("No-score outcome. {why} The oracle signed the outcome for all entries.")
 }
 
 fn entries_table(event: &Event, num_winners: usize, signed: bool) -> Markup {
@@ -797,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn blocked_settlement_is_flagged_before_the_stored_weather() {
+    fn an_unsigned_event_says_so_without_a_data_warning() {
         let mut pending = event(time::Duration::days(1), vec![], None);
         pending.weather.push(Weather {
             station_id: "KPWM".into(),
@@ -814,19 +786,22 @@ mod tests {
                 wind_speed: None,
             },
         });
-        for quality in [
-            SettlementQuality::Blocked {
-                rejected_reports: 1,
-                unverified_reports: 27,
-            },
-            SettlementQuality::Unavailable,
-        ] {
-            let html = event_detail_content(&pending, pending.signing_date, quality).into_string();
-            let alert = html.find("role=\"alert\"").expect("visible quality alert");
-            let weather = html.find(">Weather</h3>").expect("stored weather retained");
-            assert!(alert < weather, "{html}");
-            assert!(html.contains("Stored weather and scores below"), "{html}");
+        let html =
+            event_detail_content(&pending, pending.signing_date, SettlementQuality::Unsigned)
+                .into_string();
+        let notice = html.find("role=\"status\"").expect("visible status notice");
+        let weather = html.find(">Weather</h3>").expect("stored weather retained");
+        assert!(notice < weather, "{html}");
+        assert!(html.contains("Not signed."), "{html}");
+        for warning in ["role=\"alert\"", "blocked", "review", "verif", "reports"] {
+            assert!(!html.contains(warning), "{warning}: {html}");
         }
+
+        let signed =
+            event_detail_content(&pending, pending.signing_date, SettlementQuality::Signed)
+                .into_string();
+        assert!(!signed.contains("role=\"status\""), "{signed}");
+        assert!(!signed.contains("Not signed."), "{signed}");
     }
 
     #[test]
@@ -856,11 +831,9 @@ mod tests {
         );
         assert!(reason.starts_with("No-score outcome."), "{reason}");
         assert!(reason.contains("outcome for all entries"), "{reason}");
-        assert!(reason.contains("Payments depend on the competition's signed contract."));
-        assert!(
-            !reason.contains("refund") && !reason.contains("pot") && !reason.contains("ties"),
-            "{reason}"
-        );
+        for money in ["refund", "pot", "ties", "pay", "Pay", "contract"] {
+            assert!(!reason.contains(money), "{money}: {reason}");
+        }
         let with_readings = no_score_reason(false, time::Duration::hours(18));
         assert!(with_readings.contains("No entry scored any points."));
         assert!(!with_readings.contains("No hourly station report"));
