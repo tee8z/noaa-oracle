@@ -836,14 +836,17 @@ fn persist_audit(path: &Path, audit: &ObservationAudit<'_>) -> Result<String, Er
     file.write_all(json.as_bytes())?;
     file.sync_all()?;
     #[cfg(unix)]
-    {
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        File::open(parent)?.sync_all()?;
-    }
+    sync_audit_directory(path)?;
     Ok(json)
+}
+
+#[cfg(unix)]
+fn sync_audit_directory(path: &Path) -> Result<(), std::io::Error> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    File::open(parent)?.sync_all()
 }
 
 pub struct ObservationService {

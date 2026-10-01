@@ -22,6 +22,23 @@ impl Fetcher for Mock {
             .expect("unexpected request")
     }
 }
+fn assert_integral_request_times(mock: &Mock) {
+    let urls = mock.urls.lock().unwrap();
+    let index_url = reqwest::Url::parse(&urls[1]).unwrap();
+    for (key, value) in index_url
+        .query_pairs()
+        .filter(|(key, _)| key == "start" || key == "end")
+    {
+        assert_eq!(
+            OffsetDateTime::parse(&value, &Rfc3339)
+                .unwrap()
+                .nanosecond(),
+            0,
+            "NWS rejects fractional seconds in {key}"
+        );
+    }
+}
+
 fn stations() -> CityWeather {
     CityWeather {
         city_data: [(
@@ -89,22 +106,7 @@ async fn actual_positive_shef_report_keeps_utc_interval_mapping_and_replay_evide
     assert_eq!(row.mapping_sha256, sha256_hex(CATALOG.as_bytes()));
     assert_eq!(output.supported_stations, ["KNYC"]);
     assert_eq!(mock.urls.lock().unwrap().len(), 3);
-    {
-        let urls = mock.urls.lock().unwrap();
-        let index_url = reqwest::Url::parse(&urls[1]).unwrap();
-        for (key, value) in index_url
-            .query_pairs()
-            .filter(|(key, _)| key == "start" || key == "end")
-        {
-            assert_eq!(
-                OffsetDateTime::parse(&value, &Rfc3339)
-                    .unwrap()
-                    .nanosecond(),
-                0,
-                "NWS rejects fractional seconds in {key}"
-            );
-        }
-    }
+    assert_integral_request_times(&mock);
     let encoded = &output.sources[&row.source_sha256].body;
     let bytes = STANDARD.decode(encoded).unwrap();
     let mut decoded = String::new();

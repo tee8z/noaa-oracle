@@ -263,6 +263,7 @@ fn spill_setting() -> String {
         .unwrap_or_default()
 }
 
+#[derive(Clone)]
 pub struct WeatherAccess {
     file_access: Arc<dyn FileData>,
     slots: Arc<Semaphore>,
@@ -443,7 +444,7 @@ pub trait WeatherData: Sync + Send {
         _station_ids: Vec<String>,
         _required_collected_after: OffsetDateTime,
         _metrics: &[String],
-    ) -> Result<Vec<Observation>, Error> {
+    ) -> Result<Vec<SettlementObservation>, Error> {
         Err(Error::QualityUnavailable)
     }
     /// Counts reports whose problems affect `metrics` (every metric when empty).
@@ -1123,10 +1124,19 @@ impl WeatherAccess {
     pub fn new(file_access: Arc<dyn FileData>) -> Self {
         Self {
             file_access,
-            slots: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
+            slots: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES - 1)),
             database: Arc::default(),
             derived: None,
             folds: None,
+        }
+    }
+
+    /// The ETL owns one query slot that public traffic cannot consume. Both
+    /// handles share the database, its memory limit, and immutable file cache.
+    pub fn settlement_access(&self) -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(1)),
+            ..self.clone()
         }
     }
 
@@ -1244,17 +1254,7 @@ impl WeatherAccess {
         let database = self.database.clone();
         tokio::task::spawn_blocking(move || {
             let _slot = slot;
-            let connection = {
-                let mut database = database.lock().unwrap_or_else(PoisonError::into_inner);
-                let (opened, root) = match database.take() {
-                    Some((opened, root)) if opened.elapsed() < DATABASE_LIFETIME => (opened, root),
-                    // Queries still running keep the old database open.
-                    _ => (Instant::now(), open_database()?),
-                };
-                let connection = root.try_clone()?;
-                *database = Some((opened, root));
-                connection
-            };
+            let connection = clone_query_connection(&database)?;
             let mut statement = connection.prepare(&sql)?;
             let batches: Vec<RecordBatch> = statement.query_arrow([])?.collect();
             decode(&connection, &batches)
@@ -1264,6 +1264,20 @@ impl WeatherAccess {
 }
 
 /// The in-memory database queries share.
+fn clone_query_connection(
+    database: &Mutex<Option<(Instant, Connection)>>,
+) -> Result<Connection, Error> {
+    let mut database = database.lock().unwrap_or_else(PoisonError::into_inner);
+    let (opened, root) = match database.take() {
+        Some((opened, root)) if opened.elapsed() < DATABASE_LIFETIME => (opened, root),
+        // Queries still running keep the old database open.
+        _ => (Instant::now(), open_database()?),
+    };
+    let connection = root.try_clone()?;
+    *database = Some((opened, root));
+    Ok(connection)
+}
+
 fn open_database() -> Result<Connection, duckdb::Error> {
     let connection = Connection::open_in_memory()?;
     connection.execute_batch(&format!(
@@ -1423,7 +1437,7 @@ impl WeatherData for WeatherAccess {
         station_ids: Vec<String>,
         required_collected_after: OffsetDateTime,
         metrics: &[String],
-    ) -> Result<Vec<Observation>, Error> {
+    ) -> Result<Vec<SettlementObservation>, Error> {
         let coverage = coverage::Requirement {
             start: req.start.ok_or(Error::QualityUnavailable)?,
             end: req.end.ok_or(Error::QualityUnavailable)?,
@@ -1442,7 +1456,7 @@ impl WeatherData for WeatherAccess {
             .observation_batches(&point_request, station_ids, Some(coverage), metrics)
             .await?;
         decode_quality(&batches)?.settleable()?;
-        decode_observations(&batches, &req.temperature_unit)
+        decode_settlement_observations(&batches, &req.temperature_unit)
     }
 
     async fn observation_quality(
@@ -1924,6 +1938,44 @@ fn decode_quality(batches: &[RecordBatch]) -> Result<ObservationQuality, Error> 
     Ok(quality)
 }
 
+/// Settlement decodes each metric independently. The public observation wire
+/// shape keeps required temperatures; it must not decide wind availability.
+fn decode_settlement_observations(
+    batches: &[RecordBatch],
+    unit: &TemperatureUnit,
+) -> Result<Vec<SettlementObservation>, Error> {
+    let mut observations = vec![];
+    for batch in batches {
+        let station_id = strings(batch, "station_id")?;
+        let temp_low = doubles(batch, "temp_low")?;
+        let temp_high = doubles(batch, "temp_high")?;
+        let unit_code = strings(batch, "temperature_unit_code")?;
+        let wind_speed = integers(batch, "wind_speed")?;
+        let wind_direction = integers(batch, "wind_direction")?;
+        let humidity = integers(batch, "humidity")?;
+        let rain_amt = doubles(batch, "rain_amt")?;
+        let snow_amt = doubles(batch, "snow_amt")?;
+        for row in 0..batch.num_rows() {
+            let Some(station_id) = station(station_id, row) else {
+                skipped("settlement observation", row);
+                continue;
+            };
+            let code = text(unit_code, row).unwrap_or_default();
+            observations.push(SettlementObservation {
+                station_id,
+                temp_low: double(temp_low, row).map(|value| convert(value, &code, unit)),
+                temp_high: double(temp_high, row).map(|value| convert(value, &code, unit)),
+                wind_speed: within(integer(wind_speed, row), 0..=500),
+                wind_direction: within(integer(wind_direction, row), 0..=360),
+                humidity: within(integer(humidity, row), 0..=100),
+                rain_amt: non_negative(double(rain_amt, row)),
+                snow_amt: non_negative(double(snow_amt, row)),
+            });
+        }
+    }
+    Ok(observations)
+}
+
 fn decode_observations(
     batches: &[RecordBatch],
     unit: &TemperatureUnit,
@@ -2114,6 +2166,35 @@ pub struct Observation {
     pub snow_amt: Option<f64>,
     /// Ice accumulation in inches
     pub ice_amt: Option<f64>,
+}
+
+/// Independently optional measurements for the metrics settlement can score.
+/// Source validation decides availability before these values are decoded.
+#[derive(Debug)]
+pub struct SettlementObservation {
+    pub station_id: String,
+    pub temp_low: Option<f64>,
+    pub temp_high: Option<f64>,
+    pub wind_speed: Option<i64>,
+    pub wind_direction: Option<i64>,
+    pub humidity: Option<i64>,
+    pub rain_amt: Option<f64>,
+    pub snow_amt: Option<f64>,
+}
+
+impl From<Observation> for SettlementObservation {
+    fn from(observation: Observation) -> Self {
+        Self {
+            station_id: observation.station_id,
+            temp_low: Some(observation.temp_low),
+            temp_high: Some(observation.temp_high),
+            wind_speed: observation.wind_speed,
+            wind_direction: observation.wind_direction,
+            humidity: observation.humidity,
+            rain_amt: observation.rain_amt,
+            snow_amt: observation.snow_amt,
+        }
+    }
 }
 
 /// Daily aggregated observation (grouped by UTC date)
@@ -2618,7 +2699,7 @@ mod tests {
     /// succeed. The 19:00 report carries the highest temperature and wind
     /// and is flagged with `status` and `tags`.
     fn tagged_settlement_dir(status: &str, tags: Option<&str>) -> tempfile::TempDir {
-        tagged_settlement_dir_with(status, tags, "")
+        tagged_settlement_dir_with(status, tags, "", "validated")
     }
 
     /// As [`tagged_settlement_dir`], with validated reports at 18:30 and
@@ -2631,6 +2712,7 @@ mod tests {
             ",
             ('2026-01-17T18:30:00Z',11.5,8,'validated','METAR KORD 171830Z 09008KT 10SM 12/10 RMK AO2'),
             ('2026-01-17T19:30:00Z',12.5,8,'validated','METAR KORD 171930Z 09008KT 10SM 13/10 RMK AO2')",
+            "validated",
         )
     }
 
@@ -2638,6 +2720,7 @@ mod tests {
         status: &str,
         tags: Option<&str>,
         more_reports: &str,
+        routine_status: &str,
     ) -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
         let day = directory.path().join("2026-01-17");
@@ -2670,10 +2753,10 @@ mod tests {
                     CASE WHEN quality_status = 'validated' THEN NULL ELSE 'flagged' END AS quality_reason,
                     CASE WHEN quality_status = 'validated' THEN NULL ELSE {tags} END AS quality_metrics
                 FROM (VALUES
-                    ('2026-01-17T17:00:00Z',10,8,'validated','METAR KORD 171700Z 09008KT 10SM 10/08 RMK AO2'),
-                    ('2026-01-17T18:00:00Z',11,8,'validated','METAR KORD 171800Z 09008KT 10SM 11/09 RMK AO2'),
+                    ('2026-01-17T17:00:00Z',10,8,'{routine_status}','METAR KORD 171700Z 09008KT 10SM 10/08 RMK AO2'),
+                    ('2026-01-17T18:00:00Z',11,8,'{routine_status}','METAR KORD 171800Z 09008KT 10SM 11/09 RMK AO2'),
                     ('2026-01-17T19:00:00Z',14,20,'{status}','METAR KORD 171900Z 09020KT 10SM 14/12 RMK AO2 PNO'),
-                    ('2026-01-17T20:00:00Z',12,8,'validated','METAR KORD 172000Z 09008KT 10SM 12/10 RMK AO2')
+                    ('2026-01-17T20:00:00Z',12,8,'{routine_status}','METAR KORD 172000Z 09008KT 10SM 12/10 RMK AO2')
                     {more_reports}
                 ) AS reports(generated_at,temperature_value,wind_speed,quality_status,raw_text)
             ) TO '{}' (FORMAT PARQUET, KV_METADATA {{observation_coverage:'{receipt}'}})
@@ -2687,7 +2770,7 @@ mod tests {
     async fn settle(
         directory: &tempfile::TempDir,
         metrics: &[&str],
-    ) -> Result<Vec<Observation>, Error> {
+    ) -> Result<Vec<SettlementObservation>, Error> {
         let request = ObservationRequest {
             start: Some(time::macros::datetime!(2026-01-17 18:00 UTC)),
             end: Some(time::macros::datetime!(2026-01-17 20:00 UTC)),
@@ -2713,7 +2796,8 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].temp_high, 14.0,
+            rows[0].temp_high,
+            Some(14.0),
             "a rain gauge outage leaves the report's temperature usable"
         );
         assert_eq!(rows[0].wind_speed, Some(20));
@@ -2737,6 +2821,27 @@ mod tests {
                 .is_ok()
         );
         assert!(settle(&present_weather, &["rain_amt"]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn wind_settlement_keeps_stations_with_no_usable_temperatures() {
+        let directory = tagged_settlement_dir_with(
+            "unverified",
+            Some("temperature,dewpoint"),
+            "",
+            "unverified",
+        );
+        let rows = settle(&directory, &["wind_speed", "wind_direction"])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].station_id, "KORD");
+        assert_eq!(rows[0].wind_speed, Some(20));
+        assert_eq!(rows[0].wind_direction, Some(90));
+        assert_eq!(rows[0].temp_high, None);
+        assert_eq!(rows[0].temp_low, None);
+        assert_eq!(rows[0].humidity, None);
+        assert!(settle(&directory, &["temp_high"]).await.is_err());
     }
 
     #[tokio::test]
@@ -2780,7 +2885,8 @@ mod tests {
                 .unwrap();
             assert_eq!(rows[0].wind_speed, Some(20), "{status}");
             assert_eq!(
-                rows[0].temp_high, 11.0,
+                rows[0].temp_high,
+                Some(11.0),
                 "{status}: the flagged temperature stays out of every aggregate"
             );
         }
@@ -2796,7 +2902,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             (rows[0].temp_high, rows[0].temp_low),
-            (12.5, 11.0),
+            (Some(12.5), Some(11.0)),
             "the unverified 14 °C comes from no other report"
         );
         assert_eq!(rows[0].wind_speed, Some(20), "its wind is still used");
@@ -2819,14 +2925,14 @@ mod tests {
         // Problems without tags affect every metric, wind included.
         let untagged = half_hourly_settlement_dir("unverified", None);
         let rows = settle(&untagged, &metrics).await.unwrap();
-        assert_eq!(rows[0].temp_high, 12.5);
+        assert_eq!(rows[0].temp_high, Some(12.5));
         assert_eq!(rows[0].wind_speed, Some(8));
 
         // A wind problem leaves the temperature in, and a wind gap leaves
         // wind missing, which the settlement check names.
         let wind = tagged_settlement_dir("unverified", Some("wind"));
         let rows = settle(&wind, &metrics).await.unwrap();
-        assert_eq!(rows[0].temp_high, 14.0);
+        assert_eq!(rows[0].temp_high, Some(14.0));
         assert_eq!(rows[0].wind_speed, None);
 
         // Rejected reports still hold the event.
@@ -3913,6 +4019,17 @@ mod tests {
         )
     }
 
+    async fn copy_forecast(
+        derived: DerivedForecasts,
+        file: ParquetFileName,
+        source: String,
+    ) -> derived::Copied {
+        tokio::task::spawn_blocking(move || derived.copy(&file, &source))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
     /// Copies every forecast file and folds every day, whatever their age
     /// (`prepare_files` only prepares recent ones). Returns the copies.
     async fn prepare_everything(access: &WeatherAccess) -> Vec<(String, derived::Copied)> {
@@ -3933,14 +4050,7 @@ mod tests {
         for name in names {
             let file = ParquetFileName::parse(&name).unwrap();
             let source = access.file_access.build_file_path(&file);
-            let result = {
-                let derived = derived.clone();
-                let file = file.clone();
-                tokio::task::spawn_blocking(move || derived.copy(&file, &source))
-                    .await
-                    .unwrap()
-                    .unwrap()
-            };
+            let result = copy_forecast(derived.clone(), file.clone(), source).await;
             if let Some(copy) = derived.existing(&file) {
                 copies.push((file, copy));
             }

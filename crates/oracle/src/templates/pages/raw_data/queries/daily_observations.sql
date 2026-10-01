@@ -1,37 +1,40 @@
--- Daily observations: powers the weather map and dashboard
--- Groups hourly observations by station and day, classifies precipitation
--- using METAR weather codes, and derives humidity via the Magnus formula
-WITH classified AS (
+-- Exploratory daily report extrema in UTC, with temperatures in Fahrenheit.
+-- Keep the newest publication of each station/report instant before aggregation.
+-- Raw METAR precipitation reports can overlap and cannot establish a daily
+-- phase total. Show the largest reported hourly liquid amount, never a sum or
+-- a snow-depth estimate. Production settlement also validates source evidence.
+WITH deduped_observations AS (
+    SELECT * FROM observations
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY station_id, generated_at::TIMESTAMPTZ
+        ORDER BY regexp_extract(filename, 'observations_([^/]+)\.parquet$', 1)::TIMESTAMPTZ DESC,
+                 filename DESC, temperature_value DESC, wind_speed DESC,
+                 wind_direction DESC, dewpoint_value DESC, precip_in DESC
+    ) = 1
+),
+normalized_observations AS (
     SELECT *,
-        CASE
-            WHEN wx_string IS NOT NULL AND wx_string != '' THEN
-                CASE
-                    WHEN regexp_matches(wx_string, '(^|\s)[-+]?(VC)?(([A-Z]{2})*(PL|GR|GS|IC)|FZ(RA|DZ))(\s|$|[A-Z])') THEN 'ice'
-                    WHEN regexp_matches(wx_string, '(^|\s)[-+]?(VC)?([A-Z]{2})*(SN|SG)(\s|$|[A-Z])') THEN 'snow'
-                    ELSE 'rain'
-                END
-            WHEN temperature_value IS NOT NULL AND temperature_value <= 2.0 THEN 'snow'
-            ELSE 'rain'
-        END AS precip_type
-    FROM observations
+        CASE lower(temperature_unit_code)
+            WHEN 'fahrenheit' THEN temperature_value
+            WHEN 'celsius' THEN temperature_value * 9.0 / 5.0 + 32.0
+            WHEN 'celcius' THEN temperature_value * 9.0 / 5.0 + 32.0
+        END AS temperature_f
+    FROM deduped_observations
 )
 SELECT
     station_id,
-    DATE_TRUNC('day', generated_at::TIMESTAMP)::TEXT AS date,
-    MIN(temperature_value) FILTER (WHERE temperature_value IS NOT NULL) AS temp_low,
-    MAX(temperature_value) FILTER (WHERE temperature_value IS NOT NULL) AS temp_high,
-    MAX(wind_speed) FILTER (WHERE wind_speed IS NOT NULL AND wind_speed >= 0 AND wind_speed <= 500) AS wind_speed,
-    MAX(wind_direction) FILTER (WHERE wind_direction IS NOT NULL AND wind_direction >= 0 AND wind_direction <= 360) AS wind_direction,
-    MAX(temperature_unit_code) AS temperature_unit_code,
-    CASE
-        WHEN AVG(dewpoint_value) IS NOT NULL AND AVG(temperature_value) IS NOT NULL
-        THEN ROUND(100.0 * EXP((17.625 * AVG(dewpoint_value)) / (243.04 + AVG(dewpoint_value)))
-             / EXP((17.625 * AVG(temperature_value)) / (243.04 + AVG(temperature_value))))::BIGINT
-        ELSE NULL
-    END AS humidity,
-    SUM(precip_in) FILTER (WHERE precip_in IS NOT NULL AND precip_in >= 0 AND precip_type = 'rain') AS rain_amt,
-    SUM(precip_in * 10.0) FILTER (WHERE precip_in IS NOT NULL AND precip_in >= 0 AND precip_type = 'snow') AS snow_amt,
-    SUM(precip_in) FILTER (WHERE precip_in IS NOT NULL AND precip_in >= 0 AND precip_type = 'ice') AS ice_amt
-FROM classified
-GROUP BY station_id, DATE_TRUNC('day', generated_at::TIMESTAMP)::TEXT
-ORDER BY station_id, date
+    COUNT(*) AS distinct_reports,
+    DATE_TRUNC('day', generated_at::TIMESTAMPTZ AT TIME ZONE 'UTC')::TEXT AS date_utc,
+    MIN(temperature_f) FILTER (WHERE isfinite(temperature_f)) AS temp_low_f,
+    MAX(temperature_f) FILTER (WHERE isfinite(temperature_f)) AS temp_high_f,
+    MAX(wind_speed) FILTER (WHERE wind_speed BETWEEN 0 AND 500) AS wind_speed_knots,
+    FIRST(wind_direction ORDER BY wind_speed DESC, generated_at::TIMESTAMPTZ DESC)
+        FILTER (WHERE wind_speed BETWEEN 0 AND 500 AND wind_direction BETWEEN 0 AND 360)
+        AS direction_at_peak_wind_degrees,
+    MAX(precip_in) FILTER (
+        WHERE isfinite(precip_in) AND precip_in >= 0
+          AND json_extract_string(to_json(normalized_observations), '$.metar_type') = 'METAR'
+    ) AS max_reported_hourly_liquid_precip_in
+FROM normalized_observations
+GROUP BY station_id, date_utc
+ORDER BY station_id, date_utc

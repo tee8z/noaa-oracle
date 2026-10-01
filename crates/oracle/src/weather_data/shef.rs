@@ -561,6 +561,6 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].rain_amt, Some(0.21));
-        assert_eq!(rows[0].temp_high, 15.0);
+        assert_eq!(rows[0].temp_high, Some(15.0));
     }
 }

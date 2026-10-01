@@ -231,14 +231,16 @@ impl Metrics {
     /// the database and the weather directory if the last read is older
     /// than [`REFRESH_INTERVAL`]. A failed read keeps the previous values.
     pub async fn render(&self, state: &AppState) -> String {
-        {
-            let mut refreshed_at = self.refreshed_at.lock().await;
-            if refreshed_at.is_none_or(|at| at.elapsed() >= REFRESH_INTERVAL) {
-                self.refresh(state).await;
-                *refreshed_at = Some(Instant::now());
-            }
-        }
+        self.refresh_if_stale(state).await;
         self.encode()
+    }
+
+    async fn refresh_if_stale(&self, state: &AppState) {
+        let mut refreshed_at = self.refreshed_at.lock().await;
+        if refreshed_at.is_none_or(|at| at.elapsed() >= REFRESH_INTERVAL) {
+            self.refresh(state).await;
+            *refreshed_at = Some(Instant::now());
+        }
     }
 
     /// Every metric in the Prometheus text format, as last read.

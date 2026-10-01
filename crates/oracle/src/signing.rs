@@ -289,12 +289,19 @@ mod tests {
             Err(KeyError::Extension { .. })
         ));
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let path = directory.path().join("oracle.pem");
-            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
-        }
+        assert_private_key_permissions(&directory.path().join("oracle.pem"));
+    }
+
+    #[cfg(unix)]
+    fn assert_private_key_permissions(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    fn create_key_file(directory: &tempfile::TempDir) {
+        let _key = key_in(directory);
     }
 
     #[cfg(unix)]
@@ -303,7 +310,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("oracle.pem");
-        drop(key_in(&directory));
+        create_key_file(&directory);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(matches!(
             SigningKey::load_or_create(&path),

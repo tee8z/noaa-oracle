@@ -1,49 +1,47 @@
--- Daily forecast summary: powers the forecast detail page
--- Deduplicates overlapping forecast windows (keeps latest generated_at),
--- then aggregates to daily granularity with rain/snow/ice separation
+-- Exploratory summaries of native forecast intervals by their UTC start day.
+-- Temperatures are Fahrenheit. Intervals can overlap or cross midnight, so
+-- precipitation columns show interval maxima, not invented daily totals.
 WITH deduped_forecasts AS (
-    SELECT DISTINCT ON (station_id, begin_time, end_time)
-        station_id, begin_time, end_time, min_temp, max_temp,
-        wind_speed, wind_direction, relative_humidity_max, relative_humidity_min,
-        temperature_unit_code, twelve_hour_probability_of_precipitation,
-        liquid_precipitation_amt, snow_amt, snow_ratio, ice_amt, generated_at
-    FROM forecasts
-    ORDER BY station_id, begin_time, end_time, generated_at DESC
+    SELECT * FROM forecasts
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY station_id, begin_time::TIMESTAMPTZ, end_time::TIMESTAMPTZ
+        ORDER BY generated_at::TIMESTAMPTZ DESC,
+                 regexp_extract(filename, 'forecasts_([^/]+)\.parquet$', 1)::TIMESTAMPTZ DESC,
+                 filename DESC, min_temp DESC, max_temp DESC
+    ) = 1
 ),
-daily_forecasts AS (
-    SELECT
-        station_id,
-        DATE_TRUNC('day', begin_time::TIMESTAMP)::TEXT AS date,
-        MIN(begin_time) AS start_time,
-        MAX(end_time) AS end_time,
-        MIN(min_temp) FILTER (WHERE min_temp IS NOT NULL AND min_temp >= -200 AND min_temp <= 200) AS temp_low,
-        MAX(max_temp) FILTER (WHERE max_temp IS NOT NULL AND max_temp >= -200 AND max_temp <= 200) AS temp_high,
-        MAX(wind_speed) FILTER (WHERE wind_speed IS NOT NULL AND wind_speed >= 0 AND wind_speed <= 500) AS wind_speed,
-        MAX(wind_direction) FILTER (WHERE wind_direction IS NOT NULL AND wind_direction >= 0 AND wind_direction <= 360) AS wind_direction,
-        MAX(relative_humidity_max) FILTER (WHERE relative_humidity_max IS NOT NULL AND relative_humidity_max >= 0 AND relative_humidity_max <= 100) AS humidity_max,
-        MIN(relative_humidity_min) FILTER (WHERE relative_humidity_min IS NOT NULL AND relative_humidity_min >= 0 AND relative_humidity_min <= 100) AS humidity_min,
-        MAX(temperature_unit_code) AS temperature_unit_code,
-        MAX(twelve_hour_probability_of_precipitation) FILTER (WHERE twelve_hour_probability_of_precipitation IS NOT NULL) AS precip_chance,
-        SUM(liquid_precipitation_amt) FILTER (WHERE liquid_precipitation_amt IS NOT NULL AND liquid_precipitation_amt >= 0) AS total_qpf,
-        SUM(snow_amt) FILTER (WHERE snow_amt IS NOT NULL AND snow_amt >= 0) AS snow_amt,
-        AVG(snow_ratio) FILTER (WHERE snow_ratio IS NOT NULL AND snow_ratio > 0) AS avg_snow_ratio,
-        SUM(ice_amt) FILTER (WHERE ice_amt IS NOT NULL AND ice_amt >= 0) AS ice_amt
+normalized_forecasts AS (
+    SELECT *,
+        CASE lower(temperature_unit_code)
+            WHEN 'fahrenheit' THEN min_temp
+            WHEN 'celsius' THEN min_temp * 9.0 / 5.0 + 32.0
+            WHEN 'celcius' THEN min_temp * 9.0 / 5.0 + 32.0
+        END AS min_temp_f,
+        CASE lower(temperature_unit_code)
+            WHEN 'fahrenheit' THEN max_temp
+            WHEN 'celsius' THEN max_temp * 9.0 / 5.0 + 32.0
+            WHEN 'celcius' THEN max_temp * 9.0 / 5.0 + 32.0
+        END AS max_temp_f
     FROM deduped_forecasts
-    GROUP BY station_id, DATE_TRUNC('day', begin_time::TIMESTAMP)::TEXT
 )
 SELECT
-    station_id, date, MIN(start_time) AS start_time, MAX(end_time) AS end_time,
-    MIN(temp_low) AS temp_low, MAX(temp_high) AS temp_high,
-    MAX(wind_speed) AS wind_speed, MAX(wind_direction) AS wind_direction,
-    MAX(humidity_max) AS humidity_max, MIN(humidity_min) AS humidity_min,
-    MAX(temperature_unit_code) AS temperature_unit_code,
-    MAX(precip_chance) AS precip_chance,
-    GREATEST(0, COALESCE(
-        SUM(total_qpf) - (SUM(snow_amt) / NULLIF(AVG(avg_snow_ratio), 0)) - COALESCE(SUM(ice_amt), 0),
-        SUM(total_qpf) - COALESCE(SUM(ice_amt), 0)
-    )) AS rain_amt,
-    SUM(snow_amt) AS snow_amt,
-    SUM(ice_amt) AS ice_amt
-FROM daily_forecasts
-GROUP BY station_id, date
-ORDER BY station_id, date
+    station_id,
+    DATE_TRUNC('day', begin_time::TIMESTAMPTZ AT TIME ZONE 'UTC')::TEXT AS date_utc,
+    MIN(begin_time::TIMESTAMPTZ) AS first_interval_start_utc,
+    MAX(end_time::TIMESTAMPTZ) AS last_interval_end_utc,
+    MIN(min_temp_f) FILTER (WHERE isfinite(min_temp_f)) AS temp_low_f,
+    MAX(max_temp_f) FILTER (WHERE isfinite(max_temp_f)) AS temp_high_f,
+    MAX(wind_speed) FILTER (WHERE wind_speed BETWEEN 0 AND 500) AS wind_speed_knots,
+    MAX(relative_humidity_max) FILTER (WHERE relative_humidity_max BETWEEN 0 AND 100) AS humidity_max_pct,
+    MIN(relative_humidity_min) FILTER (WHERE relative_humidity_min BETWEEN 0 AND 100) AS humidity_min_pct,
+    MAX(twelve_hour_probability_of_precipitation) FILTER (
+        WHERE twelve_hour_probability_of_precipitation BETWEEN 0 AND 100
+    ) AS precip_chance_pct,
+    MAX(liquid_precipitation_amt) FILTER (
+        WHERE isfinite(liquid_precipitation_amt) AND liquid_precipitation_amt >= 0
+    ) AS max_interval_liquid_precip_in,
+    MAX(snow_amt) FILTER (WHERE isfinite(snow_amt) AND snow_amt >= 0) AS max_interval_snow_in,
+    MAX(ice_amt) FILTER (WHERE isfinite(ice_amt) AND ice_amt >= 0) AS max_interval_ice_in
+FROM normalized_forecasts
+GROUP BY station_id, date_utc
+ORDER BY station_id, date_utc

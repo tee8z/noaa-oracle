@@ -122,6 +122,18 @@ fn check_private(_path: &Path, _metadata: &fs::Metadata) -> Result<(), KeyError>
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn assert_private_then_refuse_readable_key(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            load_or_create(path),
+            Err(KeyError::Permissions { .. })
+        ));
+    }
+
     #[test]
     fn keys_are_created_private_and_reload() {
         let directory = tempfile::tempdir().unwrap();
@@ -131,16 +143,7 @@ mod tests {
         assert_eq!(created.public_key(), reloaded.public_key());
         assert!(npub(&created).starts_with("npub1"));
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-            assert!(matches!(
-                load_or_create(&path),
-                Err(KeyError::Permissions { .. })
-            ));
-        }
+        assert_private_then_refuse_readable_key(&path);
         assert!(matches!(
             load_or_create(&directory.path().join("daemon.key")),
             Err(KeyError::Extension { .. })

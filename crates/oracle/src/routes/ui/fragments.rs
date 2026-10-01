@@ -7,7 +7,7 @@ use axum::{
 };
 use maud::{PreEscaped, html};
 use serde::Deserialize;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::OffsetDateTime;
 
 use super::{
     forecast::forecast_html,
@@ -29,8 +29,10 @@ use crate::{
 pub struct WeatherQuery {
     pub stations: Option<String>,
     pub add_station: Option<String>,
-    pub start: Option<String>,
-    pub end: Option<String>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub start: Option<OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub end: Option<OffsetDateTime>,
     /// `map` or `list`
     pub view: Option<String>,
     /// Station search in the list.
@@ -58,14 +60,10 @@ pub async fn weather_handler(
         station_ids.push(add_station.to_string());
     }
 
-    let start = query
-        .start
-        .as_deref()
-        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok());
-    let end = query
-        .end
-        .as_deref()
-        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok());
+    let (start, end) = match super::weather::bounded_selection(query.start, query.end) {
+        Ok(window) => window,
+        Err(error) => return error.into_response(),
+    };
     let (weather, stations) = tokio::join!(
         super::weather::load_weather(
             &state,

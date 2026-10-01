@@ -816,8 +816,6 @@ impl ForecastService {
         city_weather: &CityWeather,
         output_path: &str,
     ) -> Result<ForecastReport, Error> {
-        let batches = split_cityweather(city_weather.clone(), STATIONS_PER_REQUEST);
-        let stations = &StationLookup::new(city_weather, &self.logger);
         let (output, file) = PartialFile::create(output_path)
             .map_err(|e| anyhow!("failed to create parquet file: {}", e))?;
         let props = parquet_file::properties()
@@ -830,6 +828,36 @@ impl ForecastService {
             SerializedFileWriter::new(file, Arc::new(create_forecast_schema()?), Arc::new(props))
                 .map_err(|e| anyhow!("failed to create parquet writer: {}", e))?;
 
+        let report = self
+            .write_forecast_batches(city_weather, &mut writer)
+            .await?;
+        writer
+            .close()
+            .map_err(|e| anyhow!("failed to close parquet writer: {}", e))?;
+        output
+            .commit()
+            .map_err(|e| anyhow!("failed to finish parquet file: {}", e))?;
+        info!(
+            self.logger,
+            "forecasts: {} rows for {}/{} stations, {} failed batches, written to {}",
+            report.rows,
+            report.written_stations,
+            report.expected_stations,
+            report.failed_batches,
+            output_path
+        );
+        Ok(report)
+    }
+
+    /// The fetch stream and station lookup end before the caller closes and
+    /// publishes the Parquet writer, including when a batch write fails.
+    async fn write_forecast_batches(
+        &self,
+        city_weather: &CityWeather,
+        writer: &mut SerializedFileWriter<std::fs::File>,
+    ) -> Result<ForecastReport, Error> {
+        let batches = split_cityweather(city_weather.clone(), STATIONS_PER_REQUEST);
+        let stations = &StationLookup::new(city_weather, &self.logger);
         let mut report = ForecastReport {
             expected_stations: city_weather.city_data.len(),
             written_stations: 0,
@@ -894,22 +922,6 @@ impl ForecastService {
                 .map_err(|e| anyhow!("failed to close row group: {}", e))?;
             report.rows += batch_forecasts.len();
         }
-        drop(results);
-        writer
-            .close()
-            .map_err(|e| anyhow!("failed to close parquet writer: {}", e))?;
-        output
-            .commit()
-            .map_err(|e| anyhow!("failed to finish parquet file: {}", e))?;
-        info!(
-            self.logger,
-            "forecasts: {} rows for {}/{} stations, {} failed batches, written to {}",
-            report.rows,
-            report.written_stations,
-            report.expected_stations,
-            report.failed_batches,
-            output_path
-        );
         Ok(report)
     }
 

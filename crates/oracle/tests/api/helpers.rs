@@ -51,6 +51,11 @@ impl TestClock {
     pub fn set(&self, time: OffsetDateTime) {
         *self.0.lock().unwrap() = time;
     }
+
+    fn oracle_clock(&self) -> Clock {
+        let clock = self.clone();
+        Arc::new(move || clock.now())
+    }
 }
 
 pub struct TestApp {
@@ -101,10 +106,7 @@ pub async fn spawn_app_at(weather_db: Arc<dyn WeatherData>, origin: &str) -> Tes
     let shutdown = CancellationToken::new();
     tokio::spawn(writer.run(shutdown.clone()));
     let clock = TestClock(Arc::new(Mutex::new(OffsetDateTime::now_utc())));
-    let oracle_clock: Clock = {
-        let clock = clock.clone();
-        Arc::new(move || clock.now())
-    };
+    let oracle_clock = clock.oracle_clock();
     let oracle = Arc::new(
         Oracle::new(
             database.clone(),
@@ -369,7 +371,7 @@ mock! {
             station_ids: Vec<String>,
             required_collected_after: OffsetDateTime,
             metrics: Vec<String>,
-        ) -> Result<Vec<oracle::Observation>, oracle::weather_data::Error>;
+        ) -> Result<Vec<oracle::weather_data::SettlementObservation>, oracle::weather_data::Error>;
         pub async fn daily_observations(
             &self,
             req: &oracle::ObservationRequest,
@@ -429,7 +431,7 @@ impl WeatherData for MockWeatherAccess {
         station_ids: Vec<String>,
         required_collected_after: OffsetDateTime,
         metrics: &[String],
-    ) -> Result<Vec<oracle::Observation>, oracle::weather_data::Error> {
+    ) -> Result<Vec<oracle::weather_data::SettlementObservation>, oracle::weather_data::Error> {
         MockWeatherAccess::settlement_observations(
             self,
             req,

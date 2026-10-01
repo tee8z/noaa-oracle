@@ -168,6 +168,13 @@ fn targets_with_enough_windows_get_their_own_line_and_all_share_a_pooled_one() {
     );
 }
 
+fn assert_first_history_reads(source: &History, latest: OffsetDateTime) {
+    let reads = source.reads.lock().unwrap();
+    assert_eq!(reads[0], (latest, 2), "newest first, two targets a query");
+    assert_eq!(reads[1], (latest, 1));
+    assert_eq!(reads.len(), 10);
+}
+
 /// Three stations; KCCC never reports, so it has no pairs of its own.
 /// Misses vary by day and station. Days in `empty` have no observations.
 struct History {
@@ -267,12 +274,7 @@ async fn passes_fill_history_newest_first_then_fit_and_prune() {
     // Four windows with pairs from two stations; the latest was empty.
     assert_eq!(first.pairs, 8);
     assert_eq!(first.lines, 0, "no line has ten windows yet");
-    {
-        let reads = source.reads.lock().unwrap();
-        assert_eq!(reads[0], (latest, 2), "newest first, two targets a query");
-        assert_eq!(reads[1], (latest, 1));
-        assert_eq!(reads.len(), 10);
-    }
+    assert_first_history_reads(&source, latest);
 
     let mut passes = 1;
     loop {

@@ -296,15 +296,14 @@
     }
 }
 
-/* Cool bands, periwinkle and pink, then teal and green to pale lime. Each is
-   light enough to stand off the slate map; none is red, and none is blue or
-   grey, which would sink into it. No report is an open ring, not a colour. The outline remains visible when the map scales
-   down on a phone. */
-.t-cold { --pin: #a78bfa; }
-.t-cool { --pin: #f472b6; }
-.t-mild { --pin: #2dd4bf; }
-.t-warm { --pin: #4ade80; }
-.t-hot { --pin: #d9f99d; }
+/* Temperatures progress from pale mint through mint, teal and lavender to
+   deeper violet, decreasing in luminance as they warm. Contrasting outlines
+   keep the dots visible on both map themes. The legend shares these tokens. */
+.t-cold { --pin: #d1fae5; }
+.t-cool { --pin: #a7f3d0; }
+.t-mild { --pin: #5eead4; }
+.t-warm { --pin: #c4b5fd; }
+.t-hot { --pin: #a78bfa; }
 .t-none { --pin: transparent; }
 
 .pin-dot,

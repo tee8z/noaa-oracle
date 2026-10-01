@@ -10,7 +10,9 @@ use time::{Date, Duration, OffsetDateTime, UtcOffset, macros::format_description
 use super::{Metric, ObservationWindow, OutcomeSource, ParRule, Reading, SourceError, SourceId};
 use crate::{
     routes::{ForecastRequest, ObservationRequest, TemperatureUnit},
-    weather_data::{self, Forecast, Observation, WeatherData, validate_station_id},
+    weather_data::{
+        self, Forecast, Observation, SettlementObservation, WeatherData, validate_station_id,
+    },
 };
 
 pub const NOAA_WEATHER: SourceId = SourceId::new("noaa_weather");
@@ -272,7 +274,7 @@ impl NoaaWeather {
                         metric: forecast.metric.clone(),
                         baseline: forecast.value,
                         observed: observation
-                            .and_then(|row| observed_metric(row, &forecast.metric)),
+                            .and_then(|row| settlement_metric(row, &forecast.metric)),
                     }
                 })
                 .collect());
@@ -355,6 +357,19 @@ fn rolled_up_baseline(
         _ => None,
     };
     value.filter(|value| value.is_finite())
+}
+
+fn settlement_metric(observation: &SettlementObservation, metric: &str) -> Option<f64> {
+    match metric {
+        TEMP_HIGH => observation.temp_high,
+        TEMP_LOW => observation.temp_low,
+        WIND_SPEED => observation.wind_speed.map(|value| value as f64),
+        WIND_DIRECTION => observation.wind_direction.map(|value| value as f64),
+        RAIN_AMT => observation.rain_amt,
+        SNOW_AMT => observation.snow_amt,
+        HUMIDITY => observation.humidity.map(|value| value as f64),
+        _ => None,
+    }
 }
 
 fn observed_metric(observation: &Observation, metric: &str) -> Option<f64> {

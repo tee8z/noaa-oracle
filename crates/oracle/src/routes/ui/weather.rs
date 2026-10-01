@@ -44,6 +44,20 @@ pub(super) fn requested_stations(value: Option<&str>) -> Option<Vec<String>> {
     (!ids.is_empty()).then_some(ids)
 }
 
+/// Explicit UI selections obey the station API's bounds. An absent selection
+/// keeps the reader's local day and remains eligible for cache warming.
+pub(super) fn bounded_selection(
+    start: Option<OffsetDateTime>,
+    end: Option<OffsetDateTime>,
+) -> Result<(Option<OffsetDateTime>, Option<OffsetDateTime>), crate::AppError> {
+    if start.is_none() && end.is_none() {
+        return Ok((None, None));
+    }
+    let (start, end) =
+        crate::routes::stations::bounded_window(start, end, OffsetDateTime::now_utc())?;
+    Ok((Some(start), Some(end)))
+}
+
 /// Refresh the requested selection, including stations without observations.
 pub(super) fn refresh_path(
     station_ids: &[String],
