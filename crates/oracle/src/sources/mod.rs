@@ -104,6 +104,11 @@ pub enum SourceError {
     InvalidTarget { target: String, reason: String },
     #[error("source data is unavailable: {0}")]
     Unavailable(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The published observations do not cover the window, so the event
+    /// cannot settle until they do. Shown as [`Self::Unavailable`] is; kept
+    /// apart so monitoring can tell it from a fault in the oracle.
+    #[error("source data is unavailable: {0}")]
+    Coverage(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("settlement blocked: {0}")]
     SettlementBlocked(String),
     #[error(

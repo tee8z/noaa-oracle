@@ -14,7 +14,7 @@ use oracle::{
 use serde_json::{Value, json};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering},
 };
 use time::{Duration, Time, UtcOffset, format_description::well_known::Rfc3339};
 use uuid::{NoContext, Timestamp, Uuid};
@@ -318,6 +318,72 @@ async fn the_best_entry_is_attested_after_the_signing_date() {
     assert_eq!(
         fetch(&test_app, event.id).await.attestation,
         signed.attestation
+    );
+}
+
+/// An event the published observations cannot cover is counted apart from
+/// one held for another reason, which alone ages the attestable gauge.
+#[tokio::test]
+async fn metrics_count_events_blocked_on_source_coverage_apart() {
+    let blocked_start = Arc::new(AtomicI64::new(0));
+    let mut weather = MockWeatherAccess::new();
+    set_forecasts(&mut weather, |request, _| {
+        Ok(forecasts_in_window(
+            request,
+            &[("KORD", 70, 50, 10), ("KSAW", 40, 30, 5)],
+        ))
+    });
+    let start = blocked_start.clone();
+    set_observations(&mut weather, move |request, _| {
+        if request.start.unwrap().unix_timestamp() == start.load(Ordering::SeqCst) {
+            Err(oracle::weather_data::Error::ObservationCoverage {
+                stations: vec!["KSAW".into()],
+                reason: "usable reports have a gap longer than 90 minutes".into(),
+            })
+        } else {
+            Err(oracle::weather_data::Error::QualityUnavailable)
+        }
+    });
+    let test_app = spawn_app(Arc::new(weather)).await;
+    let picks = || {
+        vec![
+            vec![pick("KORD", "temp_high", "Over")],
+            vec![pick("KORD", "temp_high", "Under")],
+            vec![pick("KSAW", "temp_high", "Par")],
+        ]
+    };
+    let (blocked, _) = event_with_entries(&test_app, picks()).await;
+    blocked_start.store(
+        blocked.start_observation_date.unix_timestamp(),
+        Ordering::SeqCst,
+    );
+    test_app
+        .clock
+        .set(test_app.clock.now() + Duration::hours(1));
+    let (attestable, _) = event_with_entries(&test_app, picks()).await;
+
+    test_app
+        .clock
+        .set(attestable.signing_date + Duration::seconds(60));
+    test_app.run_etl().await;
+    for event in [&blocked, &attestable] {
+        let event = fetch(&test_app, event.id).await;
+        assert!(event.attestation.is_none());
+        assert_eq!(event.settlement_block.unwrap().code, "source_unavailable");
+    }
+    let text = test_app.metrics().await;
+    assert_eq!(metric(&text, "oracle_events_awaiting_attestation"), 2);
+    assert_eq!(metric(&text, "oracle_events_blocked_on_source_coverage"), 1);
+    assert_eq!(
+        metric(
+            &text,
+            "oracle_oldest_event_awaiting_attestation_age_seconds"
+        ),
+        3660
+    );
+    assert_eq!(
+        metric(&text, "oracle_oldest_attestable_event_age_seconds"),
+        60
     );
 }
 
@@ -704,9 +770,12 @@ impl oracle::WeatherData for PublishedObservations {
 /// after signing. KORD reads 60 °F with a 70 °F high, a 50 °F low and 10 kt
 /// of wind, KSAW 35 °F with a 40 °F high, a 30 °F low and 5 kt, as
 /// forecast. Halfway through, the daemon could not verify KORD's
-/// temperature of 75 °F, reported with 25 kt of wind. With `gap`, the KORD
-/// reports half an hour either side of it are missing.
-async fn app_with_published_observations(now: time::OffsetDateTime, gap: bool) -> (TestApp, Event) {
+/// temperature of 75 °F, reported with 25 kt of wind. The KORD reports
+/// `missing` minutes after the start are absent.
+async fn app_with_published_observations(
+    now: time::OffsetDateTime,
+    missing: &[i64],
+) -> (TestApp, Event) {
     let mut forecasts = MockWeatherAccess::new();
     set_forecasts(&mut forecasts, |request, _| {
         Ok(forecasts_in_window(
@@ -723,7 +792,7 @@ async fn app_with_published_observations(now: time::OffsetDateTime, gap: bool) -
         while time <= end + Duration::hours(1) {
             let offset = time - start;
             let (temperature, wind, status) = match (station, offset.whole_minutes()) {
-                ("KORD", 690 | 750) if gap => {
+                ("KORD", minutes) if missing.contains(&minutes) => {
                     time += Duration::minutes(30);
                     continue;
                 }
@@ -834,7 +903,7 @@ async fn an_unverified_report_drops_out_of_the_metrics_it_affects() {
         .unwrap()
         .replace_nanosecond(0)
         .unwrap();
-    let (app, event) = app_with_published_observations(now, false).await;
+    let (app, event) = app_with_published_observations(now, &[]).await;
     let entries = temperature_and_wind_picks(&event);
     assert_eq!(
         app.submit_entries(event.id, json!({"event_id": event.id, "entries": entries}))
@@ -852,8 +921,24 @@ async fn an_unverified_report_drops_out_of_the_metrics_it_affects() {
     assert!(signed.settlement_block.is_none());
 
     // Without the reports either side, the drop-out leaves a two-hour gap
-    // in KORD's temperatures, and the block names it.
-    let (app, event) = app_with_published_observations(now, true).await;
+    // in KORD's temperatures: one missed hourly report, which a day-long
+    // window tolerates. The same entries win.
+    let (app, event) = app_with_published_observations(now, &[690, 750]).await;
+    let entries = temperature_and_wind_picks(&event);
+    assert_eq!(
+        app.submit_entries(event.id, json!({"event_id": event.id, "entries": entries}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    app.clock.set(event.signing_date);
+    let summary = app.oracle.etl_data(1).await.unwrap();
+    assert_eq!((summary.failed, summary.attested), (0, 1));
+    assert_attests(&app, &fetch(&app, event.id).await, &[0]);
+
+    // Without the two reports either side, the gap is three hours, more
+    // than one missed report leaves, and the block names it.
+    let (app, event) = app_with_published_observations(now, &[660, 690, 750, 780]).await;
     let entries = temperature_and_wind_picks(&event);
     assert_eq!(
         app.submit_entries(event.id, json!({"event_id": event.id, "entries": entries}))
@@ -868,10 +953,17 @@ async fn an_unverified_report_drops_out_of_the_metrics_it_affects() {
     assert!(blocked.attestation.is_none());
     let block = blocked.settlement_block.unwrap();
     assert_eq!(block.code, "source_unavailable");
-    for named in ["KORD/temp_high", "KORD/temp_low", "1 unverified reports"] {
+    for named in [
+        "KORD/temp_high",
+        "KORD/temp_low",
+        "1 unverified reports",
+        "a 180-minute gap",
+    ] {
         assert!(block.message.contains(named), "{}", block.message);
     }
     assert!(!block.message.contains("KSAW"), "{}", block.message);
+    let text = app.metrics().await;
+    assert_eq!(metric(&text, "oracle_events_blocked_on_source_coverage"), 1);
 }
 
 /// Fixture weather that counts how often a pass reads it.

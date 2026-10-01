@@ -5,6 +5,15 @@
 //! uploads). Gauges read from the event database and the weather directory
 //! are computed when scraped, at most every [`REFRESH_INTERVAL`], so
 //! frequent scrapes never add database load.
+//!
+//! `oracle_events_awaiting_attestation` and
+//! `oracle_oldest_event_awaiting_attestation_age_seconds` count every event
+//! the oracle has yet to attest. `oracle_events_blocked_on_source_coverage`
+//! counts those among them whose latest check failed because the published
+//! observations do not cover the window, such as a report the upstream
+//! source never published; the oracle cannot attest them until the data
+//! arrives. `oracle_oldest_attestable_event_age_seconds` gives the age of
+//! the oldest of the rest, so an alert on it points at the oracle itself.
 
 use std::{
     path::Path,
@@ -27,6 +36,7 @@ use time::{Date, OffsetDateTime, macros::format_description};
 
 use crate::{
     AppState,
+    database::AwaitingAttestation,
     file_access::{FileKind, ParquetFileName},
 };
 
@@ -49,6 +59,8 @@ pub struct Metrics {
     events: IntGaugeVec,
     awaiting_attestation: IntGauge,
     oldest_awaiting_age: IntGauge,
+    blocked_on_source_coverage: IntGauge,
+    oldest_attestable_age: IntGauge,
     expired_unsigned: IntGauge,
     latest_forecast: IntGauge,
     latest_observation: IntGauge,
@@ -119,6 +131,18 @@ impl Metrics {
                  0 while none is due",
             )
             .expect("valid metric"),
+            blocked_on_source_coverage: IntGauge::new(
+                "oracle_events_blocked_on_source_coverage",
+                "Events awaiting attestation whose latest check failed because the published \
+                 observations do not cover their window",
+            )
+            .expect("valid metric"),
+            oldest_attestable_age: IntGauge::new(
+                "oracle_oldest_attestable_event_age_seconds",
+                "Seconds since the signing date of the oldest event awaiting attestation \
+                 that is not blocked on source coverage; 0 while none is due",
+            )
+            .expect("valid metric"),
             expired_unsigned: IntGauge::new(
                 "oracle_events_expired_unsigned",
                 "Events with entries that reached their DLC expiry without an attestation; \
@@ -155,7 +179,7 @@ impl Metrics {
         for state in EVENT_STATES {
             metrics.events.with_label_values(&[state]);
         }
-        let collectors: [Box<dyn prometheus::core::Collector>; 13] = [
+        let collectors: [Box<dyn prometheus::core::Collector>; 15] = [
             Box::new(build_info),
             Box::new(metrics.etl_runs.clone()),
             Box::new(metrics.events_attested.clone()),
@@ -166,6 +190,8 @@ impl Metrics {
             Box::new(metrics.events.clone()),
             Box::new(metrics.awaiting_attestation.clone()),
             Box::new(metrics.oldest_awaiting_age.clone()),
+            Box::new(metrics.blocked_on_source_coverage.clone()),
+            Box::new(metrics.oldest_attestable_age.clone()),
             Box::new(metrics.expired_unsigned.clone()),
             Box::new(metrics.latest_forecast.clone()),
             Box::new(metrics.latest_observation.clone()),
@@ -245,17 +271,7 @@ impl Metrics {
             Err(error) => warn!("metrics: cannot count events: {error:#}"),
         }
         match state.oracle.awaiting_attestation().await {
-            Ok(awaiting) => {
-                self.awaiting_attestation
-                    .set(i64::try_from(awaiting.count).unwrap_or(i64::MAX));
-                self.expired_unsigned
-                    .set(i64::try_from(awaiting.expired).unwrap_or(i64::MAX));
-                let now = state.oracle.now().unix_timestamp();
-                let age = awaiting
-                    .oldest_signing_date
-                    .map_or(0, |due| (now - due.unix_timestamp()).max(0));
-                self.oldest_awaiting_age.set(age);
-            }
+            Ok(awaiting) => self.set_awaiting(&awaiting, state.oracle.now()),
             Err(error) => warn!("metrics: cannot count events awaiting attestation: {error:#}"),
         }
         let latest = latest_files(&state.weather_dir).await;
@@ -263,6 +279,22 @@ impl Metrics {
             .set(latest.forecast.map_or(0, OffsetDateTime::unix_timestamp));
         self.latest_observation
             .set(latest.observation.map_or(0, OffsetDateTime::unix_timestamp));
+    }
+
+    /// Sets the gauges of events awaiting attestation as of `now`.
+    fn set_awaiting(&self, awaiting: &AwaitingAttestation, now: OffsetDateTime) {
+        let count = |value: usize| i64::try_from(value).unwrap_or(i64::MAX);
+        let now = now.unix_timestamp();
+        let age =
+            |due: Option<OffsetDateTime>| due.map_or(0, |due| (now - due.unix_timestamp()).max(0));
+        self.awaiting_attestation.set(count(awaiting.count));
+        self.expired_unsigned.set(count(awaiting.expired));
+        self.oldest_awaiting_age
+            .set(age(awaiting.oldest_signing_date));
+        self.blocked_on_source_coverage
+            .set(count(awaiting.blocked_on_source_coverage));
+        self.oldest_attestable_age
+            .set(age(awaiting.oldest_attestable_signing_date));
     }
 }
 
@@ -395,6 +427,48 @@ mod tests {
         );
     }
 
+    /// One event waits on observations the source never published, the
+    /// other on the oracle: only the second ages the attestable gauge.
+    #[test]
+    fn events_blocked_on_source_coverage_are_counted_apart() {
+        let metrics = Metrics::new();
+        let now = datetime!(2026-10-01 12:00 UTC);
+        metrics.set_awaiting(
+            &AwaitingAttestation {
+                count: 2,
+                expired: 0,
+                oldest_signing_date: Some(now - time::Duration::hours(5)),
+                blocked_on_source_coverage: 1,
+                oldest_attestable_signing_date: Some(now - time::Duration::minutes(10)),
+            },
+            now,
+        );
+        let text = metrics.encode();
+        for (series, value) in [
+            ("oracle_events_awaiting_attestation", 2),
+            (
+                "oracle_oldest_event_awaiting_attestation_age_seconds",
+                18_000,
+            ),
+            ("oracle_events_blocked_on_source_coverage", 1),
+            ("oracle_oldest_attestable_event_age_seconds", 600),
+        ] {
+            assert!(text.contains(&format!("\n{series} {value}\n")), "{series}");
+        }
+        metrics.set_awaiting(
+            &AwaitingAttestation {
+                count: 1,
+                oldest_signing_date: Some(now - time::Duration::hours(5)),
+                blocked_on_source_coverage: 1,
+                ..AwaitingAttestation::default()
+            },
+            now,
+        );
+        let text = metrics.encode();
+        assert!(text.contains("\noracle_oldest_attestable_event_age_seconds 0\n"));
+        assert!(text.contains("\noracle_oldest_event_awaiting_attestation_age_seconds 18000\n"));
+    }
+
     #[test]
     fn every_family_is_registered_before_any_work() {
         let text = Metrics::new().encode();
@@ -409,6 +483,8 @@ mod tests {
             "oracle_events",
             "oracle_events_awaiting_attestation",
             "oracle_oldest_event_awaiting_attestation_age_seconds",
+            "oracle_events_blocked_on_source_coverage",
+            "oracle_oldest_attestable_event_age_seconds",
             "oracle_latest_forecast_timestamp_seconds",
             "oracle_latest_observation_timestamp_seconds",
         ] {

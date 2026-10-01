@@ -624,6 +624,7 @@ async fn competing_settlements_commit_one_consistent_snapshot_and_reject_stale_w
                 message: "waiting for source".into(),
                 checked_at: OffsetDateTime::now_utc(),
             },
+            false,
         )
         .await
         .unwrap();
@@ -732,7 +733,7 @@ async fn failed_settlement_rolls_back_signature_scores_readings_and_block() {
         checked_at: OffsetDateTime::now_utc().replace_nanosecond(0).unwrap(),
     };
     database
-        .set_settlement_block(event.id, block.clone())
+        .set_settlement_block(event.id, block.clone(), false)
         .await
         .unwrap();
     let replacement = EntryScore {
@@ -812,7 +813,7 @@ async fn settlement_blocks_survive_restart_and_cannot_modify_signed_events() {
         checked_at: OffsetDateTime::now_utc().replace_nanosecond(0).unwrap(),
     };
     database
-        .set_settlement_block(event.id, block.clone())
+        .set_settlement_block(event.id, block.clone(), false)
         .await
         .unwrap();
     shutdown.cancel();
@@ -840,6 +841,7 @@ async fn settlement_blocks_survive_restart_and_cannot_modify_signed_events() {
                 code: "must_not_replace".into(),
                 ..block.clone()
             },
+            false,
         )
         .await
         .unwrap();
@@ -866,6 +868,58 @@ async fn settlement_blocks_survive_restart_and_cannot_modify_signed_events() {
             .attestation,
         Some(MaybeScalar::Zero)
     );
+    shutdown.cancel();
+    bounded(task).await.unwrap().unwrap();
+}
+
+/// Only an event whose latest check found the published observations short
+/// of its window counts as blocked on source coverage, and a later failure
+/// of another kind takes it out of that count.
+#[tokio::test]
+async fn awaiting_attestation_counts_events_blocked_on_source_coverage_apart() {
+    let (_directory, database, writer) = open(8).await;
+    let (shutdown, task) = start(writer);
+    let blocked = add(&database, 2).await;
+    let attestable = add(&database, 2).await;
+    for event in [&blocked, &attestable] {
+        bounded(database.add_event_entries(event.id, vec![entry(event.id, "KORD")]))
+            .await
+            .unwrap();
+    }
+    let block = SettlementBlock {
+        code: "source_unavailable".into(),
+        message: "observation coverage is incomplete for [\"KJFK\"]".into(),
+        checked_at: blocked.signing_date,
+    };
+    bounded(database.set_settlement_block(blocked.id, block.clone(), true))
+        .await
+        .unwrap();
+    let failed = SettlementBlock {
+        code: "processing_failed".into(),
+        message: "database write failed".into(),
+        ..block.clone()
+    };
+    bounded(database.set_settlement_block(attestable.id, failed.clone(), false))
+        .await
+        .unwrap();
+    let oldest = blocked.signing_date.min(attestable.signing_date);
+    let now = blocked.signing_date.max(attestable.signing_date) + TimeDuration::minutes(5);
+    let awaiting = bounded(database.awaiting_attestation(now)).await.unwrap();
+    assert_eq!(awaiting.count, 2);
+    assert_eq!(awaiting.oldest_signing_date, Some(oldest));
+    assert_eq!(awaiting.blocked_on_source_coverage, 1);
+    assert_eq!(
+        awaiting.oldest_attestable_signing_date,
+        Some(attestable.signing_date)
+    );
+
+    bounded(database.set_settlement_block(blocked.id, failed, false))
+        .await
+        .unwrap();
+    let awaiting = bounded(database.awaiting_attestation(now)).await.unwrap();
+    assert_eq!(awaiting.count, 2);
+    assert_eq!(awaiting.blocked_on_source_coverage, 0);
+    assert_eq!(awaiting.oldest_attestable_signing_date, Some(oldest));
     shutdown.cancel();
     bounded(task).await.unwrap().unwrap();
 }
@@ -897,7 +951,7 @@ async fn events_to_settle_skip_expired_events() {
         message: "waiting for source".into(),
         checked_at: signing,
     };
-    bounded(database.set_settlement_block(event.id, block))
+    bounded(database.set_settlement_block(event.id, block, false))
         .await
         .unwrap();
     assert!(settle(signing + TimeDuration::minutes(1)).await);
@@ -922,7 +976,7 @@ async fn an_event_settled_without_entries_leaves_processing() {
         checked_at,
     };
     let at = empty.signing_date;
-    bounded(database.set_settlement_block(empty.id, block(at)))
+    bounded(database.set_settlement_block(empty.id, block(at), false))
         .await
         .unwrap();
     let to_settle = |now: OffsetDateTime| {
@@ -961,7 +1015,7 @@ async fn an_event_settled_without_entries_leaves_processing() {
             .await
             .unwrap()
     );
-    bounded(database.set_settlement_block(empty.id, block(later)))
+    bounded(database.set_settlement_block(empty.id, block(later), false))
         .await
         .unwrap();
     let blocks = database.settlement_blocks(&[empty.id]).await.unwrap();
