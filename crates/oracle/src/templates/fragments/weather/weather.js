@@ -20,6 +20,49 @@ function syncMapSelection() {
   });
 }
 
+// A pin is drawn a few pixels wide on a phone, too small for a finger, and
+// pins crowd together where airports do. A tap anywhere on the map opens the
+// pin whose centre is nearest, if one is within reach: each pin gets a 44 px
+// target, and pins that nearly share a spot split it rather than the one
+// painted on top taking every tap. The point comes from pointerdown, because
+// a browser may move the click onto a nearby link. A mouse, and Enter on a
+// focused pin, keep the pin they hit.
+var TOUCH_REACH = 22;
+var touchPoint = null;
+
+document.addEventListener(
+  "pointerdown",
+  function (event) {
+    touchPoint = event.pointerType === "mouse" ? null : { x: event.clientX, y: event.clientY };
+  },
+  true,
+);
+
+document.addEventListener(
+  "click",
+  function (event) {
+    if (!touchPoint || event.detail === 0 || !event.target.closest) return;
+    var markers = event.target.closest(".station-markers");
+    if (!markers) return;
+    var nearest = null;
+    var best = TOUCH_REACH * TOUCH_REACH;
+    markers.querySelectorAll(".pin-dot").forEach(function (dot) {
+      var box = dot.getBoundingClientRect();
+      var dx = box.left + box.width / 2 - touchPoint.x;
+      var dy = box.top + box.height / 2 - touchPoint.y;
+      if (dx * dx + dy * dy <= best) {
+        best = dx * dx + dy * dy;
+        nearest = dot.closest(".pin");
+      }
+    });
+    if (!nearest || nearest === event.target.closest(".pin")) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    nearest.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+  },
+  true,
+);
+
 document.addEventListener("htmx:after:process", syncMapSelection);
 // Load errors replace the panel directly rather than processing a fragment.
 document.addEventListener("htmx:after:request", syncMapSelection);

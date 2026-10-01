@@ -287,13 +287,12 @@
     visibility: visible;
 }
 
-/* Expand the transparent targets on touch screens without covering any
-   visible dot: all targets are painted beneath all station links. */
+/* On touch screens weather.js gives every tap on the map to the nearest pin
+   within reach. iOS sends a tap to a plain element only if it looks
+   clickable. */
 @media (pointer: coarse) {
-    .pin-target {
-        stroke: transparent;
-        stroke-width: 18px;
-        vector-effect: non-scaling-stroke;
+    .station-markers {
+        cursor: pointer;
     }
 }
 
