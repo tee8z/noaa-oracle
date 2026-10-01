@@ -25,44 +25,52 @@ function syncMapSelection() {
 // pin whose centre is nearest, if one is within reach: each pin gets a 44 px
 // target, and pins that nearly share a spot split it rather than the one
 // painted on top taking every tap. The point comes from pointerdown, because
-// a browser may move the click onto a nearby link, and serves one click only.
-// A mouse, and Enter on a focused pin (a click without a pointer type, even
-// where Firefox counts it as one press), keep the pin they hit.
+// a browser may move the click onto a nearby target, and serves one click
+// only. A mouse, and Enter on a focused pin, keep the pin they hit.
 var TOUCH_REACH = 22;
 var touchPoint = null;
+
+function openNearestPin(event) {
+  var point = touchPoint;
+  touchPoint = null;
+  if (!point || event.detail === 0) return;
+  var nearest = null;
+  var best = TOUCH_REACH * TOUCH_REACH;
+  event.currentTarget.querySelectorAll(".pin-dot").forEach(function (dot) {
+    var box = dot.getBoundingClientRect();
+    var dx = box.left + box.width / 2 - point.x;
+    var dy = box.top + box.height / 2 - point.y;
+    if (dx * dx + dy * dy <= best) {
+      best = dx * dx + dy * dy;
+      nearest = dot.closest(".pin");
+    }
+  });
+  if (!nearest || nearest === event.target.closest(".pin")) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  nearest.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+}
 
 document.addEventListener(
   "pointerdown",
   function (event) {
     var finger = event.pointerType === "touch" || event.pointerType === "pen";
-    touchPoint = finger ? { x: event.clientX, y: event.clientY } : null;
+    var markers = finger && event.target.closest && event.target.closest(".station-markers");
+    touchPoint = markers ? { x: event.clientX, y: event.clientY } : null;
+    // WebKit turns a tap into a click only near an element with its own
+    // click listener, which the map's empty space otherwise lacks. Adding
+    // the same listener again does nothing, and a refreshed map gets it on
+    // its first tap.
+    if (markers) markers.addEventListener("click", openNearestPin, true);
   },
   true,
 );
 
+// Firefox counts a click from Enter as one press, like a tap's.
 document.addEventListener(
-  "click",
-  function (event) {
-    var point = touchPoint;
+  "keydown",
+  function () {
     touchPoint = null;
-    if (!point || event.detail === 0 || event.pointerType === "" || !event.target.closest) return;
-    var markers = event.target.closest(".station-markers");
-    if (!markers) return;
-    var nearest = null;
-    var best = TOUCH_REACH * TOUCH_REACH;
-    markers.querySelectorAll(".pin-dot").forEach(function (dot) {
-      var box = dot.getBoundingClientRect();
-      var dx = box.left + box.width / 2 - point.x;
-      var dy = box.top + box.height / 2 - point.y;
-      if (dx * dx + dy * dy <= best) {
-        best = dx * dx + dy * dy;
-        nearest = dot.closest(".pin");
-      }
-    });
-    if (!nearest || nearest === event.target.closest(".pin")) return;
-    event.preventDefault();
-    event.stopImmediatePropagation();
-    nearest.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
   },
   true,
 );
