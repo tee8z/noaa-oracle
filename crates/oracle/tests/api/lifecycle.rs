@@ -283,10 +283,13 @@ async fn source_work_crossing_expiry_does_not_publish_an_attestation() {
     *clock.lock().unwrap() = Some(app.clock.clone());
     let (event, _) = event_with_entries(
         &app,
-        vec![vec![
-            pick("KORD", "temp_high", "Over"),
-            pick("KORD", "temp_low", "Par"),
-        ]],
+        vec![
+            vec![
+                pick("KORD", "temp_high", "Over"),
+                pick("KORD", "temp_low", "Par"),
+            ];
+            3
+        ],
     )
     .await;
     app.clock.set(event.signing_date);

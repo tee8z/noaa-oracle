@@ -211,15 +211,19 @@ async fn selected_utc_day_uses_its_previous_day_forecast_and_preserves_refresh_c
 }
 
 #[tokio::test]
-async fn start_only_weather_selection_keeps_its_bound_and_refresh_context() {
+async fn start_only_weather_selection_keeps_its_bounded_window_and_refresh_context() {
     let start = OffsetDateTime::parse("2024-08-12T00:00:00Z", &Rfc3339).unwrap();
+    let end = start + Duration::days(7);
     let requested_ends = Arc::new(Mutex::new(Vec::new()));
     let captured_ends = requested_ends.clone();
     let mut weather = MockWeatherAccess::new();
     weather
         .expect_observation_data()
         .withf(move |request, stations| {
-            request.start == Some(start) && request.station_ids == "KORD" && stations == &["KORD"]
+            request.start == Some(start)
+                && request.end == Some(end)
+                && request.station_ids == "KORD"
+                && stations == &["KORD"]
         })
         .times(1)
         .returning(move |request, _| {
@@ -232,7 +236,6 @@ async fn start_only_weather_selection_keeps_its_bound_and_refresh_context() {
         .times(1)
         .returning(|| Ok(mock_stations()));
     let app = spawn_app(Arc::new(weather)).await;
-    let before = OffsetDateTime::now_utc();
     let (status, body) = app
         .get("/fragments/weather?stations=KORD&start=2024-08-12T02:00:00%2B02:00")
         .await;
@@ -243,21 +246,20 @@ async fn start_only_weather_selection_keeps_its_bound_and_refresh_context() {
     let refresh = weather_refresh_url(&html);
     assert_eq!(
         refresh,
-        "/fragments/weather?stations=KORD&start=2024-08-12T00%3A00%3A00Z&view=map"
+        "/fragments/weather?stations=KORD&start=2024-08-12T00%3A00%3A00Z&end=2024-08-19T00%3A00%3A00Z&view=map"
     );
     let (status, body) = app.get(&refresh).await;
     assert!(status.is_success());
     let refreshed = String::from_utf8(body.to_vec()).unwrap();
     assert!(refreshed.contains("Selected period"));
     assert_eq!(weather_refresh_url(&refreshed), refresh);
-    let after = OffsetDateTime::now_utc();
     let ends = requested_ends.lock().unwrap();
     assert_eq!(
         ends.len(),
         1,
         "the refresh is served from the cache, and a selected window fetches no recent-report window"
     );
-    assert!(ends.iter().all(|end| *end >= before && *end <= after));
+    assert_eq!(*ends, vec![end]);
 }
 
 #[tokio::test]
