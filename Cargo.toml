@@ -42,10 +42,10 @@ slog-async = "2.8"
 # Time
 time = { version = "0.3", features = ["parsing", "formatting", "macros", "serde"] }
 
-# Parquet. Keep in step with the arrow version re-exported by the `duckdb`
-# crate so the workspace builds one copy of arrow.
-parquet = { version = "58", default-features = false, features = ["zstd"] }
-parquet_derive = "58"
+# Parquet 59 removes the legacy thrift dependency. Leave Arrow integration
+# disabled; these dependencies only write the daemon's Parquet records.
+parquet = { version = "59.3", default-features = false, features = ["zstd"] }
+parquet_derive = "59.3"
 
 # S3
 # Use the current AWS HTTPS connector; the legacy rustls feature selects rustls 0.21.

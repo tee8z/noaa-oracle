@@ -223,127 +223,107 @@ impl TryFrom<WeatherForecast> for Forecast {
     }
 }
 
-pub fn create_forecast_schema() -> Type {
+pub fn create_forecast_schema() -> Result<Type, parquet::errors::ParquetError> {
     let station_id = Type::primitive_type_builder("station_id", PhysicalType::BYTE_ARRAY)
         .with_logical_type(Some(LogicalType::String))
         .with_repetition(Repetition::REQUIRED)
-        .build()
-        .unwrap();
+        .build()?;
 
     let station_name = Type::primitive_type_builder("station_name", PhysicalType::BYTE_ARRAY)
         .with_repetition(Repetition::REQUIRED)
         .with_logical_type(Some(LogicalType::String))
-        .build()
-        .unwrap();
+        .build()?;
 
     let latitude = Type::primitive_type_builder("latitude", PhysicalType::DOUBLE)
         .with_repetition(Repetition::REQUIRED)
-        .build()
-        .unwrap();
+        .build()?;
 
     let longitude = Type::primitive_type_builder("longitude", PhysicalType::DOUBLE)
         .with_repetition(Repetition::REQUIRED)
-        .build()
-        .unwrap();
+        .build()?;
 
     let generated_at = Type::primitive_type_builder("generated_at", PhysicalType::BYTE_ARRAY)
         .with_logical_type(Some(LogicalType::String))
         .with_repetition(Repetition::REQUIRED)
-        .build()
-        .unwrap();
+        .build()?;
 
     let begin_time = Type::primitive_type_builder("begin_time", PhysicalType::BYTE_ARRAY)
         .with_logical_type(Some(LogicalType::String))
         .with_repetition(Repetition::REQUIRED)
-        .build()
-        .unwrap();
+        .build()?;
 
     let end_time = Type::primitive_type_builder("end_time", PhysicalType::BYTE_ARRAY)
         .with_logical_type(Some(LogicalType::String))
         .with_repetition(Repetition::REQUIRED)
-        .build()
-        .unwrap();
+        .build()?;
 
     let max_temp = Type::primitive_type_builder("max_temp", PhysicalType::INT64)
         .with_repetition(Repetition::OPTIONAL)
-        .build()
-        .unwrap();
+        .build()?;
 
     let min_temp = Type::primitive_type_builder("min_temp", PhysicalType::INT64)
         .with_repetition(Repetition::OPTIONAL)
-        .build()
-        .unwrap();
+        .build()?;
 
     let temperature_unit_code =
         Type::primitive_type_builder("temperature_unit_code", PhysicalType::BYTE_ARRAY)
             .with_logical_type(Some(LogicalType::String))
             .with_repetition(Repetition::REQUIRED)
-            .build()
-            .unwrap();
+            .build()?;
 
     let wind_speed_value = Type::primitive_type_builder("wind_speed", PhysicalType::INT64)
         .with_repetition(Repetition::OPTIONAL)
-        .build()
-        .unwrap();
+        .build()?;
 
     let wind_speed_unit_code =
         Type::primitive_type_builder("wind_speed_unit_code", PhysicalType::BYTE_ARRAY)
             .with_logical_type(Some(LogicalType::String))
             .with_repetition(Repetition::REQUIRED)
-            .build()
-            .unwrap();
+            .build()?;
 
     let wind_direction_value = Type::primitive_type_builder("wind_direction", PhysicalType::INT64)
         .with_repetition(Repetition::OPTIONAL)
-        .build()
-        .unwrap();
+        .build()?;
 
     let wind_direction_unit_code =
         Type::primitive_type_builder("wind_direction_unit_code", PhysicalType::BYTE_ARRAY)
             .with_logical_type(Some(LogicalType::String))
             .with_repetition(Repetition::REQUIRED)
-            .build()
-            .unwrap();
+            .build()?;
 
     let relative_humidity_max =
         Type::primitive_type_builder("relative_humidity_max", PhysicalType::INT64)
             .with_repetition(Repetition::OPTIONAL)
-            .build()
-            .unwrap();
+            .build()?;
 
     let relative_humidity_min =
         Type::primitive_type_builder("relative_humidity_min", PhysicalType::INT64)
             .with_repetition(Repetition::OPTIONAL)
-            .build()
-            .unwrap();
+            .build()?;
 
     let relative_humidity_unit_code =
         Type::primitive_type_builder("relative_humidity_unit_code", PhysicalType::BYTE_ARRAY)
             .with_logical_type(Some(LogicalType::String))
             .with_repetition(Repetition::REQUIRED)
-            .build()
-            .unwrap();
+            .build()?;
 
     let liquid_precipitation_amt =
         Type::primitive_type_builder("liquid_precipitation_amt", PhysicalType::DOUBLE)
             .with_repetition(Repetition::OPTIONAL)
-            .build()
-            .unwrap();
+            .build()?;
 
     let liquid_precipitation_unit_code =
         Type::primitive_type_builder("liquid_precipitation_unit_code", PhysicalType::BYTE_ARRAY)
             .with_logical_type(Some(LogicalType::String))
             .with_repetition(Repetition::REQUIRED)
-            .build()
-            .unwrap();
+            .build()?;
 
     let twelve_hour_probability_of_precipitation = Type::primitive_type_builder(
         "twelve_hour_probability_of_precipitation",
         PhysicalType::INT64,
     )
     .with_repetition(Repetition::OPTIONAL)
-    .build()
-    .unwrap();
+    .build()?;
 
     let twelve_hour_probability_of_precipitation_unit_code = Type::primitive_type_builder(
         "twelve_hour_probability_of_precipitation_unit_code",
@@ -351,62 +331,52 @@ pub fn create_forecast_schema() -> Type {
     )
     .with_logical_type(Some(LogicalType::String))
     .with_repetition(Repetition::REQUIRED)
-    .build()
-    .unwrap();
+    .build()?;
 
     // New fields at the end for backwards compatibility
     let state = Type::primitive_type_builder("state", PhysicalType::BYTE_ARRAY)
         .with_repetition(Repetition::REQUIRED)
         .with_logical_type(Some(LogicalType::String))
-        .build()
-        .unwrap();
+        .build()?;
 
     let iata_id = Type::primitive_type_builder("iata_id", PhysicalType::BYTE_ARRAY)
         .with_repetition(Repetition::REQUIRED)
         .with_logical_type(Some(LogicalType::String))
-        .build()
-        .unwrap();
+        .build()?;
 
     let elevation_m = Type::primitive_type_builder("elevation_m", PhysicalType::DOUBLE)
         .with_repetition(Repetition::OPTIONAL)
-        .build()
-        .unwrap();
+        .build()?;
 
     let snow_amt = Type::primitive_type_builder("snow_amt", PhysicalType::DOUBLE)
         .with_repetition(Repetition::OPTIONAL)
-        .build()
-        .unwrap();
+        .build()?;
 
     let snow_amt_unit_code =
         Type::primitive_type_builder("snow_amt_unit_code", PhysicalType::BYTE_ARRAY)
             .with_logical_type(Some(LogicalType::String))
             .with_repetition(Repetition::REQUIRED)
-            .build()
-            .unwrap();
+            .build()?;
 
     let snow_ratio = Type::primitive_type_builder("snow_ratio", PhysicalType::DOUBLE)
         .with_repetition(Repetition::OPTIONAL)
-        .build()
-        .unwrap();
+        .build()?;
 
     let snow_ratio_unit_code =
         Type::primitive_type_builder("snow_ratio_unit_code", PhysicalType::BYTE_ARRAY)
             .with_logical_type(Some(LogicalType::String))
             .with_repetition(Repetition::REQUIRED)
-            .build()
-            .unwrap();
+            .build()?;
 
     let ice_amt = Type::primitive_type_builder("ice_amt", PhysicalType::DOUBLE)
         .with_repetition(Repetition::OPTIONAL)
-        .build()
-        .unwrap();
+        .build()?;
 
     let ice_amt_unit_code =
         Type::primitive_type_builder("ice_amt_unit_code", PhysicalType::BYTE_ARRAY)
             .with_logical_type(Some(LogicalType::String))
             .with_repetition(Repetition::REQUIRED)
-            .build()
-            .unwrap();
+            .build()?;
 
     Type::group_type_builder("forecast")
         .with_fields(vec![
@@ -441,28 +411,25 @@ pub fn create_forecast_schema() -> Type {
             Arc::new(snow_ratio_unit_code),
             Arc::new(ice_amt),
             Arc::new(ice_amt_unit_code),
-            optional_forecast_text("forecast_interval_version"),
-            optional_forecast_text("interval_kind"),
-            optional_forecast_text("source_url"),
-            optional_forecast_text("source_received_at"),
-            optional_forecast_text("source_xml_sha256"),
-            optional_forecast_text("source_location"),
-            optional_forecast_text("source_layouts"),
-            optional_forecast_text("quality_status"),
-            optional_forecast_text("quality_reason"),
+            optional_forecast_text("forecast_interval_version")?,
+            optional_forecast_text("interval_kind")?,
+            optional_forecast_text("source_url")?,
+            optional_forecast_text("source_received_at")?,
+            optional_forecast_text("source_xml_sha256")?,
+            optional_forecast_text("source_location")?,
+            optional_forecast_text("source_layouts")?,
+            optional_forecast_text("quality_status")?,
+            optional_forecast_text("quality_reason")?,
         ])
         .build()
-        .unwrap()
 }
 
-fn optional_forecast_text(name: &str) -> Arc<Type> {
-    Arc::new(
-        Type::primitive_type_builder(name, PhysicalType::BYTE_ARRAY)
-            .with_logical_type(Some(LogicalType::String))
-            .with_repetition(Repetition::OPTIONAL)
-            .build()
-            .expect("valid optional forecast text column"),
-    )
+fn optional_forecast_text(name: &str) -> Result<Arc<Type>, parquet::errors::ParquetError> {
+    Type::primitive_type_builder(name, PhysicalType::BYTE_ARRAY)
+        .with_logical_type(Some(LogicalType::String))
+        .with_repetition(Repetition::OPTIONAL)
+        .build()
+        .map(Arc::new)
 }
 
 #[derive(Debug, Clone)]
@@ -860,7 +827,7 @@ impl ForecastService {
             )]))
             .build();
         let mut writer =
-            SerializedFileWriter::new(file, Arc::new(create_forecast_schema()), Arc::new(props))
+            SerializedFileWriter::new(file, Arc::new(create_forecast_schema()?), Arc::new(props))
                 .map_err(|e| anyhow!("failed to create parquet writer: {}", e))?;
 
         let mut report = ForecastReport {
