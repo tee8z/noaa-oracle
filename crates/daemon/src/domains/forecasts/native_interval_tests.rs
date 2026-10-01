@@ -299,7 +299,7 @@ async fn published_parquet_retains_native_schema_and_exact_source_xml() {
     let file = File::create(&path).unwrap();
     let mut writer = SerializedFileWriter::new(
         file,
-        Arc::new(create_forecast_schema()),
+        Arc::new(create_forecast_schema().unwrap()),
         Arc::new(WriterProperties::builder().build()),
     )
     .unwrap();
