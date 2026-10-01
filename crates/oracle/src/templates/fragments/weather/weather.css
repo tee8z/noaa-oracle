@@ -296,14 +296,14 @@
     }
 }
 
-/* Temperatures progress from deeper violet through lavender and teal to pale
-   mint, increasing in luminance as they warm. Contrasting outlines keep the
-   dots visible on both map themes. The legend shares these tokens. */
-.t-cold { --pin: #a78bfa; }
-.t-cool { --pin: #c4b5fd; }
+/* Temperatures progress from pale mint through mint, teal and lavender to
+   deeper violet, decreasing in luminance as they warm. Contrasting outlines
+   keep the dots visible on both map themes. The legend shares these tokens. */
+.t-cold { --pin: #d1fae5; }
+.t-cool { --pin: #a7f3d0; }
 .t-mild { --pin: #5eead4; }
-.t-warm { --pin: #a7f3d0; }
-.t-hot { --pin: #d1fae5; }
+.t-warm { --pin: #c4b5fd; }
+.t-hot { --pin: #a78bfa; }
 .t-none { --pin: transparent; }
 
 .pin-dot,

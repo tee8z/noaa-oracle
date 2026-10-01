@@ -10,7 +10,7 @@ use crate::templates::{
     components::{time as when, values::whole_degrees},
 };
 
-/// Cool bands lighten from violet through lavender and teal to pale mint (`weather.css`).
+/// Cool bands deepen from pale mint through teal and lavender to violet (`weather.css`).
 const BANDS: [(&str, &str); 5] = [
     ("t-cold", "Below 40°F"),
     ("t-cool", "40–59°F"),
