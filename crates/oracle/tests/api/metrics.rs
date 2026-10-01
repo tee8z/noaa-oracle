@@ -52,6 +52,8 @@ async fn the_metrics_router_serves_every_family_at_get_metrics_only() {
         "oracle_events",
         "oracle_events_awaiting_attestation",
         "oracle_oldest_event_awaiting_attestation_age_seconds",
+        "oracle_events_blocked_on_source_coverage",
+        "oracle_oldest_attestable_event_age_seconds",
         "oracle_etl_runs_total",
         "oracle_events_attested_total",
         "oracle_event_attestation_failures_total",

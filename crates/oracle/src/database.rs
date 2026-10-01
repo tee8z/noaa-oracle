@@ -560,7 +560,10 @@ impl Database {
     /// have entries but no attestation yet, with the earliest signing date
     /// among them. Events without entries are never attested, so they are
     /// left out. Those past their DLC expiry can no longer be attested and
-    /// are counted apart.
+    /// are counted apart. Of those still awaiting, the ones whose latest
+    /// check found the published observations short of the window are
+    /// counted again apart, and the earliest signing date among the rest is
+    /// given too.
     pub async fn awaiting_attestation(
         &self,
         now: OffsetDateTime,
@@ -568,8 +571,12 @@ impl Database {
         let row = sqlx::query(
             "SELECT COALESCE(SUM(e.signing_date + ?1 > ?2), 0) AS awaiting,
                 COALESCE(SUM(e.signing_date + ?1 <= ?2), 0) AS expired,
-                MIN(CASE WHEN e.signing_date + ?1 > ?2 THEN e.signing_date END) AS oldest_signing_date
-             FROM events e
+                MIN(CASE WHEN e.signing_date + ?1 > ?2 THEN e.signing_date END) AS oldest_signing_date,
+                COALESCE(SUM(e.signing_date + ?1 > ?2 AND b.source_coverage IS 1), 0)
+                    AS blocked_on_source_coverage,
+                MIN(CASE WHEN e.signing_date + ?1 > ?2 AND b.source_coverage IS NOT 1
+                    THEN e.signing_date END) AS oldest_attestable_signing_date
+             FROM events e LEFT JOIN event_settlement_blocks b ON b.event_id = e.id
              WHERE e.attestation IS NULL AND e.end_observation_date <= ?2
                AND EXISTS (SELECT 1 FROM events_entries x WHERE x.event_id = e.id)",
         )
@@ -577,14 +584,19 @@ impl Database {
         .bind(now.unix_timestamp())
         .fetch_one(&self.readers)
         .await?;
-        let oldest: Option<i64> = row.try_get("oldest_signing_date")?;
+        let date = |column: &str| -> Result<Option<OffsetDateTime>, sqlx::Error> {
+            let seconds: Option<i64> = row.try_get(column)?;
+            seconds
+                .map(OffsetDateTime::from_unix_timestamp)
+                .transpose()
+                .map_err(|error| decode_error(column, error))
+        };
         Ok(AwaitingAttestation {
             count: count_column(&row, "awaiting")?,
             expired: count_column(&row, "expired")?,
-            oldest_signing_date: oldest
-                .map(OffsetDateTime::from_unix_timestamp)
-                .transpose()
-                .map_err(|error| decode_error("oldest_signing_date", error))?,
+            oldest_signing_date: date("oldest_signing_date")?,
+            blocked_on_source_coverage: count_column(&row, "blocked_on_source_coverage")?,
+            oldest_attestable_signing_date: date("oldest_attestable_signing_date")?,
         })
     }
 
@@ -731,23 +743,30 @@ impl Database {
 
     /// Records a failure through the same single writer as event processing.
     /// A signed event cannot acquire or overwrite a blocked reason.
+    /// `source_coverage` marks a failure for published observations that do
+    /// not cover the window rather than a fault in the oracle; only metrics
+    /// read it.
     pub async fn set_settlement_block(
         &self,
         event_id: Uuid,
         block: SettlementBlock,
+        source_coverage: bool,
     ) -> Result<(), WriteError> {
         self.write_waiting(move |connection| {
             Box::pin(async move {
                 sqlx::query(
-                    "INSERT INTO event_settlement_blocks (event_id, code, message, checked_at)
-                 SELECT id, ?, ?, ? FROM events
+                    "INSERT INTO event_settlement_blocks
+                    (event_id, code, message, checked_at, source_coverage)
+                 SELECT id, ?, ?, ?, ? FROM events
                  WHERE id = ? AND attestation IS NULL AND settled_without_entries_at IS NULL
                  ON CONFLICT(event_id) DO UPDATE SET code = excluded.code,
-                    message = excluded.message, checked_at = excluded.checked_at",
+                    message = excluded.message, checked_at = excluded.checked_at,
+                    source_coverage = excluded.source_coverage",
                 )
                 .bind(block.code)
                 .bind(block.message)
                 .bind(block.checked_at.unix_timestamp())
+                .bind(source_coverage)
                 .bind(event_id.to_string())
                 .execute(connection)
                 .await?;
@@ -1109,6 +1128,12 @@ pub struct AwaitingAttestation {
     /// Unsigned events with entries past their DLC expiry.
     pub expired: usize,
     pub oldest_signing_date: Option<OffsetDateTime>,
+    /// Events among `count` whose latest check failed because the published
+    /// observations do not cover their window.
+    pub blocked_on_source_coverage: usize,
+    /// The earliest signing date among the events in `count` not in
+    /// `blocked_on_source_coverage`.
+    pub oldest_attestable_signing_date: Option<OffsetDateTime>,
 }
 
 /// Scores for one entry.

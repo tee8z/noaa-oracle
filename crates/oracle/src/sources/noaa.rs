@@ -379,6 +379,9 @@ fn unavailable(error: weather_data::Error) -> SourceError {
             rejected_reports,
             unverified_reports,
         },
+        error @ weather_data::Error::ObservationCoverage { .. } => {
+            SourceError::Coverage(Box::new(error))
+        }
         error => SourceError::Unavailable(Box::new(error)),
     }
 }

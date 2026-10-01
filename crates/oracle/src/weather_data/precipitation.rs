@@ -13,6 +13,11 @@ use std::{
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 const MAX_REPORT_GAP: Duration = Duration::minutes(90);
+/// Windows at least this long tolerate one missed routine report.
+const LONG_WINDOW: Duration = Duration::hours(12);
+/// The longest gap one missed hourly report leaves with the reports on
+/// both sides of it present.
+const MISSED_REPORT_GAP: Duration = Duration::minutes(150);
 const PHASE_CLOSURE_LIMIT: Duration = Duration::minutes(75);
 
 #[derive(Debug)]
@@ -65,22 +70,99 @@ fn chain(mut intervals: Vec<Interval>, start: OffsetDateTime, end: OffsetDateTim
     None
 }
 
+/// Why the reports usable for one metric do not sample a window.
+#[derive(Debug, PartialEq, Eq)]
+enum Shortfall {
+    /// No report inside the window.
+    Empty,
+    /// A gap over 90 minutes in a window too short to tolerate one.
+    Gap(Duration),
+    /// A gap longer than one missed hourly report leaves.
+    LongGap(Duration),
+    /// A gap over 90 minutes after the one already tolerated.
+    SecondGap(Duration),
+    /// The last report is more than 90 minutes before the window end.
+    Tail(Duration),
+}
+
+impl std::fmt::Display for Shortfall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "no report inside the window"),
+            Self::Gap(gap) => write!(
+                f,
+                "a {}-minute gap, and windows under {} hours tolerate none",
+                gap.whole_minutes(),
+                LONG_WINDOW.whole_hours()
+            ),
+            Self::LongGap(gap) => write!(
+                f,
+                "a {}-minute gap, longer than the {} minutes one missed report leaves",
+                gap.whole_minutes(),
+                MISSED_REPORT_GAP.whole_minutes()
+            ),
+            Self::SecondGap(gap) => write!(
+                f,
+                "a second long gap of {} minutes after the one missed report tolerated",
+                gap.whole_minutes()
+            ),
+            Self::Tail(gap) => write!(
+                f,
+                "the last report is {} minutes before the window end",
+                gap.whole_minutes()
+            ),
+        }
+    }
+}
+
+/// How `times`, the reports usable for one metric, sample the window. A
+/// window of at least [`LONG_WINDOW`] tolerates one gap of up to
+/// [`MISSED_REPORT_GAP`], one missed routine report, but never before the
+/// window end, where the gap could be the start of an outage. A tolerated
+/// gap adds no reading: the missed hour is simply not observed.
+fn sampling<'a>(
+    times: impl Iterator<Item = &'a Report>,
+    start: OffsetDateTime,
+    end: OffsetDateTime,
+) -> Result<(), Shortfall> {
+    let tolerates_one = end - start >= LONG_WINDOW;
+    let mut tolerated = false;
+    let mut previous = start;
+    let mut count = 0;
+    for report in times.filter(|row| row.time >= start && row.time < end) {
+        let gap = report.time - previous;
+        if gap > MAX_REPORT_GAP {
+            if !tolerates_one {
+                return Err(Shortfall::Gap(gap));
+            }
+            if gap > MISSED_REPORT_GAP {
+                return Err(Shortfall::LongGap(gap));
+            }
+            if tolerated {
+                return Err(Shortfall::SecondGap(gap));
+            }
+            tolerated = true;
+        }
+        previous = report.time;
+        count += 1;
+    }
+    if count == 0 {
+        return Err(Shortfall::Empty);
+    }
+    let tail = end - previous;
+    if tail > MAX_REPORT_GAP {
+        return Err(Shortfall::Tail(tail));
+    }
+    Ok(())
+}
+
 /// Whether `times`, the reports usable for one metric, sample the window.
 fn sampling_complete<'a>(
     times: impl Iterator<Item = &'a Report>,
     start: OffsetDateTime,
     end: OffsetDateTime,
 ) -> bool {
-    let mut previous = start;
-    let mut count = 0;
-    for report in times.filter(|row| row.time >= start && row.time < end) {
-        if report.time - previous > MAX_REPORT_GAP {
-            return false;
-        }
-        previous = report.time;
-        count += 1;
-    }
-    count > 0 && end - previous <= MAX_REPORT_GAP
+    sampling(times, start, end).is_ok()
 }
 
 /// Solid or freezing precipitation makes liquid-only rainfall ambiguous.
@@ -246,6 +328,54 @@ fn apply_fixed_hours(value: &mut Totals, fixed_total: Option<f64>, phase_known: 
     value.ice = total.filter(|_| phase_known).map(|_| 0.0);
 }
 
+/// Whether a station's reports sample the event window, both all of them and
+/// those with a usable temperature when the event scores one.
+fn sampled(
+    station: &str,
+    reports: &[Report],
+    requirement: &coverage::Requirement,
+) -> Result<(), Error> {
+    if let Err(shortfall) = sampling(reports.iter(), requirement.start, requirement.end) {
+        return Err(Error::ObservationCoverage {
+            stations: vec![station.into()],
+            reason: format!(
+                "usable reports have a gap longer than 90 minutes, or no report inside the scoring window ({shortfall})"
+            ),
+        });
+    }
+    // An unverified report drops out of the metrics its problems affect
+    // (the query removed those values); the rest must still sample the
+    // window. Wind and humidity gaps leave their values missing in totals.
+    let gaps: Vec<String> = ["temp_high", "temp_low"]
+        .into_iter()
+        .filter(|metric| requirement.scores(metric))
+        .map(|metric| format!("{station}/{metric}"))
+        .collect();
+    if gaps.is_empty() {
+        return Ok(());
+    }
+    if let Err(shortfall) = sampling(
+        reports.iter().filter(|row| row.temperature),
+        requirement.start,
+        requirement.end,
+    ) {
+        let dropped = reports
+            .iter()
+            .filter(|row| {
+                !row.verified && row.time >= requirement.start && row.time < requirement.end
+            })
+            .count();
+        return Err(Error::ObservationCoverage {
+            stations: vec![station.into()],
+            reason: format!(
+                "usable reports for {} have a gap longer than 90 minutes, or none inside the scoring window ({dropped} unverified reports left out; {shortfall})",
+                gaps.join(", ")
+            ),
+        });
+    }
+    Ok(())
+}
+
 pub(super) fn apply(
     connection: &Connection,
     files: &[String],
@@ -298,41 +428,7 @@ pub(super) fn apply(
     let fixed_hours = super::shef::Evidence::read(connection, files)?;
     let mut measured = HashMap::new();
     for (station, reports) in by_station {
-        if !sampling_complete(reports.iter(), requirement.start, requirement.end) {
-            return Err(Error::ObservationCoverage {
-                stations: vec![station],
-                reason: "usable reports have a gap longer than 90 minutes, or no report inside the scoring window".into(),
-            });
-        }
-        // An unverified report drops out of the metrics its problems affect
-        // (the query removed those values); the rest must still sample the
-        // window. Wind and humidity gaps leave their values missing below.
-        let gaps: Vec<String> = ["temp_high", "temp_low"]
-            .into_iter()
-            .filter(|metric| requirement.scores(metric))
-            .map(|metric| format!("{station}/{metric}"))
-            .collect();
-        if !gaps.is_empty()
-            && !sampling_complete(
-                reports.iter().filter(|row| row.temperature),
-                requirement.start,
-                requirement.end,
-            )
-        {
-            let dropped = reports
-                .iter()
-                .filter(|row| {
-                    !row.verified && row.time >= requirement.start && row.time < requirement.end
-                })
-                .count();
-            return Err(Error::ObservationCoverage {
-                stations: vec![station],
-                reason: format!(
-                    "usable reports for {} have a gap longer than 90 minutes, or none inside the scoring window ({dropped} unverified reports left out)",
-                    gaps.join(", ")
-                ),
-            });
-        }
+        sampled(&station, &reports, requirement)?;
         let mut value = totals(&reports, requirement.start, requirement.end);
         let phase_known =
             phase_window(&reports, requirement.start, requirement.end).is_some_and(|phase| {
@@ -535,6 +631,106 @@ mod tests {
             reports[0].time,
             reports[1].time + Duration::hours(3)
         ));
+    }
+
+    /// Hourly routine reports from the window start for `hours`, without
+    /// those at the minutes in `missed`.
+    fn hourly(hours: i64, missed: &[i64]) -> Vec<Report> {
+        (0..hours)
+            .map(|hour| hour * 60)
+            .filter(|minutes| !missed.contains(minutes))
+            .map(|minutes| report(minutes, true, 0.0))
+            .collect()
+    }
+
+    fn window(hours: i64) -> (OffsetDateTime, OffsetDateTime) {
+        let start = datetime!(2026-01-17 00:00 UTC);
+        (start, start + Duration::hours(hours))
+    }
+
+    #[test]
+    fn a_long_window_tolerates_one_missed_routine_report() {
+        let (start, end) = window(24);
+        let reports = hourly(24, &[600]);
+        assert_eq!(sampling(reports.iter(), start, end), Ok(()));
+        assert_eq!(
+            sampling(hourly(24, &[600, 1020]).iter(), start, end),
+            Err(Shortfall::SecondGap(Duration::minutes(120)))
+        );
+        assert_eq!(
+            sampling(hourly(24, &[540, 600]).iter(), start, end),
+            Err(Shortfall::LongGap(Duration::minutes(180)))
+        );
+        // The tolerated gap leaves no value for the missed hour: the
+        // accumulation chain breaks there rather than being filled in.
+        // The closing report at the window end makes the chain complete
+        // without the gap.
+        assert_eq!(totals(&hourly(25, &[]), start, end).rain, Some(0.0));
+        let mut humid = hourly(25, &[600]);
+        humid[9].humidity = Some(97);
+        let result = totals(&humid, start, end);
+        assert!(result.wind_complete && result.direction_complete);
+        assert_eq!(result.humidity, Some(97));
+        assert_eq!(result.rain, None);
+    }
+
+    #[test]
+    fn a_short_window_or_a_late_last_report_tolerates_no_gap() {
+        let (start, end) = window(6);
+        assert_eq!(sampling(hourly(6, &[]).iter(), start, end), Ok(()));
+        assert_eq!(
+            sampling(hourly(6, &[120]).iter(), start, end),
+            Err(Shortfall::Gap(Duration::minutes(120)))
+        );
+        assert_eq!(
+            sampling(hourly(6, &[300]).iter(), start, end),
+            Err(Shortfall::Tail(Duration::minutes(120)))
+        );
+        let (start, end) = window(24);
+        assert_eq!(
+            sampling(hourly(24, &[1380]).iter(), start, end),
+            Err(Shortfall::Tail(Duration::minutes(120)))
+        );
+        assert_eq!(
+            sampling(std::iter::empty(), start, end),
+            Err(Shortfall::Empty)
+        );
+    }
+
+    #[test]
+    fn one_unverified_temperature_in_a_long_window_is_tolerated_like_a_missing_report() {
+        let (start, end) = window(24);
+        let requirement = coverage::Requirement {
+            start,
+            end,
+            stations: vec!["KJFK".into()],
+            collected_after: end,
+            groups: super::super::quality_groups(&[]),
+            metrics: vec!["temp_high".into()],
+        };
+        let mut reports = hourly(24, &[]);
+        reports[10].verified = false;
+        reports[10].temperature = false;
+        assert!(sampled("KJFK", &reports, &requirement).is_ok());
+        reports[16].verified = false;
+        reports[16].temperature = false;
+        let Err(Error::ObservationCoverage { stations, reason }) =
+            sampled("KJFK", &reports, &requirement)
+        else {
+            panic!("a second unverified temperature leaves a second gap");
+        };
+        assert_eq!(stations, ["KJFK"]);
+        assert!(reason.contains("KJFK/temp_high"), "{reason}");
+        assert!(reason.contains("2 unverified reports left out"), "{reason}");
+        assert!(
+            reason.contains("a second long gap of 120 minutes"),
+            "{reason}"
+        );
+        let mut short = requirement.clone();
+        short.end = start + Duration::hours(6);
+        assert!(sampled("KJFK", &reports[..6], &short).is_ok());
+        reports[3].temperature = false;
+        assert!(sampled("KJFK", &reports[..6], &short).is_err());
     }
 
     #[test]

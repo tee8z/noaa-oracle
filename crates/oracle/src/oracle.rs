@@ -637,6 +637,7 @@ impl Oracle {
                     Error::Source(_) => "source_unavailable",
                     _ => "processing_failed",
                 };
+                let source_coverage = matches!(error, Error::Source(SourceError::Coverage(_)));
                 self.db
                     .set_settlement_block(
                         event.id,
@@ -645,6 +646,7 @@ impl Oracle {
                             message: error.to_string(),
                             checked_at: now,
                         },
+                        source_coverage,
                     )
                     .await?;
             }
