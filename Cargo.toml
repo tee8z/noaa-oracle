@@ -48,7 +48,8 @@ parquet = { version = "58", default-features = false, features = ["zstd"] }
 parquet_derive = "58"
 
 # S3
-aws-sdk-s3 = "1.148"
+# Use the current AWS HTTPS connector; the legacy rustls feature selects rustls 0.21.
+aws-sdk-s3 = { version = "1.148", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 aws-config = { version = "1.12", features = ["behavior-version-latest"] }
 
 # Testing

@@ -973,3 +973,44 @@ async fn an_event_settled_without_entries_leaves_processing() {
     shutdown.cancel();
     bounded(task).await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn authentication_claims_survive_restart_and_race_across_writers() {
+    let (directory, database, writer) = open(8).await;
+    let (stop, task) = start(writer);
+    let expires_at = OffsetDateTime::now_utc().unix_timestamp() + 60;
+    assert!(
+        database
+            .claim_auth_event("used".into(), expires_at, 8)
+            .await
+            .unwrap()
+    );
+    stop.cancel();
+    bounded(task).await.unwrap().unwrap();
+    let (first, first_writer) = Database::open(directory.path()).await.unwrap();
+    let (second, second_writer) = Database::open(directory.path()).await.unwrap();
+    let (stop_first, first_task) = start(first_writer);
+    let (stop_second, second_task) = start(second_writer);
+    assert!(
+        !first
+            .claim_auth_event("used".into(), expires_at, 8)
+            .await
+            .unwrap()
+    );
+    let (a, b) = tokio::join!(
+        first.claim_auth_event("racing".into(), expires_at, 8),
+        second.claim_auth_event("racing".into(), expires_at, 8),
+    );
+    assert_ne!(a.unwrap(), b.unwrap());
+    let expired_at = OffsetDateTime::now_utc().unix_timestamp() - 1;
+    assert!(
+        first
+            .claim_auth_event("expired".into(), expired_at, 8)
+            .await
+            .is_err()
+    );
+    stop_first.cancel();
+    stop_second.cancel();
+    bounded(first_task).await.unwrap().unwrap();
+    bounded(second_task).await.unwrap().unwrap();
+}

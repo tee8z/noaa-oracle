@@ -29,12 +29,7 @@ use nostr::{
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::{
-    collections::{HashMap, HashSet},
-    str::FromStr,
-    sync::{Arc, Mutex, PoisonError},
-    time::{Duration, Instant},
-};
+use std::{collections::HashSet, str::FromStr, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 
 use crate::AppState;
@@ -61,7 +56,6 @@ pub struct AuthPolicy {
     origin: String,
     coordinators: HashSet<PublicKey>,
     uploaders: HashSet<PublicKey>,
-    seen: Mutex<HashMap<nostr::event::EventId, Instant>>,
 }
 
 impl AuthPolicy {
@@ -74,7 +68,6 @@ impl AuthPolicy {
             origin: public_url.trim_end_matches('/').to_owned(),
             coordinators: coordinators.into_iter().collect(),
             uploaders: uploaders.into_iter().collect(),
-            seen: Mutex::new(HashMap::new()),
         }
     }
 
@@ -92,22 +85,6 @@ impl AuthPolicy {
         } else {
             Err(AuthError::NotAllowed)
         }
-    }
-
-    /// Records `id`, failing if it was already used or the cache is full.
-    fn remember(&self, id: nostr::event::EventId) -> Result<(), AuthError> {
-        let now = Instant::now();
-        let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-        // Twice the age window covers events signed slightly in the future.
-        seen.retain(|_, at| now.duration_since(*at) <= 2 * MAX_EVENT_AGE);
-        if seen.contains_key(&id) {
-            return Err(AuthError::Replayed);
-        }
-        if seen.len() >= MAX_REMEMBERED_EVENTS {
-            return Err(AuthError::Busy);
-        }
-        seen.insert(id, now);
-        Ok(())
     }
 }
 
@@ -178,7 +155,20 @@ impl FromRequest<Arc<AppState>> for Signed {
         if !payload_matches {
             return Err(AuthError::PayloadMismatch);
         }
-        policy.remember(event.id)?;
+        // Commit proof consumption before exposing the authenticated request.
+        // All processes share this uniqueness fence; storage failures fail closed.
+        let claimed = state
+            .database
+            .claim_auth_event(
+                event.id.to_hex(),
+                created_at.saturating_add(MAX_EVENT_AGE.as_secs() as i64),
+                MAX_REMEMBERED_EVENTS as i64,
+            )
+            .await
+            .map_err(|_| AuthError::Busy)?;
+        if !claimed {
+            return Err(AuthError::Replayed);
+        }
         Ok(Self {
             pubkey: event.pubkey,
             body,

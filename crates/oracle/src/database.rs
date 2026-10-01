@@ -98,6 +98,58 @@ pub struct DatabaseWriter {
 }
 
 impl Database {
+    /// Atomically claim a verified request across restarts and serving processes.
+    pub async fn claim_auth_event(
+        &self,
+        id: String,
+        expires_at: i64,
+        capacity: i64,
+    ) -> Result<bool, WriteError> {
+        self.write(move |connection| {
+            Box::pin(async move {
+                let mut tx = connection.begin().await?;
+                sqlx::query("DELETE FROM nip98_consumed_events WHERE expires_at < ?")
+                    .bind(OffsetDateTime::now_utc().unix_timestamp())
+                    .execute(&mut *tx)
+                    .await?;
+                // The body read, write queue, or lock acquisition can outlive the
+                // extractor's freshness check. Recheck after taking the write lock.
+                if expires_at < OffsetDateTime::now_utc().unix_timestamp() {
+                    return Err(sqlx::Error::Protocol(
+                        "Authentication proof expired before storage".into(),
+                    ));
+                }
+                let exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM nip98_consumed_events WHERE event_id = ?)",
+                )
+                .bind(&id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if exists {
+                    return Ok(false);
+                }
+                let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nip98_consumed_events")
+                    .fetch_one(&mut *tx)
+                    .await?;
+                if count >= capacity {
+                    return Err(sqlx::Error::Protocol(
+                        "Authentication replay capacity reached".into(),
+                    ));
+                }
+                sqlx::query(
+                    "INSERT INTO nip98_consumed_events (event_id, expires_at) VALUES (?, ?)",
+                )
+                .bind(id)
+                .bind(expires_at)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                Ok(true)
+            })
+        })
+        .await
+    }
+
     /// Opens or creates `<directory>/events.sqlite`, applies migrations, and
     /// returns the shared handle with its writer.
     pub async fn open(directory: &Path) -> Result<(Self, DatabaseWriter)> {
@@ -323,7 +375,7 @@ impl Database {
             return Ok(HashMap::new());
         }
         let ids = serde_json::to_string(&event_ids.iter().map(Uuid::to_string).collect::<Vec<_>>())
-            .expect("UUIDs serialize");
+            .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
         let rows = sqlx::query(
             "SELECT event_id, target, metric, lower, upper, level, window_hours, windows,
                     over, par, under, first_window, last_window, fitted_at
@@ -651,7 +703,7 @@ impl Database {
             return Ok(HashMap::new());
         }
         let ids = serde_json::to_string(&event_ids.iter().map(Uuid::to_string).collect::<Vec<_>>())
-            .expect("UUIDs serialize");
+            .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
         let rows = sqlx::query(
             "SELECT b.event_id, b.code, b.message, b.checked_at
              FROM event_settlement_blocks b JOIN events e ON e.id = b.event_id
