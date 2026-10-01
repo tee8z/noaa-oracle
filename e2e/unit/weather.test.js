@@ -154,3 +154,78 @@ test("opening a station moves keyboard focus into its panel, while a refresh lea
   listeners["htmx:after:swap"]({ detail: { ctx: { sourceElement: source, target: panel } } });
   assert.equal(document.activeElement, elsewhere);
 });
+
+test("a tap opens the pin nearest the finger within reach, while a mouse or Enter keeps its pin", () => {
+  const listeners = {};
+  const document = {
+    addEventListener(name, listener) {
+      listeners[name] = listener;
+    },
+  };
+  class MouseEvent {
+    constructor(type) {
+      this.type = type;
+    }
+  }
+  vm.runInNewContext(fs.readFileSync(script, "utf8"), { document, MouseEvent });
+  const markers = {
+    querySelectorAll: () => dots,
+    addEventListener(name, listener, capture) {
+      this.click = listener;
+      this.capture = capture;
+    },
+  };
+  const pin = (station, x) => {
+    const link = { station, clicks: [] };
+    link.closest = (selector) => (selector === ".pin" ? link : markers);
+    link.dispatchEvent = (event) => link.clicks.push(event.type);
+    link.dot = {
+      closest: () => link,
+      getBoundingClientRect: () => ({ left: x - 2, top: 98, width: 4, height: 4 }),
+    };
+    return link;
+  };
+  // Oakland is painted over San Francisco, a pixel to its left.
+  const sfo = pin("KSFO", 100);
+  const oak = pin("KOAK", 101);
+  const dots = [sfo.dot, oak.dot];
+  const blank = { closest: (selector) => (selector === ".pin" ? null : markers) };
+  const click = (target) => {
+    const event = { target, currentTarget: markers, detail: 1, prevented: false, stopped: false };
+    event.preventDefault = () => (event.prevented = true);
+    event.stopImmediatePropagation = () => (event.stopped = true);
+    markers.click(event);
+    return event;
+  };
+  const tap = (pointerType, x, target) => {
+    listeners.pointerdown({ pointerType, clientX: x, clientY: 100, target });
+    return click(target);
+  };
+
+  // The map itself listens, so WebKit sends taps on its empty space.
+  const onOakland = tap("touch", 99, oak);
+  assert.equal(markers.capture, true);
+  assert.equal(onOakland.prevented && onOakland.stopped, true);
+  assert.deepEqual(sfo.clicks, ["click"]);
+
+  // The finger nearer Oakland keeps Oakland's own click.
+  assert.equal(tap("touch", 102, oak).prevented, false);
+
+  // Blank map within reach of a pin opens it; farther away, nothing does.
+  assert.equal(tap("touch", 101 + 21, blank).prevented, true);
+  assert.deepEqual(oak.clicks, ["click"]);
+  assert.equal(tap("touch", 101 + 23, blank).prevented, false);
+  assert.deepEqual(oak.clicks, ["click"]);
+
+  assert.equal(tap("mouse", 99, oak).prevented, false);
+  assert.deepEqual(sfo.clicks, ["click"]);
+
+  // Enter after a tap: Firefox gives its click detail 1.
+  listeners.pointerdown({ pointerType: "touch", clientX: 99, clientY: 100, target: oak });
+  listeners.keydown({ key: "Enter" });
+  assert.equal(click(oak).prevented, false);
+  // A tap's point serves its own click, not a later one.
+  assert.equal(tap("touch", 99, oak).prevented, true);
+  assert.equal(click(oak).prevented, false);
+  assert.deepEqual(sfo.clicks, ["click", "click"]);
+});

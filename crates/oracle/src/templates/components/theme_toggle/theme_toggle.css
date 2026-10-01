@@ -1,5 +1,18 @@
+/* The hit area reaches past the small button to 44 px each way, so a finger
+   can find it on a phone while the button and the header keep their size. */
 #theme-toggle {
+    position: relative;
     background: transparent;
+}
+
+#theme-toggle::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: max(100%, 44px);
+    height: max(100%, 44px);
+    translate: -50% -50%;
 }
 
 #theme-icon-dark,
