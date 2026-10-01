@@ -3,10 +3,10 @@ use std::sync::Arc;
 use axum::{
     extract::{Query, State},
     http::{HeaderMap, HeaderValue, header},
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use serde::Deserialize;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::OffsetDateTime;
 
 use super::htmx::{Render, page_or_fragment};
 use crate::{
@@ -23,9 +23,11 @@ pub struct DashboardQuery {
     /// Comma-separated station ids; defaults to available major airports.
     pub stations: Option<String>,
     /// Start time for observation data (RFC3339 format)
-    pub start: Option<String>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub start: Option<OffsetDateTime>,
     /// End time for observation data (RFC3339 format)
-    pub end: Option<String>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub end: Option<OffsetDateTime>,
     /// `map` or `list`; defaults to the reader's last choice.
     pub view: Option<String>,
     /// Station search in the list.
@@ -61,15 +63,10 @@ pub async fn dashboard_handler(
     Query(query): Query<DashboardQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    // Parse optional time range from query params
-    let start = query
-        .start
-        .as_ref()
-        .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok());
-    let end = query
-        .end
-        .as_ref()
-        .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok());
+    let (start, end) = match super::weather::bounded_selection(query.start, query.end) {
+        Ok(window) => window,
+        Err(error) => return error.into_response(),
+    };
 
     let station_ids = super::weather::requested_stations(query.stations.as_deref());
     let calendar = super::local_day::reader_calendar(&headers);

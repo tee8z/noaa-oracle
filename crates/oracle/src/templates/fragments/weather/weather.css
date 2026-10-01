@@ -296,12 +296,11 @@
     }
 }
 
-/* Cool bands, periwinkle and pink, then teal and green to pale lime. Each is
-   light enough to stand off the slate map; none is red, and none is blue or
-   grey, which would sink into it. No report is an open ring, not a colour. The outline remains visible when the map scales
-   down on a phone. */
+/* Cool bands use violet and blue, followed by teal, green and pale lime.
+   Bright fills and outlines stay visible on the slate map at phone sizes.
+   A missing report uses an open ring. The legend shares these tokens. */
 .t-cold { --pin: #a78bfa; }
-.t-cool { --pin: #f472b6; }
+.t-cool { --pin: #60a5fa; }
 .t-mild { --pin: #2dd4bf; }
 .t-warm { --pin: #4ade80; }
 .t-hot { --pin: #d9f99d; }

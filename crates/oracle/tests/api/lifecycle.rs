@@ -13,7 +13,7 @@ use oracle::{
 };
 use serde_json::{Value, json};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering},
 };
 use time::{Duration, Time, UtcOffset, format_description::well_known::Rfc3339};
@@ -112,7 +112,7 @@ where
             // All lifecycle fixtures configure a two-hour signing grace.
             assert_eq!(cutoff, request.end.unwrap() + Duration::hours(2));
             assert!(!metrics.is_empty(), "settlement passes the event's metrics");
-            result(request, stations)
+            result(request, stations).map(|rows| rows.into_iter().map(Into::into).collect())
         },
     );
 }
@@ -254,6 +254,48 @@ fn assert_attests(test_app: &TestApp, event: &Event, winners: &[usize]) {
             .locking_points
             .contains(&locking_point)
     );
+}
+
+#[tokio::test]
+async fn source_work_crossing_expiry_does_not_publish_an_attestation() {
+    let clock = Arc::new(Mutex::new(None::<crate::helpers::TestClock>));
+    let source_clock = clock.clone();
+    let mut weather = MockWeatherAccess::new();
+    set_forecasts(&mut weather, |request, _| {
+        Ok(forecasts_in_window(
+            request,
+            &[("KORD", 70, 50, 10), ("KSAW", 40, 30, 5)],
+        ))
+    });
+    set_observations(&mut weather, move |request, _| {
+        source_clock
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .set(request.end.unwrap() + Duration::hours(26));
+        Ok(vec![
+            observation("KORD", 75.0, 50.0, 10),
+            observation("KSAW", 40.0, 29.4, 8),
+        ])
+    });
+    let app = spawn_app(Arc::new(weather)).await;
+    *clock.lock().unwrap() = Some(app.clock.clone());
+    let (event, _) = event_with_entries(
+        &app,
+        vec![vec![
+            pick("KORD", "temp_high", "Over"),
+            pick("KORD", "temp_low", "Par"),
+        ]],
+    )
+    .await;
+    app.clock.set(event.signing_date);
+    let summary = app.oracle.etl_data(1).await.unwrap();
+    assert_eq!(summary.expired, 1);
+    assert_eq!(summary.attested, 0);
+    let stored = fetch(&app, event.id).await;
+    assert!(stored.attestation.is_none());
+    assert!(stored.entries.iter().all(|entry| entry.score.is_none()));
 }
 
 #[tokio::test]
@@ -735,7 +777,7 @@ impl oracle::WeatherData for PublishedObservations {
         station_ids: Vec<String>,
         required_collected_after: time::OffsetDateTime,
         metrics: &[String],
-    ) -> Result<Vec<Observation>, oracle::weather_data::Error> {
+    ) -> Result<Vec<oracle::weather_data::SettlementObservation>, oracle::weather_data::Error> {
         self.observations
             .settlement_observations(req, station_ids, required_collected_after, metrics)
             .await

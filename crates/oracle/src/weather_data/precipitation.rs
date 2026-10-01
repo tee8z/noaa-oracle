@@ -925,7 +925,8 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            rows[0].temp_high, 14.0,
+            rows[0].temp_high,
+            Some(14.0),
             "endpoint report is accumulation evidence, not an inside-window temperature"
         );
         assert_eq!(
@@ -949,7 +950,8 @@ mod tests {
             "cutting an accumulation does not authorize a guessed total"
         );
         assert_eq!(
-            partial[0].temp_high, 14.0,
+            partial[0].temp_high,
+            Some(14.0),
             "an incompatible rain window does not erase temperature"
         );
     }
@@ -1048,7 +1050,8 @@ mod tests {
                 .unwrap();
             assert_eq!(rows.len(), 1, "{name}");
             assert_eq!(
-                rows[0].temp_high, 14.0,
+                rows[0].temp_high,
+                Some(14.0),
                 "{name}: post-window evidence must not alter point extrema"
             );
             assert_eq!(

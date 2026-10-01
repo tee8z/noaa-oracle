@@ -17,11 +17,11 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    database::{AwaitingAttestation, Database, EntryScore, WriteError},
+    database::{AwaitingAttestation, Database, EntryScore, SettlementOutcome, WriteError},
     events::{
-        AddEventEntry, CreateEvent, EntryRejection, Event, EventCounts, EventFilter,
-        EventListQuery, EventRecord, EventRejection, EventStatus, EventSummary, NewEvent,
-        SettlementBlock, WeatherEntry, validate_entries,
+        AddEventEntry, CreateEvent, EXPIRY_AFTER_SIGNING, EntryRejection, Event, EventCounts,
+        EventFilter, EventListQuery, EventRecord, EventRejection, EventStatus, EventSummary,
+        NewEvent, SettlementBlock, WeatherEntry, validate_entries,
     },
     lines::{self, Line, LinePass, LineSettings},
     scoring::{self, NotUuidV7, PickRule, Scored, ScoringRules},
@@ -98,6 +98,8 @@ pub struct EtlSummary {
     pub failed: usize,
     /// Events attested in this pass.
     pub attested: usize,
+    /// Admitted events that reached expiry before finalization.
+    pub expired: usize,
     /// Events read from their source in this pass, whatever came of it.
     pub refreshed: usize,
     /// Events left unread because their observation window has not started.
@@ -531,7 +533,7 @@ impl Oracle {
                     if matches!(settled, Ok(true)) {
                         summary.settled_without_entries += 1;
                     }
-                    settled.map(|_| false)
+                    settled.map(|_| SettlementOutcome::Unchanged)
                 }
                 Step::Read => {
                     summary.refreshed += 1;
@@ -539,8 +541,9 @@ impl Oracle {
                 }
             };
             match result {
-                Ok(true) => summary.attested += 1,
-                Ok(false) => {}
+                Ok(SettlementOutcome::Attested) => summary.attested += 1,
+                Ok(SettlementOutcome::Expired) => summary.expired += 1,
+                Ok(SettlementOutcome::Unchanged) => {}
                 Err(error) => {
                     summary.failed += 1;
                     error!("etl {etl_process_id}: event {id} failed: {error:#}");
@@ -550,14 +553,15 @@ impl Oracle {
         info!(
             "etl {etl_process_id}: done, {} attested, {} failed, {} refreshed, \
              {} skipped as live, {} skipped as backed off, {} skipped as recently refreshed, \
-             {} settled without entries",
+             {} settled without entries, {} expired before finalization",
             summary.attested,
             summary.failed,
             summary.refreshed,
             summary.skipped_live,
             summary.skipped_backed_off,
             summary.skipped_fresh,
-            summary.settled_without_entries
+            summary.settled_without_entries,
+            summary.expired
         );
         Ok(summary)
     }
@@ -617,8 +621,8 @@ impl Oracle {
         memory.refreshed.insert(event, now);
     }
 
-    /// Returns whether the event was attested.
-    async fn process_event(&self, event: EventRecord) -> Result<bool, Error> {
+    /// Reports attestation, expiry, or a provisional refresh.
+    async fn process_event(&self, event: EventRecord) -> Result<SettlementOutcome, Error> {
         let result = self.refresh_event(&event).await;
         let now = self.now();
         match &result {
@@ -680,7 +684,10 @@ impl Oracle {
         Ok(settled)
     }
 
-    async fn refresh_event(&self, event: &EventRecord) -> Result<bool, Error> {
+    async fn refresh_event(&self, event: &EventRecord) -> Result<SettlementOutcome, Error> {
+        if self.now() >= event.signing_date.saturating_add(EXPIRY_AFTER_SIGNING) {
+            return Ok(SettlementOutcome::Expired);
+        }
         let source = self.source_for(event)?;
         let window = ObservationWindow {
             start: event.start_observation_date,
@@ -729,7 +736,7 @@ impl Oracle {
         }
         self.db.replace_readings(event.id, readings).await?;
         self.db.update_entry_scores(entry_scores(&scored)).await?;
-        Ok(false)
+        Ok(SettlementOutcome::Unchanged)
     }
 
     /// The lines a `lines` event scores against; empty for `fixed` events.
@@ -747,13 +754,13 @@ impl Oracle {
 
     /// Signs the outcome for `scored`. The attestation is computed from the
     /// same readings and scores committed with it, and only for an announced outcome.
-    /// Returns whether this call stored the attestation.
+    /// Returns the finalization outcome after the writer rechecks expiry.
     async fn attest(
         &self,
         event: &EventRecord,
         scored: &[Scored],
         readings: Vec<Reading>,
-    ) -> Result<bool, Error> {
+    ) -> Result<SettlementOutcome, Error> {
         let winners = scoring::winning_indices(scored, event.number_of_places_win);
         let message = scoring::outcome_message(&winners);
         let announcement = self
@@ -761,6 +768,9 @@ impl Oracle {
             .event_announcement(event.id)
             .await?
             .ok_or(Error::EventNotFound(event.id))?;
+        if self.now() >= event.signing_date.saturating_add(EXPIRY_AFTER_SIGNING) {
+            return Ok(SettlementOutcome::Expired);
+        }
         let attestation = self
             .key
             .attest(
@@ -775,15 +785,24 @@ impl Oracle {
             })?;
         let stored = self
             .db
-            .settle_event(event.id, readings, entry_scores(scored), attestation)
+            .settle_event(
+                event.id,
+                readings,
+                entry_scores(scored),
+                attestation,
+                self.clock.clone(),
+            )
             .await?;
-        if stored {
-            info!("attested event {} with winners {winners:?}", event.id);
-        } else {
-            warn!(
-                "event {} was already attested; kept the stored attestation",
-                event.id
-            );
+        match stored {
+            SettlementOutcome::Attested => {
+                info!("attested event {} with winners {winners:?}", event.id);
+            }
+            SettlementOutcome::Unchanged => {
+                info!("event {} already finalized; kept its attestation", event.id);
+            }
+            SettlementOutcome::Expired => {
+                info!("event {} reached expiry before finalization", event.id);
+            }
         }
         Ok(stored)
     }

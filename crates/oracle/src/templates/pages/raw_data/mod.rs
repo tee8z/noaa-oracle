@@ -93,6 +93,10 @@ pub fn raw_data_content(now: OffsetDateTime) -> Markup {
 
             div class="field" {
                 p class="label is-small" { "Example queries" }
+                p class="help" {
+                    "Examples use UTC days and Fahrenheit temperatures. Precipitation columns show "
+                    "reported interval maxima, not daily totals. Forecast intervals can cross midnight."
+                }
                 div class="buttons are-small" {
                     @for (label, query) in EXAMPLES {
                         button type="button" class="button" data-query=(query) { (label) }
@@ -159,14 +163,48 @@ mod tests {
         assert!(html.contains(r#"value="2026-09-23T00:00""#), "{html}");
         assert!(html.contains(r#"value="2026-09-24T00:00""#));
         assert_eq!(html.matches("type=\"checkbox\" checked").count(), 2);
-        assert!(html.contains("data-query=\"-- Daily observations"));
+        assert!(html.contains("data-query=\"-- Exploratory daily report"));
     }
 
     #[test]
-    fn the_example_comparison_is_observed_minus_forecast() {
-        let (_, query) = EXAMPLES[2];
-        assert!(query.contains("o.temp_high - f.temp_high AS high_difference"));
-        assert!(query.contains("o.temp_low - f.temp_low AS low_difference"));
-        assert!(!query.contains("f.temp_high - o.temp_high"));
+    fn examples_normalize_units_and_do_not_sum_overlapping_precipitation() {
+        let connection = duckdb::Connection::open_in_memory().unwrap();
+        connection.execute_batch(r#"
+            CREATE TABLE observations AS
+            SELECT station_id, generated_at, temperature_value::DOUBLE AS temperature_value,
+                'celsius' AS temperature_unit_code, 18.0::DOUBLE AS dewpoint_value,
+                8::BIGINT AS wind_speed, 90::BIGINT AS wind_direction,
+                precip_in::DOUBLE AS precip_in, metar_type, filename
+            FROM (VALUES
+                ('KORD', '2026-01-17T12:00:00Z', 30.0, 0.8, 'METAR', 'observations_2026-01-17T12:10:00Z.parquet'),
+                ('KORD', '2026-01-17T12:00:00Z', 20.0, 0.4, 'METAR', 'observations_2026-01-17T12:20:00Z.parquet'),
+                ('KORD', '2026-01-17T12:30:00Z', 20.0, 0.7, 'SPECI', 'observations_2026-01-17T12:40:00Z.parquet')
+            ) AS reports(station_id, generated_at, temperature_value, precip_in, metar_type, filename);
+            CREATE TABLE forecasts AS
+            SELECT 'KORD' AS station_id, '2026-01-17T00:00:00Z' AS begin_time,
+                '2026-01-18T00:00:00Z' AS end_time, '2026-01-16T12:00:00Z' AS generated_at,
+                68.0::DOUBLE AS min_temp, 68.0::DOUBLE AS max_temp,
+                'fahrenheit' AS temperature_unit_code,
+                'forecasts_2026-01-16T12:30:00Z.parquet' AS filename;
+        "#).unwrap();
+        let mut observations = connection.prepare(EXAMPLES[0].1).unwrap();
+        let (reports, high, precip): (i64, f64, f64) = observations
+            .query_row([], |row| Ok((row.get(1)?, row.get(4)?, row.get(7)?)))
+            .unwrap();
+        assert_eq!(reports, 2, "the corrected snapshot replaces the old one");
+        assert_eq!(high, 68.0);
+        assert_eq!(
+            precip, 0.4,
+            "overlapping special reports cannot inflate a total"
+        );
+        let mut comparison = connection.prepare(EXAMPLES[2].1).unwrap();
+        let differences: (f64, f64) = comparison
+            .query_row([], |row| Ok((row.get(6)?, row.get(7)?)))
+            .unwrap();
+        assert_eq!(
+            differences,
+            (0.0, 0.0),
+            "20 Celsius and 68 Fahrenheit agree"
+        );
     }
 }

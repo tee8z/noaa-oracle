@@ -33,7 +33,7 @@ use axum::{
     extract::{DefaultBodyLimit, Request},
     handler::Handler,
     http::{
-        Method,
+        Method, StatusCode,
         header::{ACCEPT, CONTENT_TYPE},
     },
     middleware::{self, Next},
@@ -550,11 +550,13 @@ async fn build_app_state(
     let local_file_access: Arc<dyn FileData> = Arc::new(FileAccess::new(
         configuration.weather_dir.to_string_lossy().into_owned(),
     ));
-    let weather_db: Arc<dyn WeatherData> = Arc::new(WeatherAccess::with_derived_forecasts(
+    let weather = WeatherAccess::with_derived_forecasts(
         local_file_access,
         &configuration.weather_dir.join("derived"),
-    ));
-    let sources = Sources::new(Arc::new(NoaaWeather::new(weather_db.clone())), []);
+    );
+    let settlement_weather = Arc::new(weather.settlement_access());
+    let weather_db: Arc<dyn WeatherData> = Arc::new(weather);
+    let sources = Sources::new(Arc::new(NoaaWeather::new(settlement_weather)), []);
     let oracle = Oracle::new(
         database.clone(),
         sources,
@@ -604,19 +606,11 @@ pub fn app(app_state: Arc<AppState>) -> Router {
         .route("/fragments/station/{station_id}", get(station_handler))
         .layer(middleware::from_fn(content_security_policy));
 
-    Router::new()
+    // Admission bounds archive enumeration and waiting query work before a
+    // handler touches caches or files. The ETL has a separate reserved slot.
+    let public_queries = Arc::new(tokio::sync::Semaphore::new(8));
+    let weather_routes = Router::new()
         .merge(ui)
-        .route("/assets/{file}", get(serve_asset))
-        // Probes
-        .route("/health", get(health))
-        .route("/ready", get(ready))
-        .route("/healthy", get(healthy))
-        // API routes
-        .route("/files", get(files))
-        .route(
-            "/file/{file_name}",
-            get(download).post(upload.layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))),
-        )
         .route("/stations", get(get_stations))
         .route("/stations/forecasts", get(forecasts))
         .route(
@@ -629,6 +623,23 @@ pub fn app(app_state: Arc<AppState>) -> Router {
             get(crate::routes::stations::observation_quality),
         )
         .route("/stations/daily-observations", get(daily_observations))
+        .layer(middleware::from_fn(move |request, next| {
+            admit_weather_request(public_queries.clone(), request, next)
+        }));
+
+    Router::new()
+        .merge(weather_routes)
+        .route("/assets/{file}", get(serve_asset))
+        // Probes
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/healthy", get(healthy))
+        // API routes
+        .route("/files", get(files))
+        .route(
+            "/file/{file_name}",
+            get(download).post(upload.layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))),
+        )
         .route("/oracle/npub", get(get_npub))
         .route("/oracle/pubkey", get(get_pubkey))
         .route("/oracle/sources", get(list_sources))
@@ -653,6 +664,21 @@ pub fn app(app_state: Arc<AppState>) -> Router {
         .layer(CompressionLayer::new().compress_when(
             DefaultPredicate::new().and(NotForContentType::const_new("application/parquet")),
         ))
+}
+
+async fn admit_weather_request(
+    slots: Arc<tokio::sync::Semaphore>,
+    request: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    let Ok(_permit) = slots.try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "weather queries are busy; try again shortly",
+        )
+            .into_response();
+    };
+    next.run(request).await
 }
 
 async fn log_request(request: Request<Body>, next: Next) -> impl IntoResponse {

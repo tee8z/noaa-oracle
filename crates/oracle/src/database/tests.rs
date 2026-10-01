@@ -177,6 +177,16 @@ async fn writes_reply_only_after_commit_and_clones_share_the_writer() {
     assert!(!database.is_writer_available());
 }
 
+/// Admit a command, then finish its caller before receiving the commit reply.
+async fn admit_without_waiting(database: &Database, event: &NewEvent) {
+    let mut pending = Box::pin(database.add_event(event));
+    assert!(poll!(pending.as_mut()).is_pending());
+}
+
+async fn close_test_database(database: Database) {
+    database.readers.close().await;
+}
+
 #[tokio::test]
 async fn full_queue_rejects_before_admission_and_shutdown_drains_dropped_replies() {
     let (directory, database, writer) = open(2).await;
@@ -190,8 +200,7 @@ async fn full_queue_rejects_before_admission_and_shutdown_drains_dropped_replies
     let (release, holder) = hold_write(&database).await;
     let first = create_event_data(2);
     let first_id = first.id;
-    let mut dropped = Box::pin(database.add_event(&first));
-    assert!(poll!(dropped.as_mut()).is_pending());
+    admit_without_waiting(&database, &first).await;
     let second = create_event_data(2);
     let second_id = second.id;
     let mut retained = Box::pin(database.add_event(&second));
@@ -201,9 +210,6 @@ async fn full_queue_rejects_before_admission_and_shutdown_drains_dropped_replies
         database.add_event(&create_event_data(2)).await,
         Err(WriteError::Unavailable)
     ));
-    // The caller of the first admitted write goes away; the write still runs.
-    drop(dropped);
-
     shutdown.cancel();
     release.send(()).unwrap();
     bounded(holder).await.unwrap().unwrap();
@@ -404,7 +410,7 @@ async fn readers_are_read_only_and_query_only() {
             .is_err(),
         "read-only connections reject writes even without query_only"
     );
-    drop(reader);
+    reader.close().await.unwrap();
     shutdown.cancel();
     bounded(task).await.unwrap().unwrap();
 }
@@ -651,18 +657,31 @@ async fn competing_settlements_commit_one_consistent_snapshot_and_reject_stale_w
     let second_signature = MaybeScalar::from_slice(&[2; 32]).unwrap();
     let (a, b) = bounded(async {
         tokio::join!(
-            first.settle_event(event.id, reading(70.0), score(10), first_signature),
-            second.settle_event(event.id, reading(50.0), score(20), second_signature),
+            first.settle_event(
+                event.id,
+                reading(70.0),
+                score(10),
+                first_signature,
+                crate::oracle::system_clock()
+            ),
+            second.settle_event(
+                event.id,
+                reading(50.0),
+                score(20),
+                second_signature,
+                crate::oracle::system_clock()
+            ),
         )
     })
     .await;
     let (a, b) = (a.unwrap(), b.unwrap());
     assert_ne!(a, b, "exactly one process must finalize the event");
-    let (expected_readings, expected_score, expected_signature) = if a {
-        (reading(70.0), 10, first_signature)
-    } else {
-        (reading(50.0), 20, second_signature)
-    };
+    let (expected_readings, expected_score, expected_signature) =
+        if a == SettlementOutcome::Attested {
+            (reading(70.0), 10, first_signature)
+        } else {
+            (reading(50.0), 20, second_signature)
+        };
     // A slow worker can still reach these provisional writes after a different
     // worker signs. Neither operation may alter the committed evidence.
     bounded(second.replace_readings(event.id, reading(99.0)))
@@ -750,6 +769,7 @@ async fn failed_settlement_rolls_back_signature_scores_readings_and_block() {
                 vec![reading.clone(), reading.clone()],
                 vec![replacement],
                 MaybeScalar::Zero,
+                crate::oracle::system_clock(),
             )
             .await,
         Err(WriteError::Database(_))
@@ -765,7 +785,13 @@ async fn failed_settlement_rolls_back_signature_scores_readings_and_block() {
     ] {
         assert!(matches!(
             database
-                .settle_event(event.id, vec![reading.clone()], scores, MaybeScalar::Zero,)
+                .settle_event(
+                    event.id,
+                    vec![reading.clone()],
+                    scores,
+                    MaybeScalar::Zero,
+                    crate::oracle::system_clock()
+                )
                 .await,
             Err(WriteError::Database(_))
         ));
@@ -803,6 +829,73 @@ async fn failed_settlement_rolls_back_signature_scores_readings_and_block() {
 }
 
 #[tokio::test]
+async fn expiry_at_writer_admission_or_commit_rolls_back_all_settlement_evidence() {
+    for checks_before_expiry in [0, 1] {
+        let (_directory, database, writer) = open(16).await;
+        let (shutdown, task) = start(writer);
+        let event = add(&database, 2).await;
+        let participant = entry(event.id, "KORD");
+        database
+            .add_event_entries(event.id, vec![participant.clone()])
+            .await
+            .unwrap();
+        let expiry = event.signing_date + EXPIRY_AFTER_SIGNING;
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let clock: crate::oracle::Clock = Arc::new(move || {
+            if calls.fetch_add(1, Ordering::SeqCst) < checks_before_expiry {
+                expiry - TimeDuration::SECOND
+            } else {
+                expiry
+            }
+        });
+        let outcome = database
+            .settle_event(
+                event.id,
+                vec![Reading {
+                    target: "KORD".into(),
+                    metric: "temp_high".into(),
+                    baseline: Some(60.0),
+                    observed: Some(70.0),
+                }],
+                vec![EntryScore {
+                    id: participant.id,
+                    base_score: 10,
+                    total_score: 10_000,
+                }],
+                MaybeScalar::Zero,
+                clock,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, SettlementOutcome::Expired);
+        assert!(
+            database
+                .get_event(event.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .attestation
+                .is_none()
+        );
+        assert!(
+            database.event_entries(event.id).await.unwrap()[0]
+                .score
+                .is_none()
+        );
+        assert!(
+            database
+                .readings(&[event.id])
+                .await
+                .unwrap()
+                .values()
+                .all(Vec::is_empty)
+        );
+        shutdown.cancel();
+        bounded(task).await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
 async fn settlement_blocks_survive_restart_and_cannot_modify_signed_events() {
     let (directory, database, writer) = open(16).await;
     let (shutdown, task) = start(writer);
@@ -818,7 +911,7 @@ async fn settlement_blocks_survive_restart_and_cannot_modify_signed_events() {
         .unwrap();
     shutdown.cancel();
     bounded(task).await.unwrap().unwrap();
-    drop(database);
+    close_test_database(database).await;
 
     let (database, writer) = Database::open(directory.path()).await.unwrap();
     let (shutdown, task) = start(writer);

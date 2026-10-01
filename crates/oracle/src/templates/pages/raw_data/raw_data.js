@@ -189,7 +189,7 @@ async function loadFiles(fileNames) {
       }
       const urls = files.map((url) => "'" + url.replaceAll("'", "''") + "'").join(", ");
       await conn.query(`CREATE OR REPLACE TABLE ${table} AS
-        SELECT * FROM read_parquet([${urls}], union_by_name = true);`);
+        SELECT * FROM read_parquet([${urls}], union_by_name = true, filename = true);`);
       const sample = await conn.query(`SELECT * FROM ${table} LIMIT 1;`);
       loadSchema(table, sample);
     }

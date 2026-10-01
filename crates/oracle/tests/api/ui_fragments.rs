@@ -9,6 +9,32 @@ use std::sync::{Arc, Mutex};
 use time::{Duration, OffsetDateTime, Time, format_description::well_known::Rfc3339};
 use tower::ServiceExt;
 
+#[tokio::test]
+async fn weather_pages_reject_invalid_windows_before_reading_weather() {
+    let app = spawn_app(Arc::new(MockWeatherAccess::new())).await;
+    for route in ["/", "/fragments/weather"] {
+        for bounds in [
+            "start=2020-01-01T00:00:00Z&end=2026-01-01T00:00:00Z",
+            "start=2026-02-02T00:00:00Z&end=2026-02-01T00:00:00Z",
+            "start=invalid",
+            "end=invalid",
+        ] {
+            let response = app
+                .app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{route}?{bounds}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        }
+    }
+}
+
 /// Test that the dashboard endpoint returns HTML with weather data
 #[tokio::test]
 async fn dashboard_returns_current_day_observations() {

@@ -294,23 +294,7 @@ impl Folds {
         let connection = open_connection()?;
         let added_paths: Vec<String> = added.iter().map(|(_, path)| path.clone()).collect();
 
-        // Issue times of the added files, by the `<date>/<name>` each row
-        // records as its source.
-        let mut statement = connection.prepare(&format!(
-            "SELECT source, epoch_ns(min(generated_ts)), epoch_ns(max(generated_ts))
-             FROM read_parquet([{}]) GROUP BY source",
-            sql_string_list(&added_paths)
-        ))?;
-        let ranges = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<i64>>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
+        let ranges = source_ranges(&connection, &added_paths)?;
         let at = |nanos: Option<i64>| {
             nanos
                 .map(|nanos| OffsetDateTime::from_unix_timestamp_nanos(i128::from(nanos)))
@@ -324,13 +308,14 @@ impl Folds {
         for (name, _) in &added {
             let (first, last) = ranges
                 .iter()
-                .find(|(source, _, _)| {
-                    source
+                .find(|range| {
+                    range
+                        .source
                         .as_deref()
                         .and_then(|source| source.rsplit('/').next())
                         == Some(name.as_str())
                 })
-                .map(|(_, first, last)| (*first, *last))
+                .map(|range| (range.first, range.last))
                 .unwrap_or_default();
             sources.push(Source {
                 name: name.clone(),
@@ -365,13 +350,7 @@ impl Folds {
         let scratch = self
             .root
             .join(format!(".{file}.{}.tmp", uuid::Uuid::now_v7()));
-        let folded = fold_rows(&connection, &inputs, &scratch).and_then(|()| {
-            // Another oracle process may have written the same fold; both
-            // are identical, and the rename replaces atomically.
-            fs::rename(scratch.join("fold.parquet"), self.root.join(&file))?;
-            Ok(())
-        });
-        drop(connection);
+        let folded = publish_fold(connection, &inputs, &scratch, &self.root.join(&file));
         let _ = fs::remove_dir_all(&scratch);
         folded?;
 
@@ -443,6 +422,54 @@ impl Folds {
     }
 }
 
+struct SourceRange {
+    source: Option<String>,
+    first: Option<i64>,
+    last: Option<i64>,
+}
+
+/// Read source issue ranges with a statement that ends before folding starts.
+fn source_ranges(connection: &Connection, paths: &[String]) -> Result<Vec<SourceRange>, Error> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT source, epoch_ns(min(generated_ts)), epoch_ns(max(generated_ts))
+         FROM read_parquet([{}]) GROUP BY source",
+        sql_string_list(paths)
+    ))?;
+    Ok(statement
+        .query_map([], |row| {
+            Ok(SourceRange {
+                source: row.get(0)?,
+                first: row.get(1)?,
+                last: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Own the connection through writing and rename. On success or failure its
+/// temporary files are released before the caller removes the scratch directory.
+fn publish_fold(
+    connection: Connection,
+    inputs: &[String],
+    scratch: &Path,
+    target: &Path,
+) -> Result<(), Error> {
+    fold_rows(&connection, inputs, scratch)?;
+    // Concurrent writers publish identical folds through an atomic replacement.
+    fs::rename(scratch.join("fold.parquet"), target)?;
+    Ok(())
+}
+
+fn fold_station_ids(connection: &Connection, inputs: &str) -> Result<Vec<String>, Error> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT DISTINCT station_id FROM read_parquet([{inputs}])
+         WHERE station_id IS NOT NULL ORDER BY station_id"
+    ))?;
+    Ok(statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+
 /// Writes `<scratch>/fold.parquet`: for each station and period in the
 /// forecast rows of `inputs` (copies or folds, which share their columns),
 /// the row a query picks, sorted by station and period. Stations are folded
@@ -450,14 +477,7 @@ impl Folds {
 fn fold_rows(connection: &Connection, inputs: &[String], scratch: &Path) -> Result<(), Error> {
     fs::create_dir_all(scratch)?;
     let inputs = sql_string_list(inputs);
-    let mut statement = connection.prepare(&format!(
-        "SELECT DISTINCT station_id FROM read_parquet([{inputs}])
-         WHERE station_id IS NOT NULL ORDER BY station_id"
-    ))?;
-    let stations = statement
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(statement);
+    let stations = fold_station_ids(connection, &inputs)?;
     let quoted = |station: &str| format!("'{}'", station.replace('\'', "''"));
     let mut batches: Vec<String> = stations
         .chunks(STATIONS_PER_BATCH)

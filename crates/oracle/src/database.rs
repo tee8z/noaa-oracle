@@ -891,12 +891,32 @@ impl Database {
         readings: Vec<Reading>,
         scores: Vec<EntryScore>,
         attestation: MaybeScalar,
-    ) -> Result<bool, WriteError> {
+        clock: crate::oracle::Clock,
+    ) -> Result<SettlementOutcome, WriteError> {
         let attestation = attestation.serialize().to_vec();
         self.write_waiting(move |connection| {
             Box::pin(async move {
                 let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
                 let event_id = event_id.to_string();
+                let Some(event) = sqlx::query(
+                    "SELECT signing_date, attestation IS NOT NULL AS attested FROM events WHERE id = ?",
+                )
+                .bind(&event_id)
+                .fetch_optional(&mut *transaction)
+                .await? else {
+                    transaction.rollback().await?;
+                    return Ok(SettlementOutcome::Unchanged);
+                };
+                if event.try_get::<bool, _>("attested")? {
+                    transaction.rollback().await?;
+                    return Ok(SettlementOutcome::Unchanged);
+                }
+                let expires_at = event.try_get::<i64, _>("signing_date")?
+                    .saturating_add(EXPIRY_AFTER_SIGNING.whole_seconds());
+                if clock().unix_timestamp() >= expires_at {
+                    transaction.rollback().await?;
+                    return Ok(SettlementOutcome::Expired);
+                }
                 let result = sqlx::query(
                     "UPDATE events SET attestation = ?, updated_at = unixepoch()
                      WHERE id = ? AND attestation IS NULL",
@@ -907,7 +927,7 @@ impl Database {
                 .await?;
                 if result.rows_affected() == 0 {
                     transaction.rollback().await?;
-                    return Ok(false);
+                    return Ok(SettlementOutcome::Unchanged);
                 }
                 let entry_count: i64 =
                     sqlx::query_scalar("SELECT COUNT(*) FROM events_entries WHERE event_id = ?")
@@ -963,8 +983,14 @@ impl Database {
                     .bind(&event_id)
                     .execute(&mut *transaction)
                     .await?;
+                // Score and reading writes can themselves cross the deadline.
+                // Roll back all evidence instead of publishing a late signature.
+                if clock().unix_timestamp() >= expires_at {
+                    transaction.rollback().await?;
+                    return Ok(SettlementOutcome::Expired);
+                }
                 transaction.commit().await?;
-                Ok(true)
+                Ok(SettlementOutcome::Attested)
             })
         })
         .await
@@ -1118,6 +1144,14 @@ where
         })
     });
     (command, response)
+}
+
+/// Result of finalization, including an admitted operation that crossed expiry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettlementOutcome {
+    Attested,
+    Unchanged,
+    Expired,
 }
 
 /// Events waiting for the oracle's attestation; see

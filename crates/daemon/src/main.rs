@@ -200,24 +200,26 @@ async fn discard_run(run: &Run) {
 }
 
 async fn stop_on_signal(stop: CancellationToken, logger: Logger) {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let (Ok(mut terminate), Ok(mut interrupt)) = (
-            signal(SignalKind::terminate()),
-            signal(SignalKind::interrupt()),
-        ) else {
-            error!(logger, "cannot listen for stop signals");
-            return;
-        };
-        tokio::select! { _ = terminate.recv() => {}, _ = interrupt.recv() => {} }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+    if let Err(error) = wait_for_stop_signal().await {
+        error!(logger, "cannot listen for stop signals: {}", error);
+        return;
     }
     info!(logger, "stop requested");
     stop.cancel();
+}
+
+#[cfg(unix)]
+async fn wait_for_stop_signal() -> std::io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    tokio::select! { _ = terminate.recv() => {}, _ = interrupt.recv() => {} }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn wait_for_stop_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
 }
 
 #[cfg(test)]
