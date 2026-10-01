@@ -382,6 +382,66 @@ test.describe("HTMX Navigation", () => {
   });
 });
 
+test.describe("Touch", () => {
+  test.use({ viewport: { width: 390, height: 844 }, hasTouch: true });
+
+  test("the theme switch takes a 44 px tap while it stays small", async ({ page }) => {
+    await page.goto(dashboard());
+    const toggle = page.locator("#theme-toggle");
+    const box = await toggle.boundingBox();
+    expect(box.height).toBeLessThan(44);
+    const misses = await page.evaluate(() => {
+      const box = document.getElementById("theme-toggle").getBoundingClientRect();
+      const x = box.x + box.width / 2;
+      const y = box.y + box.height / 2;
+      const corners = [[-21.5, -21.5], [21.5, -21.5], [-21.5, 21.5], [21.5, 21.5]];
+      return corners.filter(([dx, dy]) => !document.elementFromPoint(x + dx, y + dy)?.closest("#theme-toggle"));
+    });
+    expect(misses).toEqual([]);
+    const theme = await page.evaluate(() => document.documentElement.dataset.theme);
+    await page.touchscreen.tap(box.x + box.width / 2, box.y + box.height / 2 + 20);
+    await expect(page.locator("html")).not.toHaveAttribute("data-theme", theme);
+  });
+
+  test("a tap opens the nearest pin, beside its small dot or under a neighbour's", async ({ page }) => {
+    await page.goto(dashboard("&view=map"));
+    const opened = page.locator("#map-station .station-detail-head h3");
+    // A point the given distance from a pin's centre, away from its nearest
+    // neighbour.
+    const near = (station, distance) =>
+      page.evaluate(
+        ({ station, distance }) => {
+          const centres = [...document.querySelectorAll(".station-markers .pin")].map((pin) => {
+            const box = pin.querySelector(".pin-dot").getBoundingClientRect();
+            return { station: pin.dataset.station, x: box.x + box.width / 2, y: box.y + box.height / 2 };
+          });
+          const own = centres.find((centre) => centre.station === station);
+          const other = centres
+            .filter((centre) => centre !== own)
+            .sort((a, b) => Math.hypot(a.x - own.x, a.y - own.y) - Math.hypot(b.x - own.x, b.y - own.y))[0];
+          const away = Math.hypot(own.x - other.x, own.y - other.y) || 1;
+          return {
+            x: own.x + ((own.x - other.x) / away) * distance,
+            y: own.y + ((own.y - other.y) / away) * distance,
+          };
+        },
+        { station, distance },
+      );
+
+    const beside = await near("KSLC", 10);
+    await page.touchscreen.tap(beside.x, beside.y);
+    await expect(opened).toHaveText("KSLC");
+
+    // San Francisco and Oakland are drawn about a pixel apart, so one dot
+    // covers the other's centre. Each still opens.
+    for (const station of ["KSFO", "KOAK", "KSFO"]) {
+      const centre = await near(station, 0);
+      await page.touchscreen.tap(centre.x, centre.y);
+      await expect(opened).toHaveText(station);
+    }
+  });
+});
+
 test.describe("Content-Security-Policy", () => {
   test("scripts and hx-on in a swapped response do not run", async ({ page, browserName }) => {
     const response = await page.goto(dashboard("&view=map"));

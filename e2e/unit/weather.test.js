@@ -184,13 +184,16 @@ test("a tap opens the pin nearest the finger within reach, while a mouse keeps t
   const oak = pin("KOAK", 101);
   const dots = [sfo.dot, oak.dot];
   const blank = { closest: (selector) => (selector === ".pin" ? null : markers) };
-  const tap = (type, x, target) => {
-    listeners.pointerdown({ pointerType: type, clientX: x, clientY: 100 });
-    const event = { target, detail: 1, prevented: false, stopped: false };
+  const click = (target, pointerType) => {
+    const event = { target, detail: 1, pointerType, prevented: false, stopped: false };
     event.preventDefault = () => (event.prevented = true);
     event.stopImmediatePropagation = () => (event.stopped = true);
     listeners.click(event);
     return event;
+  };
+  const tap = (type, x, target) => {
+    listeners.pointerdown({ pointerType: type, clientX: x, clientY: 100 });
+    return click(target, type);
   };
 
   const onOakland = tap("touch", 99, oak);
@@ -208,4 +211,12 @@ test("a tap opens the pin nearest the finger within reach, while a mouse keeps t
 
   assert.equal(tap("mouse", 99, oak).prevented, false);
   assert.deepEqual(sfo.clicks, ["click"]);
+
+  // Enter after a tap has no pointer type, and Firefox gives it detail 1.
+  listeners.pointerdown({ pointerType: "touch", clientX: 99, clientY: 100 });
+  assert.equal(click(oak, "").prevented, false);
+  // A tap's point serves its own click, not a later one.
+  assert.equal(tap("touch", 99, oak).prevented, true);
+  assert.equal(click(oak, undefined).prevented, false);
+  assert.deepEqual(sfo.clicks, ["click", "click"]);
 });
