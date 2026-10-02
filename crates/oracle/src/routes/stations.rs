@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{Query, State},
+    extract::{Query, State, rejection::QueryRejection},
 };
 use core::fmt;
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,10 @@ use utoipa::{IntoParams, ToSchema};
 use crate::{
     AppError, AppState,
     file_access::FileParams,
-    weather_data::{DailyObservation, Forecast, Observation, Station, validate_station_id},
+    weather_data::{
+        DEFAULT_DAYS, DEFAULT_WINDOW_HOURS, DailyObservation, EligibleStation, Forecast, MAX_DAYS,
+        MAX_WINDOW_HOURS, Observation, Station, validate_station_id,
+    },
 };
 
 /// Stations one public query may name.
@@ -295,6 +298,58 @@ pub async fn get_stations(
     Ok(Json(state.stations().await?.as_ref().clone()))
 }
 
+#[derive(Debug, Deserialize, IntoParams)]
+#[serde(deny_unknown_fields)]
+pub struct EligibleRequest {
+    /// Full UTC days to judge, ending with yesterday: 1 to 31, 30 by default.
+    pub days: Option<u32>,
+    /// Length of the competition window in hours: 1 to 24, 24 by default.
+    pub window_hours: Option<u32>,
+}
+
+impl EligibleRequest {
+    /// The days and window hours to judge, defaults filled in.
+    fn checked(&self) -> Result<(u32, u32), AppError> {
+        let days = self.days.unwrap_or(DEFAULT_DAYS);
+        if !(1..=MAX_DAYS).contains(&days) {
+            return Err(AppError::InvalidRequest(format!(
+                "days must be between 1 and {MAX_DAYS}"
+            )));
+        }
+        let window_hours = self.window_hours.unwrap_or(DEFAULT_WINDOW_HOURS);
+        if !(1..=MAX_WINDOW_HOURS).contains(&window_hours) {
+            return Err(AppError::InvalidRequest(format!(
+                "window_hours must be between 1 and {MAX_WINDOW_HOURS}"
+            )));
+        }
+        Ok((days, window_hours))
+    }
+}
+
+/// Stations whose reports would have sampled every window of
+/// `window_hours` on at least 95% of the last `days` full UTC days, by the
+/// rule settlement applies, that reported within the last 3 hours, and
+/// whose newest forecast runs at least `window_hours` past now. Lists are
+/// rebuilt at most every 10 minutes.
+#[utoipa::path(
+    get,
+    path = "/stations/eligible",
+    params(EligibleRequest),
+    responses(
+        (status = OK, description = "Stations eligible for a competition starting now, by station id", body = Vec<EligibleStation>),
+        (status = BAD_REQUEST, description = "Unknown query parameter, or days or window_hours out of range"),
+        (status = SERVICE_UNAVAILABLE, description = "Eligibility unavailable")
+    ))]
+pub async fn eligible_stations(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<EligibleRequest>, QueryRejection>,
+) -> Result<Json<Vec<EligibleStation>>, AppError> {
+    let Query(req) = query.map_err(|rejection| AppError::InvalidRequest(rejection.body_text()))?;
+    let (days, window_hours) = req.checked()?;
+    let stations = state.eligible_stations(days, window_hours).await?;
+    Ok(Json(stations.as_ref().clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +377,20 @@ mod tests {
             .is_err()
         );
         assert!(bounded_window(Some(now), Some(start), now).is_err());
+    }
+
+    #[test]
+    fn eligibility_queries_have_bounded_days_and_windows() {
+        let request = |days, window_hours| EligibleRequest { days, window_hours };
+        assert_eq!(request(None, None).checked().unwrap(), (30, 24));
+        assert_eq!(request(Some(1), Some(1)).checked().unwrap(), (1, 1));
+        assert_eq!(request(Some(31), Some(24)).checked().unwrap(), (31, 24));
+        for (days, window_hours) in [(0, 24), (32, 24), (30, 0), (30, 25)] {
+            assert!(
+                request(Some(days), Some(window_hours)).checked().is_err(),
+                "{days} days, {window_hours} hours"
+            );
+        }
     }
 
     #[test]

@@ -24,7 +24,7 @@ use crate::{
     },
     sources::{NoaaWeather, Sources},
     templates::{assets::serve_asset, fragments::WeatherDisplay},
-    weather_data::{self, Station, WeatherAccess, WeatherData},
+    weather_data::{self, EligibleStation, Station, WeatherAccess, WeatherData},
 };
 use anyhow::{Context, Result, anyhow};
 use axum::{
@@ -86,6 +86,12 @@ const MAX_CACHED_WEATHER: usize = 64;
 /// Recently used current weather the warmer rebuilds after new data, at
 /// most: the default airports in the readers' time zones, mostly.
 const WARM_RECENT_WEATHER: usize = 16;
+/// How long a list of eligible stations is served before it is built
+/// again. Eligibility follows weeks of reports and the hourly ETL, so new
+/// files alone do not make a list stale, and a fresher one would not differ.
+const ELIGIBLE_CACHE_REFRESH: Duration = Duration::from_secs(10 * 60);
+/// Eligible station lists kept, one per pair of query values.
+const MAX_CACHED_ELIGIBLE: usize = 16;
 /// How often recent forecast files are checked for query-ready copies and
 /// folds, besides after each upload: catches files another oracle process
 /// received.
@@ -134,6 +140,9 @@ struct StationList {
 }
 
 /// Capabilities handlers receive. Handlers never see database connections.
+/// Eligible station lists, by days judged and window hours.
+type EligibleCache = Mutex<Cache<(u32, u32), Arc<Vec<EligibleStation>>>>;
+
 pub struct AppState {
     pub remote_url: String,
     /// Local directory uploads land in and DuckDB reads.
@@ -145,6 +154,11 @@ pub struct AppState {
     pub database: Database,
     forecast_cache: Mutex<Cache<String, String>>,
     weather_cache: Mutex<Cache<WeatherKey, Arc<Vec<WeatherDisplay>>>>,
+    /// Eligible stations by days judged and window hours.
+    eligible_cache: EligibleCache,
+    /// Held while an eligible station list is built, so readers who miss
+    /// the cache together wait for one build.
+    eligible_build: tokio::sync::Mutex<()>,
     /// Counts arrivals of new data; cached values built from an older
     /// generation are stale.
     generation: AtomicU64,
@@ -227,6 +241,8 @@ impl AppState {
             database,
             forecast_cache: Mutex::new(Cache::new(MAX_CACHED_FORECASTS, FORECAST_CACHE_REFRESH)),
             weather_cache: Mutex::new(Cache::new(MAX_CACHED_WEATHER, WEATHER_CACHE_REFRESH)),
+            eligible_cache: Mutex::new(Cache::new(MAX_CACHED_ELIGIBLE, ELIGIBLE_CACHE_REFRESH)),
+            eligible_build: tokio::sync::Mutex::new(()),
             generation: AtomicU64::new(0),
             data_prepared: tokio::sync::Notify::new(),
             stations: Arc::default(),
@@ -377,6 +393,69 @@ impl AppState {
         });
     }
 
+    /// Stations a competition of `window_hours` starting now can be drawn
+    /// from, judged over the last `days` full UTC days (see
+    /// [`WeatherData::eligible_stations`]). A list is built at most once per
+    /// [`ELIGIBLE_CACHE_REFRESH`] for each pair of values.
+    pub async fn eligible_stations(
+        &self,
+        days: u32,
+        window_hours: u32,
+    ) -> Result<Arc<Vec<EligibleStation>>, weather_data::Error> {
+        // Age alone makes a list stale, so every list has generation 0.
+        let key = (days, window_hours);
+        if let Cached::Fresh(list) = lock(&self.eligible_cache).get(&key, 0) {
+            return Ok(list);
+        }
+        let _building = self.eligible_build.lock().await;
+        if let Cached::Fresh(list) = lock(&self.eligible_cache).get(&key, 0) {
+            return Ok(list);
+        }
+        match self.build_eligible(days, window_hours).await {
+            Ok(list) => {
+                let list = Arc::new(list);
+                lock(&self.eligible_cache).insert(key, list.clone(), 0);
+                Ok(list)
+            }
+            Err(error) => {
+                lock(&self.eligible_cache).refresh_failed(&key);
+                Err(error)
+            }
+        }
+    }
+
+    async fn build_eligible(
+        &self,
+        days: u32,
+        window_hours: u32,
+    ) -> Result<Vec<EligibleStation>, weather_data::Error> {
+        let started = std::time::Instant::now();
+        let judged = self
+            .weather_db
+            .eligible_stations(days, window_hours, time::OffsetDateTime::now_utc())
+            .await?;
+        let stations = self.stations().await?;
+        let stations: std::collections::HashMap<&str, &Station> = stations
+            .iter()
+            .map(|station| (station.station_id.as_str(), station))
+            .collect();
+        let eligible: Vec<EligibleStation> = judged
+            .iter()
+            .filter(|station| station.eligible)
+            .filter_map(|eligibility| {
+                EligibleStation::new(stations.get(eligibility.station_id.as_str())?, eligibility)
+            })
+            .collect();
+        info!(
+            "{} of {} stations eligible over {days} days for {window_hours}-hour windows, judged in {:?}",
+            eligible.len(),
+            judged.len(),
+            started.elapsed()
+        );
+        self.metrics.set_eligible_stations(eligible.len());
+        Ok(eligible)
+    }
+
     /// Whether `station_id` appears in the observation files.
     pub async fn is_known_station(&self, station_id: &str) -> bool {
         self.stations().await.is_ok_and(|stations| {
@@ -493,6 +572,7 @@ impl AppState {
         crate::routes::window_compatibility::window_compatibility,
         crate::routes::stations::daily_observations,
         crate::routes::stations::get_stations,
+        crate::routes::stations::eligible_stations,
         crate::routes::files::download::download,
         crate::routes::files::get_names::files,
         crate::routes::files::upload::upload,
@@ -612,6 +692,10 @@ pub fn app(app_state: Arc<AppState>) -> Router {
     let weather_routes = Router::new()
         .merge(ui)
         .route("/stations", get(get_stations))
+        .route(
+            "/stations/eligible",
+            get(crate::routes::stations::eligible_stations),
+        )
         .route("/stations/forecasts", get(forecasts))
         .route(
             "/stations/window-compatibility",

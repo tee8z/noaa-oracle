@@ -14,6 +14,9 @@
 //! source never published; the oracle cannot attest them until the data
 //! arrives. `oracle_oldest_attestable_event_age_seconds` gives the age of
 //! the oldest of the rest, so an alert on it points at the oracle itself.
+//!
+//! `oracle_eligible_stations` counts the stations in the list of eligible
+//! stations built last, for whichever query values asked for it.
 
 use std::{
     path::Path,
@@ -64,6 +67,7 @@ pub struct Metrics {
     expired_unsigned: IntGauge,
     latest_forecast: IntGauge,
     latest_observation: IntGauge,
+    eligible_stations: IntGauge,
     /// When the scrape-time gauges were last read.
     refreshed_at: tokio::sync::Mutex<Option<Instant>>,
 }
@@ -159,6 +163,11 @@ impl Metrics {
                 "Generation time of the newest observation file; 0 if there is none",
             )
             .expect("valid metric"),
+            eligible_stations: IntGauge::new(
+                "oracle_eligible_stations",
+                "Stations eligible for a competition in the list last built; 0 if none was",
+            )
+            .expect("valid metric"),
             refreshed_at: tokio::sync::Mutex::new(None),
             registry,
         };
@@ -179,7 +188,7 @@ impl Metrics {
         for state in EVENT_STATES {
             metrics.events.with_label_values(&[state]);
         }
-        let collectors: [Box<dyn prometheus::core::Collector>; 15] = [
+        let collectors: [Box<dyn prometheus::core::Collector>; 16] = [
             Box::new(build_info),
             Box::new(metrics.etl_runs.clone()),
             Box::new(metrics.events_attested.clone()),
@@ -195,6 +204,7 @@ impl Metrics {
             Box::new(metrics.expired_unsigned.clone()),
             Box::new(metrics.latest_forecast.clone()),
             Box::new(metrics.latest_observation.clone()),
+            Box::new(metrics.eligible_stations.clone()),
         ];
         for collector in collectors {
             metrics
@@ -221,6 +231,12 @@ impl Metrics {
 
     pub fn set_etl_lease_held(&self, held: bool) {
         self.etl_lease_held.set(i64::from(held));
+    }
+
+    /// A list of eligible stations was built with `count` stations.
+    pub fn set_eligible_stations(&self, count: usize) {
+        self.eligible_stations
+            .set(i64::try_from(count).unwrap_or(i64::MAX));
     }
 
     pub fn upload_accepted(&self, kind: FileKind) {
@@ -489,6 +505,7 @@ mod tests {
             "oracle_oldest_attestable_event_age_seconds",
             "oracle_latest_forecast_timestamp_seconds",
             "oracle_latest_observation_timestamp_seconds",
+            "oracle_eligible_stations",
         ] {
             assert!(text.contains(&format!("# TYPE {family} ")), "{family}");
         }
