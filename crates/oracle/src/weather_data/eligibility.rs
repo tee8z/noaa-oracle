@@ -32,8 +32,11 @@ pub const DEFAULT_WINDOW_HOURS: u32 = 24;
 /// Longest window: one placed on a day must fit in it.
 pub const MAX_WINDOW_HOURS: u32 = 24;
 /// Share of the judged days, in percent, on which the reports must have
-/// sampled every window.
-const MIN_CLEAN_PERCENT: u32 = 95;
+/// Imperfect days allowed among those checked: one in ten, and always at least one, so a
+/// single collector outage does not empty the list.
+fn allowed_imperfect_days(days_checked: u32) -> u32 {
+    (days_checked / 10).max(1)
+}
 /// A station whose newest report is this old may have stopped reporting.
 const MAX_REPORT_AGE: Duration = Duration::hours(3);
 /// Forecast issues this recent are read. A station whose newest issue is
@@ -149,7 +152,7 @@ fn eligible(
     now: OffsetDateTime,
 ) -> bool {
     days_checked > 0
-        && clean_days * 100 >= MIN_CLEAN_PERCENT * days_checked
+        && clean_days + allowed_imperfect_days(days_checked) >= days_checked
         && now - last_report < MAX_REPORT_AGE
         && forecast_through
             .is_some_and(|through| through >= now + Duration::hours(i64::from(window_hours)))
@@ -369,7 +372,10 @@ mod tests {
         let recent = NOW - Duration::minutes(10);
         assert!(eligible(29, 30, recent, through, 24, NOW));
         assert!(eligible(19, 20, recent, through, 24, NOW));
-        assert!(!eligible(28, 30, recent, through, 24, NOW));
+        assert!(eligible(27, 30, recent, through, 24, NOW));
+        assert!(!eligible(26, 30, recent, through, 24, NOW));
+        assert!(eligible(2, 3, recent, through, 24, NOW));
+        assert!(!eligible(1, 3, recent, through, 24, NOW));
         assert!(!eligible(30, 30, NOW - MAX_REPORT_AGE, through, 24, NOW));
         assert!(!eligible(30, 30, recent, through, 25, NOW));
         assert!(!eligible(30, 30, recent, None, 24, NOW));

@@ -327,7 +327,7 @@ impl EligibleRequest {
 }
 
 /// Stations whose reports would have sampled every window of
-/// `window_hours` on at least 95% of the last `days` full UTC days, by the
+/// `window_hours` on all but one in ten of the last `days` full UTC days (and always all but one), by the
 /// rule settlement applies, that reported within the last 3 hours, and
 /// whose newest forecast runs at least `window_hours` past now. Lists are
 /// rebuilt at most every 10 minutes.

@@ -14,7 +14,7 @@ REST API, HTMX dashboard, and DLC attestation service. See the
 | `GET /docs` | OpenAPI UI |
 | `GET /files`, `GET /file/{name}`, `POST /file/{name}` | List, download, and upload parquet files (`<observations|forecasts>_<rfc3339>.parquet`) |
 | `GET /stations`, `/stations/forecasts`, `/stations/observations`, `/stations/daily-observations` | Weather queries over parquet files |
-| `GET /stations/eligible?days=30&window_hours=24` | Stations a competition of `window_hours` (1 to 24) starting now can be drawn from: on at least 95% of the last `days` (1 to 31) full UTC days, the reports settlement reads covered every window of that length starting on the hour, the newest report is under 3 hours old, and the newest forecast runs at least `window_hours` past now. Ordered by station id; lists are rebuilt at most every 10 minutes; unknown parameters or values out of range get 400 |
+| `GET /stations/eligible?days=30&window_hours=24` | Stations a competition of `window_hours` (1 to 24) starting now can be drawn from: on all but one in ten (and at least all but one) of the last `days` (1 to 31) full UTC days, the reports settlement reads covered every window of that length starting on the hour, the newest report is under 3 hours old, and the newest forecast runs at least `window_hours` past now. Ordered by station id; lists are rebuilt at most every 10 minutes; unknown parameters or values out of range get 400 |
 | `GET /oracle/pubkey`, `GET /oracle/npub` | Oracle identity |
 | `GET /oracle/events`, `POST /oracle/events`, `GET /oracle/events/{id}` | DLC events (writes require NIP-98 auth) |
 | `POST /oracle/events/{id}/entries`, `GET /oracle/events/{id}/entries/{entry}` | Entries |
