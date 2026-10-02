@@ -481,6 +481,75 @@ mod tests {
         assert_eq!(one_day[0].clean_days, 1);
     }
 
+    /// Corrected publications replace old conflicts, but conflicts or rejected
+    /// reports in the newest publication must still create coverage gaps.
+    #[tokio::test]
+    async fn eligibility_uses_newest_publication_without_hiding_its_conflicts() {
+        let directory = tempfile::tempdir().unwrap();
+        for (name, newest) in [
+            ("observations_2026-01-20T11:54:00Z.parquet", false),
+            ("observations_2026-01-20T11:55:00Z.parquet", true),
+        ] {
+            let repeated = if newest {
+                "station_id = 'KDUP' OR (station_id = 'KCON' AND hour(ts) = 3)"
+            } else {
+                "station_id = 'KFIX' AND hour(ts) = 3"
+            };
+            let quality = if newest {
+                "CASE WHEN station_id = 'KBAD' AND hour(ts) = 3 THEN 'rejected' ELSE 'validated' END"
+            } else {
+                "'validated'"
+            };
+            write(
+                &directory,
+                name,
+                &format!(
+                    "SELECT station_id, strftime(ts, '%Y-%m-%dT%H:%M:%SZ') AS generated_at,
+                            (10 + CASE WHEN station_id != 'KDUP' THEN n ELSE 0 END)::DOUBLE AS temperature_value,
+                            'celsius' AS temperature_unit_code, 'METAR' AS metar_type,
+                            'METAR ' || station_id || ' ' || strftime(ts, '%d%H%MZ') || ' 09008KT 10SM 10/08 RMK AO2' AS raw_text,
+                            {quality} AS quality_status, 'metar-consistency-v1' AS validation_version,
+                            NULL::VARCHAR AS quality_reason, NULL::VARCHAR AS quality_metrics
+                     FROM (VALUES ('KFIX'), ('KCON'), ('KDUP'), ('KBAD')) AS stations(station_id),
+                          generate_series(TIMESTAMP '2026-01-17 00:53:00', TIMESTAMP '2026-01-20 11:53:00', INTERVAL 1 HOUR) AS hours(ts),
+                          range(2) AS copies(n)
+                     WHERE n = 0 OR ({repeated})"
+                ),
+            );
+        }
+        write(
+            &directory,
+            "forecasts_2026-01-20T11:30:00Z.parquet",
+            "SELECT station_id, '2026-01-20T12:00:00Z' AS begin_time,
+                    '2026-01-22T12:00:00Z' AS end_time, '2026-01-20T11:00:00Z' AS generated_at,
+                    30::BIGINT AS min_temp, 40::BIGINT AS max_temp, 'fahrenheit' AS temperature_unit_code
+             FROM (VALUES ('KFIX'), ('KCON'), ('KDUP'), ('KBAD')) AS stations(station_id)",
+        );
+        let access = WeatherAccess::new(Arc::new(crate::file_access::FileAccess::new(
+            directory.path().to_string_lossy().into_owned(),
+        )));
+        let stations = access.eligibility(3, 6, NOW).await.unwrap();
+        let results: Vec<_> = stations
+            .iter()
+            .map(|station| {
+                (
+                    station.station_id.as_str(),
+                    station.clean_days,
+                    station.eligible,
+                )
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![
+                ("KBAD", 0, false),
+                ("KCON", 0, false),
+                ("KDUP", 3, true),
+                ("KFIX", 3, true),
+            ]
+        );
+    }
+
     /// How long a cold computation takes over a month of hourly reports
     /// from 800 stations, about 600,000 reports in daily files, and a
     /// forecast for each. Run with
