@@ -155,11 +155,14 @@ fn eligible(
             .is_some_and(|through| through >= now + Duration::hours(i64::from(window_hours)))
 }
 
+/// Each station's instants, with the raw epoch seconds kept for ordering.
+type StationTimes = BTreeMap<String, Vec<(OffsetDateTime, Option<i64>)>>;
+
 /// Instants of an epoch-seconds column, by station.
 fn times_by_station(
     batches: &[RecordBatch],
     time_column: &'static str,
-) -> Result<BTreeMap<String, Vec<(OffsetDateTime, Option<i64>)>>, Error> {
+) -> Result<StationTimes, Error> {
     let mut by_station = BTreeMap::<String, Vec<_>>::new();
     for batch in batches {
         let stations = strings(batch, "station_id")?;

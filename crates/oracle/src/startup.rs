@@ -140,6 +140,9 @@ struct StationList {
 }
 
 /// Capabilities handlers receive. Handlers never see database connections.
+/// Eligible station lists, by days judged and window hours.
+type EligibleCache = Mutex<Cache<(u32, u32), Arc<Vec<EligibleStation>>>>;
+
 pub struct AppState {
     pub remote_url: String,
     /// Local directory uploads land in and DuckDB reads.
@@ -152,7 +155,7 @@ pub struct AppState {
     forecast_cache: Mutex<Cache<String, String>>,
     weather_cache: Mutex<Cache<WeatherKey, Arc<Vec<WeatherDisplay>>>>,
     /// Eligible stations by days judged and window hours.
-    eligible_cache: Mutex<Cache<(u32, u32), Arc<Vec<EligibleStation>>>>,
+    eligible_cache: EligibleCache,
     /// Held while an eligible station list is built, so readers who miss
     /// the cache together wait for one build.
     eligible_build: tokio::sync::Mutex<()>,
