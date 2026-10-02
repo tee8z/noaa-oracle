@@ -82,7 +82,18 @@ const DEDUP_OBSERVATIONS_SQL: &str = r#"
             quality := quality_status, raw := raw_text, version := validation_version, reason := quality_reason, report_type := metar_type,
             affected := quality_metrics
         )) OVER (PARTITION BY station_id, generated_at::TIMESTAMPTZ, filename) > 1 AS publication_conflict
-    FROM parquet_data
+    FROM (
+        -- Snapshots repeat earlier reports. Only the newest publication can
+        -- contribute a report, so discard older publications before checking
+        -- conflicts. Keep every row of that publication: ROW_NUMBER here
+        -- would hide contradictory reports and incorrectly clear their QC.
+        SELECT * FROM parquet_data
+        QUALIFY DENSE_RANK() OVER (
+            PARTITION BY station_id, generated_at::TIMESTAMPTZ
+            ORDER BY regexp_extract(filename, '(^|/)observations_([^/]+)\.parquet$', 2)::TIMESTAMPTZ DESC,
+                     filename DESC
+        ) = 1
+    ) AS latest_publications
     QUALIFY ROW_NUMBER() OVER (
         PARTITION BY station_id, generated_at::TIMESTAMPTZ
         ORDER BY regexp_extract(filename, '(^|/)observations_([^/]+)\.parquet$', 2)::TIMESTAMPTZ DESC,
@@ -2502,6 +2513,56 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn latest_observation_publication_orders_instants_before_filename_ties() {
+        let reports = |rows: &str| {
+            format!(
+                "SELECT station_id, '2026-01-17T18:51:00Z' AS generated_at,
+                        temperature_value::DOUBLE AS temperature_value, 'celsius' AS temperature_unit_code,
+                        'validated' AS quality_status, 'metar-consistency-v1' AS validation_version,
+                        'METAR ' || station_id || ' 171851Z 12/06' AS raw_text
+                 FROM (VALUES {rows}) AS reports(station_id, temperature_value)"
+            )
+        };
+        let directory = quality_data_dir(&[
+            (
+                "observations_2026-01-17T21:00:00Z.parquet",
+                &reports("('KTIM', 11.0), ('KTIE', 11.0)"),
+            ),
+            (
+                "observations_2026-01-17T22:00:00+01:00.parquet",
+                &reports("('KTIM', 12.0), ('KTIE', 12.0)"),
+            ),
+            (
+                "observations_2026-01-17T21:30:00Z.parquet",
+                &reports("('KTIM', 13.0)"),
+            ),
+        ]);
+        let request = ObservationRequest {
+            station_ids: "KTIM,KTIE".into(),
+            ..day_request()
+        };
+        let weather = access(&directory);
+        let observations = weather
+            .observation_data(&request, request.station_ids())
+            .await
+            .unwrap();
+        let temperature = |id| {
+            observations
+                .iter()
+                .find(|observation| observation.station_id == id)
+                .unwrap()
+                .temp_high
+        };
+        assert!((temperature("KTIM") - 55.4).abs() < 1e-6);
+        assert!((temperature("KTIE") - 53.6).abs() < 1e-6);
+        let quality = weather
+            .observation_quality(&request, request.station_ids(), &[])
+            .await
+            .unwrap();
+        assert_eq!(quality.rejected_reports, 0);
     }
 
     #[tokio::test]
