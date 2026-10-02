@@ -427,3 +427,151 @@ async fn a_failed_first_preparation_warms_the_cache_but_is_not_ready() {
     runtime.requested.cancel();
     bounded(runtime.run_until_stop()).await.unwrap();
 }
+
+/// Weather data with one station, KDEN, eligible for any query. Counts how
+/// often eligibility was judged.
+#[derive(Default)]
+struct CountedEligibility {
+    judged: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl WeatherData for CountedEligibility {
+    async fn forecasts_data(
+        &self,
+        _: &crate::routes::ForecastRequest,
+        _: Vec<String>,
+    ) -> Result<Vec<weather_data::Forecast>, weather_data::Error> {
+        Ok(vec![])
+    }
+    async fn observation_data(
+        &self,
+        _: &crate::routes::ObservationRequest,
+        _: Vec<String>,
+    ) -> Result<Vec<weather_data::Observation>, weather_data::Error> {
+        Ok(vec![])
+    }
+    async fn daily_observations(
+        &self,
+        _: &crate::routes::ObservationRequest,
+        _: Vec<String>,
+    ) -> Result<Vec<weather_data::DailyObservation>, weather_data::Error> {
+        Ok(vec![])
+    }
+    async fn stations(&self) -> Result<Vec<Station>, weather_data::Error> {
+        Ok(vec![Station {
+            station_id: "KDEN".into(),
+            station_name: "Denver Intl".into(),
+            state: "CO".into(),
+            iata_id: "DEN".into(),
+            elevation_m: Some(1655.0),
+            latitude: 39.86,
+            longitude: -104.67,
+        }])
+    }
+    async fn eligible_stations(
+        &self,
+        days: u32,
+        _: u32,
+        now: time::OffsetDateTime,
+    ) -> Result<Vec<weather_data::Eligibility>, weather_data::Error> {
+        self.judged.fetch_add(1, Ordering::SeqCst);
+        let eligibility = |station_id: &str, eligible| weather_data::Eligibility {
+            station_id: station_id.into(),
+            clean_days: days,
+            days_checked: days,
+            last_report: now - time::Duration::minutes(10),
+            forecast_through: Some(now + time::Duration::days(2)),
+            eligible,
+        };
+        Ok(vec![eligibility("KDEN", true), eligibility("KSAW", false)])
+    }
+}
+
+async fn get_json(router: &Router, path: &str) -> (StatusCode, serde_json::Value) {
+    let request = Request::get(path).body(Body::empty()).unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+#[tokio::test]
+async fn eligible_stations_are_judged_once_per_query_and_validated() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, database) = runtime(directory.path()).await;
+    let weather = Arc::new(CountedEligibility::default());
+    let state = app_state(directory.path(), &runtime, database, weather.clone()).await;
+    let router = app(state.clone());
+
+    for path in [
+        "/stations/eligible?days=0",
+        "/stations/eligible?days=32",
+        "/stations/eligible?days=thirty",
+        "/stations/eligible?window_hours=0",
+        "/stations/eligible?window_hours=25",
+        "/stations/eligible?window_hours=-1",
+        "/stations/eligible?window=12",
+    ] {
+        let (status, body) = get_json(&router, path).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("invalid request: "),
+            "{path}: {body}"
+        );
+    }
+    assert_eq!(weather.judged.load(Ordering::SeqCst), 0);
+
+    let (status, body) = get_json(&router, "/stations/eligible").await;
+    assert_eq!(status, StatusCode::OK);
+    let stations = body.as_array().unwrap();
+    assert_eq!(stations.len(), 1, "{body}");
+    let station = stations[0].as_object().unwrap();
+    let mut fields: Vec<&str> = station.keys().map(String::as_str).collect();
+    fields.sort_unstable();
+    assert_eq!(
+        fields,
+        [
+            "clean_days",
+            "days_checked",
+            "forecast_through",
+            "iata_id",
+            "last_report",
+            "latitude",
+            "longitude",
+            "state",
+            "station_id",
+            "station_name"
+        ]
+    );
+    assert_eq!(station["station_id"], "KDEN");
+    assert_eq!(station["iata_id"], "DEN");
+    assert_eq!(station["days_checked"], 30);
+    assert!(station["last_report"].as_str().unwrap().ends_with('Z'));
+    assert!(
+        state
+            .metrics()
+            .encode()
+            .contains("\noracle_eligible_stations 1\n")
+    );
+
+    // The defaults spelled out are the same query, served from the cache;
+    // other values are judged on their own.
+    let (status, _) = get_json(&router, "/stations/eligible?days=30&window_hours=24").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(weather.judged.load(Ordering::SeqCst), 1);
+    let (status, body) = get_json(&router, "/stations/eligible?days=7&window_hours=6").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body[0]["days_checked"], 7);
+    assert_eq!(weather.judged.load(Ordering::SeqCst), 2);
+    get_json(&router, "/stations/eligible?days=7&window_hours=6").await;
+    assert_eq!(weather.judged.load(Ordering::SeqCst), 2);
+
+    runtime.requested.cancel();
+    bounded(runtime.run_until_stop()).await.unwrap();
+}

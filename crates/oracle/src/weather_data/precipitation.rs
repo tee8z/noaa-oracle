@@ -125,12 +125,21 @@ fn sampling<'a>(
     start: OffsetDateTime,
     end: OffsetDateTime,
 ) -> Result<(), Shortfall> {
+    report_gaps(times.map(|report| report.time), start, end)
+}
+
+/// [`sampling`] over report instants alone.
+fn report_gaps(
+    times: impl Iterator<Item = OffsetDateTime>,
+    start: OffsetDateTime,
+    end: OffsetDateTime,
+) -> Result<(), Shortfall> {
     let tolerates_one = end - start >= LONG_WINDOW;
     let mut tolerated = false;
     let mut previous = start;
     let mut count = 0;
-    for report in times.filter(|row| row.time >= start && row.time < end) {
-        let gap = report.time - previous;
+    for time in times.filter(|time| *time >= start && *time < end) {
+        let gap = time - previous;
         if gap > MAX_REPORT_GAP {
             if !tolerates_one {
                 return Err(Shortfall::Gap(gap));
@@ -143,7 +152,7 @@ fn sampling<'a>(
             }
             tolerated = true;
         }
-        previous = report.time;
+        previous = time;
         count += 1;
     }
     if count == 0 {
@@ -163,6 +172,16 @@ fn sampling_complete<'a>(
     end: OffsetDateTime,
 ) -> bool {
     sampling(times, start, end).is_ok()
+}
+
+/// Whether reports at `times`, in order, sample the window by the rule
+/// settlement applies to the reports usable for one metric.
+pub(super) fn times_sample_window(
+    times: impl IntoIterator<Item = OffsetDateTime>,
+    start: OffsetDateTime,
+    end: OffsetDateTime,
+) -> bool {
+    report_gaps(times.into_iter(), start, end).is_ok()
 }
 
 /// Solid or freezing precipitation makes liquid-only rainfall ambiguous.
@@ -672,6 +691,30 @@ mod tests {
         assert!(result.wind_complete && result.direction_complete);
         assert_eq!(result.humidity, Some(97));
         assert_eq!(result.rain, None);
+    }
+
+    /// Bare report times follow the rule the reports themselves do.
+    #[test]
+    fn report_times_sample_a_window_as_their_reports_do() {
+        for (hours, missed) in [
+            (24, &[][..]),
+            (24, &[600][..]),
+            (24, &[600, 1020][..]),
+            (24, &[540, 600][..]),
+            (6, &[120][..]),
+            (6, &[300][..]),
+            (24, &[1380][..]),
+        ] {
+            let (start, end) = window(hours);
+            let reports = hourly(hours, missed);
+            assert_eq!(
+                times_sample_window(reports.iter().map(|report| report.time), start, end),
+                sampling(reports.iter(), start, end).is_ok(),
+                "{hours} hours without {missed:?}"
+            );
+        }
+        let (start, end) = window(24);
+        assert!(!times_sample_window([], start, end));
     }
 
     #[test]

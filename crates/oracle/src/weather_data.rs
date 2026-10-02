@@ -36,6 +36,7 @@ use utoipa::ToSchema;
 
 mod coverage;
 mod derived;
+mod eligibility;
 mod folds;
 mod forecast_display_quality;
 mod forecast_quality;
@@ -45,6 +46,9 @@ mod precipitation;
 mod shef;
 
 pub use derived::DerivedForecasts;
+pub use eligibility::{
+    DEFAULT_DAYS, DEFAULT_WINDOW_HOURS, Eligibility, EligibleStation, MAX_DAYS, MAX_WINDOW_HOURS,
+};
 pub use folds::Folds;
 pub use forecast_display_quality::{ForecastQuality, ForecastRangeIssue};
 
@@ -190,6 +194,23 @@ const NORMALIZE_OBSERVATIONS_SQL: &str = r#"
         CASE WHEN precip_usable AND metar_type IS DISTINCT FROM 'SPECI' THEN precip_in END AS precip_in
     FROM usable
 "#;
+
+/// Every observation column a query reads, typed, so files written before a
+/// column existed still load. Queries union it ahead of `read_parquet`.
+const OBSERVATION_SOURCE_COLUMNS: &str = "
+    SELECT NULL::VARCHAR AS station_id, NULL::VARCHAR AS generated_at,
+           NULL::DOUBLE AS temperature_value, NULL::BIGINT AS wind_speed,
+           NULL::BIGINT AS wind_direction,
+           NULL::DOUBLE AS dewpoint_value, NULL::DOUBLE AS precip_in,
+           NULL::VARCHAR AS temperature_unit_code,
+           NULL::VARCHAR AS wx_string, NULL::VARCHAR AS filename,
+           NULL::VARCHAR AS dewpoint_unit_code,
+           NULL::VARCHAR AS quality_status, NULL::VARCHAR AS quality_reason,
+           NULL::VARCHAR AS validation_version, NULL::VARCHAR AS raw_text,
+           NULL::VARCHAR AS wind_speed_unit_code, NULL::VARCHAR AS wind_direction_unit_code,
+           NULL::VARCHAR AS precip_unit_code, NULL::VARCHAR AS metar_type,
+           NULL::VARCHAR AS quality_metrics
+    WHERE false";
 
 /// A report or forecast issue can reach a snapshot after its validity window.
 const PUBLICATION_GRACE: Duration = Duration::hours(24);
@@ -463,6 +484,18 @@ pub trait WeatherData: Sync + Send {
         station_ids: Vec<String>,
     ) -> Result<Vec<DailyObservation>, Error>;
     async fn stations(&self) -> Result<Vec<Station>, Error>;
+    /// Every station that reported in the last `days` full UTC days, and
+    /// whether a competition of `window_hours` starting at `now` can be
+    /// drawn from it, ordered by station id. Implementations that cannot
+    /// read the reports settlement reads cannot tell.
+    async fn eligible_stations(
+        &self,
+        _days: u32,
+        _window_hours: u32,
+        _now: OffsetDateTime,
+    ) -> Result<Vec<Eligibility>, Error> {
+        Err(Error::QualityUnavailable)
+    }
 
     /// [`WeatherData::forecasts_data`] with each `date` a day of
     /// `calendar`, for a reader's local days. Implementations without
@@ -1007,19 +1040,7 @@ impl WeatherAccess {
             r#"
             WITH parquet_data AS (
                 SELECT * FROM (
-                    SELECT NULL::VARCHAR AS station_id, NULL::VARCHAR AS generated_at,
-                           NULL::DOUBLE AS temperature_value, NULL::BIGINT AS wind_speed,
-                           NULL::BIGINT AS wind_direction,
-                           NULL::DOUBLE AS dewpoint_value, NULL::DOUBLE AS precip_in,
-                           NULL::VARCHAR AS temperature_unit_code,
-                           NULL::VARCHAR AS wx_string, NULL::VARCHAR AS filename,
-                           NULL::VARCHAR AS dewpoint_unit_code,
-                           NULL::VARCHAR AS quality_status, NULL::VARCHAR AS quality_reason,
-                           NULL::VARCHAR AS validation_version, NULL::VARCHAR AS raw_text,
-                           NULL::VARCHAR AS wind_speed_unit_code, NULL::VARCHAR AS wind_direction_unit_code,
-                           NULL::VARCHAR AS precip_unit_code, NULL::VARCHAR AS metar_type,
-                           NULL::VARCHAR AS quality_metrics
-                    WHERE false
+                    {OBSERVATION_SOURCE_COLUMNS}
                     UNION ALL BY NAME
                     SELECT * FROM read_parquet([{}], union_by_name = true, filename = true)
                 )
@@ -1546,19 +1567,7 @@ impl WeatherData for WeatherAccess {
             r#"
             WITH parquet_data AS (
                 SELECT * FROM (
-                    SELECT NULL::VARCHAR AS station_id, NULL::VARCHAR AS generated_at,
-                           NULL::DOUBLE AS temperature_value, NULL::BIGINT AS wind_speed,
-                           NULL::BIGINT AS wind_direction,
-                           NULL::DOUBLE AS dewpoint_value, NULL::DOUBLE AS precip_in,
-                           NULL::VARCHAR AS temperature_unit_code,
-                           NULL::VARCHAR AS wx_string, NULL::VARCHAR AS filename,
-                           NULL::VARCHAR AS dewpoint_unit_code,
-                           NULL::VARCHAR AS quality_status, NULL::VARCHAR AS quality_reason,
-                           NULL::VARCHAR AS validation_version, NULL::VARCHAR AS raw_text,
-                           NULL::VARCHAR AS wind_speed_unit_code, NULL::VARCHAR AS wind_direction_unit_code,
-                           NULL::VARCHAR AS precip_unit_code, NULL::VARCHAR AS metar_type,
-                           NULL::VARCHAR AS quality_metrics
-                    WHERE false
+                    {OBSERVATION_SOURCE_COLUMNS}
                     UNION ALL BY NAME
                     SELECT * FROM read_parquet([{}], union_by_name = true, filename = true)
                 )
@@ -1664,6 +1673,15 @@ impl WeatherData for WeatherAccess {
         );
 
         self.query(query_sql, decode_stations).await
+    }
+
+    async fn eligible_stations(
+        &self,
+        days: u32,
+        window_hours: u32,
+        now: OffsetDateTime,
+    ) -> Result<Vec<Eligibility>, Error> {
+        self.eligibility(days, window_hours, now).await
     }
 
     async fn prepare_files(&self, stopping: &CancellationToken) -> Result<usize, Error> {
