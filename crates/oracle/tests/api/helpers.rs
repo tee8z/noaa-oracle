@@ -378,6 +378,7 @@ mock! {
             station_ids: Vec<String>,
         ) -> Result<Vec<oracle::DailyObservation>, oracle::weather_data::Error>;
         pub async fn stations(&self) -> Result<Vec<oracle::Station>, oracle::weather_data::Error>;
+        pub async fn eligible_stations(&self, days: u32, window_hours: u32, now: OffsetDateTime) -> Result<Vec<oracle::weather_data::Eligibility>, oracle::weather_data::Error>;
     }
 }
 
@@ -386,6 +387,15 @@ mock! {
 // WeatherData implementations retain the fail-closed default quality check.
 #[async_trait]
 impl WeatherData for MockWeatherAccess {
+    async fn eligible_stations(
+        &self,
+        days: u32,
+        window_hours: u32,
+        now: OffsetDateTime,
+    ) -> Result<Vec<oracle::weather_data::Eligibility>, oracle::weather_data::Error> {
+        MockWeatherAccess::eligible_stations(self, days, window_hours, now).await
+    }
+
     async fn forecasts_data(
         &self,
         req: &oracle::ForecastRequest,

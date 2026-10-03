@@ -1,6 +1,7 @@
 mod auth;
 mod coordinator_contract;
 mod daemon_contract;
+mod discovery;
 mod events;
 mod helpers;
 mod lifecycle;

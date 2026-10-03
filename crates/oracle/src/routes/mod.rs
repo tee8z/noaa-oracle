@@ -1,6 +1,7 @@
 //! HTTP routes. Handlers use [`crate::AppState`] capabilities and map errors
 //! to status codes; they never touch database connections directly.
 
+pub mod discovery;
 pub mod events;
 pub mod files;
 pub mod health;
