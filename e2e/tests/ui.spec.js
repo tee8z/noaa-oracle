@@ -291,12 +291,17 @@ for (const viewport of [
       expect(bounds.x + bounds.width).toBeLessThanOrEqual(viewport.width + 1);
       await expectOneLayout(page);
 
-      // The raw data page always loads whole; the others swap in.
+      // The raw data page always loads whole; the others swap in. Leaving
+      // it while DuckDB still downloads aborts the download, which browsers
+      // report as an error, so each visit waits for DuckDB first.
       for (const destination of ["/raw", "/events", "/raw", "/events"]) {
         await page.locator(`.site-tabs a[href='${destination}']`).click();
         await expect(page).toHaveURL((url) => url.pathname === destination);
         await expect(page.locator(`.site-tabs li.is-active a[href='${destination}']`)).toHaveCount(1);
         await expectOneLayout(page);
+        if (destination === "/raw") {
+          await expect(page.locator("#raw-data-status")).not.toHaveText("Loading DuckDB…", { timeout: 60000 });
+        }
       }
       // Back from a swapped page to the raw data page reloads it, so it
       // gets its own policy and script again.
