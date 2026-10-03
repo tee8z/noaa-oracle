@@ -4,15 +4,19 @@ use axum::{
 };
 use time::OffsetDateTime;
 
-use super::{htmx::is_htmx, policy::RAW_DATA_POLICY};
+use super::{
+    htmx::{is_history_restore, is_htmx},
+    policy::RAW_DATA_POLICY,
+};
 use crate::templates::pages::raw_data::raw_data_page;
 
 /// Handler for the raw data page (GET /raw). Its policy lets the page's
 /// script run DuckDB-WASM, so it always loads as a whole document: the tab
 /// is a plain link, and when htmx asks for it (going back to it from a page
-/// opened by htmx) the reply tells htmx to reload instead.
+/// opened by htmx) the reply tells htmx to reload instead. htmx 4 marks
+/// those history requests only with `HX-History-Restore-Request`.
 pub async fn raw_data_handler(headers: HeaderMap) -> Response {
-    if is_htmx(&headers) {
+    if is_htmx(&headers) || is_history_restore(&headers) {
         return ([(HeaderName::from_static("hx-refresh"), "true")], Html("")).into_response();
     }
     let mut response = Html(raw_data_page(OffsetDateTime::now_utc()).into_string()).into_response();
@@ -21,6 +25,9 @@ pub async fn raw_data_handler(headers: HeaderMap) -> Response {
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(RAW_DATA_POLICY),
     );
-    headers.insert(header::VARY, HeaderValue::from_static("HX-Request"));
+    headers.insert(
+        header::VARY,
+        HeaderValue::from_static("HX-Request, HX-History-Restore-Request"),
+    );
     response
 }

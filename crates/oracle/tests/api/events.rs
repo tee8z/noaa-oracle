@@ -544,17 +544,21 @@ async fn event_filters_render_the_matching_part() {
 #[tokio::test]
 async fn htmx_reloads_the_raw_data_page_instead_of_swapping_it() {
     let test_app = app().await;
-    let request = Request::get("/raw")
-        .header("hx-request", "true")
-        .header("hx-target", "body")
-        .header("hx-history-restore-request", "true")
-        .body(Body::empty())
-        .unwrap();
-    let response = test_app.app.clone().oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.headers()["hx-refresh"], "true");
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    assert!(body.is_empty());
+    // htmx 4 sends history restores without `HX-Request`.
+    for htmx_request in [true, false] {
+        let mut request = Request::get("/raw")
+            .header("hx-target", "body")
+            .header("hx-history-restore-request", "true");
+        if htmx_request {
+            request = request.header("hx-request", "true");
+        }
+        let request = request.body(Body::empty()).unwrap();
+        let response = test_app.app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["hx-refresh"], "true");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(body.is_empty());
+    }
 }
 
 /// The API reference loads Scalar from this site under its own policy,
