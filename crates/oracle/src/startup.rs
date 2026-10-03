@@ -573,6 +573,7 @@ impl AppState {
         crate::routes::stations::daily_observations,
         crate::routes::stations::get_stations,
         crate::routes::stations::eligible_stations,
+        crate::routes::discovery::eligible_forecasts,
         crate::routes::files::download::download,
         crate::routes::files::get_names::files,
         crate::routes::files::upload::upload,
@@ -697,6 +698,10 @@ pub fn app(app_state: Arc<AppState>) -> Router {
             get(crate::routes::stations::eligible_stations),
         )
         .route("/stations/forecasts", get(forecasts))
+        .route(
+            "/stations/eligible/forecasts",
+            get(crate::routes::discovery::eligible_forecasts),
+        )
         .route(
             "/stations/window-compatibility",
             get(crate::routes::window_compatibility::window_compatibility),
