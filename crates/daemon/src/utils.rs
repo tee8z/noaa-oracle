@@ -383,6 +383,9 @@ pub struct XmlFetcher {
     client: ClientWithMiddleware,
     history_client: Client,
     rate_limiter: Arc<Mutex<RateLimiter>>,
+    /// AWC is a separate API from the forecast source. Keep every METAR request
+    /// below its 100 requests/minute limit without spending forecast tokens.
+    history_rate_limiter: Mutex<RateLimiter>,
 }
 
 impl XmlFetcher {
@@ -404,6 +407,7 @@ impl XmlFetcher {
                 .with(RetryTransientMiddleware::new_with_policy(retry_policy))
                 .build(),
             rate_limiter,
+            history_rate_limiter: Mutex::new(RateLimiter::new(1, Duration::from_secs(1))),
         })
     }
 
@@ -442,7 +446,7 @@ impl XmlFetcher {
     /// middleware is deliberately bypassed: every physical request takes a
     /// rate-limit token, and the history collector records any failure.
     pub async fn fetch_history_xml(&self, url: &str) -> Result<(u16, String), FetchError> {
-        RateLimiter::acquire(&self.rate_limiter).await;
+        RateLimiter::acquire(&self.history_rate_limiter).await;
         self.fetch_bounded_evidence(url, MAX_RESPONSE_BYTES).await
     }
 
@@ -604,6 +608,40 @@ mod tests {
             assert!(limiter.try_take(later).is_ok());
         }
         assert!(limiter.try_take(later).is_err());
+    }
+
+    #[tokio::test]
+    async fn observation_requests_do_not_wait_for_forecast_tokens() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/metar", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+        let forecast = Arc::new(Mutex::new(RateLimiter::new(1, Duration::from_secs(3600))));
+        RateLimiter::acquire(&forecast).await;
+        let fetcher =
+            XmlFetcher::new(Logger::root(slog::Discard, o!()), "test", forecast.clone()).unwrap();
+        let response =
+            tokio::time::timeout(Duration::from_secs(2), fetcher.fetch_history_xml(&url))
+                .await
+                .expect("observation API must not wait an hour for a forecast token")
+                .unwrap();
+        assert_eq!(response, (200, "ok".into()));
+        assert!(forecast.lock().await.try_take(Instant::now()).is_err());
+        let history = fetcher.history_rate_limiter.lock().await;
+        assert_eq!(history.capacity, 1.0);
+        assert_eq!(
+            history.per_second, 1.0,
+            "at most 60 METAR requests/minute after the initial token"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
