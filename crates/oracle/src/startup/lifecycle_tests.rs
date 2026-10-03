@@ -429,10 +429,11 @@ async fn a_failed_first_preparation_warms_the_cache_but_is_not_ready() {
 }
 
 /// Weather data with one station, KDEN, eligible for any query. Counts how
-/// often eligibility was judged.
+/// often eligibility was judged and observations were read.
 #[derive(Default)]
 struct CountedEligibility {
     judged: AtomicUsize,
+    observed: AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -449,6 +450,7 @@ impl WeatherData for CountedEligibility {
         _: &crate::routes::ObservationRequest,
         _: Vec<String>,
     ) -> Result<Vec<weather_data::Observation>, weather_data::Error> {
+        self.observed.fetch_add(1, Ordering::SeqCst);
         Ok(vec![])
     }
     async fn daily_observations(
@@ -551,18 +553,19 @@ async fn eligible_stations_are_judged_once_per_query_and_validated() {
     );
     assert_eq!(station["station_id"], "KDEN");
     assert_eq!(station["iata_id"], "DEN");
-    assert_eq!(station["days_checked"], 30);
+    assert_eq!(station["days_checked"], 3);
     assert!(station["last_report"].as_str().unwrap().ends_with('Z'));
+    // Requests leave the gauge alone; it follows the scheduled judgment.
     assert!(
         state
             .metrics()
             .encode()
-            .contains("\noracle_eligible_stations 1\n")
+            .contains("\noracle_eligible_stations 0\n")
     );
 
     // The defaults spelled out are the same query, served from the cache;
     // other values are judged on their own.
-    let (status, _) = get_json(&router, "/stations/eligible?days=30&window_hours=24").await;
+    let (status, _) = get_json(&router, "/stations/eligible?days=3&window_hours=24").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(weather.judged.load(Ordering::SeqCst), 1);
     let (status, body) = get_json(&router, "/stations/eligible?days=7&window_hours=6").await;
@@ -572,6 +575,98 @@ async fn eligible_stations_are_judged_once_per_query_and_validated() {
     get_json(&router, "/stations/eligible?days=7&window_hours=6").await;
     assert_eq!(weather.judged.load(Ordering::SeqCst), 2);
 
+    // After a collection run the default list and the cached one the
+    // reports cover are judged again, and the gauge follows the default.
+    state.refresh_eligibility().await;
+    assert_eq!(weather.judged.load(Ordering::SeqCst), 4);
+    assert!(
+        state
+            .metrics()
+            .encode()
+            .contains("\noracle_eligible_stations 1\n")
+    );
+    let (status, body) = get_json(&router, "/stations/eligible").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(weather.judged.load(Ordering::SeqCst), 4);
+
     runtime.requested.cancel();
     bounded(runtime.run_until_stop()).await.unwrap();
+}
+
+#[tokio::test]
+async fn fixed_observation_windows_are_kept_until_new_data() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, database) = runtime(directory.path()).await;
+    let weather = Arc::new(CountedEligibility::default());
+    let state = app_state(directory.path(), &runtime, database, weather.clone()).await;
+    let router = app(state.clone());
+    let fixed = "/stations/observations?station_ids=KDEN,KORD\
+                 &start=2030-01-01T00:00:00Z&end=2030-01-02T00:00:00Z";
+    let reordered = "/stations/observations?station_ids=KORD,KDEN\
+                     &start=2030-01-01T00:00:00Z&end=2030-01-02T00:00:00Z";
+
+    for path in [fixed, reordered, fixed] {
+        let (status, _) = get_json(&router, path).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+    }
+    assert_eq!(weather.observed.load(Ordering::SeqCst), 1);
+
+    // New data: the kept answer is served while one rebuild runs.
+    state.new_data();
+    let (status, _) = get_json(&router, fixed).await;
+    assert_eq!(status, StatusCode::OK);
+    bounded(async {
+        while weather.observed.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    get_json(&router, fixed).await;
+    assert_eq!(weather.observed.load(Ordering::SeqCst), 2);
+
+    // Windows relative to now are read every time.
+    for _ in 0..2 {
+        get_json(&router, "/stations/observations?station_ids=KDEN").await;
+    }
+    assert_eq!(weather.observed.load(Ordering::SeqCst), 4);
+
+    runtime.requested.cancel();
+    bounded(runtime.run_until_stop()).await.unwrap();
+}
+
+#[tokio::test]
+async fn weather_requests_wait_briefly_for_a_turn_and_overload_is_turned_away() {
+    let admission = Arc::new(Admission::new(1, 1));
+    let first = admission.turn(Duration::ZERO).await.unwrap();
+    // A second request waits for the first to finish.
+    let second = tokio::spawn({
+        let admission = admission.clone();
+        async move { admission.turn(Duration::from_secs(4)).await.is_some() }
+    });
+    bounded(async {
+        while admission.waiting.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    // The queue is full, so a third is turned away at once.
+    assert!(
+        bounded(admission.turn(Duration::from_secs(4)))
+            .await
+            .is_none()
+    );
+    drop(first);
+    assert!(bounded(second).await.unwrap());
+    assert_eq!(admission.waiting.load(Ordering::Acquire), 0);
+
+    // A request that waits too long gives up and leaves the queue.
+    let held = admission.turn(Duration::ZERO).await.unwrap();
+    assert!(
+        bounded(admission.turn(Duration::from_millis(20)))
+            .await
+            .is_none()
+    );
+    assert_eq!(admission.waiting.load(Ordering::Acquire), 0);
+    drop(held);
 }

@@ -48,6 +48,7 @@ mod shef;
 pub use derived::DerivedForecasts;
 pub use eligibility::{
     DEFAULT_DAYS, DEFAULT_WINDOW_HOURS, Eligibility, EligibleStation, MAX_DAYS, MAX_WINDOW_HOURS,
+    PRECOMPUTED_DAYS,
 };
 pub use folds::Folds;
 pub use forecast_display_quality::{ForecastQuality, ForecastRangeIssue};
@@ -237,9 +238,10 @@ const DERIVED_WINDOW: Duration = Duration::days(10);
 
 /// Queries running at once; more wait for a slot.
 const MAX_CONCURRENT_QUERIES: usize = 4;
-/// Limits of the database queries share: what four queries of 512 MB and
-/// two threads each could use before.
-const QUERIES_MEMORY_LIMIT: &str = "2GB";
+/// Limits of the database queries share. Together with a background copy
+/// or fold (below) and the process's own caches this keeps the oracle near
+/// 4 GB at its peak; queries that need more spill to disk.
+const QUERIES_MEMORY_LIMIT: &str = "1536MB";
 const QUERIES_THREADS: usize = 4;
 /// How long queries share one database before a new one replaces it.
 const DATABASE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
@@ -305,6 +307,8 @@ pub struct WeatherAccess {
     /// written, so cached metadata never goes stale; the database is
     /// reopened daily so the cache drops files deleted since.
     database: Arc<Mutex<Option<(Instant, Connection)>>>,
+    /// Reports eligibility is judged from, read ahead of requests.
+    timeline: Arc<Mutex<Option<Arc<eligibility::Timeline>>>>,
     derived: Option<DerivedForecasts>,
     folds: Option<Folds>,
 }
@@ -506,6 +510,14 @@ pub trait WeatherData: Sync + Send {
         _now: OffsetDateTime,
     ) -> Result<Vec<Eligibility>, Error> {
         Err(Error::QualityUnavailable)
+    }
+
+    /// Reads ahead what [`WeatherData::eligible_stations`] judges, so
+    /// histories of up to [`PRECOMPUTED_DAYS`] days are judged without
+    /// reading files until the next call. Returns how many reports it
+    /// holds. Implementations that read nothing ahead return 0.
+    async fn read_ahead_eligibility(&self, _now: OffsetDateTime) -> Result<usize, Error> {
+        Ok(0)
     }
 
     /// [`WeatherData::forecasts_data`] with each `date` a day of
@@ -1158,6 +1170,7 @@ impl WeatherAccess {
             file_access,
             slots: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES - 1)),
             database: Arc::default(),
+            timeline: Arc::default(),
             derived: None,
             folds: None,
         }
@@ -1695,6 +1708,10 @@ impl WeatherData for WeatherAccess {
         self.eligibility(days, window_hours, now).await
     }
 
+    async fn read_ahead_eligibility(&self, now: OffsetDateTime) -> Result<usize, Error> {
+        self.read_ahead_reports(now).await
+    }
+
     async fn prepare_files(&self, stopping: &CancellationToken) -> Result<usize, Error> {
         let Some(derived) = &self.derived else {
             return Ok(0);
@@ -2167,7 +2184,7 @@ pub struct Forecast {
     pub ice_amt: Option<f64>,
 }
 
-#[derive(Serialize, Deserialize, Debug, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, Debug, ToSchema)]
 pub struct Observation {
     pub station_id: String,
     pub start_time: String,

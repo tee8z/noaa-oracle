@@ -10,6 +10,12 @@
 //! problems affect temperatures, as in settlement. A second query, on the
 //! same connection, finds how far each station's newest forecast issue
 //! runs. The days are then judged with settlement's own sampling rule.
+//!
+//! Reading the reports is the slow part, seconds over every station, and
+//! judging them takes milliseconds. So the reports of the last
+//! [`PRECOMPUTED_DAYS`] days are read ahead of requests after each
+//! collection run and kept as a [`Timeline`], and any shorter history or
+//! window length is judged from it without reading the files again.
 
 use super::{
     DEDUP_OBSERVATIONS_SQL, Error, NORMALIZE_OBSERVATIONS_SQL, OBSERVATION_SOURCE_COLUMNS,
@@ -19,24 +25,37 @@ use super::{
 use crate::file_access::FileParams;
 use duckdb::arrow::array::RecordBatch;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, PoisonError},
+};
 use time::{Duration, OffsetDateTime, Time, UtcOffset, format_description::well_known::Rfc3339};
 use utoipa::ToSchema;
 
-/// Full UTC days judged when a query names none.
-pub const DEFAULT_DAYS: u32 = 30;
+/// Full UTC days judged when a query names none. Longer histories take in
+/// more collection outages and judge few stations differently.
+pub const DEFAULT_DAYS: u32 = 3;
+/// Days of reports read ahead of requests (see [`Timeline`]).
+pub const PRECOMPUTED_DAYS: u32 = 7;
 /// Most days one query may judge: the longest public time range.
 pub const MAX_DAYS: u32 = 31;
 /// Competition window length when a query names none.
 pub const DEFAULT_WINDOW_HOURS: u32 = 24;
 /// Longest window: one placed on a day must fit in it.
 pub const MAX_WINDOW_HOURS: u32 = 24;
-/// Share of the judged days, in percent, on which the reports must have
 /// Imperfect days allowed among those checked: one in ten, and always at least one, so a
 /// single collector outage does not empty the list.
 fn allowed_imperfect_days(days_checked: u32) -> u32 {
     (days_checked / 10).max(1)
 }
+/// A judged day on which fewer than half of the stations were clean was a
+/// gap in collection, not at the stations, and is not checked against
+/// them. Below this many stations one station's bad day cannot be told
+/// from an outage, so every day is checked.
+const OUTAGE_MIN_STATIONS: usize = 20;
+/// How long reports read ahead serve requests. Collection runs hourly and
+/// each run reads them again; past this the files are read per request.
+const TIMELINE_MAX_AGE: Duration = Duration::minutes(90);
 /// A station whose newest report is this old may have stopped reporting.
 const MAX_REPORT_AGE: Duration = Duration::hours(3);
 /// Forecast issues this recent are read. A station whose newest issue is
@@ -113,32 +132,135 @@ fn judged_days(days: u32, now: OffsetDateTime) -> Vec<OffsetDateTime> {
         .collect()
 }
 
-/// How many of `days` (UTC midnights) are clean: every window of
-/// `window_hours` that starts on the hour and ends within the day is
-/// sampled, both by all of `reports` and by those with a usable
-/// temperature. `reports` are one station's, in time order. Competitions
-/// can start at any hour, so a gap anywhere in the day counts against it.
+/// How many of `days` (UTC midnights) are clean (see [`clean_day`]).
+/// `reports` are one station's, in time order.
+#[cfg(test)]
 pub(super) fn clean_days(reports: &[Report], days: &[OffsetDateTime], window_hours: u32) -> u32 {
+    days.iter()
+        .filter(|day| clean_day(reports, **day, window_hours))
+        .count() as u32
+}
+
+/// Whether every window of `window_hours` that starts on the hour and ends
+/// within `day` (a UTC midnight) is sampled, both by all of `reports` and
+/// by those with a usable temperature. `reports` are one station's, in
+/// time order. Competitions can start at any hour, so a gap anywhere in
+/// the day counts against it.
+fn clean_day(reports: &[Report], day: OffsetDateTime, window_hours: u32) -> bool {
     let window = Duration::hours(i64::from(window_hours));
-    let clean = days.iter().filter(|day| {
-        let from = reports.partition_point(|report| report.time < **day);
-        let to = reports.partition_point(|report| report.time < **day + Duration::DAY);
-        let reports = &reports[from..to];
-        (0..=i64::from(MAX_WINDOW_HOURS.saturating_sub(window_hours))).all(|hour| {
-            let start = **day + Duration::hours(hour);
-            let end = start + window;
-            precipitation::times_sample_window(reports.iter().map(|report| report.time), start, end)
-                && precipitation::times_sample_window(
-                    reports
-                        .iter()
-                        .filter(|report| report.temperature)
-                        .map(|report| report.time),
-                    start,
-                    end,
-                )
+    let from = reports.partition_point(|report| report.time < day);
+    let to = reports.partition_point(|report| report.time < day + Duration::DAY);
+    let reports = &reports[from..to];
+    (0..=i64::from(MAX_WINDOW_HOURS.saturating_sub(window_hours))).all(|hour| {
+        let start = day + Duration::hours(hour);
+        let end = start + window;
+        precipitation::times_sample_window(reports.iter().map(|report| report.time), start, end)
+            && precipitation::times_sample_window(
+                reports
+                    .iter()
+                    .filter(|report| report.temperature)
+                    .map(|report| report.time),
+                start,
+                end,
+            )
+    })
+}
+
+/// Which of the judged days were collection outages: days most stations
+/// missed, by each station's clean days in `clean`.
+fn outage_days(clean: &[Vec<bool>], days: usize) -> Vec<bool> {
+    if clean.len() < OUTAGE_MIN_STATIONS {
+        return vec![false; days];
+    }
+    (0..days)
+        .map(|day| clean.iter().filter(|station| station[day]).count() * 2 < clean.len())
+        .collect()
+}
+
+/// The reports settlement reads and each station's forecast extent, from
+/// the full UTC days before the one they were read on until then.
+pub(super) struct Timeline {
+    read_at: OffsetDateTime,
+    days: u32,
+    /// Each station's reports, in time order.
+    reports: BTreeMap<String, Vec<Report>>,
+    forecasts: BTreeMap<String, Option<OffsetDateTime>>,
+}
+
+impl Timeline {
+    /// Whether it holds every report a judgment of `days` at `now` reads:
+    /// read the same UTC day, recently, over at least as many days.
+    fn covers(&self, days: u32, now: OffsetDateTime) -> bool {
+        days <= self.days
+            && now >= self.read_at
+            && now - self.read_at < TIMELINE_MAX_AGE
+            && now.to_offset(UtcOffset::UTC).date() == self.read_at.to_offset(UtcOffset::UTC).date()
+    }
+
+    /// Reports held, over every station.
+    pub(super) fn report_count(&self) -> usize {
+        self.reports.values().map(Vec::len).sum()
+    }
+}
+
+/// Judges every station that reported in the last `days` full UTC days
+/// before `now` for a competition of `window_hours` starting at `now`.
+/// Ordered by station id.
+fn judge(
+    timeline: &Timeline,
+    days: u32,
+    window_hours: u32,
+    now: OffsetDateTime,
+) -> Vec<Eligibility> {
+    let days = judged_days(days, now);
+    let Some(first) = days.first().copied() else {
+        return vec![];
+    };
+    let stations: Vec<(&String, &[Report], Vec<bool>)> = timeline
+        .reports
+        .iter()
+        .filter_map(|(station_id, reports)| {
+            let reports = &reports[reports.partition_point(|report| report.time < first)..];
+            if reports.is_empty() {
+                return None;
+            }
+            let clean = days
+                .iter()
+                .map(|day| clean_day(reports, *day, window_hours))
+                .collect();
+            Some((station_id, reports, clean))
         })
-    });
-    clean.count() as u32
+        .collect();
+    let clean: Vec<Vec<bool>> = stations.iter().map(|(_, _, clean)| clean.clone()).collect();
+    let outages = outage_days(&clean, days.len());
+    let days_checked = outages.iter().filter(|outage| !**outage).count() as u32;
+    stations
+        .into_iter()
+        .filter_map(|(station_id, reports, clean)| {
+            let last_report = reports.last()?.time;
+            let clean_days = clean
+                .iter()
+                .zip(&outages)
+                .filter(|(clean, outage)| **clean && !**outage)
+                .count() as u32;
+            let forecast_through = timeline.forecasts.get(station_id).copied().flatten();
+            Some(Eligibility {
+                eligible: eligible(
+                    clean_days,
+                    days_checked,
+                    last_report,
+                    forecast_through,
+                    window_hours,
+                    now,
+                ),
+                station_id: station_id.clone(),
+                clean_days,
+                days_checked,
+                last_report,
+                forecast_through,
+            })
+        })
+        .collect()
 }
 
 /// Whether a station with these figures can host a competition of
@@ -191,7 +313,8 @@ fn times_by_station(
 impl WeatherAccess {
     /// Every station that reported in the last `days` full UTC days, and
     /// whether a competition of `window_hours` starting at `now` can be
-    /// drawn from it. Ordered by station id.
+    /// drawn from it. Ordered by station id. Judged from the reports read
+    /// ahead when they cover the days, from the files otherwise.
     pub(super) async fn eligibility(
         &self,
         days: u32,
@@ -200,9 +323,41 @@ impl WeatherAccess {
     ) -> Result<Vec<Eligibility>, Error> {
         // Whole seconds, as the reports are.
         let now = now - Duration::nanoseconds(now.nanosecond().into());
-        let days = judged_days(days, now);
-        let Some(first) = days.first().copied() else {
-            return Ok(vec![]);
+        let read_ahead = self
+            .timeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .filter(|timeline| timeline.covers(days, now));
+        let timeline = match read_ahead {
+            Some(timeline) => timeline,
+            None => Arc::new(self.read_timeline(days, now).await?),
+        };
+        Ok(tokio::task::spawn_blocking(move || judge(&timeline, days, window_hours, now)).await?)
+    }
+
+    /// Reads the reports of the last [`PRECOMPUTED_DAYS`] days for later
+    /// judgments, and returns how many it holds.
+    pub(super) async fn read_ahead_reports(&self, now: OffsetDateTime) -> Result<usize, Error> {
+        let now = now - Duration::nanoseconds(now.nanosecond().into());
+        let timeline = self.read_timeline(PRECOMPUTED_DAYS, now).await?;
+        let reports = timeline.report_count();
+        *self.timeline.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(timeline));
+        Ok(reports)
+    }
+
+    /// Reads the reports of the `days` full UTC days before `now` and the
+    /// forecast extents, as of `now` in whole seconds.
+    async fn read_timeline(&self, days: u32, now: OffsetDateTime) -> Result<Timeline, Error> {
+        let empty = || Timeline {
+            read_at: now,
+            days,
+            reports: BTreeMap::new(),
+            forecasts: BTreeMap::new(),
+        };
+        let judged = judged_days(days, now);
+        let Some(first) = judged.first().copied() else {
+            return Ok(empty());
         };
         let names = self
             .file_access
@@ -215,7 +370,7 @@ impl WeatherAccess {
             .await?;
         let files = self.file_access.build_file_paths(names);
         if files.is_empty() {
-            return Ok(vec![]);
+            return Ok(empty());
         }
         // Screening compares each report with the one before it, so read
         // from a little earlier than the first judged day.
@@ -271,49 +426,39 @@ impl WeatherAccess {
             )
         });
 
-        self.query_with_connection(reports_sql, move |connection, batches| {
-            let reports = times_by_station(batches, "report_time")?;
-            let mut forecasts = BTreeMap::new();
-            if let Some(sql) = forecasts_sql {
-                let mut statement = connection.prepare(&sql)?;
-                let batches: Vec<RecordBatch> = statement.query_arrow([])?.collect();
-                for (station_id, times) in times_by_station(&batches, "forecast_through")? {
-                    forecasts.insert(station_id, times.into_iter().map(|(time, _)| time).max());
-                }
-            }
-            let days_checked = days.len() as u32;
-            Ok(reports
-                .into_iter()
-                .filter_map(|(station_id, rows)| {
-                    let reports: Vec<Report> = rows
+        let mut timelines = self
+            .query_with_connection(reports_sql, move |connection, batches| {
+                let reports: BTreeMap<String, Vec<Report>> =
+                    times_by_station(batches, "report_time")?
                         .into_iter()
-                        .map(|(time, flag)| Report {
-                            time,
-                            temperature: flag == Some(1),
+                        .map(|(station_id, rows)| {
+                            let reports: Vec<Report> = rows
+                                .into_iter()
+                                .map(|(time, flag)| Report {
+                                    time,
+                                    temperature: flag == Some(1),
+                                })
+                                .collect();
+                            (station_id, reports)
                         })
                         .collect();
-                    let last_report = reports.last()?.time;
-                    let clean_days = clean_days(&reports, &days, window_hours);
-                    let forecast_through = forecasts.get(&station_id).copied().flatten();
-                    Some(Eligibility {
-                        eligible: eligible(
-                            clean_days,
-                            days_checked,
-                            last_report,
-                            forecast_through,
-                            window_hours,
-                            now,
-                        ),
-                        station_id,
-                        clean_days,
-                        days_checked,
-                        last_report,
-                        forecast_through,
-                    })
-                })
-                .collect())
-        })
-        .await
+                let mut forecasts = BTreeMap::new();
+                if let Some(sql) = forecasts_sql {
+                    let mut statement = connection.prepare(&sql)?;
+                    let batches: Vec<RecordBatch> = statement.query_arrow([])?.collect();
+                    for (station_id, times) in times_by_station(&batches, "forecast_through")? {
+                        forecasts.insert(station_id, times.into_iter().map(|(time, _)| time).max());
+                    }
+                }
+                Ok(vec![Timeline {
+                    read_at: now,
+                    days,
+                    reports,
+                    forecasts,
+                }])
+            })
+            .await?;
+        Ok(timelines.pop().unwrap_or_else(empty))
     }
 }
 
@@ -479,6 +624,109 @@ mod tests {
         let one_day = access.eligibility(1, 24, NOW).await.unwrap();
         assert!(one_day.iter().all(|station| station.days_checked == 1));
         assert_eq!(one_day[0].clean_days, 1);
+
+        // Reports read ahead judge every shorter history and window as the
+        // files do.
+        let reports = access.read_ahead_reports(NOW).await.unwrap();
+        assert!(reports > 0);
+        let read_later = NOW + Duration::minutes(20);
+        for (days, window_hours) in [(5, 24), (3, 6), (1, 24), (7, 12)] {
+            let files = WeatherAccess::new(Arc::new(crate::file_access::FileAccess::new(
+                directory.path().to_string_lossy().into_owned(),
+            )));
+            assert_eq!(
+                access
+                    .eligibility(days, window_hours, read_later)
+                    .await
+                    .unwrap(),
+                files
+                    .eligibility(days, window_hours, read_later)
+                    .await
+                    .unwrap(),
+                "{days} days, {window_hours} hours"
+            );
+        }
+    }
+
+    #[test]
+    fn reports_read_ahead_serve_the_same_utc_day_for_a_while() {
+        let timeline = Timeline {
+            read_at: NOW,
+            days: PRECOMPUTED_DAYS,
+            reports: BTreeMap::new(),
+            forecasts: BTreeMap::new(),
+        };
+        assert!(timeline.covers(3, NOW));
+        assert!(timeline.covers(PRECOMPUTED_DAYS, NOW + Duration::minutes(30)));
+        assert!(!timeline.covers(PRECOMPUTED_DAYS + 1, NOW));
+        assert!(!timeline.covers(3, NOW - Duration::SECOND));
+        assert!(!timeline.covers(3, NOW + TIMELINE_MAX_AGE));
+        let late = Timeline {
+            read_at: datetime!(2026-01-20 23:30 UTC),
+            ..timeline
+        };
+        assert!(!late.covers(3, datetime!(2026-01-21 00:10 UTC)));
+    }
+
+    /// Hourly reports over five days from `stations` stations, each
+    /// missing the hours `missed` gives it on a day (0 to 4).
+    fn network(stations: usize, missed: impl Fn(usize, i64) -> Vec<i64>) -> Timeline {
+        let start = datetime!(2026-01-15 00:53 UTC);
+        let reports = (0..stations)
+            .map(|station| {
+                let reports = (0..5 * 24)
+                    .filter(|hour| !missed(station, hour / 24).contains(&(hour % 24)))
+                    .map(|hour| Report {
+                        time: start + Duration::hours(hour),
+                        temperature: true,
+                    })
+                    .chain([Report {
+                        time: NOW - Duration::minutes(10),
+                        temperature: true,
+                    }])
+                    .collect();
+                (format!("K{station:03}"), reports)
+            })
+            .collect::<BTreeMap<_, Vec<_>>>();
+        let forecasts = reports
+            .keys()
+            .map(|station| (station.clone(), Some(NOW + Duration::days(2))))
+            .collect();
+        Timeline {
+            read_at: NOW,
+            days: 5,
+            reports,
+            forecasts,
+        }
+    }
+
+    #[test]
+    fn days_the_whole_network_missed_are_not_held_against_stations() {
+        // Every station misses 10:53 and 11:53 on the second day; station
+        // 1 also misses them on the third, station 2 on the third and
+        // fourth.
+        let missed = |station: usize, day: i64| match (station, day) {
+            (_, 1) | (1 | 2, 2) | (2, 3) => vec![10, 11],
+            _ => vec![],
+        };
+        let judged = judge(&network(OUTAGE_MIN_STATIONS, missed), 5, 24, NOW);
+        assert_eq!(judged.len(), OUTAGE_MIN_STATIONS);
+        assert!(judged.iter().all(|station| station.days_checked == 4));
+        let summary: Vec<_> = judged[..3]
+            .iter()
+            .map(|station| (station.clean_days, station.eligible))
+            .collect();
+        assert_eq!(summary, [(4, true), (3, true), (2, false)]);
+        assert!(judged[3..].iter().all(|station| station.eligible));
+
+        // Too few stations to tell an outage: the day counts against all.
+        let judged = judge(&network(OUTAGE_MIN_STATIONS - 1, missed), 5, 24, NOW);
+        assert!(judged.iter().all(|station| station.days_checked == 5));
+        let summary: Vec<_> = judged[..3]
+            .iter()
+            .map(|station| (station.clean_days, station.eligible))
+            .collect();
+        assert_eq!(summary, [(4, true), (3, false), (2, false)]);
     }
 
     /// Corrected publications replace old conflicts, but conflicts or rejected

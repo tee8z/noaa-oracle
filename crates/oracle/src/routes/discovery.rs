@@ -13,7 +13,7 @@ use utoipa::{IntoParams, ToSchema};
 use crate::{
     AppError, AppState,
     routes::{ForecastRequest, TemperatureUnit},
-    weather_data::{EligibleStation, Forecast, WeatherData},
+    weather_data::{DEFAULT_DAYS, EligibleStation, Forecast, WeatherData},
 };
 
 const MAX_STATIONS: usize = 5000;
@@ -31,7 +31,7 @@ pub struct DiscoveryRequest {
 
 impl DiscoveryRequest {
     fn checked(&self, now: OffsetDateTime) -> Result<(u32, u32), AppError> {
-        let days = self.days.unwrap_or(3);
+        let days = self.days.unwrap_or(DEFAULT_DAYS);
         let duration = self.end - self.start;
         if !(1..=31).contains(&days)
             || self.start < now

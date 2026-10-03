@@ -3,6 +3,8 @@ use axum::{
     extract::{Query, State, rejection::QueryRejection},
 };
 use core::fmt;
+use futures::stream::{self, StreamExt};
+use log::warn;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
@@ -10,6 +12,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::{
     AppError, AppState,
+    cache::Cached,
     file_access::FileParams,
     weather_data::{
         DEFAULT_DAYS, DEFAULT_WINDOW_HOURS, DailyObservation, EligibleStation, Forecast, MAX_DAYS,
@@ -176,7 +179,7 @@ impl From<&ObservationRequest> for FileParams {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum TemperatureUnit {
     Celsius,
@@ -208,9 +211,106 @@ pub async fn observations(
     State(state): State<Arc<AppState>>,
     Query(req): Query<ObservationRequest>,
 ) -> Result<Json<Vec<Observation>>, AppError> {
+    // Windows relative to now differ on every request; only fixed ones are
+    // worth keeping.
+    let fixed = req.start.is_some() && req.end.is_some();
     let (req, stations) = bounded_observation_request(req)?;
-    let observations = state.weather_db.observation_data(&req, stations).await?;
-    Ok(Json(observations))
+    if !fixed {
+        return Ok(Json(
+            state.weather_db.observation_data(&req, stations).await?,
+        ));
+    }
+    let key = ObservationKey::new(&req, stations);
+    let observations = match state.cached_observations(&key) {
+        Cached::Fresh(observations) => observations,
+        Cached::Stale {
+            value: observations,
+            refresh,
+        } => {
+            if refresh {
+                let task_state = state.clone();
+                state.spawn(async move {
+                    let _ = build_observations(&task_state, key).await;
+                });
+            }
+            observations
+        }
+        Cached::Missing => build_observations(&state, key).await?,
+    };
+    Ok(Json(observations.as_ref().clone()))
+}
+
+/// The stations, window and unit of a `/stations/observations` request
+/// with a fixed window. The coordinator asks for the same ones over and
+/// over while a competition runs, and the answer only changes with new
+/// data, so it is kept (see [`AppState::cached_observations`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ObservationKey {
+    /// Sorted, without repeats.
+    stations: Vec<String>,
+    start: OffsetDateTime,
+    end: OffsetDateTime,
+    unit: TemperatureUnit,
+}
+
+impl ObservationKey {
+    /// The key of a bounded request for `stations`.
+    fn new(req: &ObservationRequest, mut stations: Vec<String>) -> Self {
+        stations.sort_unstable();
+        stations.dedup();
+        Self {
+            stations,
+            start: req.start.unwrap_or(OffsetDateTime::UNIX_EPOCH),
+            end: req.end.unwrap_or(OffsetDateTime::UNIX_EPOCH),
+            unit: req.temperature_unit,
+        }
+    }
+
+    fn request(&self) -> ObservationRequest {
+        ObservationRequest {
+            start: Some(self.start),
+            end: Some(self.end),
+            station_ids: self.stations.join(","),
+            temperature_unit: self.unit,
+        }
+    }
+}
+
+/// Reads the aggregates for `key` and keeps them.
+async fn build_observations(
+    state: &Arc<AppState>,
+    key: ObservationKey,
+) -> Result<Arc<Vec<Observation>>, crate::weather_data::Error> {
+    let generation = state.data_generation();
+    match state
+        .weather_db
+        .observation_data(&key.request(), key.stations.clone())
+        .await
+    {
+        Ok(observations) => {
+            let observations = Arc::new(observations);
+            state.cache_observations(key, observations.clone(), generation);
+            Ok(observations)
+        }
+        Err(error) => {
+            warn!("cannot read observations for {:?}: {error}", key.stations);
+            state.observations_refresh_failed(&key);
+            Err(error)
+        }
+    }
+}
+
+/// Observation aggregates rebuilt at once by the warmer.
+const WARM_CONCURRENCY: usize = 2;
+
+/// Rebuilds the observation aggregates asked for lately, so the next
+/// request after new data finds them current.
+pub async fn warm_observations(state: &Arc<AppState>) {
+    stream::iter(state.recent_observations())
+        .for_each_concurrent(WARM_CONCURRENCY, |key| async move {
+            let _ = build_observations(state, key).await;
+        })
+        .await;
 }
 
 fn bounded_observation_request(
@@ -301,7 +401,7 @@ pub async fn get_stations(
 #[derive(Debug, Deserialize, IntoParams)]
 #[serde(deny_unknown_fields)]
 pub struct EligibleRequest {
-    /// Full UTC days to judge, ending with yesterday: 1 to 31, 30 by default.
+    /// Full UTC days to judge, ending with yesterday: 1 to 31, 3 by default.
     pub days: Option<u32>,
     /// Length of the competition window in hours: 1 to 24, 24 by default.
     pub window_hours: Option<u32>,
@@ -329,8 +429,10 @@ impl EligibleRequest {
 /// Stations whose reports would have sampled every window of
 /// `window_hours` on all but one in ten of the last `days` full UTC days (and always all but one), by the
 /// rule settlement applies, that reported within the last 3 hours, and
-/// whose newest forecast runs at least `window_hours` past now. Lists are
-/// rebuilt at most every 10 minutes.
+/// whose newest forecast runs at least `window_hours` past now. Days on
+/// which most stations missed a window were collection outages and are not
+/// checked. Lists are judged again after each collection run and at least
+/// every 10 minutes; requests get the list judged last.
 #[utoipa::path(
     get,
     path = "/stations/eligible",
@@ -382,7 +484,7 @@ mod tests {
     #[test]
     fn eligibility_queries_have_bounded_days_and_windows() {
         let request = |days, window_hours| EligibleRequest { days, window_hours };
-        assert_eq!(request(None, None).checked().unwrap(), (30, 24));
+        assert_eq!(request(None, None).checked().unwrap(), (3, 24));
         assert_eq!(request(Some(1), Some(1)).checked().unwrap(), (1, 1));
         assert_eq!(request(Some(31), Some(24)).checked().unwrap(), (31, 24));
         for (days, window_hours) in [(0, 24), (32, 24), (30, 0), (30, 25)] {
@@ -391,6 +493,27 @@ mod tests {
                 "{days} days, {window_hours} hours"
             );
         }
+    }
+
+    #[test]
+    fn observation_keys_ignore_station_order_and_repeats() {
+        let request = ObservationRequest {
+            start: Some(datetime!(2030-01-01 00:00 UTC)),
+            end: Some(datetime!(2030-01-02 00:00 UTC)),
+            station_ids: "KSAW,KORD,KSAW".into(),
+            temperature_unit: TemperatureUnit::Fahrenheit,
+        };
+        let key = ObservationKey::new(&request, request.station_ids());
+        assert_eq!(
+            key,
+            ObservationKey::new(&request, vec!["KORD".into(), "KSAW".into()])
+        );
+        assert_eq!(key.request().station_ids, "KORD,KSAW");
+        let celsius = ObservationRequest {
+            temperature_unit: TemperatureUnit::Celsius,
+            ..request.clone()
+        };
+        assert_ne!(key, ObservationKey::new(&celsius, celsius.station_ids()));
     }
 
     #[test]

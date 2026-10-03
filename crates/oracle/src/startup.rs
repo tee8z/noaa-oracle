@@ -14,6 +14,7 @@ use crate::{
     file_access::{FileAccess, FileData, S3FileAccess},
     metrics::{self, Metrics},
     oracle::{Oracle, system_clock},
+    routes::stations::ObservationKey,
     routes::ui::WeatherKey,
     routes::{
         add_event_entries, create_event, current_lines, daily_observations, dashboard_handler,
@@ -24,7 +25,10 @@ use crate::{
     },
     sources::{NoaaWeather, Sources},
     templates::{assets::serve_asset, fragments::WeatherDisplay},
-    weather_data::{self, EligibleStation, Station, WeatherAccess, WeatherData},
+    weather_data::{
+        self, DEFAULT_DAYS, DEFAULT_WINDOW_HOURS, EligibleStation, Observation, PRECOMPUTED_DAYS,
+        Station, WeatherAccess, WeatherData,
+    },
 };
 use anyhow::{Context, Result, anyhow};
 use axum::{
@@ -34,7 +38,7 @@ use axum::{
     handler::Handler,
     http::{
         Method, StatusCode,
-        header::{ACCEPT, CONTENT_TYPE},
+        header::{ACCEPT, CONTENT_TYPE, RETRY_AFTER},
     },
     middleware::{self, Next},
     response::IntoResponse,
@@ -46,7 +50,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -92,6 +96,23 @@ const WARM_RECENT_WEATHER: usize = 16;
 const ELIGIBLE_CACHE_REFRESH: Duration = Duration::from_secs(10 * 60);
 /// Eligible station lists kept, one per pair of query values.
 const MAX_CACHED_ELIGIBLE: usize = 16;
+/// Observation aggregates kept, one per station selection and window: the
+/// coordinator asks for each running competition's every few seconds.
+const MAX_CACHED_OBSERVATIONS: usize = 256;
+/// Recently asked for observation aggregates the warmer rebuilds after new
+/// data, at most.
+const WARM_RECENT_OBSERVATIONS: usize = 64;
+/// Weather queries handled at once. Each holds a query slot or waits for
+/// one in the weather layer, so more would only queue there.
+const WEATHER_REQUESTS: usize = 8;
+/// Weather requests that wait for a turn, beyond those handled. A burst
+/// such as a few competitions picking stations at once is served;
+/// past this the oracle is overloaded and turns requests away at once.
+const QUEUED_WEATHER_REQUESTS: usize = 128;
+/// Longest a weather request waits for a turn before it is turned away.
+const WEATHER_REQUEST_WAIT: Duration = Duration::from_secs(10);
+/// Seconds a turned away client is asked to wait before it retries.
+const WEATHER_RETRY_AFTER_SECONDS: u64 = 5;
 /// How often recent forecast files are checked for query-ready copies and
 /// folds, besides after each upload: catches files another oracle process
 /// received.
@@ -142,6 +163,7 @@ struct StationList {
 /// Capabilities handlers receive. Handlers never see database connections.
 /// Eligible station lists, by days judged and window hours.
 type EligibleCache = Mutex<Cache<(u32, u32), Arc<Vec<EligibleStation>>>>;
+type ObservationCache = Mutex<Cache<ObservationKey, Arc<Vec<Observation>>>>;
 
 pub struct AppState {
     pub remote_url: String,
@@ -159,6 +181,11 @@ pub struct AppState {
     /// Held while an eligible station list is built, so readers who miss
     /// the cache together wait for one build.
     eligible_build: tokio::sync::Mutex<()>,
+    /// Counts reads of the reports eligibility is judged from; lists judged
+    /// before the last read are stale.
+    eligibility_generation: AtomicU64,
+    /// Observation aggregates by station selection and window.
+    observation_cache: ObservationCache,
     /// Counts arrivals of new data; cached values built from an older
     /// generation are stale.
     generation: AtomicU64,
@@ -243,6 +270,11 @@ impl AppState {
             weather_cache: Mutex::new(Cache::new(MAX_CACHED_WEATHER, WEATHER_CACHE_REFRESH)),
             eligible_cache: Mutex::new(Cache::new(MAX_CACHED_ELIGIBLE, ELIGIBLE_CACHE_REFRESH)),
             eligible_build: tokio::sync::Mutex::new(()),
+            eligibility_generation: AtomicU64::new(0),
+            observation_cache: Mutex::new(Cache::new(
+                MAX_CACHED_OBSERVATIONS,
+                WEATHER_CACHE_REFRESH,
+            )),
             generation: AtomicU64::new(0),
             data_prepared: tokio::sync::Notify::new(),
             stations: Arc::default(),
@@ -324,6 +356,45 @@ impl AppState {
         lock(&self.weather_cache).refresh_failed(key);
     }
 
+    pub(crate) fn cached_observations(
+        &self,
+        key: &ObservationKey,
+    ) -> Cached<Arc<Vec<Observation>>> {
+        let generation = self.data_generation();
+        lock(&self.observation_cache).get(key, generation)
+    }
+
+    pub(crate) fn cache_observations(
+        &self,
+        key: ObservationKey,
+        observations: Arc<Vec<Observation>>,
+        generation: u64,
+    ) {
+        lock(&self.observation_cache).insert(key, observations, generation);
+    }
+
+    pub(crate) fn observations_refresh_failed(&self, key: &ObservationKey) {
+        lock(&self.observation_cache).refresh_failed(key);
+    }
+
+    /// Observation aggregates readers asked for lately, newest first.
+    pub(crate) fn recent_observations(&self) -> Vec<ObservationKey> {
+        let mut keys =
+            lock(&self.observation_cache).recent_keys(MAX_CACHED_OBSERVATIONS as u64 * 4);
+        keys.truncate(WARM_RECENT_OBSERVATIONS);
+        keys
+    }
+
+    /// Entries in the in-memory caches, by cache, for the metrics.
+    pub(crate) fn cache_entries(&self) -> [(&'static str, usize); 4] {
+        [
+            ("forecast_details", lock(&self.forecast_cache).len()),
+            ("weather", lock(&self.weather_cache).len()),
+            ("eligible_stations", lock(&self.eligible_cache).len()),
+            ("observations", lock(&self.observation_cache).len()),
+        ]
+    }
+
     /// Current weather readers asked for lately, newest first.
     pub(crate) fn recent_weather(&self) -> Vec<WeatherKey> {
         let mut keys = lock(&self.weather_cache).recent_keys(MAX_CACHED_WEATHER as u64 * 4);
@@ -395,26 +466,53 @@ impl AppState {
 
     /// Stations a competition of `window_hours` starting now can be drawn
     /// from, judged over the last `days` full UTC days (see
-    /// [`WeatherData::eligible_stations`]). A list is built at most once per
-    /// [`ELIGIBLE_CACHE_REFRESH`] for each pair of values.
+    /// [`WeatherData::eligible_stations`]). A list is judged again after
+    /// each read of the reports ([`AppState::refresh_eligibility`]) and at
+    /// least every [`ELIGIBLE_CACHE_REFRESH`]; until then readers get the
+    /// list judged before, so only the first reader of a pair of values
+    /// waits.
     pub async fn eligible_stations(
-        &self,
+        self: &Arc<Self>,
         days: u32,
         window_hours: u32,
     ) -> Result<Arc<Vec<EligibleStation>>, weather_data::Error> {
-        // Age alone makes a list stale, so every list has generation 0.
         let key = (days, window_hours);
-        if let Cached::Fresh(list) = lock(&self.eligible_cache).get(&key, 0) {
-            return Ok(list);
+        let generation = self.eligibility_generation.load(Ordering::Acquire);
+        let cached = lock(&self.eligible_cache).get(&key, generation);
+        match cached {
+            Cached::Fresh(list) => return Ok(list),
+            Cached::Stale { value, refresh } => {
+                if refresh {
+                    let state = self.clone();
+                    self.spawn(async move {
+                        let _building = state.eligible_build.lock().await;
+                        if let Err(error) = state.rebuild_eligible(key).await {
+                            warn!("cannot judge eligible stations again: {error}");
+                        }
+                    });
+                }
+                return Ok(value);
+            }
+            Cached::Missing => {}
         }
         let _building = self.eligible_build.lock().await;
-        if let Cached::Fresh(list) = lock(&self.eligible_cache).get(&key, 0) {
+        if let Cached::Fresh(list) = lock(&self.eligible_cache).get(&key, generation) {
             return Ok(list);
         }
-        match self.build_eligible(days, window_hours).await {
+        self.rebuild_eligible(key).await
+    }
+
+    /// Judges the list for `(days, window_hours)` and caches it. Callers
+    /// hold `eligible_build`.
+    async fn rebuild_eligible(
+        &self,
+        key: (u32, u32),
+    ) -> Result<Arc<Vec<EligibleStation>>, weather_data::Error> {
+        let generation = self.eligibility_generation.load(Ordering::Acquire);
+        match self.build_eligible(key.0, key.1).await {
             Ok(list) => {
                 let list = Arc::new(list);
-                lock(&self.eligible_cache).insert(key, list.clone(), 0);
+                lock(&self.eligible_cache).insert(key, list.clone(), generation);
                 Ok(list)
             }
             Err(error) => {
@@ -422,6 +520,51 @@ impl AppState {
                 Err(error)
             }
         }
+    }
+
+    /// Reads the reports eligibility is judged from, then judges the
+    /// default list and every cached one they cover again, so requests
+    /// after a collection run find their lists ready. The default list's
+    /// size is the `oracle_eligible_stations` gauge.
+    pub async fn refresh_eligibility(self: &Arc<Self>) {
+        let started = std::time::Instant::now();
+        let reports = match self
+            .weather_db
+            .read_ahead_eligibility(time::OffsetDateTime::now_utc())
+            .await
+        {
+            Ok(reports) => reports,
+            Err(error) => {
+                warn!("cannot read the reports eligibility is judged from: {error}");
+                return;
+            }
+        };
+        self.metrics.set_eligibility_reports(reports);
+        self.eligibility_generation.fetch_add(1, Ordering::AcqRel);
+        let default = (DEFAULT_DAYS, DEFAULT_WINDOW_HOURS);
+        let mut keys = vec![default];
+        let cached = lock(&self.eligible_cache).recent_keys(u64::MAX);
+        for key in cached {
+            if key.0 <= PRECOMPUTED_DAYS && !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        let _building = self.eligible_build.lock().await;
+        for key in &keys {
+            match self.rebuild_eligible(*key).await {
+                Ok(list) if *key == default => self.metrics.set_eligible_stations(list.len()),
+                Ok(_) => {}
+                Err(error) => warn!(
+                    "cannot judge eligible stations over {} days for {}-hour windows: {error}",
+                    key.0, key.1
+                ),
+            }
+        }
+        info!(
+            "read {reports} reports and judged {} eligible station lists in {:.1}s",
+            keys.len(),
+            started.elapsed().as_secs_f64()
+        );
     }
 
     async fn build_eligible(
@@ -452,7 +595,6 @@ impl AppState {
             judged.len(),
             started.elapsed()
         );
-        self.metrics.set_eligible_stations(eligible.len());
         Ok(eligible)
     }
 
@@ -689,7 +831,8 @@ pub fn app(app_state: Arc<AppState>) -> Router {
 
     // Admission bounds archive enumeration and waiting query work before a
     // handler touches caches or files. The ETL has a separate reserved slot.
-    let public_queries = Arc::new(tokio::sync::Semaphore::new(8));
+    let public_queries = Arc::new(Admission::new(WEATHER_REQUESTS, QUEUED_WEATHER_REQUESTS));
+    let admission_state = app_state.clone();
     let weather_routes = Router::new()
         .merge(ui)
         .route("/stations", get(get_stations))
@@ -713,7 +856,12 @@ pub fn app(app_state: Arc<AppState>) -> Router {
         )
         .route("/stations/daily-observations", get(daily_observations))
         .layer(middleware::from_fn(move |request, next| {
-            admit_weather_request(public_queries.clone(), request, next)
+            admit_weather_request(
+                public_queries.clone(),
+                admission_state.clone(),
+                request,
+                next,
+            )
         }));
 
     Router::new()
@@ -755,14 +903,65 @@ pub fn app(app_state: Arc<AppState>) -> Router {
         ))
 }
 
+/// Turns for weather requests: [`WEATHER_REQUESTS`] at once, and up to
+/// [`QUEUED_WEATHER_REQUESTS`] more waiting at most [`WEATHER_REQUEST_WAIT`].
+struct Admission {
+    turns: Arc<Semaphore>,
+    waiting: AtomicUsize,
+    max_waiting: usize,
+}
+
+/// One waiting request, counted until it gets a turn or gives up.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl Admission {
+    fn new(turns: usize, max_waiting: usize) -> Self {
+        Self {
+            turns: Arc::new(Semaphore::new(turns)),
+            waiting: AtomicUsize::new(0),
+            max_waiting,
+        }
+    }
+
+    /// A turn, now or after a wait, or `None` when too many requests wait
+    /// already or none came within `wait`.
+    async fn turn(&self, wait: Duration) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if let Ok(turn) = self.turns.clone().try_acquire_owned() {
+            return Some(turn);
+        }
+        if self.waiting.fetch_add(1, Ordering::AcqRel) >= self.max_waiting {
+            self.waiting.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        let _waiting = Waiting(&self.waiting);
+        tokio::time::timeout(wait, self.turns.clone().acquire_owned())
+            .await
+            .ok()?
+            .ok()
+    }
+}
+
 async fn admit_weather_request(
-    slots: Arc<tokio::sync::Semaphore>,
+    admission: Arc<Admission>,
+    state: Arc<AppState>,
     request: Request<Body>,
     next: Next,
 ) -> axum::response::Response {
-    let Ok(_permit) = slots.try_acquire_owned() else {
+    let Some(_turn) = admission.turn(WEATHER_REQUEST_WAIT).await else {
+        state.metrics().weather_request_turned_away();
+        warn!(
+            "turned away a weather request: {} waiting",
+            admission.waiting.load(Ordering::Acquire)
+        );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
+            [(RETRY_AFTER, WEATHER_RETRY_AFTER_SECONDS.to_string())],
             "weather queries are busy; try again shortly",
         )
             .into_response();
@@ -1045,6 +1244,8 @@ fn spawn_file_preparation(state: &Arc<AppState>) {
                     );
                     // Possibly files another oracle process received.
                     state.new_data();
+                    // Copies and folds run in databases of their own.
+                    release_freed_memory();
                 }
                 Err(error) => warn!("cannot prepare forecast files for queries: {error}"),
             }
@@ -1078,7 +1279,7 @@ fn spawn_cache_warmer(state: &Arc<AppState>) {
             () = state.first_preparation_ended() => {}
         }
         let mut warmed = state.data_generation();
-        warm_caches(&state).await;
+        warm_everything(&state).await;
         let mut interval = tokio::time::interval(FORECAST_CACHE_REFRESH);
         interval.tick().await; // the first tick completes immediately
         loop {
@@ -1091,11 +1292,49 @@ fn spawn_cache_warmer(state: &Arc<AppState>) {
                         continue;
                     }
                 }
+                // Eligibility judges full UTC days, so a new day needs its
+                // reports read again.
+                () = tokio::time::sleep(until_next_utc_day()) => {}
             }
             warmed = state.data_generation();
-            warm_caches(&state).await;
+            warm_everything(&state).await;
         }
     });
+}
+
+/// Eligibility first: discovery waits on it, and it reads the files the
+/// other caches then read from the page cache. Afterwards the glibc heap
+/// returns what the queries freed.
+async fn warm_everything(state: &Arc<AppState>) {
+    state.refresh_eligibility().await;
+    warm_caches(state).await;
+    crate::routes::stations::warm_observations(state).await;
+    release_freed_memory();
+}
+
+/// Time until a minute past the next UTC midnight, when the day before has
+/// its last reports.
+fn until_next_utc_day() -> Duration {
+    let now = time::OffsetDateTime::now_utc();
+    let next = (now.date() + time::Duration::DAY).midnight().assume_utc() + time::Duration::MINUTE;
+    Duration::try_from(next - now).unwrap_or(Duration::from_secs(60))
+}
+
+/// Returns freed heap memory to the system. glibc keeps what large queries
+/// and caches freed in its arenas, so without this the process stays at its
+/// peak size.
+fn release_freed_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> std::ffi::c_int;
+        }
+        // SAFETY: malloc_trim only releases free memory and may be called
+        // from any thread at any time.
+        unsafe {
+            malloc_trim(0);
+        }
+    }
 }
 
 /// On shutdown, hands processing over to another oracle process at once. The
