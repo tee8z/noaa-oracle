@@ -15,8 +15,14 @@
 //! arrives. `oracle_oldest_attestable_event_age_seconds` gives the age of
 //! the oldest of the rest, so an alert on it points at the oracle itself.
 //!
-//! `oracle_eligible_stations` counts the stations in the list of eligible
-//! stations built last, for whichever query values asked for it.
+//! `oracle_eligible_stations` counts the stations eligible over the default
+//! history and window length (3 days, 24 hours), judged after each
+//! collection run whatever requests ask for. `oracle_eligibility_reports`
+//! counts the reports read ahead for those judgments.
+//!
+//! `process_resident_memory_bytes` and `oracle_cache_entries` are read
+//! when scraped; `oracle_weather_requests_turned_away_total` counts weather
+//! requests answered 503 because too many were waiting.
 
 use std::{
     path::Path,
@@ -68,6 +74,10 @@ pub struct Metrics {
     latest_forecast: IntGauge,
     latest_observation: IntGauge,
     eligible_stations: IntGauge,
+    eligibility_reports: IntGauge,
+    turned_away: IntCounter,
+    resident_memory: IntGauge,
+    cache_entries: IntGaugeVec,
     /// When the scrape-time gauges were last read.
     refreshed_at: tokio::sync::Mutex<Option<Instant>>,
 }
@@ -165,7 +175,28 @@ impl Metrics {
             .expect("valid metric"),
             eligible_stations: IntGauge::new(
                 "oracle_eligible_stations",
-                "Stations eligible for a competition in the list last built; 0 if none was",
+                "Stations eligible for a 24-hour competition over the default 3 days of \
+                 history, judged after each collection run; 0 until the first judgment",
+            )
+            .expect("valid metric"),
+            eligibility_reports: IntGauge::new(
+                "oracle_eligibility_reports",
+                "Observation reports read ahead for eligibility judgments",
+            )
+            .expect("valid metric"),
+            turned_away: IntCounter::new(
+                "oracle_weather_requests_turned_away_total",
+                "Weather requests answered 503 because too many were waiting for a turn",
+            )
+            .expect("valid metric"),
+            resident_memory: IntGauge::new(
+                "process_resident_memory_bytes",
+                "Resident memory size of the oracle process in bytes",
+            )
+            .expect("valid metric"),
+            cache_entries: IntGaugeVec::new(
+                Opts::new("oracle_cache_entries", "Entries in each in-memory cache"),
+                &["cache"],
             )
             .expect("valid metric"),
             refreshed_at: tokio::sync::Mutex::new(None),
@@ -188,7 +219,7 @@ impl Metrics {
         for state in EVENT_STATES {
             metrics.events.with_label_values(&[state]);
         }
-        let collectors: [Box<dyn prometheus::core::Collector>; 16] = [
+        let collectors: [Box<dyn prometheus::core::Collector>; 20] = [
             Box::new(build_info),
             Box::new(metrics.etl_runs.clone()),
             Box::new(metrics.events_attested.clone()),
@@ -205,6 +236,10 @@ impl Metrics {
             Box::new(metrics.latest_forecast.clone()),
             Box::new(metrics.latest_observation.clone()),
             Box::new(metrics.eligible_stations.clone()),
+            Box::new(metrics.eligibility_reports.clone()),
+            Box::new(metrics.turned_away.clone()),
+            Box::new(metrics.resident_memory.clone()),
+            Box::new(metrics.cache_entries.clone()),
         ];
         for collector in collectors {
             metrics
@@ -233,10 +268,22 @@ impl Metrics {
         self.etl_lease_held.set(i64::from(held));
     }
 
-    /// A list of eligible stations was built with `count` stations.
+    /// The default list of eligible stations was judged with `count`
+    /// stations.
     pub fn set_eligible_stations(&self, count: usize) {
         self.eligible_stations
             .set(i64::try_from(count).unwrap_or(i64::MAX));
+    }
+
+    /// `count` reports were read ahead for eligibility judgments.
+    pub fn set_eligibility_reports(&self, count: usize) {
+        self.eligibility_reports
+            .set(i64::try_from(count).unwrap_or(i64::MAX));
+    }
+
+    /// A weather request was turned away while too many waited.
+    pub fn weather_request_turned_away(&self) {
+        self.turned_away.inc();
     }
 
     pub fn upload_accepted(&self, kind: FileKind) {
@@ -297,6 +344,15 @@ impl Metrics {
             .set(latest.forecast.map_or(0, OffsetDateTime::unix_timestamp));
         self.latest_observation
             .set(latest.observation.map_or(0, OffsetDateTime::unix_timestamp));
+        if let Some(bytes) = resident_memory().await {
+            self.resident_memory
+                .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+        }
+        for (cache, entries) in state.cache_entries() {
+            self.cache_entries
+                .with_label_values(&[cache])
+                .set(i64::try_from(entries).unwrap_or(i64::MAX));
+        }
     }
 
     /// Sets the gauges of events awaiting attestation as of `now`.
@@ -314,6 +370,25 @@ impl Metrics {
         self.oldest_attestable_age
             .set(age(awaiting.oldest_attestable_signing_date));
     }
+}
+
+/// The process's resident memory in bytes, from `/proc`; `None` where
+/// there is no `/proc`.
+async fn resident_memory() -> Option<u64> {
+    let status = tokio::fs::read_to_string("/proc/self/status").await.ok()?;
+    resident_kilobytes(&status).map(|kilobytes| kilobytes * 1024)
+}
+
+/// The `VmRSS` line of a `/proc/<pid>/status` file, in kilobytes.
+fn resident_kilobytes(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))?
+        .trim()
+        .strip_suffix("kB")?
+        .trim()
+        .parse()
+        .ok()
 }
 
 fn kind_label(kind: FileKind) -> &'static str {
@@ -488,6 +563,13 @@ mod tests {
     }
 
     #[test]
+    fn resident_memory_is_read_from_the_status_file() {
+        let status = "Name:\toracle\nVmPeak:\t 9000 kB\nVmRSS:\t   2048 kB\nRssAnon:\t 1024 kB\n";
+        assert_eq!(resident_kilobytes(status), Some(2048));
+        assert_eq!(resident_kilobytes("Name:\toracle\n"), None);
+    }
+
+    #[test]
     fn every_family_is_registered_before_any_work() {
         let text = Metrics::new().encode();
         for family in [
@@ -506,6 +588,9 @@ mod tests {
             "oracle_latest_forecast_timestamp_seconds",
             "oracle_latest_observation_timestamp_seconds",
             "oracle_eligible_stations",
+            "oracle_eligibility_reports",
+            "oracle_weather_requests_turned_away_total",
+            "process_resident_memory_bytes",
         ] {
             assert!(text.contains(&format!("# TYPE {family} ")), "{family}");
         }

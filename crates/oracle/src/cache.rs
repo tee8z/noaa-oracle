@@ -115,7 +115,6 @@ impl<K: Clone + Eq + Hash, V: Clone> Cache<K, V> {
         keys.into_iter().map(|(_, key)| key).collect()
     }
 
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
