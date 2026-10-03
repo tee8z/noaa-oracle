@@ -45,6 +45,11 @@
     opacity: 0.75;
 }
 
+.chip-unlisted {
+    font-size: 0.7rem;
+    opacity: 0.75;
+}
+
 .unlisted-toggle {
     font-size: 0.85rem;
 }

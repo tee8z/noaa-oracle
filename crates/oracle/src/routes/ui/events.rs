@@ -50,18 +50,24 @@ pub async fn events_handler(
         // One more than a page says whether an older page exists.
         limit: PAGE_SIZE + 1,
     };
-    let (events, counts) = tokio::join!(
+    // Counted both ways, so the chips can show unlisted events beside the
+    // listed ones while the list leaves them out.
+    let (events, listed, all) = tokio::join!(
         state.oracle.event_page(&list),
-        state.oracle.event_counts(filters.show_unlisted)
+        state.oracle.event_counts(false),
+        state.oracle.event_counts(true)
     );
     let mut events = events.unwrap_or_else(|error| {
         log::error!("events page: {error:#}");
         vec![]
     });
-    let counts = counts.unwrap_or_else(|error| {
-        log::error!("event counts: {error:#}");
-        Default::default()
+    let [listed, all] = [listed, all].map(|counts| {
+        counts.unwrap_or_else(|error| {
+            log::error!("event counts: {error:#}");
+            Default::default()
+        })
     });
+    let counts = if filters.show_unlisted { all } else { listed };
     let older = (events.len() > PAGE_SIZE).then(|| {
         events.truncate(PAGE_SIZE);
         events.last().map(|event| event.id)
@@ -70,6 +76,7 @@ pub async fn events_handler(
     let page = EventsPage {
         events: &views,
         counts,
+        all,
         filters,
         older: older.flatten(),
         now: OffsetDateTime::now_utc(),

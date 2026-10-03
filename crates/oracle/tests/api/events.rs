@@ -343,9 +343,9 @@ fn rows(html: &str) -> usize {
     html.matches("<a class=\"ev-row\" href=").count()
 }
 
-/// Unlisted events stay off the events list and the counts, filtered
-/// before the page limit, until the reader asks for them. Their own page
-/// and the API still serve them.
+/// Unlisted events stay off the events list and its counts, filtered
+/// before the page limit, until the reader asks for them; the chips and the
+/// dashboard still count them. Their own page and the API still serve them.
 #[tokio::test]
 async fn unlisted_events_stay_off_the_list_and_counts_but_open_by_their_link() {
     let mut weather = MockWeatherAccess::new();
@@ -376,14 +376,23 @@ async fn unlisted_events_stay_off_the_list_and_counts_but_open_by_their_link() {
     assert_eq!(rows(&page), 1);
     assert!(page.contains(&listed.id.to_string()));
     assert!(!page.contains(&newest));
-    assert!(page.contains("All <span class=\"chip-count\">1</span>"));
-    assert!(page.contains("Live <span class=\"chip-count\">1</span>"));
+    assert!(page.contains(
+        "All <span class=\"chip-count\">1</span> <span class=\"chip-unlisted\">+50 unlisted</span>"
+    ));
+    assert!(page.contains(
+        "Live <span class=\"chip-count\">1</span> <span class=\"chip-unlisted\">+50 unlisted</span>"
+    ));
     assert!(page.contains("Show unlisted"));
     assert!(page.contains("(50 hidden)"));
     assert!(!page.contains("Older events"));
+    // The dashboard counts every event and opens the list with them shown.
     let dashboard = html(&test_app, "/").await;
     assert!(
-        dashboard.contains("<span class=\"stat-value stat-live\">1</span>"),
+        dashboard.contains("<span class=\"stat-value stat-live\">51</span>"),
+        "{dashboard}"
+    );
+    assert!(
+        dashboard.contains("href=\"/events?status=live&amp;unlisted=show\""),
         "{dashboard}"
     );
 
@@ -394,6 +403,7 @@ async fn unlisted_events_stay_off_the_list_and_counts_but_open_by_their_link() {
     assert!(!page.contains(&listed.id.to_string()));
     assert!(page.contains("All <span class=\"chip-count\">51</span>"));
     assert!(!page.contains("hidden)"));
+    assert!(!page.contains("chip-unlisted"));
     assert!(page.contains(">Unlisted<"));
     let older = format!("/events?unlisted=show&before={oldest_unlisted}");
     assert!(page.contains(&older.replace('&', "&amp;")), "{page}");
@@ -534,17 +544,78 @@ async fn event_filters_render_the_matching_part() {
 #[tokio::test]
 async fn htmx_reloads_the_raw_data_page_instead_of_swapping_it() {
     let test_app = app().await;
-    let request = Request::get("/raw")
-        .header("hx-request", "true")
-        .header("hx-target", "body")
-        .header("hx-history-restore-request", "true")
-        .body(Body::empty())
+    // htmx 4 sends history restores without `HX-Request`.
+    for htmx_request in [true, false] {
+        let mut request = Request::get("/raw")
+            .header("hx-target", "body")
+            .header("hx-history-restore-request", "true");
+        if htmx_request {
+            request = request.header("hx-request", "true");
+        }
+        let request = request.body(Body::empty()).unwrap();
+        let response = test_app.app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["hx-refresh"], "true");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(body.is_empty());
+    }
+}
+
+/// The API reference loads Scalar from this site under its own policy,
+/// and nothing from elsewhere.
+#[tokio::test]
+async fn the_api_reference_loads_only_from_this_site() {
+    let test_app = app().await;
+    let response = test_app
+        .app
+        .clone()
+        .oneshot(Request::get("/docs").body(Body::empty()).unwrap())
+        .await
         .unwrap();
-    let response = test_app.app.clone().oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.headers()["hx-refresh"], "true");
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    assert!(body.is_empty());
+    let policy = response.headers()[header::CONTENT_SECURITY_POLICY]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    for directive in [
+        "script-src 'self'",
+        "default-src 'self'",
+        "object-src 'none'",
+        "base-uri 'none'",
+        "frame-ancestors 'none'",
+    ] {
+        assert!(
+            policy.split(';').any(|found| found.trim() == directive),
+            "{policy}"
+        );
+    }
+    assert!(!policy.contains("http"), "{policy}");
+    assert!(!policy.contains("'unsafe-eval'"), "{policy}");
+    assert_eq!(
+        response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+        "nosniff"
+    );
+
+    let html = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let html = String::from_utf8(html.to_vec()).unwrap();
+    assert!(!html.contains("src=\"http"), "{html}");
+    assert!(!html.contains("href=\"http"), "{html}");
+    assert!(html.contains("\"withDefaultFonts\":false"), "{html}");
+    assert!(
+        html.contains("\"/oracle/events\""),
+        "the OpenAPI document is in the page"
+    );
+    let scripts: Vec<_> = html
+        .split("<script")
+        .skip(1)
+        .filter_map(|script| script.split_once(" src=\""))
+        .map(|(_, rest)| rest.split('"').next().unwrap().to_owned())
+        .collect();
+    assert_eq!(scripts.len(), 1, "{html}");
+    assert!(scripts[0].starts_with("/assets/scalar."), "{html}");
+    let (status, script) = test_app.get(&scripts[0]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(String::from_utf8_lossy(&script).contains("createApiReference"));
 }
 
 /// Attributes named `on…`, which run inline script.
@@ -634,12 +705,27 @@ async fn pages_allow_only_their_own_script_files() {
                     policy.contains("require-trusted-types-for 'script'; trusted-types htmx"),
                     "{path}: {policy}"
                 );
+                for directive in ["default-src 'self'", "style-src 'self'"] {
+                    assert!(
+                        policy.split(';').any(|found| found.trim() == directive),
+                        "{path}: {policy}"
+                    );
+                }
             }
         }
+        assert_eq!(
+            response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
 
         let html = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(html.to_vec()).unwrap();
         assert!(html.starts_with("<!DOCTYPE html>"), "{path}");
+        // Bulma is served from this site, before the site's own styles.
+        let bulma = html.find("<link rel=\"stylesheet\" href=\"/assets/bulma.");
+        let site = html.find("<link rel=\"stylesheet\" href=\"/assets/site.");
+        assert!(bulma.is_some() && bulma < site, "{path}");
+        assert!(!html.contains("bulma@"), "{path}");
         for script in html.split("<script").skip(1) {
             let (attributes, rest) = script.split_once('>').unwrap();
             assert!(

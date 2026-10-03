@@ -74,6 +74,9 @@ impl EventFilters {
 pub struct EventsPage<'a> {
     pub events: &'a [EventView],
     pub counts: EventCounts,
+    /// Every event, unlisted ones included, so a chip can say how many of
+    /// its events the list leaves out.
+    pub all: EventCounts,
     pub filters: EventFilters,
     /// The last row's id when an older page exists.
     pub older: Option<Uuid>,
@@ -132,9 +135,13 @@ pub fn events_section(page: &EventsPage) -> Markup {
                             input type="radio" name="status"
                                 value=(status.map_or("", status_param))
                                 checked[filters.status == status];
+                            @let unlisted = page.all.of(status).saturating_sub(page.counts.of(status));
                             span {
                                 (status.map_or("All", status_text))
                                 " " span class="chip-count" { (page.counts.of(status)) }
+                                @if !filters.show_unlisted && unlisted > 0 {
+                                    " " span class="chip-unlisted" { "+" (unlisted) " unlisted" }
+                                }
                             }
                         }
                     }
@@ -265,12 +272,17 @@ mod tests {
     }
 
     fn page<'a>(events: &'a [EventView], filters: EventFilters) -> EventsPage<'a> {
+        let counts = EventCounts {
+            running: 1,
+            unlisted: 1,
+            ..EventCounts::default()
+        };
         EventsPage {
             events,
-            counts: EventCounts {
-                running: 1,
-                unlisted: 1,
-                ..EventCounts::default()
+            counts,
+            all: EventCounts {
+                running: 2,
+                ..counts
             },
             filters,
             older: None,
@@ -286,9 +298,18 @@ mod tests {
         assert!(html.contains("Show unlisted"));
         assert!(html.contains("(1 hidden)"));
         assert!(!html.contains(">Unlisted<"));
+        // Each chip counts the listed events, and the unlisted ones beside.
+        assert!(
+            html.contains(
+                "Running <span class=\"chip-count\">1</span> <span class=\"chip-unlisted\">+1 unlisted</span>"
+            ),
+            "{html}"
+        );
+        assert_eq!(html.matches("chip-unlisted").count(), 2, "{html}");
         let shown = EventFilters::parse(None, Some("show"), None);
         let html = events_section(&page(&events, shown)).into_string();
         assert!(!html.contains(" hidden)"), "{html}");
+        assert!(!html.contains("chip-unlisted"), "{html}");
     }
 
     #[test]

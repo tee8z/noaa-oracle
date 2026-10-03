@@ -3,8 +3,8 @@
 //! Styles and scripts sit next to the template that uses them. This script
 //! minifies them (lightningcss for styles, oxc for scripts) into a few
 //! bundles in Cargo's `OUT_DIR`, next to copies of the files in
-//! `src/templates/static` and of the vendored htmx, and generates
-//! `assets.rs`. That file embeds each asset, plain and gzipped, with
+//! `src/templates/static` and of the vendored htmx, Bulma and Scalar, and
+//! generates `assets.rs`. That file embeds each asset, plain and gzipped, with
 //! `include_bytes!` under a URL containing a hash of its content. Nothing is
 //! written to the source tree.
 
@@ -38,6 +38,10 @@ const RAW_DATA_DIR: &str = "pages/raw_data";
 const HTMX: &str = "vendor/htmx/4.0.0/htmx.min.js";
 /// Pinned DuckDB and Arrow browser module; workers/WASM remain on jsDelivr.
 const DUCKDB: &str = "vendor/duckdb/1.29.0/duckdb.js";
+/// Bulma as published on npm, already minified.
+const BULMA: &str = "vendor/bulma/1.0.4/bulma.min.css";
+/// Scalar's API reference bundle, which draws `/docs`.
+const SCALAR: &str = "vendor/scalar/1.72.4/standalone.js";
 
 struct Asset {
     /// Rust constant naming the asset in `assets.rs`.
@@ -59,6 +63,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo::rerun-if-changed={}", htmx.display());
     let duckdb = Path::new(&manifest).join(DUCKDB);
     println!("cargo::rerun-if-changed={}", duckdb.display());
+    let bulma = Path::new(&manifest).join(BULMA);
+    println!("cargo::rerun-if-changed={}", bulma.display());
+    let scalar = Path::new(&manifest).join(SCALAR);
+    println!("cargo::rerun-if-changed={}", scalar.display());
     let output = Path::new(&output);
 
     let mut files = Vec::new();
@@ -90,6 +98,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     htmx_script.extend_from_slice(&minify_scripts(std::slice::from_ref(&htmx_security))?);
 
     let assets = [
+        Asset {
+            constant: "BULMA_CSS",
+            stem: "bulma",
+            extension: "css",
+            content_type: "text/css; charset=utf-8",
+            bytes: fs::read(&bulma)?,
+        },
         Asset {
             constant: "SITE_CSS",
             stem: "site",
@@ -133,6 +148,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             extension: "js",
             content_type: "text/javascript; charset=utf-8",
             bytes: fs::read(&duckdb)?,
+        },
+        Asset {
+            constant: "SCALAR_JS",
+            stem: "scalar",
+            extension: "js",
+            content_type: "text/javascript; charset=utf-8",
+            bytes: fs::read(&scalar)?,
         },
         Asset {
             constant: "USA_MAP_SVG",
