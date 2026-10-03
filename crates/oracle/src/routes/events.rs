@@ -4,7 +4,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use std::sync::Arc;
@@ -399,6 +399,10 @@ impl IntoResponse for Error {
         };
         if status.is_server_error() {
             error!("oracle request failed: {:#}", anyhow::Error::from(self));
+        } else if matches!(self, Error::EventNotFound(_) | Error::EntryNotFound { .. }) {
+            // The coordinator looks an event up before creating it, so a
+            // missing one is routine.
+            debug!("oracle request rejected: {self}");
         } else {
             warn!("oracle request rejected: {self}");
         }
