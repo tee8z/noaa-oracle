@@ -28,7 +28,7 @@ pub fn base(config: &PageConfig, content: Markup) -> Markup {
                 meta name="htmx-config" content=(HTMX_CONFIG);
                 // Applies the saved theme before the page paints.
                 script src=(assets::HEAD_JS.url) {}
-                link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@1.0.4/css/bulma.min.css";
+                link rel="stylesheet" href=(assets::BULMA_CSS.url);
                 link rel="stylesheet" href=(assets::SITE_CSS.url);
                 script defer src=(assets::HTMX_JS.url) {}
                 script defer src=(assets::SITE_JS.url) {}

@@ -12,7 +12,7 @@ use crate::{
 pub struct DashboardData {
     pub pubkey: String,
     pub npub: String,
-    /// Without unlisted events, like the events list they link to.
+    /// Every event, unlisted ones included.
     pub counts: EventCounts,
     pub weather: std::sync::Arc<Vec<WeatherDisplay>>,
 }

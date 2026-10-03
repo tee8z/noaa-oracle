@@ -77,3 +77,39 @@
 .event-weather .fcst {
     display: block;
 }
+
+/* Par lines on phones: one block per line, each value beside its label
+   (data-label), instead of five columns squeezed into the screen. Bulma's
+   .table.is-narrow rules are as specific, hence .table here. */
+@media screen and (max-width: 768px) {
+    .table.lines-table thead {
+        display: none;
+    }
+
+    .table.lines-table,
+    .table.lines-table tbody,
+    .table.lines-table tr {
+        display: block;
+        width: 100%;
+    }
+
+    .table.lines-table tr {
+        padding: 0.5rem 0;
+        border-bottom: 1px solid var(--bulma-border-weak);
+    }
+
+    .table.lines-table td {
+        display: grid;
+        grid-template-columns: 5.5rem 1fr;
+        gap: 0.75rem;
+        padding: 0.1rem 0;
+        border: 0;
+    }
+
+    .table.lines-table td::before {
+        content: attr(data-label);
+        color: var(--muted);
+        font-size: 0.75rem;
+        line-height: 1.5rem;
+    }
+}

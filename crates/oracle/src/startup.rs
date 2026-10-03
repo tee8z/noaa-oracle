@@ -20,7 +20,8 @@ use crate::{
         download, event_detail_handler, events_handler, files, forecast_handler, forecasts,
         get_event, get_event_entry, get_npub, get_pubkey, get_stations, health, healthy,
         list_events, list_sources, observations, raw_data_handler, ready, station_handler,
-        ui::policy::content_security_policy, update_data, upload, warm_caches, weather_handler,
+        ui::{docs_router, policy::content_security_policy},
+        update_data, upload, warm_caches, weather_handler,
     },
     sources::{NoaaWeather, Sources},
     templates::{assets::serve_asset, fragments::WeatherDisplay},
@@ -62,7 +63,6 @@ use tower_http::compression::{
 };
 use tower_http::cors::{Any, CorsLayer};
 use utoipa::OpenApi;
-use utoipa_scalar::{Scalar, Servable};
 
 /// Parquet uploads from the daemon. The 2.3.3 daemon wrote forecast files
 /// uncompressed, near 90 MiB with their source provenance; files it left
@@ -745,7 +745,7 @@ pub fn app(app_state: Arc<AppState>) -> Router {
         .with_state(app_state)
         .layer(middleware::from_fn(log_request))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .merge(Scalar::with_url("/docs", api_docs))
+        .merge(docs_router(api_docs))
         .layer(cors)
         // Pages, fragments and JSON shrink about twentyfold; the weather
         // list is 160 KB of repetitive HTML. Assets arrive gzipped already

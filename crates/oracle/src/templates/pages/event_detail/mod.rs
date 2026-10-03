@@ -274,6 +274,21 @@ pub fn event_detail_content(
     }
 }
 
+/// A metric's name for readers, as the coordinator names it; an unknown
+/// metric shows its key.
+fn metric_label(metric: &str) -> &str {
+    match metric {
+        "temp_high" => "High temperature",
+        "temp_low" => "Low temperature",
+        "wind_speed" => "Wind speed",
+        "wind_direction" => "Wind direction",
+        "rain_amt" => "Rain",
+        "snow_amt" => "Snow",
+        "humidity" => "Humidity",
+        other => other,
+    }
+}
+
 /// A metric's unit after a value.
 fn unit(metric: &str) -> &'static str {
     match metric {
@@ -286,6 +301,8 @@ fn unit(metric: &str) -> &'static str {
 
 /// Each location and metric's line: Par as a miss from the forecast, the
 /// same range around the current forecast, and the history it was fitted on.
+/// On phones each line is a block of labelled values (`data-label`), so no
+/// column is squeezed.
 fn lines_table(lines: &[Line], readings: &[Reading]) -> Markup {
     html! {
         p class="muted" {
@@ -312,10 +329,12 @@ fn lines_table(lines: &[Line], readings: &[Reading]) -> Markup {
                             .find(|reading| reading.target == line.target && reading.metric == line.metric)
                             .and_then(|reading| reading.baseline);
                         tr {
-                            td { (line.target) }
-                            td { code { (line.metric) } }
-                            td { (format!("{:+.1} to {:+.1}{unit}", line.lower, line.upper)) }
-                            td {
+                            td data-label="Location" { (line.target) }
+                            td data-label="Metric" { (metric_label(&line.metric)) }
+                            td data-label="Par" {
+                                (format!("{:+.1} to {:+.1}{unit}", line.lower, line.upper))
+                            }
+                            td data-label="Par now" {
                                 @match forecast {
                                     Some(forecast) => {
                                         (format!("{:.1}–{:.1}{unit}", forecast + line.lower, forecast + line.upper))
@@ -323,7 +342,7 @@ fn lines_table(lines: &[Line], readings: &[Reading]) -> Markup {
                                     None => { span class="muted" { "no forecast yet" } }
                                 }
                             }
-                            td class="muted" {
+                            td class="muted" data-label="Fitted on" {
                                 (line.windows) " windows"
                                 @if line.level == LineLevel::Pooled { ", all stations" }
                                 " · Over " (line.over) ", Par " (line.par) ", Under " (line.under)
@@ -682,6 +701,16 @@ mod tests {
         assert!(html.contains("no forecast yet"));
         assert_eq!(html.matches("all stations").count(), 1);
         assert!(html.contains("Over 19, Par 20, Under 19"));
+        assert!(html.contains(">High temperature</td>"), "{html}");
+        assert!(!html.contains("temp_high"), "{html}");
+        assert_eq!(html.matches("data-label=\"Fitted on\"").count(), 2);
+    }
+
+    #[test]
+    fn metrics_have_reader_names() {
+        assert_eq!(metric_label("temp_low"), "Low temperature");
+        assert_eq!(metric_label("wind_speed"), "Wind speed");
+        assert_eq!(metric_label("new_metric"), "new_metric");
     }
 
     #[test]

@@ -503,6 +503,54 @@ test.describe("Assets", () => {
   });
 });
 
+// Every request a page makes, and what its Content-Security-Policy blocked.
+async function watchLoads(page) {
+  const requests = [];
+  page.on("request", (request) => requests.push(request.url()));
+  await page.addInitScript(() => {
+    window.qaBlocked = [];
+    document.addEventListener("securitypolicyviolation", (event) => {
+      window.qaBlocked.push(`${event.effectiveDirective} ${event.blockedURI}`);
+    });
+  });
+  return async () => {
+    const origin = new URL(page.url()).origin;
+    return {
+      offSite: requests.filter((url) => /^https?:/.test(url) && new URL(url).origin !== origin),
+      blocked: await page.evaluate(() => window.qaBlocked),
+    };
+  };
+}
+
+test.describe("Third-party loads", () => {
+  test("pages load Bulma and everything else from this site", async ({ page, request }) => {
+    const loads = await watchLoads(page);
+    await page.goto(dashboard("&view=map"));
+    await expect(page.locator(".station-markers .pin").first()).toBeVisible();
+    const bulma = await page.locator('link[href^="/assets/bulma."]').getAttribute("href");
+    const response = await request.get(bulma);
+    expect(response.ok()).toBeTruthy();
+    expect(response.headers()["cache-control"]).toBe("public, max-age=31536000, immutable");
+    await page.goto("/events");
+    await expect(page.locator(".status-filter")).toBeVisible();
+    expect(await loads()).toEqual({ offSite: [], blocked: [] });
+  });
+
+  test("the API reference draws with the local Scalar and nothing from other sites", async ({ page }) => {
+    const loads = await watchLoads(page);
+    const response = await page.goto("/docs");
+    const policy = response.headers()["content-security-policy"];
+    expect(policy).toContain("script-src 'self';");
+    expect(policy).toContain("frame-ancestors 'none'");
+    expect(response.headers()["x-content-type-options"]).toBe("nosniff");
+    await expect(page.locator(".scalar-app").first()).toBeVisible({ timeout: 30000 });
+    const { offSite, blocked } = await loads();
+    expect(offSite).toEqual([]);
+    // Scalar probes once whether it may compile code, and falls back.
+    expect(blocked.filter((entry) => !entry.endsWith(" eval"))).toEqual([]);
+  });
+});
+
 test.describe("API Endpoints", () => {
   test("oracle pubkey endpoint returns data", async ({ request }) => {
     const response = await request.get("/oracle/pubkey");

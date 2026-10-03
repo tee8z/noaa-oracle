@@ -105,9 +105,10 @@ async fn build_dashboard_data(
     let pubkey = state.oracle.public_key_base64();
     let npub = state.oracle.npub();
 
-    // The cards link to the events list, which leaves out unlisted events.
+    // Every event counts, unlisted ones too: coordinators create most
+    // events unlisted. The cards open the list with unlisted events shown.
     let (counts, (weather, default_airports)) = tokio::join!(
-        state.oracle.event_counts(false),
+        state.oracle.event_counts(true),
         get_latest_weather(state, station_ids, start, end, calendar)
     );
     let counts = counts.unwrap_or_else(|error| {

@@ -163,6 +163,16 @@ mod tests {
     }
 
     #[test]
+    fn bulma_and_scalar_are_the_pinned_files() {
+        let bulma = std::str::from_utf8(BULMA_CSS.bytes).unwrap();
+        assert!(bulma.contains("bulma.io v1.0.4"));
+        let scalar = std::str::from_utf8(SCALAR_JS.bytes).unwrap();
+        assert!(scalar.contains("createApiReference"));
+        // Fonts come from Scalar's site unless the page turns them off.
+        assert!(scalar.contains("withDefaultFonts"));
+    }
+
+    #[test]
     fn htmx_security_is_in_the_same_script_task_as_htmx() {
         let head = std::str::from_utf8(HEAD_JS.bytes).unwrap();
         let htmx = std::str::from_utf8(HTMX_JS.bytes).unwrap();

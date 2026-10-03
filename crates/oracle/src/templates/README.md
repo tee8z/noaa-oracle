@@ -31,8 +31,10 @@ and/or `name.js`.
    `<head>` before the page paints; `pages/raw_data/` scripts load only on
    the raw data page; everything else is `site.js`. A script that does not
    parse fails the build.
-3. Takes the map in `static/` and htmx 4.0.0 as published
-   (`crates/oracle/vendor/htmx/4.0.0/`, with its checksum) as they are.
+3. Takes the map in `static/`, htmx 4.0.0, Bulma 1.0.4 and Scalar's API
+   reference 1.72.4 as published (`crates/oracle/vendor/`, each with its
+   checksum) as they are. Pages load nothing from other sites; `/docs`
+   (`routes/ui/docs.rs`) uses the Scalar bundle with its web fonts off.
 4. Generates `assets.rs` with a content-hashed URL, the bytes and a gzipped
    copy of each file.
 
@@ -65,6 +67,10 @@ Scripts set text with `textContent` and build elements with
 htmx 4 attributes are not inherited: put `hx-target`, `hx-swap` and the rest
 on the element that makes the request. htmx names the target in `HX-Target`
 as `tag#id`; `routes/ui/htmx.rs` reads the id.
+
+Pages also take styles, images and requests only from this site
+(`default-src 'self'; style-src 'self'`), so no `style` attribute or
+`<style>` element: put styles in the template's stylesheet.
 
 The raw data page's policy also allows DuckDB-WASM and the three modules it
 imports from jsdelivr, by exact path. That page always loads as a whole
