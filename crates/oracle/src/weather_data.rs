@@ -227,6 +227,10 @@ const OBSERVATION_SOURCE_COLUMNS: &str = "
 /// A report or forecast issue can reach a snapshot after its validity window.
 const PUBLICATION_GRACE: Duration = Duration::hours(24);
 const FORECAST_LOOKBACK: Duration = Duration::days(7);
+/// How far from a day's part of a window a forecast period may lie for the
+/// day's row to borrow from it (see [`forecasts_sql`]). Highs and lows each
+/// come once a day in periods of 12 or 13 hours, so one is always this near.
+const BORROW_REACH: Duration = Duration::hours(12);
 
 /// Observation history, back from the newest file, the station list is read from.
 const STATION_LOOKBACK: Duration = Duration::days(30);
@@ -667,12 +671,51 @@ fn source_forecast_rows_sql(files: &[String], filter: &str) -> String {
     )
 }
 
-/// Which forecast rows a request reads: periods overlapping its validity
-/// window, from issues generated in `generated_start..=generated_end`.
-fn forecast_row_conditions(
-    req: &ForecastRequest,
-    (generated_start, generated_end): (OffsetDateTime, OffsetDateTime),
-) -> Result<String, Error> {
+/// A calendar day a forecast window covers only in part, with that part.
+struct PartialDay {
+    /// As queries name days: `YYYY-MM-DD 00:00:00`.
+    date: String,
+    start: OffsetDateTime,
+    end: OffsetDateTime,
+}
+
+/// The days of `calendar` a request's window covers only in part: its first
+/// day, its last day, both or neither.
+fn partial_days(req: &ForecastRequest, calendar: Calendar) -> Vec<PartialDay> {
+    let (Some(start), Some(end)) = (req.start, req.end) else {
+        return vec![];
+    };
+    if start >= end {
+        return vec![];
+    }
+    let first = calendar.date_of(start);
+    let last = calendar.date_of(end - Duration::nanoseconds(1));
+    let mut days = vec![];
+    for day in [Some(first), (last != first).then_some(last)]
+        .into_iter()
+        .flatten()
+    {
+        let begins = calendar.start_of(day);
+        let ends = calendar.start_of(day.next_day().unwrap_or(day));
+        if start > begins || end < ends {
+            days.push(PartialDay {
+                date: format!(
+                    "{:04}-{:02}-{:02} 00:00:00",
+                    day.year(),
+                    u8::from(day.month()),
+                    day.day()
+                ),
+                start: start.max(begins),
+                end: end.min(ends),
+            });
+        }
+    }
+    days
+}
+
+/// Which periods lie in a request's validity window: those overlapping it,
+/// and point samples from its start on.
+fn window_conditions(req: &ForecastRequest) -> Result<Vec<String>, Error> {
     let mut conditions = Vec::new();
     if let Some(start) = &req.start {
         conditions.push(format!(
@@ -685,6 +728,32 @@ fn forecast_row_conditions(
             "begin_ts < '{}'::TIMESTAMPTZ",
             end.format(&Rfc3339)?
         ));
+    }
+    Ok(conditions)
+}
+
+/// Which forecast rows a request reads: periods in its validity window,
+/// from issues generated in `generated_start..=generated_end`. For days the
+/// window covers only in part (`partial`) it also reads the highs and lows
+/// within [`BORROW_REACH`] of those parts, which their rows may borrow.
+fn forecast_row_conditions(
+    req: &ForecastRequest,
+    (generated_start, generated_end): (OffsetDateTime, OffsetDateTime),
+    partial: &[PartialDay],
+) -> Result<String, Error> {
+    let mut conditions = window_conditions(req)?;
+    let reach = partial
+        .iter()
+        .map(|day| day.start)
+        .min()
+        .zip(partial.iter().map(|day| day.end).max());
+    if let Some((from, to)) = reach {
+        conditions = vec![format!(
+            "(({}) OR ((min_temp IS NOT NULL OR max_temp IS NOT NULL) AND end_ts > '{}'::TIMESTAMPTZ AND begin_ts < '{}'::TIMESTAMPTZ))",
+            conditions.join(" AND "),
+            from.saturating_sub(BORROW_REACH).format(&Rfc3339)?,
+            to.saturating_add(BORROW_REACH).format(&Rfc3339)?
+        )];
     }
     conditions.push(format!(
         "generated_ts >= '{}'::TIMESTAMPTZ",
@@ -736,11 +805,20 @@ fn precipitation_sql(name: &str, value: &str, extra_columns: &str, sums: &str) -
 /// `calendar` the extremes, peak wind with its direction, humidity range,
 /// precipitation chance, and precipitation totals. Rain is QPF minus the
 /// liquid equivalent of snow and ice, never below zero.
+///
+/// A period counts toward the day it begins on. NOAA forecasts a high for
+/// each daytime and a low for each night, so the part of a day a window
+/// covers can hold one and not the other, or no wind sample. The row of
+/// such a day (`partial`) borrows what it lacks from the nearest period
+/// within [`BORROW_REACH`], one in the window first, so the days of a
+/// window still combine to the window's own extremes. A borrowed extreme
+/// never inverts the day's range.
 fn forecasts_sql(
     rows: &str,
     req: &ForecastRequest,
     calendar: Calendar,
     (generated_start, generated_end): (OffsetDateTime, OffsetDateTime),
+    partial: &[PartialDay],
 ) -> Result<String, Error> {
     let date = calendar.day_sql(
         "begin_ts",
@@ -749,14 +827,14 @@ fn forecasts_sql(
     );
     let start_time = match &req.start {
         Some(start) => format!(
-            "GREATEST('{}'::TIMESTAMPTZ, d.start_time)",
+            "GREATEST('{}'::TIMESTAMPTZ, COALESCE(w.part_start, d.start_time))",
             start.format(&Rfc3339)?
         ),
         None => "d.start_time".to_owned(),
     };
     let end_time = match &req.end {
         Some(end) => format!(
-            "LEAST('{}'::TIMESTAMPTZ, d.end_time)",
+            "LEAST('{}'::TIMESTAMPTZ, COALESCE(w.part_end, d.end_time))",
             end.format(&Rfc3339)?
         ),
         None => "d.end_time".to_owned(),
@@ -786,6 +864,36 @@ fn forecasts_sql(
         utc_timestamp_sql("begin_ts"),
         utc_timestamp_sql("end_ts")
     );
+    let in_window = match window_conditions(req)? {
+        conditions if conditions.is_empty() => "true".to_owned(),
+        conditions => conditions.join(" AND "),
+    };
+    // Each day's part of the window, and the span periods may be borrowed from.
+    let partial_days = if partial.is_empty() {
+        "SELECT NULL::VARCHAR AS date, NULL::TIMESTAMPTZ AS part_start, NULL::TIMESTAMPTZ AS part_end, \
+         NULL::TIMESTAMPTZ AS near_start, NULL::TIMESTAMPTZ AS near_end WHERE false"
+            .to_owned()
+    } else {
+        let mut days = vec![];
+        for day in partial {
+            days.push(format!(
+                "('{}', '{}'::TIMESTAMPTZ, '{}'::TIMESTAMPTZ, '{}'::TIMESTAMPTZ, '{}'::TIMESTAMPTZ)",
+                day.date,
+                day.start.format(&Rfc3339)?,
+                day.end.format(&Rfc3339)?,
+                day.start.saturating_sub(BORROW_REACH).format(&Rfc3339)?,
+                day.end.saturating_add(BORROW_REACH).format(&Rfc3339)?
+            ));
+        }
+        format!(
+            "SELECT * FROM (VALUES {}) AS days(date, part_start, part_end, near_start, near_end)",
+            days.join(", ")
+        )
+    };
+    // Nearest to the day's part of the window; of two equally near, the later.
+    let nearest = "p.in_window DESC, \
+         GREATEST(epoch(p.begin_ts) - epoch(w.part_end), epoch(w.part_start) - epoch(p.end_ts), 0), \
+         p.begin_ts DESC, p.end_ts DESC";
     Ok(format!(
         r#"
     WITH forecast_rows AS (
@@ -794,11 +902,11 @@ fn forecasts_sql(
     -- Per station and period, the newest issue, then the newest
     -- publication of that issue. Value ties are deterministic.
     selected AS (
-        SELECT station_id, begin_ts, end_ts, picked.*,
+        SELECT station_id, begin_ts, end_ts, in_window, picked.*,
             {date} AS date,
             EXTRACT(EPOCH FROM (end_ts - begin_ts)) AS duration_secs
         FROM (
-            SELECT station_id, begin_ts, end_ts,
+            SELECT station_id, begin_ts, end_ts, ({in_window}) AS in_window,
                 FIRST(STRUCT_PACK(
                     min_temp := min_temp, max_temp := max_temp,
                     wind_speed := wind_speed, wind_direction := wind_direction,
@@ -812,14 +920,14 @@ fn forecasts_sql(
                     source_layouts := source_layouts
                 ) ORDER BY {DEDUPE_ORDER}) AS picked
             FROM forecast_rows
-            GROUP BY station_id, begin_ts, end_ts
+            GROUP BY station_id, begin_ts, end_ts, ({in_window})
         )
     ),
     -- Keep the newest publication even when quarantined; removing it before
     -- selection would silently restore an older value. Historical files have
     -- no producer status and remain provisional display data.
-    deduped AS (
-        SELECT station_id, begin_ts, end_ts, date, duration_secs,
+    periods AS (
+        SELECT station_id, begin_ts, end_ts, in_window, date, duration_secs,
             quality_status, forecast_interval_version, source_layouts,
             CASE WHEN quality_status IS DISTINCT FROM 'rejected' THEN min_temp END AS min_temp,
             CASE WHEN quality_status IS DISTINCT FROM 'rejected' THEN max_temp END AS max_temp,
@@ -833,6 +941,10 @@ fn forecasts_sql(
             CASE WHEN quality_status IS DISTINCT FROM 'rejected' THEN snow_ratio END AS snow_ratio,
             CASE WHEN quality_status IS DISTINCT FROM 'rejected' THEN ice_amt END AS ice_amt
         FROM selected
+    ),
+    -- Periods outside the window are read only to be borrowed from.
+    deduped AS (
+        SELECT * EXCLUDE (in_window) FROM periods WHERE in_window
     ),{qpf}{snow}{ice}
     daily AS (
         SELECT
@@ -859,16 +971,45 @@ fn forecasts_sql(
             to_json(arg_max({native_period}, relative_humidity_max) FILTER (WHERE relative_humidity_max >= 0 AND relative_humidity_max <= 100))::VARCHAR AS humidity_max_period
         FROM deduped
         GROUP BY station_id, date
+    ),
+    -- The days the window covers only in part.
+    partial_days AS (
+        {partial_days}
+    ),
+    -- What the row of such a day lacks, from the nearest period that has it.
+    -- Wind is borrowed only from samples in the window.
+    borrowed AS (
+        SELECT d.station_id, d.date,
+            FIRST(p.min_temp ORDER BY {nearest})
+                FILTER (WHERE p.min_temp >= -200 AND p.min_temp <= 200) AS temp_low,
+            FIRST(p.max_temp ORDER BY {nearest})
+                FILTER (WHERE p.max_temp >= -200 AND p.max_temp <= 200) AS temp_high,
+            FIRST(p.wind_speed ORDER BY {nearest})
+                FILTER (WHERE p.in_window AND p.wind_speed >= 0 AND p.wind_speed <= 500) AS wind_speed,
+            FIRST(p.wind_direction ORDER BY {nearest})
+                FILTER (WHERE p.in_window AND p.wind_speed >= 0 AND p.wind_speed <= 500) AS wind_direction
+        FROM daily d
+        JOIN partial_days w ON d.date = w.date
+        JOIN periods p ON p.station_id = d.station_id
+            AND p.end_ts > w.near_start AND p.begin_ts < w.near_end
+        WHERE d.temp_low IS NULL OR d.temp_high IS NULL OR d.wind_speed IS NULL
+        GROUP BY d.station_id, d.date
     )
     SELECT
         d.station_id::VARCHAR AS station_id,
         d.date::VARCHAR AS date,
         ({})::VARCHAR AS start_time,
         ({})::VARCHAR AS end_time,
-        CASE WHEN d.temp_low > d.temp_high THEN NULL ELSE d.temp_low END::BIGINT AS temp_low,
-        CASE WHEN d.temp_low > d.temp_high THEN NULL ELSE d.temp_high END::BIGINT AS temp_high,
-        d.wind_speed::BIGINT AS wind_speed,
-        d.wind_direction::BIGINT AS wind_direction,
+        CASE WHEN d.temp_low > d.temp_high THEN NULL
+            WHEN d.temp_low IS NOT NULL THEN d.temp_low
+            WHEN b.temp_low > d.temp_high THEN d.temp_high
+            ELSE b.temp_low END::BIGINT AS temp_low,
+        CASE WHEN d.temp_low > d.temp_high THEN NULL
+            WHEN d.temp_high IS NOT NULL THEN d.temp_high
+            WHEN b.temp_high < COALESCE(d.temp_low, b.temp_low) THEN COALESCE(d.temp_low, b.temp_low)
+            ELSE b.temp_high END::BIGINT AS temp_high,
+        COALESCE(d.wind_speed, b.wind_speed)::BIGINT AS wind_speed,
+        CASE WHEN d.wind_speed IS NULL THEN b.wind_direction ELSE d.wind_direction END::BIGINT AS wind_direction,
         CASE WHEN d.humidity_min > d.humidity_max THEN NULL ELSE d.humidity_max END::BIGINT AS humidity_max,
         CASE WHEN d.humidity_min > d.humidity_max THEN NULL ELSE d.humidity_min END::BIGINT AS humidity_min,
         'fahrenheit'::VARCHAR AS temperature_unit_code,
@@ -886,6 +1027,8 @@ fn forecasts_sql(
     LEFT JOIN qpf_daily q ON d.station_id = q.station_id AND d.date = q.date
     LEFT JOIN snow_daily s ON d.station_id = s.station_id AND d.date = s.date
     LEFT JOIN ice_daily i ON d.station_id = i.station_id AND d.date = i.date
+    LEFT JOIN borrowed b ON d.station_id = b.station_id AND d.date = b.date
+    LEFT JOIN partial_days w ON d.date = w.date
     ORDER BY d.station_id, d.date
     "#,
         utc_timestamp_sql(&start_time),
@@ -1443,16 +1586,17 @@ impl WeatherData for WeatherAccess {
         if names.is_empty() {
             return Ok((vec![], ForecastQuality::default()));
         }
+        let partial = partial_days(req, calendar);
         let rows = self.forecast_rows_sql(
             names,
             window,
             stations.as_deref(),
-            &forecast_row_conditions(req, window)?,
+            &forecast_row_conditions(req, window, &partial)?,
         );
         if rows.is_empty() {
             return Ok((vec![], ForecastQuality::default()));
         }
-        let query_sql = forecasts_sql(&rows, req, calendar, window)?;
+        let query_sql = forecasts_sql(&rows, req, calendar, window, &partial)?;
         let unit = req.temperature_unit;
         let mut result = self
             .query(query_sql, move |batches| {
@@ -4508,6 +4652,370 @@ mod tests {
                 ("2026-03-07 00:00:00", 45),
                 ("2026-03-09 00:00:00", 55),
             ]
+        );
+    }
+
+    /// Forecasts as the daemon writes them: a low for each night and a high
+    /// for each daytime on their own periods, winds as point samples.
+    /// KWST's periods are a Pacific station's (highs 15:00–03:00 UTC, lows
+    /// 03:00–16:00), KEST's an Eastern one's (12:00–00:00 and 00:00–13:00).
+    /// KEST has no wind.
+    fn native_forecast_dir() -> tempfile::TempDir {
+        data_dir(&[(
+            "forecasts_2026-10-05T11:05:00Z.parquet",
+            "SELECT station_id, begin_time, end_time, '2026-10-05T11:00:00Z' AS generated_at,
+                    min_temp::BIGINT AS min_temp, max_temp::BIGINT AS max_temp,
+                    'fahrenheit' AS temperature_unit_code, wind_speed::BIGINT AS wind_speed,
+                    (wind_speed * 10)::BIGINT AS wind_direction,
+                    CASE WHEN begin_time = end_time THEN 'instant' ELSE 'period' END AS interval_kind
+             FROM (VALUES
+                 ('KWST', '2026-10-05T03:00:00Z', '2026-10-05T16:00:00Z', 55, NULL, NULL),
+                 ('KWST', '2026-10-05T15:00:00Z', '2026-10-06T03:00:00Z', NULL, 98, NULL),
+                 ('KWST', '2026-10-06T03:00:00Z', '2026-10-06T16:00:00Z', 59, NULL, NULL),
+                 ('KWST', '2026-10-06T15:00:00Z', '2026-10-07T03:00:00Z', NULL, 100, NULL),
+                 ('KWST', '2026-10-07T03:00:00Z', '2026-10-07T16:00:00Z', 57, NULL, NULL),
+                 ('KWST', '2026-10-07T15:00:00Z', '2026-10-08T03:00:00Z', NULL, 96, NULL),
+                 ('KEST', '2026-10-05T00:00:00Z', '2026-10-05T13:00:00Z', 48, NULL, NULL),
+                 ('KEST', '2026-10-05T12:00:00Z', '2026-10-06T00:00:00Z', NULL, 64, NULL),
+                 ('KEST', '2026-10-06T00:00:00Z', '2026-10-06T13:00:00Z', 50, NULL, NULL),
+                 ('KEST', '2026-10-06T12:00:00Z', '2026-10-07T00:00:00Z', NULL, 66, NULL),
+                 ('KEST', '2026-10-07T00:00:00Z', '2026-10-07T13:00:00Z', 52, NULL, NULL),
+                 ('KEST', '2026-10-07T12:00:00Z', '2026-10-08T00:00:00Z', NULL, 68, NULL),
+                 ('KWST', '2026-10-05T12:00:00Z', '2026-10-05T12:00:00Z', NULL, NULL, 6),
+                 ('KWST', '2026-10-05T15:00:00Z', '2026-10-05T15:00:00Z', NULL, NULL, 9),
+                 ('KWST', '2026-10-05T18:00:00Z', '2026-10-05T18:00:00Z', NULL, NULL, 12),
+                 ('KWST', '2026-10-05T21:00:00Z', '2026-10-05T21:00:00Z', NULL, NULL, 8),
+                 ('KWST', '2026-10-06T00:00:00Z', '2026-10-06T00:00:00Z', NULL, NULL, 5),
+                 ('KWST', '2026-10-06T03:00:00Z', '2026-10-06T03:00:00Z', NULL, NULL, 4),
+                 ('KWST', '2026-10-06T06:00:00Z', '2026-10-06T06:00:00Z', NULL, NULL, 3),
+                 ('KWST', '2026-10-06T09:00:00Z', '2026-10-06T09:00:00Z', NULL, NULL, 4),
+                 ('KWST', '2026-10-06T12:00:00Z', '2026-10-06T12:00:00Z', NULL, NULL, 7),
+                 ('KWST', '2026-10-06T15:00:00Z', '2026-10-06T15:00:00Z', NULL, NULL, 11),
+                 ('KWST', '2026-10-06T18:00:00Z', '2026-10-06T18:00:00Z', NULL, NULL, 14),
+                 ('KWST', '2026-10-06T21:00:00Z', '2026-10-06T21:00:00Z', NULL, NULL, 10),
+                 ('KWST', '2026-10-07T00:00:00Z', '2026-10-07T00:00:00Z', NULL, NULL, 6),
+                 ('KWST', '2026-10-07T03:00:00Z', '2026-10-07T03:00:00Z', NULL, NULL, 5),
+                 ('KWST', '2026-10-07T12:00:00Z', '2026-10-07T12:00:00Z', NULL, NULL, 8)
+             ) AS periods(station_id, begin_time, end_time, min_temp, max_temp, wind_speed)",
+        )])
+    }
+
+    /// A request for the native fixture's stations from its one issue.
+    fn native_forecast_request(start: &str, end: &str) -> ForecastRequest {
+        let at = |text: &str| OffsetDateTime::parse(text, &Rfc3339).unwrap();
+        ForecastRequest {
+            start: Some(at(start)),
+            end: Some(at(end)),
+            generated_start: Some(at("2026-10-01T00:00:00Z")),
+            generated_end: Some(at("2026-10-05T12:00:00Z")),
+            station_ids: "KEST,KWST".into(),
+            temperature_unit: TemperatureUnit::Fahrenheit,
+        }
+    }
+
+    /// Station, day, low, high and wind speed of each row.
+    fn day_values(forecasts: &[Forecast]) -> Vec<(&str, &str, i64, i64, Option<i64>)> {
+        forecasts
+            .iter()
+            .map(|row| {
+                (
+                    row.station_id.as_str(),
+                    &row.date[..10],
+                    row.temp_low,
+                    row.temp_high,
+                    row.wind_speed,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn only_the_first_and_last_day_of_a_window_can_be_partial() {
+        let days = |start: &str, end: &str, calendar: Calendar| {
+            let format = |time: OffsetDateTime| time.format(&Rfc3339).unwrap();
+            partial_days(&native_forecast_request(start, end), calendar)
+                .into_iter()
+                .map(|day| (day.date, format(day.start), format(day.end)))
+                .collect::<Vec<_>>()
+        };
+        let day = |date: &str, start: &str, end: &str| {
+            (format!("{date} 00:00:00"), start.to_owned(), end.to_owned())
+        };
+        assert!(
+            days(
+                "2026-10-06T00:00:00Z",
+                "2026-10-07T00:00:00Z",
+                Calendar::Utc
+            )
+            .is_empty()
+        );
+        assert!(
+            days(
+                "2026-10-06T00:00:00Z",
+                "2026-10-09T00:00:00Z",
+                Calendar::Utc
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            days(
+                "2026-10-05T18:25:00Z",
+                "2026-10-06T18:25:00Z",
+                Calendar::Utc
+            ),
+            vec![
+                day("2026-10-05", "2026-10-05T18:25:00Z", "2026-10-06T00:00:00Z"),
+                day("2026-10-06", "2026-10-06T00:00:00Z", "2026-10-06T18:25:00Z"),
+            ]
+        );
+        assert_eq!(
+            days(
+                "2026-10-06T00:00:00Z",
+                "2026-10-06T12:00:00Z",
+                Calendar::Utc
+            ),
+            vec![day(
+                "2026-10-06",
+                "2026-10-06T00:00:00Z",
+                "2026-10-06T12:00:00Z"
+            )]
+        );
+        assert_eq!(
+            days(
+                "2026-10-05T12:00:00Z",
+                "2026-10-09T00:00:00Z",
+                Calendar::Utc
+            ),
+            vec![day(
+                "2026-10-05",
+                "2026-10-05T12:00:00Z",
+                "2026-10-06T00:00:00Z"
+            )]
+        );
+        // A UTC day is two partial days in New York (UTC-4 in October).
+        let new_york = Calendar::from_zone_name("America/New_York").unwrap();
+        assert_eq!(
+            days("2026-10-06T00:00:00Z", "2026-10-07T00:00:00Z", new_york),
+            vec![
+                day("2026-10-05", "2026-10-06T00:00:00Z", "2026-10-06T04:00:00Z"),
+                day("2026-10-06", "2026-10-06T04:00:00Z", "2026-10-07T00:00:00Z"),
+            ]
+        );
+        assert!(days("2026-10-06T04:00:00Z", "2026-10-07T04:00:00Z", new_york).is_empty());
+        let unbounded = ForecastRequest {
+            end: None,
+            ..native_forecast_request("2026-10-05T18:25:00Z", "2026-10-06T18:25:00Z")
+        };
+        assert!(partial_days(&unbounded, Calendar::Utc).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_forecast_window_has_a_row_for_every_utc_day_it_overlaps() {
+        let directory = native_forecast_dir();
+        let access = access(&directory);
+        type Day = (&'static str, &'static str, i64, i64, Option<i64>);
+        let cases: [(&str, &str, &str, &[Day]); 8] = [
+            (
+                "starts mid-day",
+                "2026-10-05T18:25:00Z",
+                "2026-10-06T18:25:00Z",
+                &[
+                    // The evening has a high of its own and borrows the
+                    // coming night's low.
+                    ("KEST", "2026-10-05", 50, 64, None),
+                    ("KEST", "2026-10-06", 50, 66, None),
+                    ("KWST", "2026-10-05", 59, 98, Some(8)),
+                    ("KWST", "2026-10-06", 59, 100, Some(14)),
+                ],
+            ),
+            (
+                "ends mid-day",
+                "2026-10-06T00:00:00Z",
+                "2026-10-07T12:00:00Z",
+                &[
+                    ("KEST", "2026-10-06", 50, 66, None),
+                    // The morning borrows the window's last high, not the
+                    // one of the afternoon after the window.
+                    ("KEST", "2026-10-07", 52, 66, None),
+                    ("KWST", "2026-10-06", 59, 100, Some(14)),
+                    ("KWST", "2026-10-07", 57, 100, Some(6)),
+                ],
+            ),
+            (
+                "spans midnight from its last half hour",
+                "2026-10-05T23:30:00Z",
+                "2026-10-06T23:30:00Z",
+                &[
+                    ("KEST", "2026-10-05", 50, 64, None),
+                    ("KEST", "2026-10-06", 50, 66, None),
+                    // No wind sample falls in the half hour; midnight's is nearest.
+                    ("KWST", "2026-10-05", 59, 98, Some(5)),
+                    ("KWST", "2026-10-06", 59, 100, Some(14)),
+                ],
+            ),
+            (
+                "00:00 to 12:00",
+                "2026-10-06T00:00:00Z",
+                "2026-10-06T12:00:00Z",
+                &[
+                    // No high overlaps an Eastern night; the day's own is
+                    // as near as the day before's, and later.
+                    ("KEST", "2026-10-06", 50, 66, None),
+                    // The evening's high runs three hours into the window.
+                    ("KWST", "2026-10-06", 59, 98, Some(5)),
+                ],
+            ),
+            (
+                "12:00 to 24:00",
+                "2026-10-06T12:00:00Z",
+                "2026-10-07T00:00:00Z",
+                &[
+                    ("KEST", "2026-10-06", 50, 66, None),
+                    ("KWST", "2026-10-06", 59, 100, Some(14)),
+                ],
+            ),
+            (
+                "exactly one day",
+                "2026-10-06T00:00:00Z",
+                "2026-10-07T00:00:00Z",
+                &[
+                    ("KEST", "2026-10-06", 50, 66, None),
+                    ("KWST", "2026-10-06", 59, 100, Some(14)),
+                ],
+            ),
+            (
+                "12 hours across midnight",
+                "2026-10-05T18:00:00Z",
+                "2026-10-06T06:00:00Z",
+                &[
+                    ("KEST", "2026-10-05", 50, 64, None),
+                    ("KEST", "2026-10-06", 50, 64, None),
+                    ("KWST", "2026-10-05", 59, 98, Some(12)),
+                    ("KWST", "2026-10-06", 59, 98, Some(5)),
+                ],
+            ),
+            (
+                "whole days borrow nothing",
+                "2026-10-06T00:00:00Z",
+                "2026-10-08T00:00:00Z",
+                &[
+                    ("KEST", "2026-10-06", 50, 66, None),
+                    ("KEST", "2026-10-07", 52, 68, None),
+                    ("KWST", "2026-10-06", 59, 100, Some(14)),
+                    ("KWST", "2026-10-07", 57, 96, Some(8)),
+                ],
+            ),
+        ];
+        for (name, start, end, expected) in cases {
+            let request = native_forecast_request(start, end);
+            let forecasts = access
+                .forecasts_data(&request, request.station_ids())
+                .await
+                .unwrap();
+            assert_eq!(day_values(&forecasts), expected, "{name}");
+            for row in &forecasts {
+                let (from, to) = (
+                    OffsetDateTime::parse(&row.start_time, &Rfc3339).unwrap(),
+                    OffsetDateTime::parse(&row.end_time, &Rfc3339).unwrap(),
+                );
+                assert!(
+                    request.start.unwrap() <= from && from <= to && to <= request.end.unwrap(),
+                    "{name}: {row:?} lies outside the window"
+                );
+            }
+        }
+    }
+
+    /// The two windows that returned too little on 2026-10-05: the entry
+    /// form's (a day from 18:25 UTC, issues before the start, as the
+    /// coordinator asks) lost its first day, and discovery's 00:00 to 12:00
+    /// (no issue bounds) returned no rows at all.
+    #[tokio::test]
+    async fn windows_cut_between_a_days_high_and_low_keep_their_rows() {
+        let directory = native_forecast_dir();
+        let access = access(&directory);
+        let start = time::macros::datetime!(2026-10-05 18:25 UTC);
+        let entry_form = ForecastRequest {
+            generated_start: Some(start - Duration::days(7)),
+            generated_end: Some(start - Duration::nanoseconds(1)),
+            ..native_forecast_request("2026-10-05T18:25:00Z", "2026-10-06T18:25:00Z")
+        };
+        let forecasts = access
+            .forecasts_data(&entry_form, entry_form.station_ids())
+            .await
+            .unwrap();
+        for station in ["KEST", "KWST"] {
+            let days: Vec<_> = forecasts
+                .iter()
+                .filter(|row| row.station_id == station)
+                .collect();
+            assert_eq!(
+                days.iter().map(|row| &row.date[..10]).collect::<Vec<_>>(),
+                ["2026-10-05", "2026-10-06"],
+                "{station}: one row for each UTC day of the window"
+            );
+            assert_eq!(days[0].start_time, "2026-10-05T18:25:00.000000Z");
+            assert_eq!(days[0].end_time, "2026-10-06T00:00:00.000000Z");
+            assert_eq!(days[1].start_time, "2026-10-06T00:00:00.000000Z");
+            assert_eq!(days[1].end_time, "2026-10-06T18:25:00.000000Z");
+        }
+        // The days combine as the coordinator combines them.
+        let west: Vec<_> = forecasts
+            .iter()
+            .filter(|row| row.station_id == "KWST")
+            .collect();
+        assert_eq!(west.iter().map(|row| row.temp_high).max(), Some(100));
+        assert_eq!(west.iter().map(|row| row.temp_low).min(), Some(59));
+        assert_eq!(west.iter().filter_map(|row| row.wind_speed).max(), Some(14));
+        assert!(west.iter().all(|row| row.wind_speed.is_some()));
+
+        let discovery = ForecastRequest {
+            generated_start: None,
+            generated_end: None,
+            ..native_forecast_request("2026-10-06T00:00:00Z", "2026-10-06T12:00:00Z")
+        };
+        let forecasts = access
+            .forecasts_data(&discovery, discovery.station_ids())
+            .await
+            .unwrap();
+        assert_eq!(
+            day_values(&forecasts),
+            [
+                ("KEST", "2026-10-06", 50, 66, None),
+                ("KWST", "2026-10-06", 59, 98, Some(5)),
+            ]
+        );
+        assert_eq!(forecasts[0].start_time, "2026-10-06T00:00:00.000000Z");
+        assert_eq!(forecasts[0].end_time, "2026-10-06T12:00:00.000000Z");
+    }
+
+    #[tokio::test]
+    async fn a_borrowed_extreme_is_near_and_never_inverts_the_day() {
+        let directory = data_dir(&[(
+            "forecasts_2026-10-05T11:05:00Z.parquet",
+            "SELECT station_id, begin_time, end_time, '2026-10-05T11:00:00Z' AS generated_at,
+                    min_temp::BIGINT AS min_temp, max_temp::BIGINT AS max_temp,
+                    'fahrenheit' AS temperature_unit_code
+             FROM (VALUES
+                 ('KCLD', '2026-10-06T00:00:00Z', '2026-10-06T13:00:00Z', 60, NULL),
+                 ('KCLD', '2026-10-06T12:00:00Z', '2026-10-07T00:00:00Z', NULL, 55),
+                 ('KFAR', '2026-10-06T00:00:00Z', '2026-10-06T06:00:00Z', 40, NULL),
+                 ('KFAR', '2026-10-07T00:00:01Z', '2026-10-07T12:00:00Z', NULL, 70)
+             ) AS periods(station_id, begin_time, end_time, min_temp, max_temp)",
+        )]);
+        let request = ForecastRequest {
+            station_ids: "KCLD,KFAR".into(),
+            ..native_forecast_request("2026-10-06T00:00:00Z", "2026-10-06T12:00:00Z")
+        };
+        let forecasts = access(&directory)
+            .forecasts_data(&request, request.station_ids())
+            .await
+            .unwrap();
+        // KCLD's afternoon is colder than its night: the borrowed high
+        // stops at the low. KFAR's next high begins a second out of reach.
+        assert_eq!(
+            day_values(&forecasts),
+            [("KCLD", "2026-10-06", 60, 60, None)]
         );
     }
 
