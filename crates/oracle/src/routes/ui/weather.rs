@@ -102,6 +102,12 @@ pub struct WeatherKey {
 }
 
 impl WeatherKey {
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.stations.capacity() * std::mem::size_of::<String>()
+            + self.stations.iter().map(String::capacity).sum::<usize>()
+    }
+
     /// A selected period keeps UTC days, as its address says.
     pub fn new(
         station_ids: &[String],

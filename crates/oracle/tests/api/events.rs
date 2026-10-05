@@ -357,7 +357,7 @@ async fn unlisted_events_stay_off_the_list_and_counts_but_open_by_their_link() {
         .returning(|_, _| Ok(vec![]));
     weather.expect_forecasts_data().returning(|_, _| Ok(vec![]));
     weather.expect_stations().returning(|| Ok(vec![]));
-    let test_app = spawn_app(Arc::new(weather)).await;
+    let mut test_app = spawn_app(Arc::new(weather)).await;
 
     // One listed event, then a full page (50 rows) of newer unlisted ones.
     let listed = created_with(&test_app, false).await;
@@ -376,25 +376,24 @@ async fn unlisted_events_stay_off_the_list_and_counts_but_open_by_their_link() {
     assert_eq!(rows(&page), 1);
     assert!(page.contains(&listed.id.to_string()));
     assert!(!page.contains(&newest));
-    assert!(page.contains(
-        "All <span class=\"chip-count\">1</span> <span class=\"chip-unlisted\">+50 unlisted</span>"
-    ));
-    assert!(page.contains(
-        "Live <span class=\"chip-count\">1</span> <span class=\"chip-unlisted\">+50 unlisted</span>"
-    ));
-    assert!(page.contains("Show unlisted"));
-    assert!(page.contains("(50 hidden)"));
+    assert!(page.contains("All <span class=\"chip-count\">1</span>"));
+    assert!(!page.contains("Show unlisted"));
+    assert!(!page.contains("hidden)"));
     assert!(!page.contains("Older events"));
-    // The dashboard counts every event and opens the list with them shown.
     let dashboard = html(&test_app, "/").await;
-    assert!(
-        dashboard.contains("<span class=\"stat-value stat-live\">51</span>"),
-        "{dashboard}"
-    );
-    assert!(
-        dashboard.contains("href=\"/events?status=live&amp;unlisted=show\""),
-        "{dashboard}"
-    );
+    assert!(dashboard.contains("<span class=\"stat-value stat-live\">1</span>"));
+    assert!(!dashboard.contains("unlisted=show"));
+    assert!(!dashboard.contains("Events awaiting attestation"));
+    let page = html(&test_app, "/events?unlisted=show").await;
+    assert_eq!(rows(&page), 1);
+    assert!(!page.contains(&newest));
+
+    // The separate private listener includes the operator marker.
+    test_app.app = oracle::metrics::router(test_app.state.clone());
+    let dashboard = html(&test_app, "/").await;
+    assert!(dashboard.contains("<span class=\"stat-value stat-live\">51</span>"));
+    assert!(dashboard.contains("unlisted=show"));
+    assert!(dashboard.contains("Events awaiting attestation"));
 
     // With the toggle: newest first, a page at a time, counted too.
     let page = html(&test_app, "/events?unlisted=show").await;
@@ -412,6 +411,7 @@ async fn unlisted_events_stay_off_the_list_and_counts_but_open_by_their_link() {
     assert!(page.contains(&listed.id.to_string()));
     assert!(page.contains("Newest events"));
 
+    test_app.app = oracle::app(test_app.state.clone());
     // Reachable by their link, on their page and over the API.
     let page = html(&test_app, &format!("/events/{newest}")).await;
     assert!(page.contains(&newest));

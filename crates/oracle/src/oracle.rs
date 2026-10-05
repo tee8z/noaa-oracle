@@ -19,14 +19,15 @@ use uuid::Uuid;
 use crate::{
     database::{AwaitingAttestation, Database, EntryScore, SettlementOutcome, WriteError},
     events::{
-        AddEventEntry, CreateEvent, EXPIRY_AFTER_SIGNING, EntryRejection, Event, EventCounts,
-        EventFilter, EventListQuery, EventRecord, EventRejection, EventStatus, EventSummary,
-        NewEvent, SettlementBlock, WeatherEntry, validate_entries,
+        AWAITING_COLLECTION, AddEventEntry, BASELINE_UNAVAILABLE, CreateEvent,
+        EXPIRY_AFTER_SIGNING, EntryRejection, Event, EventCounts, EventFilter, EventListQuery,
+        EventRecord, EventRejection, EventStatus, EventSummary, NewEvent, SettlementBlock,
+        WeatherEntry, validate_entries,
     },
     lines::{self, Line, LinePass, LineSettings},
     scoring::{self, NotUuidV7, PickRule, Scored, ScoringRules},
     signing::{AttestError, KeyError, SigningKey},
-    sources::{ObservationWindow, OutcomeSource, Reading, SourceError, Sources},
+    sources::{ObservationWindow, OutcomeSource, PlannedBaseline, Reading, SourceError, Sources},
     statement::Statement,
 };
 
@@ -90,6 +91,17 @@ const FIRST_RETRY: Duration = Duration::minutes(15);
 /// inside the day an event has between its signing date and its expiry.
 const LONGEST_RETRY: Duration = Duration::hours(6);
 
+/// How long a collection run takes to ask its source for every target. A
+/// run that started this long before a signing date can still hold a
+/// request made after it, which is what settlement needs.
+const COLLECTION_RUN: Duration = Duration::minutes(5);
+
+/// How long after its signing date an event's missing observations are
+/// expected to arrive with the next collection. Until then a settlement
+/// check waits for a new collection instead of a timer; a gap that outlasts
+/// it is retried with the growing wait.
+const COLLECTION_SETTLING: Duration = Duration::hours(2);
+
 /// What one processing pass did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EtlSummary {
@@ -110,6 +122,11 @@ pub struct EtlSummary {
     pub skipped_fresh: usize,
     /// Events closed in this pass for having no entries at their signing date.
     pub settled_without_entries: usize,
+    /// Events left unread because they can never be attested.
+    pub skipped_unsettleable: usize,
+    /// Events past their signing date left unread until a new observation
+    /// collection is published.
+    pub awaiting_collection: usize,
 }
 
 /// A failed read of an event, and how many in a row it makes.
@@ -117,6 +134,10 @@ pub struct EtlSummary {
 struct Failure {
     count: u32,
     at: OffsetDateTime,
+    /// The published observations did not cover the window.
+    coverage: bool,
+    /// When the newest observation collection had started, if known.
+    collection: Option<OffsetDateTime>,
 }
 
 impl Failure {
@@ -146,6 +167,10 @@ struct EtlMemory {
     refreshed: HashMap<Uuid, OffsetDateTime>,
     /// Events whose latest read failed.
     failures: HashMap<Uuid, Failure>,
+    /// When the newest published observation collection started, as the
+    /// process last told the oracle. `None` when it never did: settlement
+    /// checks then run on timers alone.
+    collection: Option<OffsetDateTime>,
 }
 
 /// What a pass does with one unsigned event.
@@ -159,6 +184,11 @@ enum Step {
     SkipBackedOff,
     /// The provisional readings are recent.
     SkipFresh,
+    /// A scored baseline does not exist: no read can settle the event.
+    SkipUnsettleable,
+    /// The signing date passed and the observations that settle the event
+    /// come with a collection that is not published yet.
+    AwaitCollection,
     Read,
 }
 
@@ -189,6 +219,108 @@ fn next_step(
 
 fn signing_due(event: &EventRecord, now: OffsetDateTime) -> bool {
     event.status(now) == EventStatus::Completed && now >= event.signing_date
+}
+
+/// [`next_step`] for an event whose settlement is due, given what is known
+/// beyond its timers: whether its stored block is final, and when the newest
+/// observation collection started.
+///
+/// Settlement needs a source request made after the signing date, so the
+/// first check waits for a collection that can hold one, and a check that
+/// found the observations short waits for the next collection. Both apply
+/// for [`COLLECTION_SETTLING`] after the signing date and only while the
+/// collection time is known; past that the timers of [`next_step`] decide.
+fn settlement_step(
+    event: &EventRecord,
+    now: OffsetDateTime,
+    refreshed: Option<OffsetDateTime>,
+    failure: Option<Failure>,
+    unsettleable: bool,
+    collection: Option<OffsetDateTime>,
+) -> Step {
+    let step = next_step(event, now, refreshed, failure);
+    if !signing_due(event, now) || event.total_entries == 0 {
+        return step;
+    }
+    if unsettleable {
+        return Step::SkipUnsettleable;
+    }
+    let (Some(collection), true) = (
+        collection,
+        now < event.signing_date.saturating_add(COLLECTION_SETTLING),
+    ) else {
+        return step;
+    };
+    // Failures from before the signing date say nothing about settlement.
+    match failure.filter(|failure| failure.next_attempt(event, now).is_some()) {
+        None if collection < event.signing_date.saturating_sub(COLLECTION_RUN) => {
+            Step::AwaitCollection
+        }
+        None => step,
+        Some(failure) if failure.coverage => {
+            if failure.collection.is_none_or(|seen| collection > seen) {
+                Step::Read
+            } else {
+                Step::AwaitCollection
+            }
+        }
+        Some(_) => step,
+    }
+}
+
+/// When a blocked event is read next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NextAttempt {
+    At(OffsetDateTime),
+    /// When the next observation collection is published.
+    NextCollection,
+    /// Never: the event cannot be attested and ends through its expiry.
+    Never,
+}
+
+/// An event past its signing date that has entries and no attestation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OverdueEvent {
+    pub id: Uuid,
+    pub locations: Vec<String>,
+    pub signing_date: OffsetDateTime,
+    /// When its contract expires and the event can no longer be attested.
+    pub expires_at: OffsetDateTime,
+    pub total_entries: usize,
+    /// Why the last check did not sign it, if a check has run.
+    pub block: Option<SettlementBlock>,
+    pub next_attempt: Option<NextAttempt>,
+}
+
+/// The `target/metric` pairs of `targets` and `metrics` that `planned` gives
+/// no baseline, each with the source's reason. Nothing when the source
+/// planned nothing: it cannot tell, and creation is not checked.
+fn unplanned_baselines(
+    targets: &[String],
+    metrics: &[String],
+    planned: &[PlannedBaseline],
+) -> Vec<String> {
+    if planned.is_empty() {
+        return vec![];
+    }
+    let mut missing = vec![];
+    for target in targets {
+        for metric in metrics {
+            let mut rows = planned
+                .iter()
+                .filter(|row| &row.target == target && &row.metric == metric);
+            let row = rows.next().filter(|_| rows.next().is_none());
+            if row.is_some_and(|row| row.reason.is_none() && row.value.is_some_and(f64::is_finite))
+            {
+                continue;
+            }
+            let reason = row
+                .and_then(|row| row.reason.as_deref())
+                .unwrap_or("the source has no forecast for it");
+            missing.push(format!("{target}/{metric} ({reason})"));
+        }
+    }
+    missing
 }
 
 pub struct Oracle {
@@ -433,6 +565,7 @@ impl Oracle {
                     .map_err(|missing| EventRejection::LinesUnavailable(missing.join(", ")))?,
             };
         }
+        self.require_baselines(&new_event).await?;
         self.db.add_event(&new_event).await?;
         info!(
             "created event {} for {} with {} outcomes",
@@ -441,6 +574,32 @@ impl Oracle {
             new_event.event_announcement.locking_points.len()
         );
         self.get_event(new_event.id).await
+    }
+
+    /// Refuses an event when its source has no baseline for a target and
+    /// metric it scores. Such an event could collect entries and then never
+    /// be attested, leaving its contract to run out.
+    async fn require_baselines(&self, new_event: &NewEvent) -> Result<(), Error> {
+        let source = self
+            .sources
+            .get(&new_event.source)
+            .ok_or_else(|| Error::UnknownSource {
+                event: new_event.id,
+                source_id: new_event.source.clone(),
+            })?;
+        let window = ObservationWindow {
+            start: new_event.start_observation_date,
+            end: new_event.end_observation_date,
+        };
+        let planned = source
+            .planned_baselines(window, &new_event.locations)
+            .await?;
+        let missing = unplanned_baselines(&new_event.locations, &new_event.metrics, &planned);
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(EventRejection::BaselineUnavailable(missing.join(", ")).into())
+        }
     }
 
     pub async fn add_event_entries(
@@ -528,6 +687,15 @@ impl Oracle {
                     summary.skipped_fresh += 1;
                     continue;
                 }
+                Step::SkipUnsettleable => {
+                    summary.skipped_unsettleable += 1;
+                    continue;
+                }
+                Step::AwaitCollection => {
+                    summary.awaiting_collection += 1;
+                    self.note_awaiting_collection(&event, blocks.get(&id)).await;
+                    continue;
+                }
                 Step::SettleWithoutEntries => {
                     let settled = self.settle_without_entries(&event).await;
                     if matches!(settled, Ok(true)) {
@@ -553,7 +721,8 @@ impl Oracle {
         info!(
             "etl {etl_process_id}: done, {} attested, {} failed, {} refreshed, \
              {} skipped as live, {} skipped as backed off, {} skipped as recently refreshed, \
-             {} settled without entries, {} expired before finalization",
+             {} settled without entries, {} expired before finalization, \
+             {} awaiting a collection, {} unsettleable",
             summary.attested,
             summary.failed,
             summary.refreshed,
@@ -561,9 +730,103 @@ impl Oracle {
             summary.skipped_backed_off,
             summary.skipped_fresh,
             summary.settled_without_entries,
-            summary.expired
+            summary.expired,
+            summary.awaiting_collection,
+            summary.skipped_unsettleable
         );
         Ok(summary)
+    }
+
+    /// Tells the oracle when the newest published observation collection
+    /// started, so settlement checks can wait for the collection they need
+    /// (see [`settlement_step`]). Called before each pass by a process that
+    /// knows; without it checks run on timers alone.
+    pub fn set_latest_collection(&self, started: Option<OffsetDateTime>) {
+        self.etl_memory().collection = started;
+    }
+
+    /// Records why an event past its signing date was left unread, unless a
+    /// settlement check already recorded its own reason.
+    async fn note_awaiting_collection(&self, event: &EventRecord, block: Option<&SettlementBlock>) {
+        if block.is_some_and(|block| block.checked_at >= event.signing_date) {
+            return;
+        }
+        let block = SettlementBlock {
+            code: AWAITING_COLLECTION.into(),
+            message: "the observation collection that checks the end of the window has not \
+                      been published yet"
+                .into(),
+            checked_at: self.now(),
+        };
+        if let Err(error) = self.db.set_settlement_block(event.id, block, true).await {
+            warn!(
+                "event {}: cannot record that it awaits a collection: {error:#}",
+                event.id
+            );
+        }
+    }
+
+    /// When `block`, the stored block of the unsigned event `id`, lets the
+    /// event be read again.
+    pub fn next_attempt(
+        &self,
+        id: Uuid,
+        signing_date: OffsetDateTime,
+        block: &SettlementBlock,
+    ) -> NextAttempt {
+        if block.is_final() {
+            return NextAttempt::Never;
+        }
+        if block.code == AWAITING_COLLECTION {
+            return NextAttempt::NextCollection;
+        }
+        let now = self.now();
+        let memory = self.etl_memory();
+        match memory.failures.get(&id) {
+            Some(failure)
+                if failure.coverage
+                    && memory.collection.is_some()
+                    && now < signing_date.saturating_add(COLLECTION_SETTLING) =>
+            {
+                NextAttempt::NextCollection
+            }
+            Some(failure) => NextAttempt::At(failure.at + retry_delay(failure.count)),
+            None => NextAttempt::At(block.checked_at + retry_delay(1)),
+        }
+    }
+
+    /// Events with entries whose signing date has passed without an
+    /// attestation, oldest signing date first, with why and when each is
+    /// read next. Events past their expiry are left out.
+    pub async fn overdue_events(&self) -> Result<Vec<OverdueEvent>, Error> {
+        let now = self.now();
+        let mut events: Vec<EventRecord> = self
+            .db
+            .events_to_settle(now)
+            .await?
+            .into_iter()
+            .filter(|event| signing_due(event, now) && event.total_entries > 0)
+            .collect();
+        events.sort_by_key(|event| event.signing_date);
+        let ids: Vec<Uuid> = events.iter().map(|event| event.id).collect();
+        let mut blocks = self.db.settlement_blocks(&ids).await?;
+        Ok(events
+            .into_iter()
+            .map(|event| {
+                let block = blocks.remove(&event.id);
+                OverdueEvent {
+                    next_attempt: block
+                        .as_ref()
+                        .map(|block| self.next_attempt(event.id, event.signing_date, block)),
+                    id: event.id,
+                    locations: event.locations,
+                    signing_date: event.signing_date,
+                    expires_at: event.signing_date.saturating_add(EXPIRY_AFTER_SIGNING),
+                    total_entries: event.total_entries,
+                    block,
+                }
+            })
+            .collect())
     }
 
     fn etl_memory(&self) -> MutexGuard<'_, EtlMemory> {
@@ -580,27 +843,40 @@ impl Oracle {
     }
 
     /// The step for `event` now. A new process remembers no failures, so a
-    /// stored `block` counts as the event's first.
+    /// stored `block` counts as the event's first, unless it only records
+    /// that the event waited for a collection.
     fn step_for(&self, event: &EventRecord, block: Option<&SettlementBlock>) -> Step {
         let now = self.now();
         let memory = self.etl_memory();
         let failure = memory.failures.get(&event.id).copied().or_else(|| {
-            block.map(|block| Failure {
-                count: 1,
-                at: block.checked_at,
-            })
+            block
+                .filter(|block| block.code != AWAITING_COLLECTION)
+                .map(|block| Failure {
+                    count: 1,
+                    at: block.checked_at,
+                    coverage: false,
+                    collection: None,
+                })
         });
-        next_step(
+        settlement_step(
             event,
             now,
             memory.refreshed.get(&event.id).copied(),
             failure,
+            block.is_some_and(SettlementBlock::is_final),
+            memory.collection,
         )
     }
 
     /// Counts a failed read at `now` and returns it. Failures from before
     /// the signing date do not lengthen the wait between settlement checks.
-    fn remember_failure(&self, event: &EventRecord, now: OffsetDateTime) -> Failure {
+    /// `coverage` says the published observations did not cover the window.
+    fn remember_failure(
+        &self,
+        event: &EventRecord,
+        now: OffsetDateTime,
+        coverage: bool,
+    ) -> Failure {
         let mut memory = self.etl_memory();
         let earlier = memory
             .failures
@@ -610,6 +886,8 @@ impl Oracle {
         let failure = Failure {
             count: earlier.saturating_add(1),
             at: now,
+            coverage,
+            collection: memory.collection,
         };
         memory.failures.insert(event.id, failure);
         failure
@@ -628,20 +906,28 @@ impl Oracle {
         match &result {
             Ok(_) => self.remember_refresh(event.id, now),
             Err(error) => {
-                let failure = self.remember_failure(&event, now);
-                warn!(
-                    "event {}: failure {} in a row; next attempt at {}",
-                    event.id,
-                    failure.count,
-                    now + retry_delay(failure.count)
-                );
+                let source_coverage = matches!(error, Error::Source(SourceError::Coverage(_)));
+                let failure = self.remember_failure(&event, now, source_coverage);
                 let code = match error {
                     Error::Source(SourceError::DataQuality { .. }) => "data_quality",
                     Error::Source(SourceError::SettlementBlocked(_)) => "incomplete_readings",
+                    Error::Source(SourceError::BaselineUnavailable(_)) => BASELINE_UNAVAILABLE,
                     Error::Source(_) => "source_unavailable",
                     _ => "processing_failed",
                 };
-                let source_coverage = matches!(error, Error::Source(SourceError::Coverage(_)));
+                if code == BASELINE_UNAVAILABLE {
+                    warn!(
+                        "event {} cannot be attested and will not be read again: {error}",
+                        event.id
+                    );
+                } else {
+                    warn!(
+                        "event {}: failure {} in a row; next attempt at {}",
+                        event.id,
+                        failure.count,
+                        now + retry_delay(failure.count)
+                    );
+                }
                 self.db
                     .set_settlement_block(
                         event.id,
@@ -914,7 +1200,23 @@ mod tests {
     }
 
     fn failure(count: u32, at: OffsetDateTime) -> Option<Failure> {
-        Some(Failure { count, at })
+        Some(Failure {
+            count,
+            at,
+            coverage: false,
+            collection: None,
+        })
+    }
+
+    /// A failed check that found the observations short of the window while
+    /// the newest collection had started at `collection`.
+    fn coverage_failure(at: OffsetDateTime, collection: OffsetDateTime) -> Option<Failure> {
+        Some(Failure {
+            count: 1,
+            at,
+            coverage: true,
+            collection: Some(collection),
+        })
     }
 
     #[test]
@@ -987,6 +1289,188 @@ mod tests {
             next_step(&event, event.signing_date, None, failed),
             Step::Read
         );
+    }
+
+    #[test]
+    fn the_first_settlement_check_waits_for_a_collection_that_can_cover_it() {
+        let event = event(3);
+        let signing = event.signing_date;
+        let step = |now: OffsetDateTime, collection: Option<OffsetDateTime>| {
+            settlement_step(&event, now, None, None, false, collection)
+        };
+        // The newest collection started well before the signing date: no
+        // request in it was made after that date, so the check would fail.
+        let earlier = signing - Duration::minutes(40);
+        assert_eq!(
+            step(signing + Duration::minutes(1), Some(earlier)),
+            Step::AwaitCollection
+        );
+        // A run that started just before the signing date can hold one.
+        assert_eq!(
+            step(
+                signing + Duration::minutes(8),
+                Some(signing - COLLECTION_RUN)
+            ),
+            Step::Read
+        );
+        // The next collection is published: the first check runs then.
+        let covering = signing + Duration::minutes(20);
+        assert_eq!(
+            step(covering + Duration::minutes(9), Some(covering)),
+            Step::Read
+        );
+        // Without a known collection time, and once the settling time is
+        // over, the timers decide as before.
+        assert_eq!(step(signing + Duration::minutes(1), None), Step::Read);
+        assert_eq!(
+            step(signing + COLLECTION_SETTLING, Some(earlier)),
+            Step::Read
+        );
+        // Before the signing date nothing changes.
+        let before = signing - Duration::minutes(1);
+        assert_eq!(step(before, Some(earlier)), Step::Read);
+    }
+
+    #[test]
+    fn a_check_short_of_observations_runs_again_with_the_next_collection() {
+        let event = event(3);
+        let signing = event.signing_date;
+        let seen = signing - Duration::minutes(3);
+        let failed_at = signing + Duration::minutes(6);
+        let step = |now: OffsetDateTime, collection: OffsetDateTime| {
+            settlement_step(
+                &event,
+                now,
+                None,
+                coverage_failure(failed_at, seen),
+                false,
+                Some(collection),
+            )
+        };
+        // The same collection cannot answer differently, timer or not.
+        assert_eq!(
+            step(failed_at + Duration::minutes(5), seen),
+            Step::AwaitCollection
+        );
+        assert_eq!(
+            step(failed_at + Duration::minutes(40), seen),
+            Step::AwaitCollection
+        );
+        // A new one is read at once, before the fifteen-minute wait is over.
+        let next = seen + Duration::hours(1);
+        assert_eq!(step(next + Duration::minutes(9), next), Step::Read);
+        // A gap that outlasts the settling time goes back to the timers.
+        let late = signing + COLLECTION_SETTLING;
+        assert_eq!(step(late, seen), Step::Read);
+        let again = Some(Failure {
+            count: 4,
+            at: late,
+            coverage: true,
+            collection: Some(seen),
+        });
+        assert_eq!(
+            settlement_step(
+                &event,
+                late + Duration::minutes(119),
+                None,
+                again,
+                false,
+                Some(seen)
+            ),
+            Step::SkipBackedOff
+        );
+        assert_eq!(
+            settlement_step(
+                &event,
+                late + Duration::hours(2),
+                None,
+                again,
+                false,
+                Some(seen)
+            ),
+            Step::Read
+        );
+        // Other failures keep their timers while a collection is awaited.
+        let other = failure(1, failed_at);
+        assert_eq!(
+            settlement_step(
+                &event,
+                failed_at + Duration::minutes(5),
+                None,
+                other,
+                false,
+                Some(next)
+            ),
+            Step::SkipBackedOff
+        );
+    }
+
+    #[test]
+    fn an_event_without_a_baseline_is_never_read_again() {
+        let event = event(3);
+        let signing = event.signing_date;
+        let failed = failure(1, signing);
+        for after in [Duration::ZERO, Duration::hours(7), Duration::hours(23)] {
+            assert_eq!(
+                settlement_step(&event, signing + after, None, failed, true, None),
+                Step::SkipUnsettleable
+            );
+        }
+        // Without entries there is no outcome to hold: it is closed as usual.
+        let empty = self::event(0);
+        assert_eq!(
+            settlement_step(&empty, empty.signing_date, None, None, true, None),
+            Step::SettleWithoutEntries
+        );
+    }
+
+    #[test]
+    fn creation_names_every_pair_without_a_baseline() {
+        let planned = |target: &str, metric: &str, value: Option<f64>, reason: Option<&str>| {
+            PlannedBaseline {
+                target: target.into(),
+                metric: metric.into(),
+                value,
+                reason: reason.map(str::to_owned),
+            }
+        };
+        let targets = vec!["KORD".to_owned(), "PAGK".to_owned()];
+        let metrics = vec!["temp_high".to_owned(), "wind_speed".to_owned()];
+        let rows = vec![
+            planned("KORD", "temp_high", Some(70.0), None),
+            planned("KORD", "wind_speed", Some(9.0), None),
+            planned("KORD", "rain_amt", None, Some("not scored")),
+            planned("PAGK", "temp_high", Some(37.0), None),
+            planned(
+                "PAGK",
+                "wind_speed",
+                None,
+                Some("native forecast value is missing"),
+            ),
+        ];
+        assert_eq!(
+            unplanned_baselines(&targets, &metrics, &rows),
+            vec!["PAGK/wind_speed (native forecast value is missing)"]
+        );
+        // A pair the source did not assess, or assessed twice, has none.
+        let mut twice = rows.clone();
+        twice.push(planned("KORD", "temp_high", Some(71.0), None));
+        twice.retain(|row| !(row.target == "PAGK" && row.metric == "temp_high"));
+        assert_eq!(
+            unplanned_baselines(&targets, &metrics, &twice),
+            vec![
+                "KORD/temp_high (the source has no forecast for it)",
+                "PAGK/temp_high (the source has no forecast for it)",
+                "PAGK/wind_speed (native forecast value is missing)",
+            ]
+        );
+        let not_finite = vec![planned("KORD", "temp_high", Some(f64::NAN), None)];
+        assert_eq!(
+            unplanned_baselines(&targets[..1], &metrics[..1], &not_finite),
+            vec!["KORD/temp_high (the source has no forecast for it)"]
+        );
+        // A source that plans nothing cannot tell: nothing is refused.
+        assert!(unplanned_baselines(&targets, &metrics, &[]).is_empty());
     }
 
     #[test]

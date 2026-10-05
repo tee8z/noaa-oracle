@@ -224,12 +224,12 @@ test.describe("Events Page", () => {
     await page.goto("/events");
     await expect(page.locator(".site-header")).toHaveCount(1);
     await expect(page.locator(".status-filter")).toBeVisible();
-    await expect(page.getByText("Show unlisted")).toBeVisible();
+    await expect(page.getByText("Show unlisted")).toHaveCount(0);
     await page.locator(".status-chip", { hasText: "Signed" }).click();
     await expect(page).toHaveURL(/status=signed/);
-    await page.getByLabel("Show unlisted").check();
-    await expect(page).toHaveURL(/status=signed&unlisted=show/);
-    await expect(page.getByLabel("Show unlisted")).toBeChecked();
+    await page.goto("/events?status=signed&unlisted=show");
+    await expect(page.getByLabel("Show unlisted")).toHaveCount(0);
+    await expect(page.locator(".chip-unlisted")).toHaveCount(0);
     expect(errors()).toHaveLength(0);
   });
 });

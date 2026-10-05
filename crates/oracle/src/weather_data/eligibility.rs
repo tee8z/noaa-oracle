@@ -36,7 +36,7 @@ use utoipa::ToSchema;
 /// more collection outages and judge few stations differently.
 pub const DEFAULT_DAYS: u32 = 3;
 /// Days of reports read ahead of requests (see [`Timeline`]).
-pub const PRECOMPUTED_DAYS: u32 = 7;
+pub const PRECOMPUTED_DAYS: u32 = DEFAULT_DAYS;
 /// Most days one query may judge: the longest public time range.
 pub const MAX_DAYS: u32 = 31;
 /// Competition window length when a query names none.
@@ -197,6 +197,18 @@ impl Timeline {
             && now.to_offset(UtcOffset::UTC).date() == self.read_at.to_offset(UtcOffset::UTC).date()
     }
 
+    pub(super) fn estimated_bytes(&self) -> usize {
+        self.reports
+            .iter()
+            .map(|(id, reports)| id.capacity() + reports.capacity() * std::mem::size_of::<Report>())
+            .sum::<usize>()
+            + self
+                .forecasts
+                .keys()
+                .map(|id| id.capacity() + std::mem::size_of::<Option<OffsetDateTime>>())
+                .sum::<usize>()
+    }
+
     /// Reports held, over every station.
     pub(super) fn report_count(&self) -> usize {
         self.reports.values().map(Vec::len).sum()
@@ -342,8 +354,14 @@ impl WeatherAccess {
         let now = now - Duration::nanoseconds(now.nanosecond().into());
         let timeline = self.read_timeline(PRECOMPUTED_DAYS, now).await?;
         let reports = timeline.report_count();
-        *self.timeline.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(timeline));
-        Ok(reports)
+        let held = if timeline.estimated_bytes() <= 128 * 1024 * 1024 {
+            Some(Arc::new(timeline))
+        } else {
+            None
+        };
+        let count = if held.is_some() { reports } else { 0 };
+        *self.timeline.lock().unwrap_or_else(PoisonError::into_inner) = held;
+        Ok(count)
     }
 
     /// Reads the reports of the `days` full UTC days before `now` and the

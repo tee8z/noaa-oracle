@@ -254,6 +254,12 @@ pub struct ObservationKey {
 }
 
 impl ObservationKey {
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.stations.capacity() * std::mem::size_of::<String>()
+            + self.stations.iter().map(String::capacity).sum::<usize>()
+    }
+
     /// The key of a bounded request for `stations`.
     fn new(req: &ObservationRequest, mut stations: Vec<String>) -> Self {
         stations.sort_unstable();

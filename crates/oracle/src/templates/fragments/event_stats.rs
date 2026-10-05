@@ -2,10 +2,8 @@ use maud::{Markup, html};
 
 use crate::events::EventCounts;
 
-/// One line of counts of every event, unlisted ones included; each opens
-/// the events list filtered to that status with unlisted events shown, so
-/// the list matches the count.
-pub fn event_stats(counts: &EventCounts) -> Markup {
+/// Counts and links use the same visibility on each listener.
+pub fn event_stats(counts: &EventCounts, operator: bool) -> Markup {
     html! {
         section class="box event-stats" aria-label="Events by status" {
             @for (status, count, label, hint) in [
@@ -14,7 +12,7 @@ pub fn event_stats(counts: &EventCounts) -> Markup {
                 ("completed", counts.completed, "Completed", "Awaiting signature"),
                 ("signed", counts.signed, "Signed", "Attested"),
             ] {
-                @let href = format!("/events?status={status}&unlisted=show");
+                @let href = format!("/events?status={status}{}", if operator { "&unlisted=show" } else { "" });
                 a class="stat-card" href=(href)
                   hx-get=(href)
                   hx-target="#main-content"
@@ -41,7 +39,9 @@ mod tests {
             signed: 185,
             unlisted: 290,
         };
-        let html = event_stats(&counts).into_string();
+        let public = event_stats(&counts, false).into_string();
+        assert!(!public.contains("unlisted"));
+        let html = event_stats(&counts, true).into_string();
         assert!(html.contains(">33<"), "{html}");
         assert!(
             html.contains("href=\"/events?status=running&amp;unlisted=show\""),

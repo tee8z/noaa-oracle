@@ -561,9 +561,12 @@ impl Database {
     /// among them. Events without entries are never attested, so they are
     /// left out. Those past their DLC expiry can no longer be attested and
     /// are counted apart. Of those still awaiting, the ones whose latest
-    /// check found the published observations short of the window are
-    /// counted again apart, and the earliest signing date among the rest is
-    /// given too.
+    /// check found the published observations short of the window, or no
+    /// baseline for a scored metric (the code
+    /// [`crate::events::BASELINE_UNAVAILABLE`]), are counted again apart,
+    /// and so are the latter alone. The earliest signing date among those
+    /// not waiting on observations is given too; it includes events without
+    /// a baseline, which nothing but the operator can resolve.
     pub async fn awaiting_attestation(
         &self,
         now: OffsetDateTime,
@@ -572,8 +575,11 @@ impl Database {
             "SELECT COALESCE(SUM(e.signing_date + ?1 > ?2), 0) AS awaiting,
                 COALESCE(SUM(e.signing_date + ?1 <= ?2), 0) AS expired,
                 MIN(CASE WHEN e.signing_date + ?1 > ?2 THEN e.signing_date END) AS oldest_signing_date,
-                COALESCE(SUM(e.signing_date + ?1 > ?2 AND b.source_coverage IS 1), 0)
+                COALESCE(SUM(e.signing_date + ?1 > ?2
+                    AND (b.source_coverage IS 1 OR b.code IS 'baseline_unavailable')), 0)
                     AS blocked_on_source_coverage,
+                COALESCE(SUM(e.signing_date + ?1 > ?2 AND b.code IS 'baseline_unavailable'), 0)
+                    AS unsettleable,
                 MIN(CASE WHEN e.signing_date + ?1 > ?2 AND b.source_coverage IS NOT 1
                     THEN e.signing_date END) AS oldest_attestable_signing_date
              FROM events e LEFT JOIN event_settlement_blocks b ON b.event_id = e.id
@@ -596,6 +602,7 @@ impl Database {
             expired: count_column(&row, "expired")?,
             oldest_signing_date: date("oldest_signing_date")?,
             blocked_on_source_coverage: count_column(&row, "blocked_on_source_coverage")?,
+            unsettleable: count_column(&row, "unsettleable")?,
             oldest_attestable_signing_date: date("oldest_attestable_signing_date")?,
         })
     }
@@ -1163,10 +1170,14 @@ pub struct AwaitingAttestation {
     pub expired: usize,
     pub oldest_signing_date: Option<OffsetDateTime>,
     /// Events among `count` whose latest check failed because the published
-    /// observations do not cover their window.
+    /// observations do not cover their window, or because a scored metric
+    /// has no baseline.
     pub blocked_on_source_coverage: usize,
-    /// The earliest signing date among the events in `count` not in
-    /// `blocked_on_source_coverage`.
+    /// Events among `blocked_on_source_coverage` without a baseline: they
+    /// can never be attested.
+    pub unsettleable: usize,
+    /// The earliest signing date among the events in `count` that do not
+    /// wait on observations.
     pub oldest_attestable_signing_date: Option<OffsetDateTime>,
 }
 

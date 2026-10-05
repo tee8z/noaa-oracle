@@ -135,6 +135,10 @@ pub enum EventRejection {
     NotCalibrated(String),
     #[error("no line has been fitted yet for {0}; use fixed scoring rules or try later")]
     LinesUnavailable(String),
+    /// The source has no baseline for these target and metric pairs, so the
+    /// event could never be attested.
+    #[error("no forecast baseline for {0}; choose other locations or scoring fields")]
+    BaselineUnavailable(String),
     #[error("lines_from_event needs lines scoring rules")]
     LinesFromEventNeedsLines,
     #[error("lines_from_event {0} is not an event on this oracle")]
@@ -709,13 +713,34 @@ impl std::fmt::Display for EventStatus {
     }
 }
 
-/// A failed settlement or source check. The event is retried automatically.
+/// [`SettlementBlock::code`] of an event that can never be attested: a
+/// target and metric it scores has no baseline, and the baseline was fixed
+/// when the window opened. The event is not read again and its contract
+/// ends through its expiry.
+pub const BASELINE_UNAVAILABLE: &str = "baseline_unavailable";
+
+/// [`SettlementBlock::code`] of an event past its signing date that waits
+/// for the first observation collection started after that date.
+pub const AWAITING_COLLECTION: &str = "awaiting_collection";
+
+/// A failed settlement or source check. The event is retried automatically,
+/// except with the code `baseline_unavailable`, which is final. `message`
+/// names the targets and metrics that hold it.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
 pub struct SettlementBlock {
+    /// `baseline_unavailable`, `awaiting_collection`, `incomplete_readings`,
+    /// `data_quality`, `source_unavailable` or `processing_failed`.
     pub code: String,
     pub message: String,
     #[serde(with = "time::serde::rfc3339")]
     pub checked_at: OffsetDateTime,
+}
+
+impl SettlementBlock {
+    /// Whether nothing can lift this block before the event expires.
+    pub fn is_final(&self) -> bool {
+        self.code == BASELINE_UNAVAILABLE
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]

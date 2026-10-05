@@ -146,6 +146,7 @@ pub fn events_section(page: &EventsPage) -> Markup {
                         }
                     }
                 }
+                @if page.all.unlisted > 0 || filters.show_unlisted {
                 label class="checkbox unlisted-toggle" {
                     input type="checkbox" name="unlisted" value="show"
                         checked[filters.show_unlisted];
@@ -153,6 +154,7 @@ pub fn events_section(page: &EventsPage) -> Markup {
                     @if !filters.show_unlisted && page.counts.unlisted > 0 {
                         span class="muted" { " (" (page.counts.unlisted) " hidden)" }
                     }
+                }
                 }
                 noscript { button type="submit" class="button is-small" { "Apply" } }
             }

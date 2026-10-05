@@ -33,6 +33,8 @@ remote_url = "http://127.0.0.1:9800"
 
 # Prometheus metrics on a separate listener (GET /metrics, no
 # authentication). Off unless set; keep it off the public interface.
+# This private listener also serves operator pages. Restrict it at the
+# firewall and reverse proxy. The public listener shows listed-event navigation.
 # metrics_bind = "127.0.0.1:9801"
 
 # =============================================================================

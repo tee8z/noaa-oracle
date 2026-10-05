@@ -1,5 +1,5 @@
-//! The metrics listener serves only `GET /metrics`, and the public router
-//! never serves metrics.
+//! The private listener serves metrics and operator pages. The public
+//! router never serves metrics.
 
 use crate::helpers::{MockWeatherAccess, metric, signed, spawn_app};
 use axum::{
@@ -14,8 +14,17 @@ const FORECAST: &str = "forecasts_2030-01-02T06:00:00Z.parquet";
 const OBSERVATION: &str = "observations_2030-01-01T00:00:00Z.parquet";
 
 #[tokio::test]
-async fn the_metrics_router_serves_every_family_at_get_metrics_only() {
-    let test_app = spawn_app(Arc::new(MockWeatherAccess::new())).await;
+async fn the_private_router_serves_every_metric_family() {
+    let mut weather = MockWeatherAccess::new();
+    weather
+        .expect_observation_data()
+        .returning(|_, _| Ok(vec![]));
+    weather
+        .expect_daily_observations()
+        .returning(|_, _| Ok(vec![]));
+    weather.expect_forecasts_data().returning(|_, _| Ok(vec![]));
+    weather.expect_stations().returning(|| Ok(vec![]));
+    let test_app = spawn_app(Arc::new(weather)).await;
     for name in [FORECAST, OBSERVATION] {
         let request = signed(
             Method::POST,
@@ -53,6 +62,8 @@ async fn the_metrics_router_serves_every_family_at_get_metrics_only() {
         "oracle_events_awaiting_attestation",
         "oracle_oldest_event_awaiting_attestation_age_seconds",
         "oracle_events_blocked_on_source_coverage",
+        "oracle_events_unsettleable",
+        "oracle_cache_bytes",
         "oracle_oldest_attestable_event_age_seconds",
         "oracle_etl_runs_total",
         "oracle_events_attested_total",
@@ -104,8 +115,8 @@ async fn the_metrics_router_serves_every_family_at_get_metrics_only() {
             .unwrap();
         async move { router.oneshot(request).await.unwrap().status() }
     };
-    assert_eq!(status(Method::GET, "/").await, StatusCode::NOT_FOUND);
-    assert_eq!(status(Method::GET, "/health").await, StatusCode::NOT_FOUND);
+    assert_eq!(status(Method::GET, "/").await, StatusCode::OK);
+    assert_eq!(status(Method::GET, "/health").await, StatusCode::OK);
     assert_eq!(
         status(Method::POST, "/metrics").await,
         StatusCode::METHOD_NOT_ALLOWED

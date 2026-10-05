@@ -98,6 +98,18 @@ pub struct Reading {
     pub observed: Option<f64>,
 }
 
+/// The baseline an event would settle against for one metric at one target,
+/// as the source can tell before the event exists. `value` is `None` when
+/// the source has none; `reason` then says why.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlannedBaseline {
+    pub target: String,
+    /// A [`Metric::id`] of the source.
+    pub metric: String,
+    pub value: Option<f64>,
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {
     #[error("invalid target {target:?}: {reason}")]
@@ -111,6 +123,11 @@ pub enum SourceError {
     Coverage(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("settlement blocked: {0}")]
     SettlementBlocked(String),
+    /// The source has no baseline for a scored target and metric. The
+    /// baseline is fixed when the window opens, so no later read can change
+    /// this: the event can never be attested.
+    #[error("no baseline exists for {0}, so the event can never be attested")]
+    BaselineUnavailable(String),
     #[error(
         "settlement blocked by observation quality: {rejected_reports} rejected reports, {unverified_reports} unverified reports"
     )]
@@ -168,6 +185,18 @@ pub trait OutcomeSource: Send + Sync {
         Err(SourceError::SettlementBlocked(
             "this source has no verified settlement reader".into(),
         ))
+    }
+
+    /// The baseline each of `targets` would settle against, per metric, if
+    /// an event over `window` were created now. Event creation refuses a
+    /// target and metric without one. Sources that cannot tell return
+    /// nothing, and creation is not checked.
+    async fn planned_baselines(
+        &self,
+        _window: ObservationWindow,
+        _targets: &[String],
+    ) -> Result<Vec<PlannedBaseline>, SourceError> {
+        Ok(vec![])
     }
 
     /// Whether an event over `window` scoring `metrics` can be attested from

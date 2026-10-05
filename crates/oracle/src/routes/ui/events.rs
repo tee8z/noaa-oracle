@@ -34,13 +34,18 @@ pub struct EventsQuery {
 /// `#events`; the 30-second refresh and the page links replace
 /// `#events-list`.
 pub async fn events_handler(
+    operator: Option<axum::Extension<super::OperatorView>>,
     headers: HeaderMap,
     Query(query): Query<EventsQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Response {
     let filters = EventFilters::parse(
         query.status.as_deref(),
-        query.unlisted.as_deref(),
+        if operator.is_some() {
+            query.unlisted.as_deref()
+        } else {
+            None
+        },
         query.before.as_deref(),
     );
     let list = EventListQuery {
@@ -55,17 +60,21 @@ pub async fn events_handler(
     let (events, listed, all) = tokio::join!(
         state.oracle.event_page(&list),
         state.oracle.event_counts(false),
-        state.oracle.event_counts(true)
+        state.oracle.event_counts(operator.is_some())
     );
     let mut events = events.unwrap_or_else(|error| {
         log::error!("events page: {error:#}");
         vec![]
     });
     let [listed, all] = [listed, all].map(|counts| {
-        counts.unwrap_or_else(|error| {
+        let mut counts = counts.unwrap_or_else(|error| {
             log::error!("event counts: {error:#}");
             Default::default()
-        })
+        });
+        if operator.is_none() {
+            counts.unlisted = 0;
+        }
+        counts
     });
     let counts = if filters.show_unlisted { all } else { listed };
     let older = (events.len() > PAGE_SIZE).then(|| {

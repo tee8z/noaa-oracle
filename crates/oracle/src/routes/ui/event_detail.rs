@@ -20,6 +20,7 @@ use crate::{
 /// Returns the full page for normal requests and only the content for htmx,
 /// which swaps it into the page's existing layout.
 pub async fn event_detail_handler(
+    operator: Option<axum::Extension<super::OperatorView>>,
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Path(event_id): Path<Uuid>,
@@ -35,6 +36,23 @@ pub async fn event_detail_handler(
             } else {
                 SettlementQuality::Unsigned
             };
+            if operator.is_some() {
+                let next = event.settlement_block.as_ref().map(|block| {
+                    state
+                        .oracle
+                        .next_attempt(event.id, event.signing_date, block)
+                });
+                return page_or_fragment(
+                    crate::templates::pages::event_detail::operator_event_detail(
+                        &event,
+                        now,
+                        quality,
+                        next,
+                        matches!(super::htmx::render(&headers), Render::Page),
+                    )
+                    .into_string(),
+                );
+            }
             page_or_fragment(
                 match super::htmx::render(&headers) {
                     Render::Page => event_detail_page(&event, now, quality),
