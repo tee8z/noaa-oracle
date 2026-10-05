@@ -827,14 +827,14 @@ fn forecasts_sql(
     );
     let start_time = match &req.start {
         Some(start) => format!(
-            "GREATEST('{}'::TIMESTAMPTZ, COALESCE(w.part_start, d.start_time))",
+            "GREATEST('{}'::TIMESTAMPTZ, d.start_time, w.part_start)",
             start.format(&Rfc3339)?
         ),
         None => "d.start_time".to_owned(),
     };
     let end_time = match &req.end {
         Some(end) => format!(
-            "LEAST('{}'::TIMESTAMPTZ, COALESCE(w.part_end, d.end_time))",
+            "LEAST('{}'::TIMESTAMPTZ, d.end_time, w.part_end)",
             end.format(&Rfc3339)?
         ),
         None => "d.end_time".to_owned(),
