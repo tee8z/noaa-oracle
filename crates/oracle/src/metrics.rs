@@ -237,7 +237,7 @@ impl Metrics {
         for state in EVENT_STATES {
             metrics.events.with_label_values(&[state]);
         }
-        let collectors: [Box<dyn prometheus::core::Collector>; 20] = [
+        let collectors: Vec<Box<dyn prometheus::core::Collector>> = vec![
             Box::new(build_info),
             Box::new(metrics.etl_runs.clone()),
             Box::new(metrics.events_attested.clone()),
