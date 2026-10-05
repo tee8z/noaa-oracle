@@ -9,11 +9,14 @@
 //! `oracle_events_awaiting_attestation` and
 //! `oracle_oldest_event_awaiting_attestation_age_seconds` count every event
 //! the oracle has yet to attest. `oracle_events_blocked_on_source_coverage`
-//! counts those among them whose latest check failed because the published
-//! observations do not cover the window, such as a report the upstream
-//! source never published; the oracle cannot attest them until the data
-//! arrives. `oracle_oldest_attestable_event_age_seconds` gives the age of
-//! the oldest of the rest, so an alert on it points at the oracle itself.
+//! counts those among them whose latest check failed on the published data:
+//! observations that do not cover the window, such as a report the upstream
+//! source never published, or a scored metric without a forecast baseline.
+//! `oracle_events_unsettleable` counts the latter alone: they can never be
+//! attested, and their contracts end through expiry.
+//! `oracle_oldest_attestable_event_age_seconds` gives the age of the oldest
+//! event that does not wait on observations, so an alert on it points at
+//! the oracle itself or at an event only an operator can resolve.
 //!
 //! `oracle_eligible_stations` counts the stations eligible over the default
 //! history and window length (3 days, 24 hours), judged after each
@@ -69,6 +72,7 @@ pub struct Metrics {
     awaiting_attestation: IntGauge,
     oldest_awaiting_age: IntGauge,
     blocked_on_source_coverage: IntGauge,
+    unsettleable: IntGauge,
     oldest_attestable_age: IntGauge,
     expired_unsigned: IntGauge,
     latest_forecast: IntGauge,
@@ -78,6 +82,7 @@ pub struct Metrics {
     turned_away: IntCounter,
     resident_memory: IntGauge,
     cache_entries: IntGaugeVec,
+    cache_bytes: IntGaugeVec,
     /// When the scrape-time gauges were last read.
     refreshed_at: tokio::sync::Mutex<Option<Instant>>,
 }
@@ -148,7 +153,12 @@ impl Metrics {
             blocked_on_source_coverage: IntGauge::new(
                 "oracle_events_blocked_on_source_coverage",
                 "Events awaiting attestation whose latest check failed because the published \
-                 observations do not cover their window",
+                 observations or scored forecast baselines do not cover their window",
+            )
+            .expect("valid metric"),
+            unsettleable: IntGauge::new(
+                "oracle_events_unsettleable",
+                "Events awaiting expiry because a scored forecast baseline is missing",
             )
             .expect("valid metric"),
             oldest_attestable_age: IntGauge::new(
@@ -194,6 +204,14 @@ impl Metrics {
                 "Resident memory size of the oracle process in bytes",
             )
             .expect("valid metric"),
+            cache_bytes: IntGaugeVec::new(
+                Opts::new(
+                    "oracle_cache_bytes",
+                    "Estimated retained key and value allocation bytes by cache",
+                ),
+                &["cache"],
+            )
+            .expect("valid metric"),
             cache_entries: IntGaugeVec::new(
                 Opts::new("oracle_cache_entries", "Entries in each in-memory cache"),
                 &["cache"],
@@ -231,6 +249,7 @@ impl Metrics {
             Box::new(metrics.awaiting_attestation.clone()),
             Box::new(metrics.oldest_awaiting_age.clone()),
             Box::new(metrics.blocked_on_source_coverage.clone()),
+            Box::new(metrics.unsettleable.clone()),
             Box::new(metrics.oldest_attestable_age.clone()),
             Box::new(metrics.expired_unsigned.clone()),
             Box::new(metrics.latest_forecast.clone()),
@@ -240,6 +259,7 @@ impl Metrics {
             Box::new(metrics.turned_away.clone()),
             Box::new(metrics.resident_memory.clone()),
             Box::new(metrics.cache_entries.clone()),
+            Box::new(metrics.cache_bytes.clone()),
         ];
         for collector in collectors {
             metrics
@@ -348,6 +368,11 @@ impl Metrics {
             self.resident_memory
                 .set(i64::try_from(bytes).unwrap_or(i64::MAX));
         }
+        for (cache, bytes) in state.cache_bytes() {
+            self.cache_bytes
+                .with_label_values(&[cache])
+                .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+        }
         for (cache, entries) in state.cache_entries() {
             self.cache_entries
                 .with_label_values(&[cache])
@@ -363,6 +388,7 @@ impl Metrics {
             |due: Option<OffsetDateTime>| due.map_or(0, |due| (now - due.unix_timestamp()).max(0));
         self.awaiting_attestation.set(count(awaiting.count));
         self.expired_unsigned.set(count(awaiting.expired));
+        self.unsettleable.set(count(awaiting.unsettleable));
         self.oldest_awaiting_age
             .set(age(awaiting.oldest_signing_date));
         self.blocked_on_source_coverage
@@ -456,11 +482,14 @@ pub async fn latest_files(weather_dir: &Path) -> LatestFiles {
     latest
 }
 
-/// The metrics listener's router: `GET /metrics` and nothing else.
+/// The private listener serves metrics and the operator view. Keep it behind
+/// the operator access policy; the public listener never installs this marker.
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/metrics", get(metrics))
-        .with_state(state)
+        .with_state(state.clone())
+        .merge(crate::startup::app(state))
+        .layer(axum::Extension(crate::routes::ui::OperatorView))
 }
 
 async fn metrics(State(state): State<Arc<AppState>>) -> Response {
@@ -530,6 +559,7 @@ mod tests {
             &AwaitingAttestation {
                 count: 2,
                 expired: 0,
+                unsettleable: 0,
                 oldest_signing_date: Some(now - time::Duration::hours(5)),
                 blocked_on_source_coverage: 1,
                 oldest_attestable_signing_date: Some(now - time::Duration::minutes(10)),

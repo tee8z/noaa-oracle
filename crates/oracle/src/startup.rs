@@ -266,14 +266,27 @@ impl AppState {
             weather_db,
             oracle,
             database,
-            forecast_cache: Mutex::new(Cache::new(MAX_CACHED_FORECASTS, FORECAST_CACHE_REFRESH)),
-            weather_cache: Mutex::new(Cache::new(MAX_CACHED_WEATHER, WEATHER_CACHE_REFRESH)),
-            eligible_cache: Mutex::new(Cache::new(MAX_CACHED_ELIGIBLE, ELIGIBLE_CACHE_REFRESH)),
+            forecast_cache: Mutex::new(Cache::with_byte_limit(
+                MAX_CACHED_FORECASTS,
+                FORECAST_CACHE_REFRESH,
+                128 * 1024 * 1024,
+            )),
+            weather_cache: Mutex::new(Cache::with_byte_limit(
+                MAX_CACHED_WEATHER,
+                WEATHER_CACHE_REFRESH,
+                64 * 1024 * 1024,
+            )),
+            eligible_cache: Mutex::new(Cache::with_byte_limit(
+                MAX_CACHED_ELIGIBLE,
+                ELIGIBLE_CACHE_REFRESH,
+                16 * 1024 * 1024,
+            )),
             eligible_build: tokio::sync::Mutex::new(()),
             eligibility_generation: AtomicU64::new(0),
-            observation_cache: Mutex::new(Cache::new(
+            observation_cache: Mutex::new(Cache::with_byte_limit(
                 MAX_CACHED_OBSERVATIONS,
                 WEATHER_CACHE_REFRESH,
+                64 * 1024 * 1024,
             )),
             generation: AtomicU64::new(0),
             data_prepared: tokio::sync::Notify::new(),
@@ -331,7 +344,8 @@ impl AppState {
     /// Caches a rendered forecast built from data `generation`. Callers
     /// pass only known station ids.
     pub(crate) fn cache_forecast(&self, key: String, html: String, generation: u64) {
-        lock(&self.forecast_cache).insert(key, html, generation);
+        let bytes = key.capacity() + html.capacity();
+        lock(&self.forecast_cache).insert_sized(key, html, generation, bytes);
     }
 
     pub(crate) fn forecast_refresh_failed(&self, key: &str) {
@@ -349,7 +363,30 @@ impl AppState {
         weather: Arc<Vec<WeatherDisplay>>,
         generation: u64,
     ) {
-        lock(&self.weather_cache).insert(key, weather, generation);
+        let bytes = key.estimated_bytes()
+            + weather.capacity() * std::mem::size_of::<WeatherDisplay>()
+            + weather
+                .iter()
+                .map(|row| {
+                    let period = match &row.observation_period {
+                        crate::templates::fragments::ObservationPeriod::Today { zone } => {
+                            zone.capacity()
+                        }
+                        crate::templates::fragments::ObservationPeriod::Selected { start, end } => {
+                            start.capacity() + end.capacity()
+                        }
+                    };
+                    row.station_id.capacity()
+                        + row.station_name.capacity()
+                        + row.state.capacity()
+                        + row.iata_id.capacity()
+                        + row.observed_start.capacity()
+                        + row.observed_end.capacity()
+                        + row.latest_temp_time.as_ref().map_or(0, String::capacity)
+                        + period
+                })
+                .sum::<usize>();
+        lock(&self.weather_cache).insert_sized(key, weather, generation, bytes);
     }
 
     pub(crate) fn weather_refresh_failed(&self, key: &WeatherKey) {
@@ -370,7 +407,19 @@ impl AppState {
         observations: Arc<Vec<Observation>>,
         generation: u64,
     ) {
-        lock(&self.observation_cache).insert(key, observations, generation);
+        let bytes = key.estimated_bytes()
+            + observations.capacity() * std::mem::size_of::<Observation>()
+            + observations
+                .iter()
+                .map(|row| {
+                    row.station_id.capacity()
+                        + row.start_time.capacity()
+                        + row.end_time.capacity()
+                        + row.temp_unit_code.capacity()
+                        + row.latest_temp_time.as_ref().map_or(0, String::capacity)
+                })
+                .sum::<usize>();
+        lock(&self.observation_cache).insert_sized(key, observations, generation, bytes);
     }
 
     pub(crate) fn observations_refresh_failed(&self, key: &ObservationKey) {
@@ -392,6 +441,20 @@ impl AppState {
             ("weather", lock(&self.weather_cache).len()),
             ("eligible_stations", lock(&self.eligible_cache).len()),
             ("observations", lock(&self.observation_cache).len()),
+        ]
+    }
+
+    /// Retained allocation estimates, excluding temporary query buffers.
+    pub(crate) fn cache_bytes(&self) -> [(&'static str, usize); 5] {
+        [
+            ("forecast_details", lock(&self.forecast_cache).bytes()),
+            ("weather", lock(&self.weather_cache).bytes()),
+            ("eligible_stations", lock(&self.eligible_cache).bytes()),
+            ("observations", lock(&self.observation_cache).bytes()),
+            (
+                "eligibility_reports",
+                self.weather_db.eligibility_cache_bytes(),
+            ),
         ]
     }
 
@@ -512,7 +575,19 @@ impl AppState {
         match self.build_eligible(key.0, key.1).await {
             Ok(list) => {
                 let list = Arc::new(list);
-                lock(&self.eligible_cache).insert(key, list.clone(), generation);
+                let bytes = list.capacity() * std::mem::size_of::<EligibleStation>()
+                    + list
+                        .iter()
+                        .map(|row| {
+                            row.station_id.capacity()
+                                + row.station_name.capacity()
+                                + row.state.capacity()
+                                + row.iata_id.capacity()
+                                + row.last_report.capacity()
+                                + row.forecast_through.capacity()
+                        })
+                        .sum::<usize>();
+                lock(&self.eligible_cache).insert_sized(key, list.clone(), generation, bytes);
                 Ok(list)
             }
             Err(error) => {
@@ -582,13 +657,42 @@ impl AppState {
             .iter()
             .map(|station| (station.station_id.as_str(), station))
             .collect();
-        let eligible: Vec<EligibleStation> = judged
+        let mut eligible: Vec<EligibleStation> = judged
             .iter()
             .filter(|station| station.eligible)
             .filter_map(|eligibility| {
                 EligibleStation::new(stations.get(eligibility.station_id.as_str())?, eligibility)
             })
             .collect();
+        let now = time::OffsetDateTime::now_utc();
+        let request = crate::routes::ForecastRequest {
+            start: Some(now),
+            end: Some(now + time::Duration::hours(i64::from(window_hours))),
+            generated_start: None,
+            generated_end: None,
+            station_ids: String::new(),
+            temperature_unit: crate::routes::TemperatureUnit::Fahrenheit,
+        };
+        // Short-window discovery selects the applicable daily extreme later.
+        let metrics: Vec<String> = if window_hours >= 24 {
+            vec!["temp_high", "temp_low", "wind_speed"]
+        } else {
+            vec!["wind_speed"]
+        }
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let ids = eligible
+            .iter()
+            .map(|station| station.station_id.clone())
+            .collect();
+        let available: std::collections::HashSet<String> = self
+            .weather_db
+            .forecast_candidates(&request, ids, &metrics)
+            .await?
+            .into_iter()
+            .collect();
+        eligible.retain(|station| available.contains(&station.station_id));
         info!(
             "{} of {} stations eligible over {days} days for {window_hours}-hour windows, judged in {:?}",
             eligible.len(),
@@ -639,6 +743,8 @@ impl AppState {
                     return;
                 }
             }
+            let latest = metrics::latest_files(&state.weather_dir).await;
+            state.oracle.set_latest_collection(latest.observation);
             info!("starting etl process: {}", etl_process_id);
             // Keep the lease for as long as the pass runs.
             let renewal = async {
@@ -779,7 +885,10 @@ async fn build_app_state(
     );
     let settlement_weather = Arc::new(weather.settlement_access());
     let weather_db: Arc<dyn WeatherData> = Arc::new(weather);
-    let sources = Sources::new(Arc::new(NoaaWeather::new(settlement_weather)), []);
+    let sources = Sources::new(
+        Arc::new(NoaaWeather::new(settlement_weather).with_planning(weather_db.clone())),
+        [],
+    );
     let oracle = Oracle::new(
         database.clone(),
         sources,
@@ -1279,6 +1388,8 @@ fn spawn_cache_warmer(state: &Arc<AppState>) {
             () = state.first_preparation_ended() => {}
         }
         let mut warmed = state.data_generation();
+        let mut warmed_files = metrics::latest_files(&state.weather_dir).await;
+        let mut warmed_day = time::OffsetDateTime::now_utc().date();
         warm_everything(&state).await;
         let mut interval = tokio::time::interval(FORECAST_CACHE_REFRESH);
         interval.tick().await; // the first tick completes immediately
@@ -1297,6 +1408,13 @@ fn spawn_cache_warmer(state: &Arc<AppState>) {
                 () = tokio::time::sleep(until_next_utc_day()) => {}
             }
             warmed = state.data_generation();
+            let files = metrics::latest_files(&state.weather_dir).await;
+            let day = time::OffsetDateTime::now_utc().date();
+            if files == warmed_files && day == warmed_day {
+                continue;
+            }
+            warmed_files = files;
+            warmed_day = day;
             warm_everything(&state).await;
         }
     });

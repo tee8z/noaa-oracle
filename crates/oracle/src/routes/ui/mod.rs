@@ -10,6 +10,10 @@ pub mod policy;
 mod raw_data;
 mod weather;
 
+/// Installed only by the private metrics/operator listener.
+#[derive(Clone, Copy)]
+pub struct OperatorView;
+
 pub use dashboard::dashboard_handler;
 pub use docs::docs_router;
 pub use event_detail::event_detail_handler;

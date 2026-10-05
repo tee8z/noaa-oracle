@@ -12,8 +12,10 @@ use crate::{
 pub struct DashboardData {
     pub pubkey: String,
     pub npub: String,
-    /// Every event, unlisted ones included.
+    /// Listed events on public pages, all events on the operator listener.
     pub counts: EventCounts,
+    pub operator: bool,
+    pub overdue: Vec<crate::oracle::OverdueEvent>,
     pub weather: std::sync::Arc<Vec<WeatherDisplay>>,
 }
 
@@ -34,7 +36,20 @@ pub fn dashboard_fragment(data: &DashboardData, weather: &WeatherContext) -> Mar
 fn dashboard_content(data: &DashboardData, weather: &WeatherContext) -> Markup {
     html! {
         (weather_section(&data.weather, weather))
-        (event_stats(&data.counts))
+        (event_stats(&data.counts, data.operator))
+        @if data.operator {
+            section class="box" {
+                h2 class="title is-5" { "Events awaiting attestation" }
+                @if data.overdue.is_empty() { p { "No events are overdue." } }
+                @for event in &data.overdue {
+                    article {
+                        a href=(format!("/events/{}", event.id)) { (event.id) }
+                        p { (event.locations.join(", ")) }
+                        (crate::templates::pages::event_detail::settlement_note(event.block.as_ref(), event.next_attempt))
+                    }
+                }
+            }
+        }
         (oracle_info(&data.pubkey, &data.npub))
     }
 }

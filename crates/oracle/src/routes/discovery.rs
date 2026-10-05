@@ -65,7 +65,7 @@ async fn collect(
             "Too many eligible stations for discovery".into(),
         ));
     }
-    let stations: Vec<_> = eligible
+    let mut stations: Vec<_> = eligible
         .iter()
         .filter(|station| {
             OffsetDateTime::parse(&station.forecast_through, &Rfc3339)
@@ -91,6 +91,27 @@ async fn collect(
         station_ids: ids.join(","),
         temperature_unit: TemperatureUnit::Fahrenheit,
     };
+    let metrics = if request.end - request.start >= Duration::DAY {
+        vec!["temp_high", "temp_low", "wind_speed"]
+    } else if request.start.to_offset(time::UtcOffset::UTC).hour() >= 12 {
+        vec!["temp_high", "wind_speed"]
+    } else {
+        vec!["temp_low", "wind_speed"]
+    }
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    let ids = weather
+        .forecast_candidates(&forecast_request, ids, &metrics)
+        .await?;
+    let available: HashSet<_> = ids.iter().cloned().collect();
+    stations.retain(|station| available.contains(&station.station_id));
+    if ids.is_empty() {
+        return Ok(DiscoveryForecasts {
+            stations,
+            forecasts: vec![],
+        });
+    }
     let mut forecasts = weather.forecasts_data(&forecast_request, ids).await?;
     let allowed: HashSet<_> = stations
         .iter()

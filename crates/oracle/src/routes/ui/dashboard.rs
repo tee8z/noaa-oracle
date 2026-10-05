@@ -59,6 +59,7 @@ pub(super) fn remember_view(response: &mut Response, view: WeatherView) {
 /// Returns full page for normal requests, content only for HTMX requests
 /// Optional `start` and `end` query params override the reader's day so far.
 pub async fn dashboard_handler(
+    operator: Option<axum::Extension<super::OperatorView>>,
     headers: HeaderMap,
     Query(query): Query<DashboardQuery>,
     State(state): State<Arc<AppState>>,
@@ -70,8 +71,15 @@ pub async fn dashboard_handler(
 
     let station_ids = super::weather::requested_stations(query.stations.as_deref());
     let calendar = super::local_day::reader_calendar(&headers);
-    let (data, selection_path) =
-        build_dashboard_data(&state, station_ids.as_deref(), start, end, calendar).await;
+    let (data, selection_path) = build_dashboard_data(
+        &state,
+        station_ids.as_deref(),
+        start,
+        end,
+        calendar,
+        operator.is_some(),
+    )
+    .await;
     let stations = state.stations().await.unwrap_or_default();
     let view = chosen_view(query.view.as_deref(), &headers);
     let context = WeatherContext {
@@ -100,15 +108,14 @@ async fn build_dashboard_data(
     start: Option<OffsetDateTime>,
     end: Option<OffsetDateTime>,
     calendar: Calendar,
+    operator: bool,
 ) -> (DashboardData, String) {
     // Get oracle identity
     let pubkey = state.oracle.public_key_base64();
     let npub = state.oracle.npub();
 
-    // Every event counts, unlisted ones too: coordinators create most
-    // events unlisted. The cards open the list with unlisted events shown.
     let (counts, (weather, default_airports)) = tokio::join!(
-        state.oracle.event_counts(true),
+        state.oracle.event_counts(operator),
         get_latest_weather(state, station_ids, start, end, calendar)
     );
     let counts = counts.unwrap_or_else(|error| {
@@ -134,6 +141,15 @@ async fn build_dashboard_data(
             npub,
             counts,
             weather,
+            operator,
+            overdue: if operator {
+                state.oracle.overdue_events().await.unwrap_or_else(|error| {
+                    log::error!("operator overdue events: {error:#}");
+                    vec![]
+                })
+            } else {
+                vec![]
+            },
         },
         selection_path,
     )

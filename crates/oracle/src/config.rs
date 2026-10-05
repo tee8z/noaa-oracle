@@ -53,8 +53,8 @@ pub struct Cli {
     pub port: Option<u16>,
 
     /// Address for a separate Prometheus metrics listener, e.g.
-    /// 127.0.0.1:9801. Serves only GET /metrics, without authentication.
-    /// Unset: no metrics listener.
+    /// 127.0.0.1:9801. Also serves operator pages, without authentication.
+    /// Bind privately and enforce operator access at the proxy. Unset disables it.
     #[arg(long, env = "NOAA_ORACLE_METRICS_BIND")]
     pub metrics_bind: Option<SocketAddr>,
 

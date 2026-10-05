@@ -7,7 +7,10 @@ use async_trait::async_trait;
 use std::{collections::BTreeMap, sync::Arc};
 use time::{Date, Duration, OffsetDateTime, UtcOffset, macros::format_description};
 
-use super::{Metric, ObservationWindow, OutcomeSource, ParRule, Reading, SourceError, SourceId};
+use super::{
+    Metric, ObservationWindow, OutcomeSource, ParRule, PlannedBaseline, Reading, SourceError,
+    SourceId,
+};
 use crate::{
     routes::{ForecastRequest, ObservationRequest, TemperatureUnit},
     weather_data::{
@@ -80,11 +83,38 @@ const METRICS: &[Metric] = &[
 
 pub struct NoaaWeather {
     weather: Arc<dyn WeatherData>,
+    /// Reads the check before an event is created, when set, so a
+    /// coordinator's request does not wait behind a processing pass.
+    planning: Option<Arc<dyn WeatherData>>,
 }
 
 impl NoaaWeather {
     pub fn new(weather: Arc<dyn WeatherData>) -> Self {
-        Self { weather }
+        Self {
+            weather,
+            planning: None,
+        }
+    }
+
+    /// Checks events before they are created through `planning` instead.
+    pub fn with_planning(mut self, planning: Arc<dyn WeatherData>) -> Self {
+        self.planning = Some(planning);
+        self
+    }
+
+    /// The request the baseline of an event over `window` is read with:
+    /// the latest publication before the window, or before now until it
+    /// opens, among recent ones.
+    fn baseline_request(window: ObservationWindow, targets: &[String]) -> ForecastRequest {
+        let issued_before = window.start.min(OffsetDateTime::now_utc());
+        ForecastRequest {
+            start: Some(window.start),
+            end: Some(window.end),
+            generated_start: Some(issued_before.saturating_sub(PROVISIONAL_LOOKBACK)),
+            generated_end: Some(window.start.saturating_sub(Duration::nanoseconds(1))),
+            station_ids: targets.join(","),
+            temperature_unit: TemperatureUnit::Fahrenheit,
+        }
     }
 }
 
@@ -203,6 +233,32 @@ impl OutcomeSource for NoaaWeather {
             .await
     }
 
+    /// The whole-period baselines provisional readings show, which are the
+    /// ones settlement reads once the window has opened.
+    async fn planned_baselines(
+        &self,
+        window: ObservationWindow,
+        targets: &[String],
+    ) -> Result<Vec<PlannedBaseline>, SourceError> {
+        if window.start >= window.end {
+            return Ok(vec![]);
+        }
+        let weather = self.planning.as_ref().unwrap_or(&self.weather);
+        let assessed = weather
+            .planned_baselines(&Self::baseline_request(window, targets), targets.to_vec())
+            .await
+            .map_err(unavailable)?;
+        Ok(assessed
+            .into_iter()
+            .map(|assessment| PlannedBaseline {
+                target: assessment.station_id,
+                metric: assessment.metric,
+                value: assessment.value.filter(|value| value.is_finite()),
+                reason: assessment.reason,
+            })
+            .collect())
+    }
+
     async fn line_targets(&self) -> Result<Vec<String>, SourceError> {
         let mut stations: Vec<String> = self
             .weather
@@ -255,6 +311,13 @@ impl NoaaWeather {
                 .settlement_forecasts(&forecast_request, targets.to_vec())
                 .await
                 .map_err(unavailable)?;
+            // The baseline was fixed when the window opened. Without one for
+            // a scored metric no observation can settle the event, so say so
+            // before waiting on observations.
+            let missing = missing_baselines(targets, metrics, &forecasts);
+            if !missing.is_empty() {
+                return Err(SourceError::BaselineUnavailable(missing.join(", ")));
+            }
             let observations = self
                 .weather
                 .settlement_observations(&observation_request, targets.to_vec(), cutoff, metrics)
@@ -313,6 +376,39 @@ impl NoaaWeather {
             })
             .collect())
     }
+}
+
+/// The `target/metric` pairs among `targets` and `metrics` that the
+/// target's baseline publication has no value for. Only targets whose
+/// publication gave some metric a value are judged: where it gave none, it
+/// was not found or did not verify, which a later read may see differently.
+/// A pair with no row, or several, is left to the lifecycle's own check.
+fn missing_baselines(
+    targets: &[String],
+    metrics: &[String],
+    forecasts: &[weather_data::SettlementValue],
+) -> Vec<String> {
+    let finite = |row: &weather_data::SettlementValue| row.value.is_some_and(f64::is_finite);
+    let mut missing = vec![];
+    for target in targets {
+        let published = forecasts
+            .iter()
+            .any(|row| &row.station_id == target && finite(row));
+        if !published {
+            continue;
+        }
+        for metric in metrics {
+            let mut rows = forecasts
+                .iter()
+                .filter(|row| &row.station_id == target && &row.metric == metric);
+            if let (Some(row), None) = (rows.next(), rows.next())
+                && !finite(row)
+            {
+                missing.push(format!("{target}/{metric}"));
+            }
+        }
+    }
+    missing
 }
 
 /// The baseline line history used before 2.5.0: over the window's UTC days,

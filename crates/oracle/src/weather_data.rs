@@ -38,6 +38,7 @@ mod coverage;
 mod derived;
 mod eligibility;
 mod folds;
+mod forecast_availability;
 mod forecast_display_quality;
 mod forecast_quality;
 #[cfg(test)]
@@ -251,6 +252,12 @@ const DATABASE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(24
 const QUERY_MEMORY_LIMIT: &str = "1536MB";
 const QUERY_THREADS: usize = 2;
 
+/// DuckDB otherwise keeps the bytes of every Parquet file it reads in its
+/// buffer pool until the memory limit is reached. The files are local and
+/// the kernel's page cache holds them already, so that copy only fills the
+/// pool and the process's resident memory with a second one.
+const FILE_CACHE_OFF: &str = "SET enable_external_file_cache = false;";
+
 /// Where DuckDB writes what a query cannot hold within its memory limit.
 /// Its default, `.tmp` in the working directory, is read-only where the
 /// oracle runs, so a query that outgrew its limit failed instead ("Failed to
@@ -426,6 +433,20 @@ pub struct ForecastAssessment {
 
 #[async_trait]
 pub trait WeatherData: Sync + Send {
+    fn eligibility_cache_bytes(&self) -> usize {
+        0
+    }
+
+    /// Discovery screening; final source verification remains part of event creation.
+    async fn forecast_candidates(
+        &self,
+        _request: &ForecastRequest,
+        station_ids: Vec<String>,
+        _metrics: &[String],
+    ) -> Result<Vec<String>, Error> {
+        Ok(station_ids)
+    }
+
     async fn forecasts_data(
         &self,
         req: &ForecastRequest,
@@ -444,6 +465,16 @@ pub trait WeatherData: Sync + Send {
         _station_ids: Vec<String>,
     ) -> Result<Vec<ForecastAssessment>, Error> {
         Err(Error::QualityUnavailable)
+    }
+    /// The assessment [`WeatherData::forecast_assessment`] gives, for the
+    /// check an event passes before it is created. Implementations that
+    /// cannot assess return nothing, and creation is not checked.
+    async fn planned_baselines(
+        &self,
+        _req: &ForecastRequest,
+        _station_ids: Vec<String>,
+    ) -> Result<Vec<ForecastAssessment>, Error> {
+        Ok(vec![])
     }
     async fn calendar_forecasts_with_quality(
         &self,
@@ -1327,6 +1358,7 @@ fn open_database() -> Result<Connection, duckdb::Error> {
     let connection = Connection::open_in_memory()?;
     connection.execute_batch(&format!(
         "SET memory_limit = '{QUERIES_MEMORY_LIMIT}'; SET threads = {QUERIES_THREADS};
+         {FILE_CACHE_OFF}
          INSTALL parquet; LOAD parquet; SET parquet_metadata_cache = true;{}",
         spill_setting()
     ))?;
@@ -1339,6 +1371,7 @@ fn open_connection() -> Result<Connection, duckdb::Error> {
     let connection = Connection::open_in_memory()?;
     connection.execute_batch(&format!(
         "SET memory_limit = '{QUERY_MEMORY_LIMIT}'; SET threads = {QUERY_THREADS};
+         {FILE_CACHE_OFF}
          INSTALL parquet; LOAD parquet;{}",
         spill_setting()
     ))?;
@@ -1346,6 +1379,24 @@ fn open_connection() -> Result<Connection, duckdb::Error> {
 }
 #[async_trait]
 impl WeatherData for WeatherAccess {
+    async fn forecast_candidates(
+        &self,
+        request: &ForecastRequest,
+        station_ids: Vec<String>,
+        metrics: &[String],
+    ) -> Result<Vec<String>, Error> {
+        self.available_forecasts(request, station_ids, metrics)
+            .await
+    }
+
+    fn eligibility_cache_bytes(&self) -> usize {
+        self.timeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, |timeline| timeline.estimated_bytes())
+    }
+
     async fn forecasts_data(
         &self,
         req: &ForecastRequest,
@@ -1405,6 +1456,14 @@ impl WeatherData for WeatherAccess {
     }
 
     async fn forecast_assessment(
+        &self,
+        req: &ForecastRequest,
+        station_ids: Vec<String>,
+    ) -> Result<Vec<ForecastAssessment>, Error> {
+        self.native_forecast_assessment(req, station_ids).await
+    }
+
+    async fn planned_baselines(
         &self,
         req: &ForecastRequest,
         station_ids: Vec<String>,
