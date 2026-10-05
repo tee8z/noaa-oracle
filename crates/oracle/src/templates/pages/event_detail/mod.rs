@@ -578,6 +578,55 @@ fn back_icon() -> Markup {
     }
 }
 
+/// The private listener appends the stored settlement reason, without querying weather.
+pub fn operator_event_detail(
+    event: &Event,
+    now: OffsetDateTime,
+    quality: SettlementQuality,
+    next: Option<crate::oracle::NextAttempt>,
+    full_page: bool,
+) -> Markup {
+    let (title, current_page) = config(event);
+    let config = PageConfig {
+        title: &title,
+        current_page,
+    };
+    let content = html! {
+        (event_detail_content(event, now, quality))
+        @if event.attestation.is_none() && now >= event.signing_date {
+            section class="box" {
+                h2 class="title is-5" { "Attestation status" }
+                (settlement_note(event.settlement_block.as_ref(), next))
+            }
+        }
+    };
+    if full_page {
+        base(&config, content)
+    } else {
+        page_fragment(&config, content)
+    }
+}
+
+pub(crate) fn settlement_note(
+    block: Option<&crate::events::SettlementBlock>,
+    next: Option<crate::oracle::NextAttempt>,
+) -> Markup {
+    html! {
+        @if let Some(block) = block {
+            p { code { (&block.code) } ": " (&block.message) }
+            p { "Last checked " (when::absolute(block.checked_at)) }
+        } @else { p { "Waiting for a settlement check." } }
+        p {
+            @match next {
+                Some(crate::oracle::NextAttempt::At(at)) => { "Next check " (when::absolute(at)) }
+                Some(crate::oracle::NextAttempt::NextCollection) => { "Next check after a new observation collection." }
+                Some(crate::oracle::NextAttempt::Never) => { "This event cannot be attested. No further checks are scheduled." }
+                None => { "Next scheduled processing pass." }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -908,54 +957,5 @@ mod tests {
         assert_eq!(html.matches(">No score<").count(), 2, "{html}");
         assert!(!html.contains("pts"), "{html}");
         assert!(!html.contains("10000"), "{html}");
-    }
-}
-
-/// The private listener appends the stored settlement reason, without querying weather.
-pub fn operator_event_detail(
-    event: &Event,
-    now: OffsetDateTime,
-    quality: SettlementQuality,
-    next: Option<crate::oracle::NextAttempt>,
-    full_page: bool,
-) -> Markup {
-    let (title, current_page) = config(event);
-    let config = PageConfig {
-        title: &title,
-        current_page,
-    };
-    let content = html! {
-        (event_detail_content(event, now, quality))
-        @if event.attestation.is_none() && now >= event.signing_date {
-            section class="box" {
-                h2 class="title is-5" { "Attestation status" }
-                (settlement_note(event.settlement_block.as_ref(), next))
-            }
-        }
-    };
-    if full_page {
-        base(&config, content)
-    } else {
-        page_fragment(&config, content)
-    }
-}
-
-pub(crate) fn settlement_note(
-    block: Option<&crate::events::SettlementBlock>,
-    next: Option<crate::oracle::NextAttempt>,
-) -> Markup {
-    html! {
-        @if let Some(block) = block {
-            p { code { (&block.code) } ": " (&block.message) }
-            p { "Last checked " (when::absolute(block.checked_at)) }
-        } @else { p { "Waiting for a settlement check." } }
-        p {
-            @match next {
-                Some(crate::oracle::NextAttempt::At(at)) => { "Next check " (when::absolute(at)) }
-                Some(crate::oracle::NextAttempt::NextCollection) => { "Next check after a new observation collection." }
-                Some(crate::oracle::NextAttempt::Never) => { "This event cannot be attested. No further checks are scheduled." }
-                None => { "Next scheduled processing pass." }
-            }
-        }
     }
 }

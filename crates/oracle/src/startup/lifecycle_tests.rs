@@ -575,10 +575,10 @@ async fn eligible_stations_are_judged_once_per_query_and_validated() {
     get_json(&router, "/stations/eligible?days=7&window_hours=6").await;
     assert_eq!(weather.judged.load(Ordering::SeqCst), 2);
 
-    // After a collection run the default list and the cached one the
-    // reports cover are judged again, and the gauge follows the default.
+    // A collection refresh warms the bounded default history. Longer histories are
+    // refreshed when requested, and the gauge follows the default.
     state.refresh_eligibility().await;
-    assert_eq!(weather.judged.load(Ordering::SeqCst), 4);
+    assert_eq!(weather.judged.load(Ordering::SeqCst), 3);
     assert!(
         state
             .metrics()
@@ -588,6 +588,15 @@ async fn eligible_stations_are_judged_once_per_query_and_validated() {
     let (status, body) = get_json(&router, "/stations/eligible").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body.as_array().unwrap().len(), 1);
+    assert_eq!(weather.judged.load(Ordering::SeqCst), 3);
+
+    get_json(&router, "/stations/eligible?days=7&window_hours=6").await;
+    bounded(async {
+        while weather.judged.load(Ordering::SeqCst) < 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
     assert_eq!(weather.judged.load(Ordering::SeqCst), 4);
 
     runtime.requested.cancel();
