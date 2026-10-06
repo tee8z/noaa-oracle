@@ -23,7 +23,7 @@ use super::{
     station, strings,
 };
 use crate::file_access::FileParams;
-use duckdb::arrow::array::RecordBatch;
+use duckdb::{Connection, arrow::array::RecordBatch};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -444,38 +444,46 @@ impl WeatherAccess {
             )
         });
 
-        let mut timelines = self
-            .query_with_connection(reports_sql, move |connection, batches| {
-                let reports: BTreeMap<String, Vec<Report>> =
-                    times_by_station(batches, "report_time")?
+        let decode = move |connection: &Connection,
+                           batches: &[RecordBatch]|
+              -> Result<Vec<Timeline>, Error> {
+            let reports: BTreeMap<String, Vec<Report>> = times_by_station(batches, "report_time")?
+                .into_iter()
+                .map(|(station_id, rows)| {
+                    let reports: Vec<Report> = rows
                         .into_iter()
-                        .map(|(station_id, rows)| {
-                            let reports: Vec<Report> = rows
-                                .into_iter()
-                                .map(|(time, flag)| Report {
-                                    time,
-                                    temperature: flag == Some(1),
-                                })
-                                .collect();
-                            (station_id, reports)
+                        .map(|(time, flag)| Report {
+                            time,
+                            temperature: flag == Some(1),
                         })
                         .collect();
-                let mut forecasts = BTreeMap::new();
-                if let Some(sql) = forecasts_sql {
-                    let mut statement = connection.prepare(&sql)?;
-                    let batches: Vec<RecordBatch> = statement.query_arrow([])?.collect();
-                    for (station_id, times) in times_by_station(&batches, "forecast_through")? {
-                        forecasts.insert(station_id, times.into_iter().map(|(time, _)| time).max());
-                    }
+                    (station_id, reports)
+                })
+                .collect();
+            let mut forecasts = BTreeMap::new();
+            if let Some(sql) = forecasts_sql {
+                let mut statement = connection.prepare(&sql)?;
+                let batches: Vec<RecordBatch> = statement.query_arrow([])?.collect();
+                for (station_id, times) in times_by_station(&batches, "forecast_through")? {
+                    forecasts.insert(station_id, times.into_iter().map(|(time, _)| time).max());
                 }
-                Ok(vec![Timeline {
-                    read_at: now,
-                    days,
-                    reports,
-                    forecasts,
-                }])
-            })
-            .await?;
+            }
+            Ok(vec![Timeline {
+                read_at: now,
+                days,
+                reports,
+                forecasts,
+            }])
+        };
+        // Weeks of reports through the window functions that deduplicate
+        // and screen them filled the pool queries share and more beside it.
+        // A history longer than the days read ahead is read in a smaller
+        // database of its own instead (see `query_alone`).
+        let mut timelines = if days > PRECOMPUTED_DAYS {
+            self.query_alone(reports_sql, decode).await?
+        } else {
+            self.query_with_connection(reports_sql, decode).await?
+        };
         Ok(timelines.pop().unwrap_or_else(empty))
     }
 }

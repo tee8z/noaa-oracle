@@ -7,16 +7,22 @@
 //! configured shutdown timeout.
 
 use crate::{
+    AppError,
     auth::AuthPolicy,
     cache::{Cache, Cached},
     config::{Configuration, Storage},
     database::Database,
     file_access::{FileAccess, FileData, S3FileAccess},
+    heavy::{
+        self, Admission, HEAVY_REQUEST_TIMEOUT, HeavyWork, Kept, PASS_WAIT, release_freed_memory,
+    },
     metrics::{self, Metrics},
     oracle::{Oracle, system_clock},
     publication::{PASS_ROWS, Publication, Publisher, PublishingKey, WebSocketTransport},
+    routes::discovery::{DiscoveryForecasts, DiscoveryKey},
     routes::stations::ObservationKey,
     routes::ui::WeatherKey,
+    routes::window_compatibility::{PlanKey, WindowCompatibility},
     routes::{
         add_event_entries, create_event, current_lines, daily_observations, dashboard_handler,
         download, event_detail_handler, events_handler, files, forecast_handler, forecasts,
@@ -52,13 +58,13 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
 use tokio::{
     net::TcpListener,
-    sync::{Notify, Semaphore, watch},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore, watch},
     task::{JoinError, JoinHandle},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -110,10 +116,31 @@ const WEATHER_REQUESTS: usize = 8;
 /// such as a few competitions picking stations at once is served;
 /// past this the oracle is overloaded and turns requests away at once.
 const QUEUED_WEATHER_REQUESTS: usize = 128;
+/// Requests for answers that heavy work builds (eligible lists, discovery,
+/// window planning) handled at once, apart from the weather requests above.
+/// Kept answers return at once; the rest wait for a heavy turn (see
+/// [`heavy`]), so more would only wait there.
+const HEAVY_ROUTE_REQUESTS: usize = 8;
+/// Such requests that wait for a turn, beyond those handled.
+const QUEUED_HEAVY_ROUTE_REQUESTS: usize = 32;
 /// Longest a weather request waits for a turn before it is turned away.
 const WEATHER_REQUEST_WAIT: Duration = Duration::from_secs(10);
+/// Longest a weather request runs once it has a turn before it is answered
+/// 503. Work it started in the background (see [`heavy`]) goes on.
+const WEATHER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Seconds a turned away client is asked to wait before it retries.
-const WEATHER_RETRY_AFTER_SECONDS: u64 = 5;
+const WEATHER_RETRY_AFTER_SECONDS: u64 = heavy::RETRY_AFTER_SECONDS;
+/// Discovery answers kept, one per history and window: a few windows are
+/// asked for over and over.
+const MAX_KEPT_DISCOVERIES: usize = 16;
+/// Window assessments kept, one per window, station list and metrics.
+const MAX_KEPT_PLANS: usize = 64;
+/// How long a kept discovery answer or window assessment is served before it
+/// is built again, as for eligible station lists.
+const KEPT_REFRESH: Duration = ELIGIBLE_CACHE_REFRESH;
+/// A kept answer built from older data is served while it is rebuilt, but
+/// not once it is this old.
+const KEPT_MAX_STALE: Duration = Duration::from_secs(60 * 60);
 /// How often recent forecast files are checked for query-ready copies and
 /// folds, besides after each upload: catches files another oracle process
 /// received.
@@ -187,6 +214,13 @@ pub struct AppState {
     eligibility_generation: AtomicU64,
     /// Observation aggregates by station selection and window.
     observation_cache: ObservationCache,
+    /// Turns for heavy work, shared by both listeners and the background
+    /// passes (see [`heavy`]).
+    heavy: Arc<HeavyWork>,
+    /// Discovery answers by history and window.
+    discoveries: Arc<Kept<DiscoveryKey, Arc<DiscoveryForecasts>>>,
+    /// Window assessments by window, stations and metrics.
+    plans: Arc<Kept<PlanKey, Arc<WindowCompatibility>>>,
     /// Counts arrivals of new data; cached values built from an older
     /// generation are stale.
     generation: AtomicU64,
@@ -253,6 +287,10 @@ pub enum EtlRejected {
     ShuttingDown,
 }
 
+/// Shutdown began while a pass waited for its turns.
+#[derive(Debug)]
+struct Stopping;
+
 /// Everything [`AppState`] is built from.
 pub struct AppParts {
     pub remote_url: String,
@@ -306,6 +344,21 @@ impl AppState {
                 MAX_CACHED_OBSERVATIONS,
                 WEATHER_CACHE_REFRESH,
                 64 * 1024 * 1024,
+            )),
+            heavy: Arc::new(HeavyWork::new()),
+            discoveries: Arc::new(Kept::new(
+                MAX_KEPT_DISCOVERIES,
+                KEPT_REFRESH,
+                64 * 1024 * 1024,
+                KEPT_MAX_STALE,
+                DiscoveryKey::estimated_bytes,
+            )),
+            plans: Arc::new(Kept::new(
+                MAX_KEPT_PLANS,
+                KEPT_REFRESH,
+                16 * 1024 * 1024,
+                KEPT_MAX_STALE,
+                PlanKey::estimated_bytes,
             )),
             generation: AtomicU64::new(0),
             data_prepared: tokio::sync::Notify::new(),
@@ -454,17 +507,19 @@ impl AppState {
     }
 
     /// Entries in the in-memory caches, by cache, for the metrics.
-    pub(crate) fn cache_entries(&self) -> [(&'static str, usize); 4] {
+    pub(crate) fn cache_entries(&self) -> [(&'static str, usize); 6] {
         [
             ("forecast_details", lock(&self.forecast_cache).len()),
             ("weather", lock(&self.weather_cache).len()),
             ("eligible_stations", lock(&self.eligible_cache).len()),
             ("observations", lock(&self.observation_cache).len()),
+            ("discovery", self.discoveries.len()),
+            ("window_compatibility", self.plans.len()),
         ]
     }
 
     /// Retained allocation estimates, excluding temporary query buffers.
-    pub(crate) fn cache_bytes(&self) -> [(&'static str, usize); 5] {
+    pub(crate) fn cache_bytes(&self) -> [(&'static str, usize); 7] {
         [
             ("forecast_details", lock(&self.forecast_cache).bytes()),
             ("weather", lock(&self.weather_cache).bytes()),
@@ -474,7 +529,68 @@ impl AppState {
                 "eligibility_reports",
                 self.weather_db.eligibility_cache_bytes(),
             ),
+            ("discovery", self.discoveries.bytes()),
+            ("window_compatibility", self.plans.bytes()),
         ]
+    }
+
+    /// Turns for heavy work (see [`heavy`]).
+    pub fn heavy(&self) -> &Arc<HeavyWork> {
+        &self.heavy
+    }
+
+    pub(crate) fn discoveries(&self) -> &Arc<Kept<DiscoveryKey, Arc<DiscoveryForecasts>>> {
+        &self.discoveries
+    }
+
+    pub(crate) fn plans(&self) -> &Arc<Kept<PlanKey, Arc<WindowCompatibility>>> {
+        &self.plans
+    }
+
+    /// The generation discovery answers are fresh for: new data and each
+    /// new judgment of eligibility make them stale. Both counters only
+    /// grow, so their sum changes whenever either does.
+    pub(crate) fn discovery_generation(&self) -> u64 {
+        self.data_generation()
+            .wrapping_add(self.eligibility_generation.load(Ordering::Acquire))
+    }
+
+    /// Counts a heavy request turned away, and passes its error on.
+    pub(crate) fn turned_away(&self, error: AppError) -> AppError {
+        if error.is_busy() {
+            self.metrics.heavy_request_turned_away();
+        }
+        error
+    }
+
+    /// A heavy turn for background work, whenever one is free; `None` once
+    /// shutdown has begun.
+    pub(crate) async fn background_turn(&self) -> Option<OwnedSemaphorePermit> {
+        tokio::select! {
+            biased;
+            () = self.background.stopping.cancelled() => None,
+            turn = self.heavy.patient_turn() => turn,
+        }
+    }
+
+    /// Every heavy turn, for `pass`, which should run alone: once the heavy
+    /// work already running ends, but after [`PASS_WAIT`] the pass runs
+    /// beside it (`Ok(None)`). Memory that work freed is returned first.
+    /// `Err` once shutdown has begun: the pass should not start.
+    async fn pass_turns(&self, pass: &str) -> Result<Option<OwnedSemaphorePermit>, Stopping> {
+        let turns = tokio::select! {
+            biased;
+            () = self.background.stopping.cancelled() => return Err(Stopping),
+            turns = self.heavy.every_turn(PASS_WAIT) => turns,
+        };
+        if turns.is_none() {
+            warn!(
+                "{pass}: heavy work still running after {}s; running beside it",
+                PASS_WAIT.as_secs()
+            );
+        }
+        release_freed_memory();
+        Ok(turns)
     }
 
     /// Current weather readers asked for lately, newest first.
@@ -553,35 +669,99 @@ impl AppState {
     /// least every [`ELIGIBLE_CACHE_REFRESH`]; until then readers get the
     /// list judged before, so only the first reader of a pair of values
     /// waits.
+    ///
+    /// Judging is heavy work (see [`heavy`]): a list nobody has asked for
+    /// yet is judged on a heavy turn, in a task of its own, so a reader who
+    /// stops waiting after [`HEAVY_REQUEST_TIMEOUT`] leaves it to the next.
+    /// Histories longer than the [`PRECOMPUTED_DAYS`] read ahead read weeks
+    /// of reports and run alone. Without a turn the reader gets
+    /// [`AppError::Busy`].
     pub async fn eligible_stations(
+        self: &Arc<Self>,
+        days: u32,
+        window_hours: u32,
+    ) -> Result<Arc<Vec<EligibleStation>>, AppError> {
+        if let Some(list) = self.kept_eligible((days, window_hours)) {
+            return Ok(list);
+        }
+        let state = self.clone();
+        let judging = tokio::spawn(async move {
+            let Some(_turn) = state.eligibility_turn(days).await else {
+                return Err(AppError::Busy(heavy::NO_TURN));
+            };
+            let judged = state.eligible_stations_on_turn(days, window_hours).await;
+            release_freed_memory();
+            judged.map_err(AppError::from)
+        });
+        let judged = match tokio::time::timeout(HEAVY_REQUEST_TIMEOUT, judging).await {
+            Ok(Ok(judged)) => judged,
+            Ok(Err(error)) => Err(weather_data::Error::Task(error).into()),
+            Err(_) => Err(AppError::Busy(heavy::STILL_WORKING)),
+        };
+        judged.map_err(|error| self.turned_away(error))
+    }
+
+    /// [`Self::eligible_stations`] for a caller that holds a heavy turn.
+    pub(crate) async fn eligible_stations_on_turn(
         self: &Arc<Self>,
         days: u32,
         window_hours: u32,
     ) -> Result<Arc<Vec<EligibleStation>>, weather_data::Error> {
         let key = (days, window_hours);
-        let generation = self.eligibility_generation.load(Ordering::Acquire);
-        let cached = lock(&self.eligible_cache).get(&key, generation);
-        match cached {
-            Cached::Fresh(list) => return Ok(list),
-            Cached::Stale { value, refresh } => {
-                if refresh {
-                    let state = self.clone();
-                    self.spawn(async move {
-                        let _building = state.eligible_build.lock().await;
-                        if let Err(error) = state.rebuild_eligible(key).await {
-                            warn!("cannot judge eligible stations again: {error}");
-                        }
-                    });
-                }
-                return Ok(value);
-            }
-            Cached::Missing => {}
+        if let Some(list) = self.kept_eligible(key) {
+            return Ok(list);
         }
+        let generation = self.eligibility_generation.load(Ordering::Acquire);
         let _building = self.eligible_build.lock().await;
         if let Cached::Fresh(list) = lock(&self.eligible_cache).get(&key, generation) {
             return Ok(list);
         }
         self.rebuild_eligible(key).await
+    }
+
+    /// The kept list for `key`, fresh or stale, or `None`. A stale list is
+    /// judged again in the background on a heavy turn; without one it stays
+    /// as it is and the next reader tries again.
+    fn kept_eligible(self: &Arc<Self>, key: (u32, u32)) -> Option<Arc<Vec<EligibleStation>>> {
+        let generation = self.eligibility_generation.load(Ordering::Acquire);
+        let cached = lock(&self.eligible_cache).get(&key, generation);
+        match cached {
+            Cached::Fresh(list) => Some(list),
+            Cached::Stale { value, refresh } => {
+                if refresh {
+                    let state = self.clone();
+                    self.spawn(async move {
+                        let turn = tokio::select! {
+                            biased;
+                            () = state.background.stopping.cancelled() => None,
+                            turn = state.eligibility_turn(key.0) => turn,
+                        };
+                        let Some(_turn) = turn else {
+                            lock(&state.eligible_cache).refresh_failed(&key);
+                            return;
+                        };
+                        let _building = state.eligible_build.lock().await;
+                        if let Err(error) = state.rebuild_eligible(key).await {
+                            warn!("cannot judge eligible stations again: {error}");
+                        }
+                        release_freed_memory();
+                    });
+                }
+                Some(value)
+            }
+            Cached::Missing => None,
+        }
+    }
+
+    /// The heavy turn judging `days` of history takes: one turn for the
+    /// days read ahead, every turn for longer histories, which read weeks
+    /// of reports.
+    async fn eligibility_turn(&self, days: u32) -> Option<OwnedSemaphorePermit> {
+        if days > PRECOMPUTED_DAYS {
+            self.heavy.every_turn_for_request().await
+        } else {
+            self.heavy.turn().await
+        }
     }
 
     /// Judges the list for `(days, window_hours)` and caches it. Callers
@@ -762,6 +942,12 @@ impl AppState {
                     return;
                 }
             }
+            // Attestation runs alone: heavy requests, file preparation and
+            // the reading of eligibility reports wait for it (see `heavy`).
+            let Ok(_turns) = state.pass_turns("processing").await else {
+                info!("shutting down; skipped processing {etl_process_id}");
+                return;
+            };
             let latest = metrics::latest_files(&state.weather_dir).await;
             state.oracle.set_latest_collection(latest.observation);
             info!("starting etl process: {}", etl_process_id);
@@ -1002,19 +1188,7 @@ pub fn app(app_state: Arc<AppState>) -> Router {
     let weather_routes = Router::new()
         .merge(ui)
         .route("/stations", get(get_stations))
-        .route(
-            "/stations/eligible",
-            get(crate::routes::stations::eligible_stations),
-        )
         .route("/stations/forecasts", get(forecasts))
-        .route(
-            "/stations/eligible/forecasts",
-            get(crate::routes::discovery::eligible_forecasts),
-        )
-        .route(
-            "/stations/window-compatibility",
-            get(crate::routes::window_compatibility::window_compatibility),
-        )
         .route("/stations/observations", get(observations))
         .route(
             "/stations/observation-quality",
@@ -1029,9 +1203,38 @@ pub fn app(app_state: Arc<AppState>) -> Router {
                 next,
             )
         }));
+    // Answers heavy work builds (see `heavy`) wait in a line of their own,
+    // so a crowd asking for them never holds the turns the routes above use.
+    let heavy_queries = Arc::new(Admission::new(
+        HEAVY_ROUTE_REQUESTS,
+        QUEUED_HEAVY_ROUTE_REQUESTS,
+    ));
+    let heavy_admission_state = app_state.clone();
+    let heavy_routes = Router::new()
+        .route(
+            "/stations/eligible",
+            get(crate::routes::stations::eligible_stations),
+        )
+        .route(
+            "/stations/eligible/forecasts",
+            get(crate::routes::discovery::eligible_forecasts),
+        )
+        .route(
+            "/stations/window-compatibility",
+            get(crate::routes::window_compatibility::window_compatibility),
+        )
+        .layer(middleware::from_fn(move |request, next| {
+            admit_weather_request(
+                heavy_queries.clone(),
+                heavy_admission_state.clone(),
+                request,
+                next,
+            )
+        }));
 
     Router::new()
         .merge(weather_routes)
+        .merge(heavy_routes)
         .route("/assets/{file}", get(serve_asset))
         // Probes
         .route("/health", get(health))
@@ -1069,70 +1272,43 @@ pub fn app(app_state: Arc<AppState>) -> Router {
         ))
 }
 
-/// Turns for weather requests: [`WEATHER_REQUESTS`] at once, and up to
-/// [`QUEUED_WEATHER_REQUESTS`] more waiting at most [`WEATHER_REQUEST_WAIT`].
-struct Admission {
-    turns: Arc<Semaphore>,
-    waiting: AtomicUsize,
-    max_waiting: usize,
-}
-
-/// One waiting request, counted until it gets a turn or gives up.
-struct Waiting<'a>(&'a AtomicUsize);
-
-impl Drop for Waiting<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-impl Admission {
-    fn new(turns: usize, max_waiting: usize) -> Self {
-        Self {
-            turns: Arc::new(Semaphore::new(turns)),
-            waiting: AtomicUsize::new(0),
-            max_waiting,
-        }
-    }
-
-    /// A turn, now or after a wait, or `None` when too many requests wait
-    /// already or none came within `wait`.
-    async fn turn(&self, wait: Duration) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        if let Ok(turn) = self.turns.clone().try_acquire_owned() {
-            return Some(turn);
-        }
-        if self.waiting.fetch_add(1, Ordering::AcqRel) >= self.max_waiting {
-            self.waiting.fetch_sub(1, Ordering::AcqRel);
-            return None;
-        }
-        let _waiting = Waiting(&self.waiting);
-        tokio::time::timeout(wait, self.turns.clone().acquire_owned())
-            .await
-            .ok()?
-            .ok()
-    }
-}
-
+/// Admits a weather request: [`WEATHER_REQUESTS`] at once, and up to
+/// [`QUEUED_WEATHER_REQUESTS`] more waiting at most [`WEATHER_REQUEST_WAIT`];
+/// each runs at most [`WEATHER_REQUEST_TIMEOUT`]. Past either it gets 503.
 async fn admit_weather_request(
     admission: Arc<Admission>,
     state: Arc<AppState>,
     request: Request<Body>,
     next: Next,
 ) -> axum::response::Response {
+    let busy = |message: &'static str| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(RETRY_AFTER, WEATHER_RETRY_AFTER_SECONDS.to_string())],
+            message,
+        )
+            .into_response()
+    };
     let Some(_turn) = admission.turn(WEATHER_REQUEST_WAIT).await else {
         state.metrics().weather_request_turned_away();
         warn!(
             "turned away a weather request: {} waiting",
             admission.waiting.load(Ordering::Acquire)
         );
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(RETRY_AFTER, WEATHER_RETRY_AFTER_SECONDS.to_string())],
-            "weather queries are busy; try again shortly",
-        )
-            .into_response();
+        return busy("weather queries are busy; try again shortly");
     };
-    next.run(request).await
+    let path = request.uri().path().to_owned();
+    match tokio::time::timeout(WEATHER_REQUEST_TIMEOUT, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => {
+            state.metrics().weather_request_turned_away();
+            warn!(
+                "{path} took longer than {}s; answered 503",
+                WEATHER_REQUEST_TIMEOUT.as_secs()
+            );
+            busy("weather queries are slow right now; try again shortly")
+        }
+    }
 }
 
 async fn log_request(request: Request<Body>, next: Next) -> impl IntoResponse {
@@ -1402,8 +1578,14 @@ fn spawn_file_preparation(state: &Arc<AppState>) {
     let stopping = state.background.stopping.clone();
     state.background.tasks.clone().spawn(async move {
         loop {
+            // Copies and folds take a gigabyte or more: never beside a
+            // processing pass or other heavy work (see `heavy`).
+            let Ok(turns) = state.pass_turns("file preparation").await else {
+                break;
+            };
             let started = std::time::Instant::now();
             let result = state.weather_db.prepare_files(&stopping).await;
+            drop(turns);
             match &result {
                 Ok(0) => {}
                 Ok(made) => {
@@ -1481,10 +1663,18 @@ fn spawn_cache_warmer(state: &Arc<AppState>) {
 }
 
 /// Eligibility first: discovery waits on it, and it reads the files the
-/// other caches then read from the page cache. Afterwards the glibc heap
+/// other caches then read from the page cache. Reading the reports takes
+/// every heavy turn, so it never runs beside a processing pass; the other
+/// caches take a turn per value (see [`heavy`]). Afterwards the glibc heap
 /// returns what the queries freed.
 async fn warm_everything(state: &Arc<AppState>) {
-    state.refresh_eligibility().await;
+    {
+        let Ok(_turns) = state.pass_turns("eligibility").await else {
+            return;
+        };
+        state.refresh_eligibility().await;
+        release_freed_memory();
+    }
     warm_caches(state).await;
     crate::routes::stations::warm_observations(state).await;
     release_freed_memory();
@@ -1496,23 +1686,6 @@ fn until_next_utc_day() -> Duration {
     let now = time::OffsetDateTime::now_utc();
     let next = (now.date() + time::Duration::DAY).midnight().assume_utc() + time::Duration::MINUTE;
     Duration::try_from(next - now).unwrap_or(Duration::from_secs(60))
-}
-
-/// Returns freed heap memory to the system. glibc keeps what large queries
-/// and caches freed in its arenas, so without this the process stays at its
-/// peak size.
-fn release_freed_memory() {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    {
-        unsafe extern "C" {
-            fn malloc_trim(pad: usize) -> std::ffi::c_int;
-        }
-        // SAFETY: malloc_trim only releases free memory and may be called
-        // from any thread at any time.
-        unsafe {
-            malloc_trim(0);
-        }
-    }
 }
 
 /// On shutdown, hands processing over to another oracle process at once. The

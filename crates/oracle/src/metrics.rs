@@ -25,7 +25,10 @@
 //!
 //! `process_resident_memory_bytes` and `oracle_cache_entries` are read
 //! when scraped; `oracle_weather_requests_turned_away_total` counts weather
-//! requests answered 503 because too many were waiting.
+//! requests answered 503 because too many were waiting or one ran too long,
+//! and `oracle_heavy_requests_turned_away_total` those whose heavy work
+//! (eligible lists, discovery, window planning) found no turn or was not
+//! done in time (see [`crate::heavy`]).
 //!
 //! `oracle_nostr_published_total` and `oracle_nostr_publish_failures_total`
 //! count deliveries of announcements and attestations to Nostr relays, one
@@ -85,6 +88,7 @@ pub struct Metrics {
     eligible_stations: IntGauge,
     eligibility_reports: IntGauge,
     turned_away: IntCounter,
+    heavy_turned_away: IntCounter,
     resident_memory: IntGauge,
     cache_entries: IntGaugeVec,
     cache_bytes: IntGaugeVec,
@@ -204,7 +208,14 @@ impl Metrics {
             .expect("valid metric"),
             turned_away: IntCounter::new(
                 "oracle_weather_requests_turned_away_total",
-                "Weather requests answered 503 because too many were waiting for a turn",
+                "Weather requests answered 503 because too many were waiting for a turn, \
+                 or because one ran longer than the request timeout",
+            )
+            .expect("valid metric"),
+            heavy_turned_away: IntCounter::new(
+                "oracle_heavy_requests_turned_away_total",
+                "Requests answered 503 because the heavy work they needed found no turn \
+                 or was not done within the request timeout",
             )
             .expect("valid metric"),
             resident_memory: IntGauge::new(
@@ -280,6 +291,7 @@ impl Metrics {
             Box::new(metrics.eligible_stations.clone()),
             Box::new(metrics.eligibility_reports.clone()),
             Box::new(metrics.turned_away.clone()),
+            Box::new(metrics.heavy_turned_away.clone()),
             Box::new(metrics.resident_memory.clone()),
             Box::new(metrics.cache_entries.clone()),
             Box::new(metrics.cache_bytes.clone()),
@@ -327,9 +339,15 @@ impl Metrics {
             .set(i64::try_from(count).unwrap_or(i64::MAX));
     }
 
-    /// A weather request was turned away while too many waited.
+    /// A weather request was turned away while too many waited, or ran
+    /// too long.
     pub fn weather_request_turned_away(&self) {
         self.turned_away.inc();
+    }
+
+    /// A request's heavy work found no turn or was not done in time.
+    pub fn heavy_request_turned_away(&self) {
+        self.heavy_turned_away.inc();
     }
 
     /// A publishing pass delivered `published` events to relays and failed
@@ -668,6 +686,7 @@ mod tests {
             "oracle_eligible_stations",
             "oracle_eligibility_reports",
             "oracle_weather_requests_turned_away_total",
+            "oracle_heavy_requests_turned_away_total",
             "process_resident_memory_bytes",
             "oracle_nostr_published_total",
             "oracle_nostr_publish_failures_total",

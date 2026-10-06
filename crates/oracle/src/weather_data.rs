@@ -239,7 +239,7 @@ const STATION_LOOKBACK: Duration = Duration::days(30);
 /// Forecast files published this recently get derived copies: the widest
 /// window a page or the coordinator reads (seven days of issues before a
 /// week of comparisons) with a day to spare.
-const DERIVED_WINDOW: Duration = Duration::days(10);
+pub(crate) const DERIVED_WINDOW: Duration = Duration::days(10);
 
 /// Queries running at once; more wait for a slot.
 const MAX_CONCURRENT_QUERIES: usize = 4;
@@ -255,6 +255,14 @@ const DATABASE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(24
 /// 415,000-row, 87 MB file (September 2026) needs about 1 GB.
 const QUERY_MEMORY_LIMIT: &str = "1536MB";
 const QUERY_THREADS: usize = 2;
+/// Limits of the database an eligibility history longer than the days read
+/// ahead is read in (see [`WeatherAccess::query_alone`]). Thirty days of
+/// reports through the window functions that deduplicate and screen them
+/// filled the pool queries share and gigabytes beside it (October 2026).
+/// Alone, in a smaller pool with fewer threads, the read spills to disk
+/// instead, and what it held goes when it ends.
+const LONG_READ_MEMORY_LIMIT: &str = "1GB";
+const LONG_READ_THREADS: usize = 2;
 
 /// DuckDB otherwise keeps the bytes of every Parquet file it reads in its
 /// buffer pool until the memory limit is reached. The files are local and
@@ -1104,7 +1112,9 @@ fn observation_file_params(req: &ObservationRequest, now: OffsetDateTime) -> Fil
     }
 }
 
-fn forecast_generated_window(
+/// The issue window a forecast request reads: as given, or the week of
+/// issues before its end or `now`, whichever is earlier.
+pub(crate) fn forecast_generated_window(
     req: &ForecastRequest,
     now: OffsetDateTime,
 ) -> (OffsetDateTime, OffsetDateTime) {
@@ -1480,6 +1490,26 @@ impl WeatherAccess {
         })
         .await?
     }
+
+    /// Runs `sql` as [`Self::query_with_connection`] does, but in a
+    /// database of its own with [`LONG_READ_MEMORY_LIMIT`] and
+    /// [`LONG_READ_THREADS`], closed when it ends: for reads that would
+    /// otherwise crowd every other query out of the shared pool.
+    async fn query_alone<T: Send + 'static>(
+        &self,
+        sql: String,
+        decode: impl FnOnce(&Connection, &[RecordBatch]) -> Result<Vec<T>, Error> + Send + 'static,
+    ) -> Result<Vec<T>, Error> {
+        let slot = self.slot().await?;
+        tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            let connection = open_long_read_connection()?;
+            let mut statement = connection.prepare(&sql)?;
+            let batches: Vec<RecordBatch> = statement.query_arrow([])?.collect();
+            decode(&connection, &batches)
+        })
+        .await?
+    }
 }
 
 /// The in-memory database queries share.
@@ -1503,6 +1533,19 @@ fn open_database() -> Result<Connection, duckdb::Error> {
         "SET memory_limit = '{QUERIES_MEMORY_LIMIT}'; SET threads = {QUERIES_THREADS};
          {FILE_CACHE_OFF}
          INSTALL parquet; LOAD parquet; SET parquet_metadata_cache = true;{}",
+        spill_setting()
+    ))?;
+    Ok(connection)
+}
+
+/// A fresh in-memory database for one long read (see
+/// [`LONG_READ_MEMORY_LIMIT`]).
+fn open_long_read_connection() -> Result<Connection, duckdb::Error> {
+    let connection = Connection::open_in_memory()?;
+    connection.execute_batch(&format!(
+        "SET memory_limit = '{LONG_READ_MEMORY_LIMIT}'; SET threads = {LONG_READ_THREADS};
+         {FILE_CACHE_OFF}
+         INSTALL parquet; LOAD parquet;{}",
         spill_setting()
     ))?;
     Ok(connection)

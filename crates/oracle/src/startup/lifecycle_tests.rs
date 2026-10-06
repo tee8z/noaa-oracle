@@ -510,6 +510,7 @@ async fn eligible_stations_are_judged_once_per_query_and_validated() {
 
     for path in [
         "/stations/eligible?days=0",
+        "/stations/eligible?days=4",
         "/stations/eligible?days=32",
         "/stations/eligible?days=thirty",
         "/stations/eligible?window_hours=0",
@@ -568,12 +569,26 @@ async fn eligible_stations_are_judged_once_per_query_and_validated() {
     let (status, _) = get_json(&router, "/stations/eligible?days=3&window_hours=24").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(weather.judged.load(Ordering::SeqCst), 1);
+    // Longer histories read weeks of reports: only the operator listener
+    // judges them.
     let (status, body) = get_json(&router, "/stations/eligible?days=7&window_hours=6").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["error"],
+        "invalid request: days must be between 1 and 3"
+    );
+    assert_eq!(weather.judged.load(Ordering::SeqCst), 1);
+    let operator = crate::metrics::router(state.clone());
+    let (status, body) = get_json(&operator, "/stations/eligible?days=7&window_hours=6").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body[0]["days_checked"], 7);
     assert_eq!(weather.judged.load(Ordering::SeqCst), 2);
-    get_json(&router, "/stations/eligible?days=7&window_hours=6").await;
+    get_json(&operator, "/stations/eligible?days=7&window_hours=6").await;
     assert_eq!(weather.judged.load(Ordering::SeqCst), 2);
+    // A kept long history is not served on the public listener either.
+    let (status, _) = get_json(&router, "/stations/eligible?days=7&window_hours=6").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(state.heavy().free_turns(), heavy::HEAVY_TURNS as usize);
 
     // A collection refresh warms the bounded default history. Longer histories are
     // refreshed when requested, and the gauge follows the default.
@@ -590,7 +605,7 @@ async fn eligible_stations_are_judged_once_per_query_and_validated() {
     assert_eq!(body.as_array().unwrap().len(), 1);
     assert_eq!(weather.judged.load(Ordering::SeqCst), 3);
 
-    get_json(&router, "/stations/eligible?days=7&window_hours=6").await;
+    get_json(&operator, "/stations/eligible?days=7&window_hours=6").await;
     bounded(async {
         while weather.judged.load(Ordering::SeqCst) < 4 {
             tokio::task::yield_now().await;
@@ -598,6 +613,88 @@ async fn eligible_stations_are_judged_once_per_query_and_validated() {
     })
     .await;
     assert_eq!(weather.judged.load(Ordering::SeqCst), 4);
+
+    runtime.requested.cancel();
+    bounded(runtime.run_until_stop()).await.unwrap();
+}
+
+/// Weather data whose eligibility judgment announces that it started, then
+/// waits until `release` is notified.
+#[derive(Default)]
+struct HeldEligibility {
+    started: Notify,
+    release: Notify,
+}
+
+#[async_trait::async_trait]
+impl WeatherData for HeldEligibility {
+    async fn forecasts_data(
+        &self,
+        _: &crate::routes::ForecastRequest,
+        _: Vec<String>,
+    ) -> Result<Vec<weather_data::Forecast>, weather_data::Error> {
+        Ok(vec![])
+    }
+    async fn observation_data(
+        &self,
+        _: &crate::routes::ObservationRequest,
+        _: Vec<String>,
+    ) -> Result<Vec<weather_data::Observation>, weather_data::Error> {
+        Ok(vec![])
+    }
+    async fn daily_observations(
+        &self,
+        _: &crate::routes::ObservationRequest,
+        _: Vec<String>,
+    ) -> Result<Vec<weather_data::DailyObservation>, weather_data::Error> {
+        Ok(vec![])
+    }
+    async fn stations(&self) -> Result<Vec<Station>, weather_data::Error> {
+        Ok(vec![])
+    }
+    async fn eligible_stations(
+        &self,
+        _: u32,
+        _: u32,
+        _: time::OffsetDateTime,
+    ) -> Result<Vec<weather_data::Eligibility>, weather_data::Error> {
+        self.started.notify_one();
+        self.release.notified().await;
+        Ok(vec![])
+    }
+}
+
+/// Attestation never runs beside heavy work: a processing pass waits for the
+/// heavy work already running, then takes every turn until it is done.
+#[tokio::test]
+async fn a_processing_pass_waits_for_heavy_work_already_running() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, database) = runtime(directory.path()).await;
+    let weather = Arc::new(HeldEligibility::default());
+    let state = app_state(directory.path(), &runtime, database, weather.clone()).await;
+    let router = app(state.clone());
+
+    // A request judges a list nobody has asked for yet, on a heavy turn.
+    let request = tokio::spawn({
+        let router = router.clone();
+        async move { status(&router, "/stations/eligible").await }
+    });
+    bounded(weather.started.notified()).await;
+    assert_eq!(state.heavy().free_turns(), heavy::HEAVY_TURNS as usize - 1);
+
+    // The pass starts and waits for it ...
+    state.start_etl().unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), state.wait_for_etl())
+            .await
+            .is_err(),
+        "the pass must wait for the heavy work already running"
+    );
+    // ... runs once it is done, and gives every turn back.
+    weather.release.notify_one();
+    assert_eq!(bounded(request).await.unwrap(), StatusCode::OK);
+    bounded(state.wait_for_etl()).await;
+    assert_eq!(state.heavy().free_turns(), heavy::HEAVY_TURNS as usize);
 
     runtime.requested.cancel();
     bounded(runtime.run_until_stop()).await.unwrap();

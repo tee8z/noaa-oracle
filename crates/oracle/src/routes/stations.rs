@@ -14,9 +14,12 @@ use crate::{
     AppError, AppState,
     cache::Cached,
     file_access::FileParams,
+    heavy::release_freed_memory_now_and_then,
+    routes::Audience,
     weather_data::{
-        DEFAULT_DAYS, DEFAULT_WINDOW_HOURS, DailyObservation, EligibleStation, Forecast, MAX_DAYS,
-        MAX_WINDOW_HOURS, Observation, Station, validate_station_id,
+        DEFAULT_DAYS, DEFAULT_WINDOW_HOURS, DERIVED_WINDOW, DailyObservation, EligibleStation,
+        Forecast, MAX_WINDOW_HOURS, Observation, Station, forecast_generated_window,
+        validate_station_id,
     },
 };
 
@@ -26,6 +29,11 @@ pub const MAX_STATIONS: usize = 100;
 pub const MAX_WINDOW: Duration = Duration::days(31);
 /// Range used when a query gives no bounds.
 const DEFAULT_WINDOW: Duration = Duration::days(7);
+/// How far back the forecast issues a public query reads may begin: as far
+/// as query-ready copies of the published files reach. Older issues would
+/// be read from the published files, seconds and a gigabyte or more per
+/// request; they remain downloadable from `/files`.
+pub const PUBLIC_FORECAST_HISTORY: Duration = DERIVED_WINDOW;
 
 /// Validates the station list of a public query: 1 to [`MAX_STATIONS`]
 /// valid ids.
@@ -64,6 +72,9 @@ pub fn bounded_window(
     Ok((start, end))
 }
 
+/// Forecasts issued in the last 10 days (`generated_start` and
+/// `generated_end`, or by default the week of issues before `end` or now,
+/// whichever is earlier). Older issues are in the archive files (`/files`).
 #[utoipa::path(
     get,
     path = "/stations/forecasts",
@@ -72,10 +83,12 @@ pub fn bounded_window(
     ),
     responses(
         (status = OK, description = "Successfully retrieved forecast data", body = Vec<Forecast>),
-        (status = BAD_REQUEST, description = "Times are not in RFC3339 format"),
+        (status = BAD_REQUEST, description = "Times are not in RFC3339 format, a range is longer than 31 days, or the issues read begin more than 10 days ago"),
+        (status = SERVICE_UNAVAILABLE, description = "Weather queries are busy; retry after the Retry-After delay"),
         (status = INTERNAL_SERVER_ERROR, description = "Failed to retrieved weather data")
     ))]
 pub async fn forecasts(
+    audience: Audience,
     State(state): State<Arc<AppState>>,
     Query(mut req): Query<ForecastRequest>,
 ) -> Result<Json<Vec<Forecast>>, AppError> {
@@ -94,8 +107,26 @@ pub async fn forecasts(
             bounded_window(req.generated_start, req.generated_end, now)?;
         (req.generated_start, req.generated_end) = (Some(generated_start), Some(generated_end));
     }
+    if audience == Audience::Public {
+        checked_forecast_history(&req, now)?;
+    }
     let forecasts = state.weather_db.forecasts_data(&req, stations).await?;
     Ok(Json(forecasts))
+}
+
+/// Rejects a public forecast query whose issues begin more than
+/// [`PUBLIC_FORECAST_HISTORY`] before `now`. `req` has its bounds filled in.
+fn checked_forecast_history(req: &ForecastRequest, now: OffsetDateTime) -> Result<(), AppError> {
+    let (issued_from, _) = forecast_generated_window(req, now);
+    if issued_from < now - PUBLIC_FORECAST_HISTORY {
+        return Err(AppError::InvalidRequest(format!(
+            "forecasts issued in the last {} days only: generated_start, or end when \
+             generated_start is absent, reaches too far back; older forecasts are in the \
+             archive files listed at /files",
+            PUBLIC_FORECAST_HISTORY.whole_days()
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Serialize, Deserialize, IntoParams)]
@@ -310,11 +341,16 @@ async fn build_observations(
 const WARM_CONCURRENCY: usize = 2;
 
 /// Rebuilds the observation aggregates asked for lately, so the next
-/// request after new data finds them current.
+/// request after new data finds them current. Each takes a heavy turn, so
+/// a processing pass waits for at most the ones being built.
 pub async fn warm_observations(state: &Arc<AppState>) {
     stream::iter(state.recent_observations())
         .for_each_concurrent(WARM_CONCURRENCY, |key| async move {
+            let Some(_turn) = state.background_turn().await else {
+                return;
+            };
             let _ = build_observations(state, key).await;
+            release_freed_memory_now_and_then();
         })
         .await;
 }
@@ -407,19 +443,20 @@ pub async fn get_stations(
 #[derive(Debug, Deserialize, IntoParams)]
 #[serde(deny_unknown_fields)]
 pub struct EligibleRequest {
-    /// Full UTC days to judge, ending with yesterday: 1 to 31, 3 by default.
+    /// Full UTC days to judge, ending with yesterday: 1 to 3, 3 by default.
     pub days: Option<u32>,
     /// Length of the competition window in hours: 1 to 24, 24 by default.
     pub window_hours: Option<u32>,
 }
 
 impl EligibleRequest {
-    /// The days and window hours to judge, defaults filled in.
-    fn checked(&self) -> Result<(u32, u32), AppError> {
+    /// The days and window hours to judge, defaults filled in. At most
+    /// `max_days` of history (see [`Audience::max_eligible_days`]).
+    fn checked(&self, max_days: u32) -> Result<(u32, u32), AppError> {
         let days = self.days.unwrap_or(DEFAULT_DAYS);
-        if !(1..=MAX_DAYS).contains(&days) {
+        if !(1..=max_days).contains(&days) {
             return Err(AppError::InvalidRequest(format!(
-                "days must be between 1 and {MAX_DAYS}"
+                "days must be between 1 and {max_days}"
             )));
         }
         let window_hours = self.window_hours.unwrap_or(DEFAULT_WINDOW_HOURS);
@@ -446,14 +483,15 @@ impl EligibleRequest {
     responses(
         (status = OK, description = "Stations eligible for a competition starting now, by station id", body = Vec<EligibleStation>),
         (status = BAD_REQUEST, description = "Unknown query parameter, or days or window_hours out of range"),
-        (status = SERVICE_UNAVAILABLE, description = "Eligibility unavailable")
+        (status = SERVICE_UNAVAILABLE, description = "Eligibility unavailable, or busy; retry after the Retry-After delay")
     ))]
 pub async fn eligible_stations(
+    audience: Audience,
     State(state): State<Arc<AppState>>,
     query: Result<Query<EligibleRequest>, QueryRejection>,
 ) -> Result<Json<Vec<EligibleStation>>, AppError> {
     let Query(req) = query.map_err(|rejection| AppError::InvalidRequest(rejection.body_text()))?;
-    let (days, window_hours) = req.checked()?;
+    let (days, window_hours) = req.checked(audience.max_eligible_days())?;
     let stations = state.eligible_stations(days, window_hours).await?;
     Ok(Json(stations.as_ref().clone()))
 }
@@ -490,15 +528,77 @@ mod tests {
     #[test]
     fn eligibility_queries_have_bounded_days_and_windows() {
         let request = |days, window_hours| EligibleRequest { days, window_hours };
-        assert_eq!(request(None, None).checked().unwrap(), (3, 24));
-        assert_eq!(request(Some(1), Some(1)).checked().unwrap(), (1, 1));
-        assert_eq!(request(Some(31), Some(24)).checked().unwrap(), (31, 24));
+        let operator = Audience::Operator.max_eligible_days();
+        assert_eq!(request(None, None).checked(operator).unwrap(), (3, 24));
+        assert_eq!(request(Some(1), Some(1)).checked(operator).unwrap(), (1, 1));
+        assert_eq!(
+            request(Some(31), Some(24)).checked(operator).unwrap(),
+            (31, 24)
+        );
         for (days, window_hours) in [(0, 24), (32, 24), (30, 0), (30, 25)] {
             assert!(
-                request(Some(days), Some(window_hours)).checked().is_err(),
+                request(Some(days), Some(window_hours))
+                    .checked(operator)
+                    .is_err(),
                 "{days} days, {window_hours} hours"
             );
         }
+    }
+
+    #[test]
+    fn public_eligibility_queries_judge_only_the_days_read_ahead() {
+        let request = |days| EligibleRequest {
+            days,
+            window_hours: Some(24),
+        };
+        let public = Audience::Public.max_eligible_days();
+        assert_eq!(public, crate::weather_data::PRECOMPUTED_DAYS);
+        for days in [None, Some(1), Some(2), Some(3)] {
+            assert!(request(days).checked(public).is_ok(), "{days:?}");
+        }
+        for days in [4, 7, 30, 31] {
+            let error = request(Some(days)).checked(public).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "invalid request: days must be between 1 and 3"
+            );
+        }
+    }
+
+    #[test]
+    fn public_forecast_queries_read_only_recent_issues() {
+        let now = datetime!(2030-01-20 12:00 UTC);
+        let request = |start, end, generated_start, generated_end| ForecastRequest {
+            start: Some(start),
+            end: Some(end),
+            generated_start,
+            generated_end,
+            station_ids: "KORD".into(),
+            temperature_unit: TemperatureUnit::Fahrenheit,
+        };
+        let tomorrow = now + Duration::DAY;
+        // The entry form and discovery: tomorrow, issues of the last week.
+        assert!(checked_forecast_history(&request(now, tomorrow, None, None), now).is_ok());
+        // A competition that started two days ago, issues of the week before it.
+        let started = now - Duration::days(2);
+        let baseline = request(
+            started,
+            started + Duration::DAY,
+            Some(started - Duration::days(7)),
+            Some(started - Duration::NANOSECOND),
+        );
+        assert!(checked_forecast_history(&baseline, now).is_ok());
+        // Issues from beyond the query-ready copies.
+        let old = now - PUBLIC_FORECAST_HISTORY - Duration::SECOND;
+        assert!(
+            checked_forecast_history(&request(now, tomorrow, Some(old), Some(now)), now).is_err()
+        );
+        // A past window without issue bounds reads the week before its end.
+        let past = now - Duration::days(4);
+        assert!(
+            checked_forecast_history(&request(past - Duration::DAY, past, None, None), now)
+                .is_err()
+        );
     }
 
     #[test]

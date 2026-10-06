@@ -1,4 +1,5 @@
 mod auth;
+mod bounds;
 mod coordinator_contract;
 mod daemon_contract;
 mod discovery;
