@@ -338,7 +338,8 @@ and publishes `attestation` `s` with `s·G` equal to that outcome's locking
 point. The oracle attests each event at most once and only an announced
 outcome; the nonce behind `R` is derived from the oracle key and never
 published. A client verifies an attestation by finding the `i` with
-`locking_points[i] = s·G`.
+`locking_points[i] = s·G`. When relays are configured, the oracle also
+publishes each announcement and attestation to Nostr; see [NOSTR.md](NOSTR.md).
 
 Final readings, entry scores, the attestation, and clearing the blocked reason commit in one SQLite transaction.
 Competing finalizations cannot mix their evidence. Delayed provisional updates cannot change a signed event's readings or scores.

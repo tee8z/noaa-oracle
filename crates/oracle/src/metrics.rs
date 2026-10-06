@@ -26,6 +26,11 @@
 //! `process_resident_memory_bytes` and `oracle_cache_entries` are read
 //! when scraped; `oracle_weather_requests_turned_away_total` counts weather
 //! requests answered 503 because too many were waiting.
+//!
+//! `oracle_nostr_published_total` and `oracle_nostr_publish_failures_total`
+//! count deliveries of announcements and attestations to Nostr relays, one
+//! per event and relay; `oracle_nostr_outbox_depth` counts those still
+//! waiting, due or backing off after a failure.
 
 use std::{
     path::Path,
@@ -83,6 +88,9 @@ pub struct Metrics {
     resident_memory: IntGauge,
     cache_entries: IntGaugeVec,
     cache_bytes: IntGaugeVec,
+    nostr_published: IntCounter,
+    nostr_failures: IntCounter,
+    nostr_outbox_depth: IntGauge,
     /// When the scrape-time gauges were last read.
     refreshed_at: tokio::sync::Mutex<Option<Instant>>,
 }
@@ -217,6 +225,21 @@ impl Metrics {
                 &["cache"],
             )
             .expect("valid metric"),
+            nostr_published: IntCounter::new(
+                "oracle_nostr_published_total",
+                "Announcements and attestations accepted by a Nostr relay, per relay",
+            )
+            .expect("valid metric"),
+            nostr_failures: IntCounter::new(
+                "oracle_nostr_publish_failures_total",
+                "Attempts to publish to a Nostr relay that failed and will be retried",
+            )
+            .expect("valid metric"),
+            nostr_outbox_depth: IntGauge::new(
+                "oracle_nostr_outbox_depth",
+                "Publications to Nostr relays not yet accepted",
+            )
+            .expect("valid metric"),
             refreshed_at: tokio::sync::Mutex::new(None),
             registry,
         };
@@ -260,6 +283,9 @@ impl Metrics {
             Box::new(metrics.resident_memory.clone()),
             Box::new(metrics.cache_entries.clone()),
             Box::new(metrics.cache_bytes.clone()),
+            Box::new(metrics.nostr_published.clone()),
+            Box::new(metrics.nostr_failures.clone()),
+            Box::new(metrics.nostr_outbox_depth.clone()),
         ];
         for collector in collectors {
             metrics
@@ -304,6 +330,18 @@ impl Metrics {
     /// A weather request was turned away while too many waited.
     pub fn weather_request_turned_away(&self) {
         self.turned_away.inc();
+    }
+
+    /// A publishing pass delivered `published` events to relays and failed
+    /// `failed` deliveries.
+    pub fn nostr_pass(&self, published: u64, failed: u64) {
+        self.nostr_published.inc_by(published);
+        self.nostr_failures.inc_by(failed);
+    }
+
+    pub fn set_nostr_outbox_depth(&self, depth: u64) {
+        self.nostr_outbox_depth
+            .set(i64::try_from(depth).unwrap_or(i64::MAX));
     }
 
     pub fn upload_accepted(&self, kind: FileKind) {
@@ -358,6 +396,16 @@ impl Metrics {
         match state.oracle.awaiting_attestation().await {
             Ok(awaiting) => self.set_awaiting(&awaiting, state.oracle.now()),
             Err(error) => warn!("metrics: cannot count events awaiting attestation: {error:#}"),
+        }
+        if let Some(publication) = state.oracle.publication() {
+            match state
+                .database
+                .publication_backlog(&publication.relays)
+                .await
+            {
+                Ok(depth) => self.set_nostr_outbox_depth(depth),
+                Err(error) => warn!("metrics: cannot count the nostr outbox: {error:#}"),
+            }
         }
         let latest = latest_files(&state.weather_dir).await;
         self.latest_forecast
@@ -621,6 +669,9 @@ mod tests {
             "oracle_eligibility_reports",
             "oracle_weather_requests_turned_away_total",
             "process_resident_memory_bytes",
+            "oracle_nostr_published_total",
+            "oracle_nostr_publish_failures_total",
+            "oracle_nostr_outbox_depth",
         ] {
             assert!(text.contains(&format!("# TYPE {family} ")), "{family}");
         }

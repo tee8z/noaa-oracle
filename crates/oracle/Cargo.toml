@@ -29,7 +29,7 @@ serde_json.workspace = true
 clap.workspace = true
 
 # Async
-tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { workspace = true, features = ["io", "rt"] }
 futures.workspace = true
 
@@ -47,7 +47,7 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 
 # DLC / Crypto
 dlctix = "0.1.0"
-nostr = { version = "0.45", default-features = false, features = ["std", "nip98"] }
+nostr = { version = "0.45", default-features = false, features = ["std", "nip98", "os-rng"] }
 pem-rfc7468 = { version = "1.0", features = ["alloc"] }
 base64 = "0.23"
 flate2 = "1.1"
@@ -56,6 +56,11 @@ flate2 = "1.1"
 rand = "0.9"
 sha2 = "0.11"
 zeroize = "1.8"
+
+# Nostr relays: a small websocket client over TLS (see src/publication/relay.rs)
+sha1 = "0.11"
+tokio-rustls = "0.26"
+webpki-roots = "1.0"
 
 # Logging
 log = { workspace = true, features = ["serde"] }

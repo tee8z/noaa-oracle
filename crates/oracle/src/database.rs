@@ -1370,6 +1370,9 @@ fn json_column<T: DeserializeOwned>(row: &SqliteRow, column: &str) -> Result<T, 
 }
 
 mod lines;
+mod publication;
+
+pub use publication::DuePublication;
 #[cfg(test)]
 mod tests;
 
