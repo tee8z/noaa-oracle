@@ -600,6 +600,12 @@ mod tests {
             task.abort();
         }
         drop(all);
+        bounded(async {
+            while heavy.waiting() > 0 || heavy.free_turns() < HEAVY_TURNS as usize {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
         let value = kept
             .get(&heavy, Turns::One, "KORD", 0, || async { Ok(4) })
             .await

@@ -268,6 +268,13 @@ async fn new_questions_are_turned_away_while_heavy_work_is_busy() {
         task.abort();
     }
     drop(pass);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while heavy.waiting() > 0 || heavy.free_turns() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the turns come back");
     let built: Value = app.get_json(&earlier).await;
     assert_eq!(built["stations"].as_array().unwrap().len(), 2);
 }

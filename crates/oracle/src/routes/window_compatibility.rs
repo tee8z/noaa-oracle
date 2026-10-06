@@ -129,8 +129,7 @@ impl PlanKey {
     /// Retained bytes of a kept assessment, roughly.
     pub(crate) fn estimated_bytes(&self, plan: &Arc<WindowCompatibility>) -> usize {
         let strings = |values: &[String]| {
-            values.len() * std::mem::size_of::<String>()
-                + values.iter().map(String::capacity).sum::<usize>()
+            std::mem::size_of_val(values) + values.iter().map(String::capacity).sum::<usize>()
         };
         std::mem::size_of::<Self>()
             + std::mem::size_of::<WindowCompatibility>()
