@@ -132,7 +132,9 @@ and list the tracked targets in `line_targets`; the oracle then reads the
 source's history and fits lines itself. Scoring, ranking, announcements, and
 attestation are shared. On the daemon side, implement its `Source` trait to fetch and write
 the parquet datasets. The event, entry, and attestation contract is the same for
-every source; see [docs/attestation.md](docs/attestation.md).
+every source; see [docs/attestation.md](docs/attestation.md). With `[nostr]`
+relays configured, the oracle also publishes announcements and attestations to
+Nostr ([docs/NOSTR.md](docs/NOSTR.md)).
 
 ### Daemon Configuration
 

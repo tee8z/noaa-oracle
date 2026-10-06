@@ -14,6 +14,7 @@ use crate::{
     file_access::{FileAccess, FileData, S3FileAccess},
     metrics::{self, Metrics},
     oracle::{Oracle, system_clock},
+    publication::{PASS_ROWS, Publication, Publisher, PublishingKey, WebSocketTransport},
     routes::stations::ObservationKey,
     routes::ui::WeatherKey,
     routes::{
@@ -57,7 +58,7 @@ use std::{
 };
 use tokio::{
     net::TcpListener,
-    sync::{Semaphore, watch},
+    sync::{Notify, Semaphore, watch},
     task::{JoinError, JoinHandle},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -227,6 +228,24 @@ const ETL_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
 const LINES_LEASE: &str = "lines";
 const LINES_LEASE_TTL: Duration = Duration::from_secs(30 * 60);
 const LINES_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// Publishing to Nostr relays runs in one process at a time. The lease
+/// outlasts the longest wait between passes.
+const NOSTR_LEASE: &str = "nostr";
+const NOSTR_LEASE_TTL: Duration = Duration::from_secs(5 * 60);
+/// Longest wait between publishing passes; rows backing off after a
+/// failure become due without a wake.
+const NOSTR_IDLE: Duration = Duration::from_secs(30);
+/// Wait between passes while more rows are due, which bounds how fast a
+/// backfill reaches the relays.
+const NOSTR_PASS_SPACING: Duration = Duration::from_secs(2);
+/// At startup, events whose signing date is at most this many days ago
+/// are queued for relays that do not have them yet.
+const NOSTR_BACKFILL_DAYS: i64 = 30;
+/// Afterwards, events this recent are queued again every
+/// [`NOSTR_SWEEP_INTERVAL`], catching rows that could not be queued when
+/// their event was written. Rows already published are kept.
+const NOSTR_SWEEP_DAYS: i64 = 2;
+const NOSTR_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum EtlRejected {
@@ -850,7 +869,8 @@ impl AppState {
                 crate::events::AddEventEntry,
                 crate::events::CreateEvent,
                 crate::routes::events::Pubkey,
-                crate::routes::events::Base64Pubkey
+                crate::routes::events::Base64Pubkey,
+                crate::routes::events::NostrPublishing
             )
     ),
     tags(
@@ -865,7 +885,7 @@ async fn build_app_state(
     configuration: &Configuration,
     database: Database,
     background: Background,
-) -> Result<Arc<AppState>> {
+) -> Result<(Arc<AppState>, Option<NostrStart>)> {
     let file_access: Arc<dyn FileData> = match &configuration.storage {
         Storage::S3 { bucket, endpoint } => {
             info!("Using S3 bucket '{}' for file access", bucket);
@@ -889,7 +909,7 @@ async fn build_app_state(
         Arc::new(NoaaWeather::new(settlement_weather).with_planning(weather_db.clone())),
         [],
     );
-    let oracle = Oracle::new(
+    let mut oracle = Oracle::new(
         database.clone(),
         sources,
         &configuration.private_key,
@@ -898,13 +918,41 @@ async fn build_app_state(
     .await
     .context("set up oracle")?;
     info!("oracle npub: {}", oracle.npub());
+    let nostr = match &configuration.nostr {
+        Some(settings) => {
+            let path = settings.key_path.clone();
+            let key = tokio::task::spawn_blocking(move || PublishingKey::load_or_create(&path))
+                .await?
+                .with_context(|| format!("load the nostr key {}", settings.key_path.display()))?;
+            let wake = Arc::new(Notify::new());
+            oracle = oracle
+                .with_publication(Publication {
+                    relays: settings.relays.clone(),
+                    public_key: key.public_key(),
+                    wake: wake.clone(),
+                })
+                .context("set up nostr publishing")?;
+            info!(
+                "publishing to nostr as {} on {}",
+                key.public_key().to_hex(),
+                settings.relays.join(", ")
+            );
+            Some(NostrStart {
+                key,
+                relays: settings.relays.clone(),
+                transport: WebSocketTransport::new().map_err(|error| anyhow!(error))?,
+                wake,
+            })
+        }
+        None => None,
+    };
     if configuration.coordinators.is_empty() {
         warn!("no coordinator_pubkeys configured: nobody can create events");
     }
     if configuration.uploaders.is_empty() {
         warn!("no uploader_pubkeys configured: nobody can upload data");
     }
-    Ok(Arc::new(AppState::new(AppParts {
+    let state = Arc::new(AppState::new(AppParts {
         remote_url: configuration.remote_url.clone(),
         weather_dir: configuration.weather_dir.clone(),
         auth: AuthPolicy::new(
@@ -917,7 +965,16 @@ async fn build_app_state(
         oracle: Arc::new(oracle),
         database,
         background,
-    })))
+    }));
+    Ok((state, nostr))
+}
+
+/// What the Nostr publisher starts from, once the state is built.
+struct NostrStart {
+    key: PublishingKey,
+    relays: Vec<String>,
+    transport: WebSocketTransport,
+    wake: Arc<Notify>,
 }
 
 pub fn app(app_state: Arc<AppState>) -> Router {
@@ -1167,7 +1224,7 @@ impl ApplicationRuntime {
                         configuration.weather_dir.display()
                     )
                 })?;
-            let state = build_app_state(configuration, database, background).await?;
+            let (state, nostr) = build_app_state(configuration, database, background).await?;
             let listener = TcpListener::bind(configuration.listen)
                 .await
                 .with_context(|| format!("bind HTTP listener {}", configuration.listen))?;
@@ -1186,7 +1243,7 @@ impl ApplicationRuntime {
                 }
                 None => None,
             };
-            Ok::<_, anyhow::Error>((state, listener, address, metrics_listener))
+            Ok::<_, anyhow::Error>((state, nostr, listener, address, metrics_listener))
         };
         let prepared = tokio::select! {
             biased;
@@ -1197,7 +1254,7 @@ impl ApplicationRuntime {
             }
             result = prepare => result.map(Some),
         };
-        let (state, listener, address, metrics_listener) = match prepared {
+        let (state, nostr, listener, address, metrics_listener) = match prepared {
             Ok(Some(prepared)) if !runtime.requested.is_cancelled() => prepared,
             result => {
                 // Startup failures and signals must still close SQLite cleanly.
@@ -1210,6 +1267,9 @@ impl ApplicationRuntime {
         spawn_etl_schedule(&state, configuration.etl_interval);
         spawn_line_schedule(&state);
         spawn_lease_release(&state);
+        if let Some(nostr) = nostr {
+            spawn_nostr_publisher(&state, nostr);
+        }
         if let Some((listener, address)) = metrics_listener {
             runtime.metrics = Some(spawn_http(
                 listener,
@@ -1523,6 +1583,98 @@ fn spawn_line_schedule(state: &Arc<AppState>) {
             .await
         {
             warn!("cannot release the lines lease: {e}");
+        }
+    });
+}
+
+/// Publishes queued announcements and attestations to Nostr relays while
+/// this process holds the nostr lease: first queues recent events the
+/// relays may lack, then runs a pass whenever a row is queued, at most
+/// [`NOSTR_IDLE`] apart. Relays are only reached from this task.
+fn spawn_nostr_publisher(state: &Arc<AppState>, start: NostrStart) {
+    let NostrStart {
+        key,
+        relays,
+        transport,
+        wake,
+    } = start;
+    let publisher = Publisher::new(
+        state.database.clone(),
+        state.oracle.clone(),
+        key,
+        relays,
+        state.remote_url.clone(),
+        transport,
+        system_clock(),
+    );
+    let state = state.clone();
+    let stopping = state.background.stopping.clone();
+    state.background.tasks.clone().spawn(async move {
+        let mut swept: Option<std::time::Instant> = None;
+        loop {
+            let wait = match state
+                .database
+                .take_lease(NOSTR_LEASE, &state.instance, NOSTR_LEASE_TTL)
+                .await
+            {
+                Ok(true) => {
+                    if swept.is_none_or(|at| at.elapsed() >= NOSTR_SWEEP_INTERVAL) {
+                        let days = if swept.is_none() {
+                            NOSTR_BACKFILL_DAYS
+                        } else {
+                            NOSTR_SWEEP_DAYS
+                        };
+                        match publisher.queue_recent(days).await {
+                            Ok(0) => swept = Some(std::time::Instant::now()),
+                            Ok(added) => {
+                                info!("nostr: queued {added} publications of recent events");
+                                swept = Some(std::time::Instant::now());
+                            }
+                            Err(e) => warn!("nostr: cannot queue recent events: {e}"),
+                        }
+                    }
+                    let pass = tokio::select! {
+                        biased;
+                        () = stopping.cancelled() => break,
+                        pass = publisher.run_pass() => pass,
+                    };
+                    match pass {
+                        Ok(summary) => {
+                            state.metrics.nostr_pass(summary.published, summary.failed);
+                            if summary.rows >= PASS_ROWS {
+                                NOSTR_PASS_SPACING
+                            } else {
+                                NOSTR_IDLE
+                            }
+                        }
+                        Err(e) => {
+                            warn!("nostr: publishing pass failed: {e}");
+                            NOSTR_IDLE
+                        }
+                    }
+                }
+                Ok(false) => NOSTR_IDLE,
+                Err(e) => {
+                    warn!("cannot take the nostr lease: {e}");
+                    NOSTR_IDLE
+                }
+            };
+            if let Ok(depth) = publisher.backlog().await {
+                state.metrics.set_nostr_outbox_depth(depth);
+            }
+            tokio::select! {
+                biased;
+                () = stopping.cancelled() => break,
+                () = wake.notified() => {}
+                () = tokio::time::sleep(wait) => {}
+            }
+        }
+        if let Err(e) = state
+            .database
+            .release_lease(NOSTR_LEASE, &state.instance)
+            .await
+        {
+            warn!("cannot release the nostr lease: {e}");
         }
     });
 }

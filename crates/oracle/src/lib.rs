@@ -16,6 +16,7 @@ pub mod file_access;
 pub mod lines;
 pub mod metrics;
 pub mod oracle;
+pub mod publication;
 pub mod routes;
 pub mod scoring;
 pub mod signing;

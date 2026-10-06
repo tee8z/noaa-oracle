@@ -107,6 +107,43 @@ pub struct Cli {
     /// writes to finish after a stop signal before giving up
     #[arg(long, env = "NOAA_ORACLE_SHUTDOWN_TIMEOUT")]
     pub shutdown_timeout: Option<u64>,
+
+    /// Publishing announcements and attestations to Nostr relays
+    #[command(flatten)]
+    #[serde(default)]
+    pub nostr: NostrArgs,
+}
+
+/// The `[nostr]` table: publishing to Nostr relays (see `docs/NOSTR.md`).
+#[derive(clap::Args, Clone, Debug, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct NostrArgs {
+    /// Publish event announcements and attestations to the relays
+    #[arg(
+        id = "nostr_enabled",
+        long = "nostr-enabled",
+        env = "NOAA_ORACLE_NOSTR_ENABLED"
+    )]
+    pub enabled: Option<bool>,
+
+    /// Relay URLs (wss:// or ws://)
+    #[arg(
+        id = "nostr_relays",
+        long = "nostr-relays",
+        env = "NOAA_ORACLE_NOSTR_RELAYS",
+        value_delimiter = ','
+    )]
+    #[serde(default)]
+    pub relays: Vec<String>,
+
+    /// Path to the Nostr publishing key (secp256k1, PEM, mode 0600). Must
+    /// not be the oracle signing key.
+    #[arg(
+        id = "nostr_key_path",
+        long = "nostr-key",
+        env = "NOAA_ORACLE_NOSTR_KEY"
+    )]
+    pub key_path: Option<PathBuf>,
 }
 
 /// Validated settings the application starts from.
@@ -124,6 +161,15 @@ pub struct Configuration {
     pub storage: Storage,
     pub etl_interval: Duration,
     pub shutdown_timeout: Duration,
+    /// Relay publishing; `None` when off.
+    pub nostr: Option<NostrSettings>,
+}
+
+/// Validated `[nostr]` settings for an enabled publisher.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NostrSettings {
+    pub relays: Vec<String>,
+    pub key_path: PathBuf,
 }
 
 /// Where data files are listed and served from. Uploads and queries always
@@ -151,6 +197,12 @@ pub enum ConfigError {
     Pubkey { field: &'static str, value: String },
     #[error("{0} must be positive")]
     Zero(&'static str),
+    #[error("invalid nostr relay {0:?}: expected a wss:// or ws:// URL")]
+    Relay(String),
+    #[error("nostr is enabled without relays")]
+    NoRelays,
+    #[error("the nostr key must be a separate file from the oracle signing key")]
+    SharedKey,
 }
 
 impl Cli {
@@ -191,6 +243,11 @@ impl Cli {
             s3_endpoint: self.s3_endpoint.or(file.s3_endpoint),
             etl_interval: self.etl_interval.or(file.etl_interval),
             shutdown_timeout: self.shutdown_timeout.or(file.shutdown_timeout),
+            nostr: NostrArgs {
+                enabled: self.nostr.enabled.or(file.nostr.enabled),
+                relays: list(self.nostr.relays, file.nostr.relays),
+                key_path: self.nostr.key_path.or(file.nostr.key_path),
+            },
         }
     }
 
@@ -206,6 +263,11 @@ impl Cli {
             Some(url) => validate_origin(url)?,
             None => format!("http://{}", SocketAddr::new(host, port)),
         };
+        let private_key = self
+            .oracle_private_key
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("./oracle_private_key.pem"));
+        let nostr = self.nostr.settings(&private_key)?;
         let seconds = |value: Option<u64>, default, name| match value.unwrap_or(default) {
             0 => Err(ConfigError::Zero(name)),
             seconds => Ok(Duration::from_secs(seconds)),
@@ -222,10 +284,7 @@ impl Cli {
                 .event_db
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("./event_data")),
-            private_key: self
-                .oracle_private_key
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("./oracle_private_key.pem")),
+            private_key,
             coordinators: parse_pubkeys("coordinator_pubkeys", &self.coordinator_pubkeys)?,
             uploaders: parse_pubkeys("uploader_pubkeys", &self.uploader_pubkeys)?,
             storage: match self.s3_bucket.clone().filter(|bucket| !bucket.is_empty()) {
@@ -248,7 +307,51 @@ impl Cli {
                 DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
                 "shutdown_timeout",
             )?,
+            nostr,
         })
+    }
+}
+
+impl NostrArgs {
+    /// `None` unless enabled. An enabled publisher needs relays and a key
+    /// file other than `private_key`, the oracle signing key.
+    fn settings(
+        &self,
+        private_key: &std::path::Path,
+    ) -> Result<Option<NostrSettings>, ConfigError> {
+        if self.enabled != Some(true) {
+            return Ok(None);
+        }
+        let relays: Vec<String> = self
+            .relays
+            .iter()
+            .map(|relay| relay.trim())
+            .filter(|relay| !relay.is_empty())
+            .map(validate_relay)
+            .collect::<Result<_, _>>()?;
+        if relays.is_empty() {
+            return Err(ConfigError::NoRelays);
+        }
+        let key_path = self
+            .key_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("./oracle_nostr_key.pem"));
+        if key_path.as_path() == private_key {
+            return Err(ConfigError::SharedKey);
+        }
+        Ok(Some(NostrSettings { relays, key_path }))
+    }
+}
+
+/// Accepts `wss://` and `ws://` URLs and returns them without a trailing
+/// slash, so one relay is one outbox key however it is written.
+fn validate_relay(relay: &str) -> Result<String, ConfigError> {
+    let invalid = || ConfigError::Relay(relay.to_owned());
+    let parsed = nostr::types::Url::parse(relay).map_err(|_| invalid())?;
+    if matches!(parsed.scheme(), "wss" | "ws") && parsed.host_str().is_some() {
+        Ok(relay.trim_end_matches('/').to_owned())
+    } else {
+        Err(invalid())
     }
 }
 
@@ -410,6 +513,64 @@ mod tests {
         assert_eq!(configuration.coordinators, vec![keys.public_key()]);
         assert_eq!(configuration.uploaders, vec![keys.public_key()]);
         assert_eq!(configuration.remote_url, "https://oracle.example.com");
+    }
+
+    #[test]
+    fn nostr_publishing_is_off_unless_enabled_with_relays() {
+        assert_eq!(Cli::default().configuration().unwrap().nostr, None);
+        let parsed: Cli =
+            toml::from_str("[nostr]\nenabled = false\nrelays = [\"wss://relay.example.com\"]")
+                .unwrap();
+        assert_eq!(parsed.configuration().unwrap().nostr, None);
+
+        let parsed: Cli = toml::from_str(
+            "port = 9900\n[nostr]\nenabled = true\nrelays = [\"wss://relay.example.com/\", \"ws://127.0.0.1:7777\"]",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.configuration().unwrap().nostr,
+            Some(NostrSettings {
+                relays: vec![
+                    "wss://relay.example.com".into(),
+                    "ws://127.0.0.1:7777".into()
+                ],
+                key_path: PathBuf::from("./oracle_nostr_key.pem"),
+            })
+        );
+
+        let flag =
+            Cli::try_parse_from(["oracle", "--nostr-relays", "wss://other.example.com"]).unwrap();
+        assert_eq!(
+            flag.merge(parsed)
+                .configuration()
+                .unwrap()
+                .nostr
+                .unwrap()
+                .relays,
+            vec!["wss://other.example.com".to_owned()],
+            "the flag wins over the file"
+        );
+
+        let enabled = |relays: &str, key: &str| {
+            toml::from_str::<Cli>(&format!(
+                "private_key_path = \"./oracle.pem\"\n[nostr]\nenabled = true\nrelays = {relays}\n{key}"
+            ))
+            .unwrap()
+            .configuration()
+        };
+        assert!(matches!(enabled("[]", ""), Err(ConfigError::NoRelays)));
+        assert!(matches!(
+            enabled("[\"https://relay.example.com\"]", ""),
+            Err(ConfigError::Relay(_))
+        ));
+        assert!(matches!(
+            enabled(
+                "[\"wss://relay.example.com\"]",
+                "key_path = \"./oracle.pem\""
+            ),
+            Err(ConfigError::SharedKey)
+        ));
+        assert!(toml::from_str::<Cli>("[nostr]\nrelay = []").is_err());
     }
 
     #[test]

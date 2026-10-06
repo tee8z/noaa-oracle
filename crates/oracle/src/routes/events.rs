@@ -5,6 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use log::{debug, error, info, warn};
+use nostr::nips::nip19::ToBech32;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use std::sync::Arc;
@@ -31,6 +32,21 @@ pub struct Base64Pubkey {
     /// base64 of the compressed SEC1 public key: a parity byte (`0x02` or
     /// `0x03`) followed by the big-endian X coordinate.
     pub key: String,
+    /// Where the oracle publishes announcements and attestations, when it
+    /// does (see `docs/NOSTR.md`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nostr: Option<NostrPublishing>,
+}
+
+/// The oracle's Nostr publishing identity. A separate key from the
+/// attestation key; it only signs the relay events.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct NostrPublishing {
+    /// x-only public key, hex: the `authors` filter for the oracle's events
+    pub pubkey: String,
+    pub npub: String,
+    /// Relays the oracle publishes to
+    pub relays: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -49,11 +65,19 @@ pub struct ErrorBody {
     get,
     path = "/oracle/pubkey",
     responses(
-        (status = OK, description = "The oracle's attestation public key", body = Base64Pubkey),
+        (status = OK, description = "The oracle's attestation public key, and its Nostr publishing key when it publishes to relays", body = Base64Pubkey),
     ))]
 pub async fn get_pubkey(State(state): State<Arc<AppState>>) -> Json<Base64Pubkey> {
     Json(Base64Pubkey {
         key: state.oracle.public_key_base64(),
+        nostr: state.oracle.publication().map(|publication| {
+            let Ok(npub) = publication.public_key.to_bech32();
+            NostrPublishing {
+                pubkey: publication.public_key.to_hex(),
+                npub,
+                relays: publication.relays.clone(),
+            }
+        }),
     })
 }
 
@@ -61,7 +85,7 @@ pub async fn get_pubkey(State(state): State<Arc<AppState>>) -> Json<Base64Pubkey
     get,
     path = "/oracle/npub",
     responses(
-        (status = OK, description = "The oracle's nostr npub (the same key)", body = Pubkey),
+        (status = OK, description = "The oracle's attestation key as an npub. Relay events are signed by the separate key in `/oracle/pubkey`", body = Pubkey),
     ))]
 pub async fn get_npub(State(state): State<Arc<AppState>>) -> Json<Pubkey> {
     Json(Pubkey {
@@ -378,6 +402,7 @@ impl IntoResponse for Error {
             | Error::UnknownSource { .. }
             | Error::Key(_)
             | Error::KeyMismatch { .. }
+            | Error::SharedPublishingKey
             | Error::Read(_)
             | Error::Source(_)
             | Error::Attest { .. }

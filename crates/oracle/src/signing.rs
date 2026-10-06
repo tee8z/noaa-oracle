@@ -88,76 +88,12 @@ impl Drop for SigningKey {
 impl SigningKey {
     /// Loads the key at `path`, or creates it with mode 0600 when missing.
     pub fn load_or_create(path: &Path) -> Result<Self, KeyError> {
-        let display = || path.display().to_string();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("pem") {
-            return Err(KeyError::Extension { path: display() });
-        }
-        match fs::metadata(path) {
-            Ok(_) => Self::read(path),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let key = Self::from_secret(SecretKey::new(&mut rand::rng()));
-                key.write_new(path)?;
-                Ok(key)
-            }
-            Err(source) => Err(KeyError::Read {
-                path: display(),
-                source,
-            }),
-        }
+        load_or_create_secret(path).map(Self::from_secret)
     }
 
     fn from_secret(secret: SecretKey) -> Self {
         let public = secret.public_key(&Secp256k1::signing_only());
         Self { secret, public }
-    }
-
-    fn read(path: &Path) -> Result<Self, KeyError> {
-        let display = || path.display().to_string();
-        let metadata = fs::metadata(path).map_err(|source| KeyError::Read {
-            path: display(),
-            source,
-        })?;
-        check_private(path, &metadata)?;
-        if metadata.len() > MAX_KEY_FILE_BYTES {
-            return Err(KeyError::TooLarge { path: display() });
-        }
-        let pem = Zeroizing::new(fs::read(path).map_err(|source| KeyError::Read {
-            path: display(),
-            source,
-        })?);
-        let (label, der) =
-            pem_rfc7468::decode_vec(&pem).map_err(|_| KeyError::Format { path: display() })?;
-        let der = Zeroizing::new(der);
-        if label != PEM_LABEL {
-            return Err(KeyError::Format { path: display() });
-        }
-        let bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
-            der.as_slice()
-                .try_into()
-                .map_err(|_| KeyError::InvalidKey { path: display() })?,
-        );
-        let secret = SecretKey::from_byte_array(*bytes)
-            .map_err(|_| KeyError::InvalidKey { path: display() })?;
-        Ok(Self::from_secret(secret))
-    }
-
-    fn write_new(&self, path: &Path) -> Result<(), KeyError> {
-        let create = |source| KeyError::Create {
-            path: path.display().to_string(),
-            source,
-        };
-        let secret = Zeroizing::new(self.secret.secret_bytes());
-        let pem = Zeroizing::new(
-            pem_rfc7468::encode_string(PEM_LABEL, LineEnding::LF, secret.as_slice())
-                .map_err(|error| create(io::Error::other(error)))?,
-        );
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let mut file = options.open(path).map_err(create)?;
-        file.write_all(pem.as_bytes()).map_err(create)?;
-        file.sync_all().map_err(create)
     }
 
     pub fn public_key(&self) -> PublicKey {
@@ -168,7 +104,8 @@ impl SigningKey {
         self.public.x_only_public_key().0
     }
 
-    /// The oracle's nostr identity: the same key as an npub.
+    /// The attestation key as an npub, served at `/oracle/npub`. Relay
+    /// publications are signed by a separate key (see [`crate::publication`]).
     pub fn npub(&self) -> String {
         let key = NostrPublicKey::from_byte_array(self.x_only_public_key().serialize());
         let Ok(npub) = key.to_bech32();
@@ -249,6 +186,75 @@ impl SigningKey {
         debug_assert_eq!(attestation.base_point_mul(), locking_point);
         Ok(attestation)
     }
+}
+
+/// Loads the secp256k1 secret in the PEM file at `path`, or creates one
+/// with mode 0600 when the file is missing. Shared by the attestation key
+/// and the Nostr publishing key, which live in separate files.
+pub(crate) fn load_or_create_secret(path: &Path) -> Result<SecretKey, KeyError> {
+    let display = || path.display().to_string();
+    if path.extension().and_then(|extension| extension.to_str()) != Some("pem") {
+        return Err(KeyError::Extension { path: display() });
+    }
+    match fs::metadata(path) {
+        Ok(_) => read_secret(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let secret = SecretKey::new(&mut rand::rng());
+            write_new_secret(&secret, path)?;
+            Ok(secret)
+        }
+        Err(source) => Err(KeyError::Read {
+            path: display(),
+            source,
+        }),
+    }
+}
+
+fn read_secret(path: &Path) -> Result<SecretKey, KeyError> {
+    let display = || path.display().to_string();
+    let metadata = fs::metadata(path).map_err(|source| KeyError::Read {
+        path: display(),
+        source,
+    })?;
+    check_private(path, &metadata)?;
+    if metadata.len() > MAX_KEY_FILE_BYTES {
+        return Err(KeyError::TooLarge { path: display() });
+    }
+    let pem = Zeroizing::new(fs::read(path).map_err(|source| KeyError::Read {
+        path: display(),
+        source,
+    })?);
+    let (label, der) =
+        pem_rfc7468::decode_vec(&pem).map_err(|_| KeyError::Format { path: display() })?;
+    let der = Zeroizing::new(der);
+    if label != PEM_LABEL {
+        return Err(KeyError::Format { path: display() });
+    }
+    let bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
+        der.as_slice()
+            .try_into()
+            .map_err(|_| KeyError::InvalidKey { path: display() })?,
+    );
+    SecretKey::from_byte_array(*bytes).map_err(|_| KeyError::InvalidKey { path: display() })
+}
+
+fn write_new_secret(secret: &SecretKey, path: &Path) -> Result<(), KeyError> {
+    let create = |source| KeyError::Create {
+        path: path.display().to_string(),
+        source,
+    };
+    let bytes = Zeroizing::new(secret.secret_bytes());
+    let pem = Zeroizing::new(
+        pem_rfc7468::encode_string(PEM_LABEL, LineEnding::LF, bytes.as_slice())
+            .map_err(|error| create(io::Error::other(error)))?,
+    );
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path).map_err(create)?;
+    file.write_all(pem.as_bytes()).map_err(create)?;
+    file.sync_all().map_err(create)
 }
 
 #[cfg(unix)]

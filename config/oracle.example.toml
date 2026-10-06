@@ -84,8 +84,8 @@ event_db = "./event_data"
 # =============================================================================
 # Keys
 # =============================================================================
-# Oracle signing key (secp256k1, PEM). Used for DLC attestations and as the
-# oracle's nostr identity - keep it secret. Generated with mode 0600 if it
+# Oracle signing key (secp256k1, PEM). Used for DLC attestations and served
+# as the oracle's npub at /oracle/npub - keep it secret. Generated with mode 0600 if it
 # doesn't exist; the oracle refuses to start if the file is readable by
 # group or others.
 private_key_path = "./oracle_private_key.pem"
@@ -97,3 +97,16 @@ private_key_path = "./oracle_private_key.pem"
 # database writes to finish after SIGTERM. Keep this below the container's
 # termination grace period.
 shutdown_timeout = 25
+
+# =============================================================================
+# Nostr relays
+# =============================================================================
+# Publish each event's announcement and attestation to Nostr relays, so
+# contracts can settle from the relays after the oracle is gone. Off unless
+# enabled with at least one relay. Events are signed by a separate key, kept
+# in its own file and generated with mode 0600 if missing; it must not be
+# the signing key above. Format: docs/NOSTR.md.
+[nostr]
+enabled = false
+relays = []
+# key_path = "./oracle_nostr_key.pem"

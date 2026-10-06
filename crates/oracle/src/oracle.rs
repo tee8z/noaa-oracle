@@ -25,6 +25,7 @@ use crate::{
         WeatherEntry, validate_entries,
     },
     lines::{self, Line, LinePass, LineSettings},
+    publication::{Publication, Stage},
     scoring::{self, NotUuidV7, PickRule, Scored, ScoringRules},
     signing::{AttestError, KeyError, SigningKey},
     sources::{ObservationWindow, OutcomeSource, PlannedBaseline, Reading, SourceError, Sources},
@@ -59,6 +60,8 @@ pub enum Error {
     Key(#[from] KeyError),
     #[error("database was created with key {stored}, but the configured key is {configured}")]
     KeyMismatch { stored: String, configured: String },
+    #[error("the nostr publishing key is the oracle signing key; use a separate key file")]
+    SharedPublishingKey,
     #[error("failed to read events")]
     Read(#[source] Box<sqlx::Error>),
     #[error(transparent)]
@@ -330,6 +333,8 @@ pub struct Oracle {
     clock: Clock,
     lines: LineSettings,
     etl: Mutex<EtlMemory>,
+    /// Where announcements and attestations are queued for Nostr relays.
+    publication: Option<Publication>,
 }
 
 impl Oracle {
@@ -350,6 +355,7 @@ impl Oracle {
             clock,
             lines: LineSettings::default(),
             etl: Mutex::default(),
+            publication: None,
         };
         oracle.check_stored_key().await?;
         Ok(oracle)
@@ -378,6 +384,46 @@ impl Oracle {
 
     pub fn npub(&self) -> String {
         self.key.npub()
+    }
+
+    /// Queues announcements and attestations for Nostr relays from now on.
+    /// Refuses a publishing key equal to the attestation key.
+    pub fn with_publication(mut self, publication: Publication) -> Result<Self, Error> {
+        if publication.public_key.to_bytes() == self.key.x_only_public_key().serialize() {
+            return Err(Error::SharedPublishingKey);
+        }
+        self.publication = Some(publication);
+        Ok(self)
+    }
+
+    pub fn publication(&self) -> Option<&Publication> {
+        self.publication.as_ref()
+    }
+
+    /// Queues `stage` of `event_id` for each relay, when publishing is on.
+    /// Runs after the event write commits and never fails the caller: a
+    /// row that cannot be queued now is queued by the publisher's next
+    /// sweep of recent events.
+    async fn queue_publication(&self, event_id: Uuid, stage: Stage) {
+        let Some(publication) = &self.publication else {
+            return;
+        };
+        match self
+            .db
+            .queue_publication(
+                event_id,
+                stage,
+                publication.relays.clone(),
+                self.now().unix_timestamp(),
+            )
+            .await
+        {
+            Ok(()) => publication.wake.notify_one(),
+            Err(error) => warn!(
+                "event {event_id}: cannot queue its {} publication yet: {error}",
+                stage.as_str()
+            ),
+        }
     }
 
     pub fn sources(&self) -> &Sources {
@@ -573,6 +619,7 @@ impl Oracle {
             new_event.coordinator_pubkey,
             new_event.event_announcement.locking_points.len()
         );
+        self.queue_publication(new_event.id, Stage::Announced).await;
         self.get_event(new_event.id).await
     }
 
@@ -1082,6 +1129,7 @@ impl Oracle {
         match stored {
             SettlementOutcome::Attested => {
                 info!("attested event {} with winners {winners:?}", event.id);
+                self.queue_publication(event.id, Stage::Attested).await;
             }
             SettlementOutcome::Unchanged => {
                 info!("event {} already finalized; kept its attestation", event.id);
