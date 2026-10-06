@@ -369,7 +369,7 @@ mod tests {
     fn accept_key_matches_rfc_6455() {
         assert_eq!(
             accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
-            "s3pPLMBiTxaQ9kYGzzhZRxw0BBA="
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
         );
     }
 
