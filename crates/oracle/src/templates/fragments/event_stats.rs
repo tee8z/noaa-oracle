@@ -36,6 +36,7 @@ mod tests {
             live: 2,
             running: 33,
             completed: 145,
+            without_entries: 12,
             signed: 185,
             unlisted: 290,
         };

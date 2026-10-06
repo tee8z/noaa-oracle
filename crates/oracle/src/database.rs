@@ -519,7 +519,8 @@ impl Database {
     }
 
     /// Events by status, with or without unlisted events, and the number of
-    /// unlisted events either way.
+    /// unlisted events either way. A finished event without entries is never
+    /// attested, so it is counted apart rather than as completed.
     pub async fn event_counts(
         &self,
         include_unlisted: bool,
@@ -529,18 +530,24 @@ impl Database {
         let row = sqlx::query(
             "WITH e AS (
                  SELECT attestation, start_observation_date AS start_,
-                        end_observation_date AS end_, (? OR unlisted = 0) AS counted, unlisted
+                        end_observation_date AS end_, (? OR unlisted = 0) AS counted, unlisted,
+                        EXISTS (SELECT 1 FROM events_entries x WHERE x.event_id = events.id)
+                            AS has_entries
                  FROM events)
              SELECT
                  COALESCE(SUM(counted AND attestation IS NULL AND ? < start_), 0) AS live,
                  COALESCE(SUM(counted AND attestation IS NULL AND start_ <= ? AND ? < end_), 0)
                      AS running,
-                 COALESCE(SUM(counted AND attestation IS NULL AND end_ <= ?), 0) AS completed,
+                 COALESCE(SUM(counted AND attestation IS NULL AND end_ <= ? AND has_entries), 0)
+                     AS completed,
+                 COALESCE(SUM(counted AND attestation IS NULL AND end_ <= ? AND NOT has_entries), 0)
+                     AS without_entries,
                  COALESCE(SUM(counted AND attestation IS NOT NULL), 0) AS signed,
                  COALESCE(SUM(unlisted), 0) AS unlisted
              FROM e",
         )
         .bind(include_unlisted)
+        .bind(now)
         .bind(now)
         .bind(now)
         .bind(now)
@@ -551,6 +558,7 @@ impl Database {
             live: count_column(&row, "live")?,
             running: count_column(&row, "running")?,
             completed: count_column(&row, "completed")?,
+            without_entries: count_column(&row, "without_entries")?,
             signed: count_column(&row, "signed")?,
             unlisted: count_column(&row, "unlisted")?,
         })
@@ -1213,7 +1221,11 @@ fn status_condition(status: EventStatus) -> (&'static str, usize) {
              AND ? < e.end_observation_date",
             2,
         ),
-        EventStatus::Completed => ("e.attestation IS NULL AND e.end_observation_date <= ?", 1),
+        EventStatus::Completed => (
+            "e.attestation IS NULL AND e.end_observation_date <= ? \
+             AND EXISTS (SELECT 1 FROM events_entries x WHERE x.event_id = e.id)",
+            1,
+        ),
     }
 }
 
