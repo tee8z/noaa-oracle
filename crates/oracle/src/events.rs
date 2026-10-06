@@ -665,7 +665,10 @@ pub struct EventListQuery {
 pub struct EventCounts {
     pub live: usize,
     pub running: usize,
+    /// Finished, unsigned and with entries: awaiting signature.
     pub completed: usize,
+    /// Finished without entries; never attested, so on no status's list.
+    pub without_entries: usize,
     pub signed: usize,
     /// Unlisted events, whether or not they are counted above.
     pub unlisted: usize,
@@ -674,7 +677,7 @@ pub struct EventCounts {
 impl EventCounts {
     pub fn of(&self, status: Option<EventStatus>) -> usize {
         match status {
-            None => self.live + self.running + self.completed + self.signed,
+            None => self.live + self.running + self.completed + self.without_entries + self.signed,
             Some(EventStatus::Live) => self.live,
             Some(EventStatus::Running) => self.running,
             Some(EventStatus::Completed) => self.completed,

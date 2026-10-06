@@ -508,8 +508,9 @@ async fn the_events_list_filters_unlisted_events_and_status_before_its_limit() {
     let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
     let hours = TimeDuration::hours;
     // Oldest first: a signed listed event, a running one, then unlisted
-    // events that would fill a limit applied after the query. Window
-    // length plays no part: a short listed event is listed.
+    // events that would fill a limit applied after the query, all but one
+    // with entries. Window length plays no part: a short listed event is
+    // listed.
     let signed = add_window(&database, now, -hours(30), hours(24), false).await;
     assert!(
         bounded(database.record_attestation(signed, MaybeScalar::from_slice(&[7; 32]).unwrap()))
@@ -520,6 +521,13 @@ async fn the_events_list_filters_unlisted_events_and_status_before_its_limit() {
     let mut unlisted = vec![];
     for _ in 0..5 {
         unlisted.push(add_window(&database, now, -hours(30), hours(24), true).await);
+    }
+    for &event in &unlisted[1..] {
+        assert!(
+            bounded(database.add_event_entries(event, vec![entry(event, "KORD")]))
+                .await
+                .unwrap()
+        );
     }
     let live_unlisted = add_window(&database, now, hours(1), hours(24), true).await;
     let short = add_window(&database, now, hours(1), TimeDuration::minutes(10), false).await;
@@ -548,7 +556,13 @@ async fn the_events_list_filters_unlisted_events_and_status_before_its_limit() {
         .event_page(&page(Some(EventStatus::Completed), true, None, 10), now)
         .await
         .unwrap();
-    assert_eq!(completed_unlisted.len(), unlisted.len());
+    // The finished event without entries will never be signed: it is not
+    // completed.
+    assert_eq!(ids(completed_unlisted.clone()), {
+        let mut awaiting = unlisted[1..].to_vec();
+        awaiting.reverse();
+        awaiting
+    });
     assert!(completed_unlisted.iter().all(|event| event.unlisted));
 
     // Paging with unlisted events: newest first, then the page before the
@@ -573,12 +587,20 @@ async fn the_events_list_filters_unlisted_events_and_status_before_its_limit() {
             live: 1,
             running: 1,
             completed: 0,
+            without_entries: 0,
             signed: 1,
             unlisted: 6,
         }
     );
     let with_unlisted = database.event_counts(true, now).await.unwrap();
-    assert_eq!((with_unlisted.live, with_unlisted.completed), (2, 5));
+    assert_eq!(
+        (
+            with_unlisted.live,
+            with_unlisted.completed,
+            with_unlisted.without_entries
+        ),
+        (2, 4, 1)
+    );
     assert_eq!(with_unlisted.of(None), 9);
     assert_eq!(with_unlisted.unlisted, 6);
     for include_unlisted in [false, true] {
