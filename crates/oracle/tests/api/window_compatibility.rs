@@ -208,3 +208,30 @@ async fn ambiguous_or_nonfinite_forecasts_are_explicitly_unavailable() {
         assert!(forecast["reason"].is_string());
     }
 }
+
+/// An assessment reads a week of forecast files: asking again gets the kept
+/// one, which still says when it was made, while whether observations can
+/// exist follows the time of asking.
+#[tokio::test]
+async fn repeated_plans_are_kept_and_observation_status_follows_the_clock() {
+    let mut weather = MockWeatherAccess::new();
+    weather
+        .expect_forecast_assessment()
+        .times(1)
+        .returning(|_, _| Ok(vec![value("wind_speed", Some(10.0))]));
+    weather
+        .expect_precipitation_station_capabilities()
+        .times(1)
+        .returning(|_| Ok(vec![]));
+    let app = spawn_app(Arc::new(weather)).await;
+    app.clock.set(datetime!(2026-09-27 00:00 UTC));
+    let path =
+        format!("/stations/window-compatibility?{WINDOW}&station_ids=KORD&metrics=wind_speed");
+    let first: Value = app.get_json(&path).await;
+    assert_eq!(first["observations"], "pending");
+    app.clock.set(datetime!(2026-10-01 00:00 UTC));
+    let again: Value = app.get_json(&path).await;
+    assert_eq!(again["evaluated_at"], first["evaluated_at"]);
+    assert_eq!(again["forecasts"], first["forecasts"]);
+    assert_eq!(again["observations"], "not_assessed");
+}

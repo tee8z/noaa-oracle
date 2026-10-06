@@ -170,6 +170,19 @@ impl TestApp {
         serde_json::from_slice(&body).unwrap()
     }
 
+    /// GET `path` from the private listener, which serves operators.
+    pub async fn get_operator(&self, path: &str) -> (StatusCode, Bytes) {
+        let response = oracle::metrics::router(self.state.clone())
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .expect("response");
+        let status = response.status();
+        (
+            status,
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+    }
+
     /// Creates `event` as the allowlisted coordinator.
     pub async fn create_event(&self, event: &CreateEvent) -> (StatusCode, Bytes) {
         let body = serde_json::to_vec(event).unwrap();

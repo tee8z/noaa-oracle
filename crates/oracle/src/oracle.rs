@@ -764,6 +764,9 @@ impl Oracle {
                     error!("etl {etl_process_id}: event {id} failed: {error:#}");
                 }
             }
+            // Each read allocates hundreds of megabytes that glibc would
+            // otherwise keep: hand them back before the next event.
+            crate::heavy::release_freed_memory();
         }
         info!(
             "etl {etl_process_id}: done, {} attested, {} failed, {} refreshed, \

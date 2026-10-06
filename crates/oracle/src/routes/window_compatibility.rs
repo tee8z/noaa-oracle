@@ -1,5 +1,10 @@
 //! Read-only planning evidence. A compatible forecast does not promise future
 //! observations, collector uptime, station capability, or a settlement outcome.
+//!
+//! An assessment reads a week of published forecast files, seconds of work
+//! and up to a gigabyte, so assessments are kept per question until new
+//! data arrives (at most 10 minutes) and built on a heavy turn (see
+//! [`crate::heavy`]).
 
 use axum::{
     Json,
@@ -12,6 +17,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::{
     AppError, AppState,
+    heavy::Turns,
     routes::{ForecastRequest, TemperatureUnit},
     sources::noaa::{
         HUMIDITY, RAIN_AMT, SNOW_AMT, TEMP_HIGH, TEMP_LOW, WIND_DIRECTION, WIND_SPEED,
@@ -44,7 +50,7 @@ pub struct WindowCompatibilityRequest {
     pub metrics: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 pub struct RequestedWindow {
     #[serde(with = "time::serde::rfc3339")]
     pub start: OffsetDateTime,
@@ -54,7 +60,7 @@ pub struct RequestedWindow {
     pub metrics: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 pub struct MetricCompatibility {
     pub station_id: String,
     pub metric: String,
@@ -65,7 +71,7 @@ pub struct MetricCompatibility {
     pub native_intervals: Vec<ForecastNativeInterval>,
 }
 
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservationPlanningStatus {
     /// The requested window has not ended; future measurements do not exist yet.
@@ -74,7 +80,7 @@ pub enum ObservationPlanningStatus {
     NotAssessed,
 }
 
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PrecipitationCapability {
     /// Recent verified fixed-hour reports exist. Future service is not guaranteed.
@@ -83,13 +89,13 @@ pub enum PrecipitationCapability {
     Unknown,
 }
 
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 pub struct StationCapability {
     pub station_id: String,
     pub fixed_hour_precipitation_source: PrecipitationCapability,
 }
 
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 pub struct WindowCompatibility {
     pub source: String,
     pub requested_window: RequestedWindow,
@@ -107,6 +113,40 @@ pub struct WindowCompatibility {
 
 fn invalid(message: impl Into<String>) -> AppError {
     AppError::InvalidRequest(message.into())
+}
+
+/// One planning question: a window in UTC, its stations and metrics in the
+/// order asked, as the answer lists them.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PlanKey {
+    start: OffsetDateTime,
+    end: OffsetDateTime,
+    stations: Vec<String>,
+    metrics: Vec<String>,
+}
+
+impl PlanKey {
+    /// Retained bytes of a kept assessment, roughly.
+    pub(crate) fn estimated_bytes(&self, plan: &Arc<WindowCompatibility>) -> usize {
+        let strings = |values: &[String]| {
+            std::mem::size_of_val(values) + values.iter().map(String::capacity).sum::<usize>()
+        };
+        std::mem::size_of::<Self>()
+            + std::mem::size_of::<WindowCompatibility>()
+            + 2 * (strings(&self.stations) + strings(&self.metrics))
+            + plan.forecasts.capacity() * (std::mem::size_of::<MetricCompatibility>() + 256)
+            + plan.stations.capacity() * (std::mem::size_of::<StationCapability>() + 16)
+            + plan.notice.capacity()
+    }
+}
+
+/// Whether observations of a window ending at `end` can exist at `now`.
+fn observation_status(end: OffsetDateTime, now: OffsetDateTime) -> ObservationPlanningStatus {
+    if end > now {
+        ObservationPlanningStatus::Pending
+    } else {
+        ObservationPlanningStatus::NotAssessed
+    }
 }
 
 impl WindowCompatibilityRequest {
@@ -223,9 +263,42 @@ pub async fn window_compatibility(
     Query(request): Query<WindowCompatibilityRequest>,
 ) -> Result<Json<WindowCompatibility>, AppError> {
     let (stations, metrics) = request.checked()?;
+    let key = PlanKey {
+        start: request.start.to_offset(UtcOffset::UTC),
+        end: request.end.to_offset(UtcOffset::UTC),
+        stations,
+        metrics,
+    };
+    let generation = state.data_generation();
+    let builder = state.clone();
+    let assessed = key.clone();
+    let plan = state
+        .plans()
+        .get(
+            state.heavy(),
+            Turns::One,
+            key,
+            generation,
+            move || async move { assess(&builder, assessed).await.map(Arc::new) },
+        )
+        .await
+        .map_err(|error| state.turned_away(error))?;
+    // Kept assessments say when they were made; whether observations can
+    // exist yet depends on the time asked.
+    let mut plan = plan.as_ref().clone();
+    plan.observations = observation_status(plan.requested_window.end, state.oracle.now());
+    Ok(Json(plan))
+}
+
+/// Assesses the window, stations and metrics of `key` now.
+async fn assess(state: &AppState, key: PlanKey) -> Result<WindowCompatibility, AppError> {
+    let PlanKey {
+        start,
+        end,
+        stations,
+        metrics,
+    } = key;
     let now = state.oracle.now();
-    let start = request.start.to_offset(UtcOffset::UTC);
-    let end = request.end.to_offset(UtcOffset::UTC);
     let issued_end = now.min(start.saturating_sub(Duration::nanoseconds(1)));
     let forecast_request = ForecastRequest {
         start: Some(start),
@@ -251,11 +324,11 @@ pub async fn window_compatibility(
             (vec![], Some("Recent fixed-hour precipitation capability could not be checked; station support remains unknown".into()))
         }
     };
-    Ok(Json(WindowCompatibility {
+    Ok(WindowCompatibility {
         source: "noaa_weather".into(),
         forecasts: stations.iter().flat_map(|station| metrics.iter()
             .map(|metric| metric_compatibility(station, metric, &forecast))).collect(),
-        observations: if end > now { ObservationPlanningStatus::Pending } else { ObservationPlanningStatus::NotAssessed },
+        observations: observation_status(end, now),
         stations: stations.iter().map(|station| StationCapability {
             station_id: station.clone(),
             fixed_hour_precipitation_source: if capabilities.contains(station) {
@@ -267,5 +340,5 @@ pub async fn window_compatibility(
         settlement_ready: false,
         precipitation_capability_warning: warning,
         notice: "Forecast compatibility is provisional. Native boundaries do not guarantee future measurements. Settlement must verify the announced window, station coverage, reporting cadence, and every enabled metric again.".into(),
-    }))
+    })
 }

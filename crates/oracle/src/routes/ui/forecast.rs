@@ -16,6 +16,7 @@ use crate::{
     AppState, ForecastRequest, ObservationRequest, TemperatureUnit,
     cache::Cached,
     calendar::Calendar,
+    heavy::release_freed_memory_now_and_then,
     templates::fragments::{ForecastComparison, ForecastDisplay, forecast_detail},
     weather_data::{self, DailyObservation, Forecast},
 };
@@ -93,7 +94,9 @@ fn cache_key(station_id: &str, calendar: Calendar, now: OffsetDateTime) -> Strin
 /// airports' forecast details, in UTC days and in the calendars of those
 /// readers. Called at startup, after new data and every 30 minutes;
 /// readers get the values built before until each is replaced. A value
-/// whose query fails keeps its old copy.
+/// whose query fails keeps its old copy. Each value takes a heavy turn
+/// (see [`crate::heavy`]), so a processing pass waits for at most the
+/// values being built, and warming waits for the pass.
 pub async fn warm_caches(state: &Arc<AppState>) {
     let started = std::time::Instant::now();
     let generation = state.data_generation();
@@ -128,7 +131,11 @@ pub async fn warm_caches(state: &Arc<AppState>) {
     let rows = weather.len();
     stream::iter(weather)
         .for_each_concurrent(WARM_CONCURRENCY, |key| async move {
+            let Some(_turn) = state.background_turn().await else {
+                return;
+            };
             super::weather::refresh_weather(state, key).await;
+            release_freed_memory_now_and_then();
         })
         .await;
     let airports = super::weather::default_airports();
@@ -143,6 +150,9 @@ pub async fn warm_caches(state: &Arc<AppState>) {
         .collect();
     stream::iter(jobs)
         .for_each_concurrent(WARM_CONCURRENCY, |(station_id, calendar)| async move {
+            let Some(_turn) = state.background_turn().await else {
+                return;
+            };
             match build(state, &station_id, calendar).await {
                 Ok(html) => {
                     let key = cache_key(&station_id, calendar, OffsetDateTime::now_utc());
@@ -150,6 +160,7 @@ pub async fn warm_caches(state: &Arc<AppState>) {
                 }
                 Err(error) => error!("warming the forecast detail for {station_id}: {error}"),
             }
+            release_freed_memory_now_and_then();
         })
         .await;
     info!(

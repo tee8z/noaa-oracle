@@ -58,10 +58,12 @@ GET /stations/window-compatibility?station_ids=KORD&metrics=rain_amt&start=2030-
 Replace the example dates with the proposed event window. A request beyond the retained forecast horizon returns unavailable baselines.
 The endpoint returns planning evidence without creating or changing an event.
 
+An assessment reads a week of published forecast files, so the oracle keeps it for the same window, stations, and metrics until new data arrives, for at most 10 minutes. Asking again returns the kept assessment with its original `evaluated_at`; `observations` follows the time of the request. Building an assessment waits for a turn among the oracle's heavy work (see [Weather discovery](discovery.md#heavy-work)); when none comes, the request gets `503` with `Retry-After: 5`.
+
 | Response field | Meaning |
 |---|---|
 | `requested_window` | The exact stations, metrics, and UTC interval evaluated. |
-| `evaluated_at` | The time of this planning check. |
+| `evaluated_at` | The time of this planning check, or of the kept check it repeats. |
 | `forecasts[].baseline_available` | The strict forecast assessment currently has a valid value for this metric and interval. |
 | `forecasts[].baseline` and `unit` | The value in settlement units; temperatures use Fahrenheit. |
 | `forecasts[].reason` | Why the baseline is unavailable. |
