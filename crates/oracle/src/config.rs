@@ -2,6 +2,8 @@
 //! validated into [`Configuration`] before anything is opened, plus
 //! process logging setup.
 
+use crate::request_context::{Cidr, DEFAULT_CLIENT_IP_HEADER, RequestSettings};
+use axum::http::HeaderName;
 use clap::Parser;
 use fern::{
     Dispatch,
@@ -112,6 +114,16 @@ pub struct Cli {
     #[command(flatten)]
     #[serde(default)]
     pub nostr: NostrArgs,
+
+    /// Request ids and client addresses from the proxy in front
+    #[command(flatten)]
+    #[serde(default)]
+    pub http_context: HttpContextArgs,
+
+    /// The browser telemetry beacon
+    #[command(flatten)]
+    #[serde(default)]
+    pub telemetry: TelemetryArgs,
 }
 
 /// The `[nostr]` table: publishing to Nostr relays (see `docs/NOSTR.md`).
@@ -146,6 +158,44 @@ pub struct NostrArgs {
     pub key_path: Option<PathBuf>,
 }
 
+/// The `[http_context]` table: which peers may tell the oracle the request
+/// id and the client's address (see `docs/request-logging.md`).
+#[derive(clap::Args, Clone, Debug, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct HttpContextArgs {
+    /// Proxies (addresses or CIDRs) whose X-Request-Id and client address
+    /// header are believed. Empty: none, so the peer address is logged.
+    #[arg(
+        id = "trusted_proxies",
+        long = "trusted-proxies",
+        env = "NOAA_ORACLE_TRUSTED_PROXIES",
+        value_delimiter = ','
+    )]
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+
+    /// Header a trusted proxy puts the client's address in (default X-Real-IP)
+    #[arg(
+        id = "client_ip_header",
+        long = "client-ip-header",
+        env = "NOAA_ORACLE_CLIENT_IP_HEADER"
+    )]
+    pub client_ip_header: Option<String>,
+}
+
+/// The `[telemetry]` table: the browser beacon and `POST /api/v1/telemetry`.
+#[derive(clap::Args, Clone, Debug, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryArgs {
+    /// Load the beacon on pages and log its events
+    #[arg(
+        id = "telemetry_enabled",
+        long = "telemetry-enabled",
+        env = "NOAA_ORACLE_TELEMETRY_ENABLED"
+    )]
+    pub enabled: Option<bool>,
+}
+
 /// Validated settings the application starts from.
 #[derive(Clone, Debug)]
 pub struct Configuration {
@@ -163,6 +213,8 @@ pub struct Configuration {
     pub shutdown_timeout: Duration,
     /// Relay publishing; `None` when off.
     pub nostr: Option<NostrSettings>,
+    /// Trusted proxies, the client address header, and telemetry.
+    pub request: RequestSettings,
 }
 
 /// Validated `[nostr]` settings for an enabled publisher.
@@ -203,6 +255,10 @@ pub enum ConfigError {
     NoRelays,
     #[error("the nostr key must be a separate file from the oracle signing key")]
     SharedKey,
+    #[error("invalid trusted_proxies entry {0:?}: expected an IP address or CIDR")]
+    TrustedProxy(String),
+    #[error("invalid client_ip_header {0:?}: expected an HTTP header name")]
+    ClientIpHeader(String),
 }
 
 impl Cli {
@@ -247,6 +303,19 @@ impl Cli {
                 enabled: self.nostr.enabled.or(file.nostr.enabled),
                 relays: list(self.nostr.relays, file.nostr.relays),
                 key_path: self.nostr.key_path.or(file.nostr.key_path),
+            },
+            http_context: HttpContextArgs {
+                trusted_proxies: list(
+                    self.http_context.trusted_proxies,
+                    file.http_context.trusted_proxies,
+                ),
+                client_ip_header: self
+                    .http_context
+                    .client_ip_header
+                    .or(file.http_context.client_ip_header),
+            },
+            telemetry: TelemetryArgs {
+                enabled: self.telemetry.enabled.or(file.telemetry.enabled),
             },
         }
     }
@@ -308,6 +377,36 @@ impl Cli {
                 "shutdown_timeout",
             )?,
             nostr,
+            request: self.request_settings()?,
+        })
+    }
+
+    fn request_settings(&self) -> Result<RequestSettings, ConfigError> {
+        let trusted_proxies = self
+            .http_context
+            .trusted_proxies
+            .iter()
+            .map(|proxy| proxy.trim())
+            .filter(|proxy| !proxy.is_empty())
+            .map(|proxy| {
+                proxy
+                    .parse::<Cidr>()
+                    .map_err(|_| ConfigError::TrustedProxy(proxy.to_owned()))
+            })
+            .collect::<Result<_, _>>()?;
+        let header = self
+            .http_context
+            .client_ip_header
+            .as_deref()
+            .map(str::trim)
+            .filter(|header| !header.is_empty())
+            .unwrap_or(DEFAULT_CLIENT_IP_HEADER);
+        let client_ip_header = HeaderName::from_bytes(header.as_bytes())
+            .map_err(|_| ConfigError::ClientIpHeader(header.to_owned()))?;
+        Ok(RequestSettings {
+            trusted_proxies,
+            client_ip_header,
+            telemetry: self.telemetry.enabled == Some(true),
         })
     }
 }
@@ -392,6 +491,9 @@ fn parse_pubkeys(field: &'static str, values: &[String]) -> Result<Vec<PublicKey
 /// busy with other writes. If that thread falls 128,000 lines behind, new
 /// lines are dropped rather than waited for. Keep the guard until the
 /// process ends; dropping it writes out the lines still queued.
+///
+/// Lines logged while a request is handled end with ` rid=<id>` (see
+/// [`crate::request_context`]).
 pub fn setup_logger() -> (Dispatch, WorkerGuard) {
     let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
     let colors = ColoredLevelConfig::new()
@@ -404,13 +506,14 @@ pub fn setup_logger() -> (Dispatch, WorkerGuard) {
     let dispatch = fern::Dispatch::new()
         .format(move |out, message, record| {
             out.finish(format_args!(
-                "[{} {}] {}: {}",
+                "[{} {}] {}: {}{}",
                 OffsetDateTime::now_utc()
                     .format(&Iso8601::DEFAULT)
                     .unwrap_or_default(),
                 colors.color(record.level()),
                 record.target(),
-                message
+                message,
+                crate::request_context::log_suffix(record.target())
             ));
         })
         .chain(fern::Output::call(move |record| {
@@ -571,6 +674,47 @@ mod tests {
             Err(ConfigError::SharedKey)
         ));
         assert!(toml::from_str::<Cli>("[nostr]\nrelay = []").is_err());
+    }
+
+    #[test]
+    fn request_context_settings_default_to_no_proxies_and_no_telemetry() {
+        let request = Cli::default().configuration().unwrap().request;
+        assert!(request.trusted_proxies.is_empty());
+        assert_eq!(request.client_ip_header, "x-real-ip");
+        assert!(!request.telemetry);
+
+        let parsed: Cli = toml::from_str(
+            "[http_context]\ntrusted_proxies = [\"127.0.0.1\", \"10.0.0.0/8\"]\n\
+             client_ip_header = \"X-Client-IP\"\n[telemetry]\nenabled = true",
+        )
+        .unwrap();
+        let request = parsed.configuration().unwrap().request;
+        assert_eq!(request.trusted_proxies.len(), 2);
+        assert_eq!(request.client_ip_header, "x-client-ip");
+        assert!(request.telemetry);
+
+        let flag = Cli::try_parse_from([
+            "oracle",
+            "--trusted-proxies",
+            "::1,127.0.0.1",
+            "--telemetry-enabled",
+            "false",
+        ])
+        .unwrap();
+        let request = flag.merge(parsed).configuration().unwrap().request;
+        assert_eq!(request.trusted_proxies.len(), 2);
+        assert!(!request.telemetry, "the flag wins over the file");
+
+        let invalid = |toml: &str| toml::from_str::<Cli>(toml).unwrap().configuration();
+        assert!(matches!(
+            invalid("[http_context]\ntrusted_proxies = [\"10.0.0.0/40\"]"),
+            Err(ConfigError::TrustedProxy(_))
+        ));
+        assert!(matches!(
+            invalid("[http_context]\nclient_ip_header = \"Not A Header\""),
+            Err(ConfigError::ClientIpHeader(_))
+        ));
+        assert!(toml::from_str::<Cli>("[telemetry]\nenable = true").is_err());
     }
 
     #[test]

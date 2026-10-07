@@ -34,6 +34,9 @@
 //! count deliveries of announcements and attestations to Nostr relays, one
 //! per event and relay; `oracle_nostr_outbox_depth` counts those still
 //! waiting, due or backing off after a failure.
+//!
+//! `oracle_telemetry_events_dropped_total` counts browser telemetry events
+//! not logged (see [`crate::telemetry`]).
 
 use std::{
     path::Path,
@@ -95,6 +98,7 @@ pub struct Metrics {
     nostr_published: IntCounter,
     nostr_failures: IntCounter,
     nostr_outbox_depth: IntGauge,
+    telemetry_dropped: IntCounter,
     /// When the scrape-time gauges were last read.
     refreshed_at: tokio::sync::Mutex<Option<Instant>>,
 }
@@ -251,6 +255,12 @@ impl Metrics {
                 "Publications to Nostr relays not yet accepted",
             )
             .expect("valid metric"),
+            telemetry_dropped: IntCounter::new(
+                "oracle_telemetry_events_dropped_total",
+                "Browser telemetry events dropped by the per-session or global caps, \
+                 or because a batch held too many or of unknown types",
+            )
+            .expect("valid metric"),
             refreshed_at: tokio::sync::Mutex::new(None),
             registry,
         };
@@ -298,6 +308,7 @@ impl Metrics {
             Box::new(metrics.nostr_published.clone()),
             Box::new(metrics.nostr_failures.clone()),
             Box::new(metrics.nostr_outbox_depth.clone()),
+            Box::new(metrics.telemetry_dropped.clone()),
         ];
         for collector in collectors {
             metrics
@@ -355,6 +366,11 @@ impl Metrics {
     pub fn nostr_pass(&self, published: u64, failed: u64) {
         self.nostr_published.inc_by(published);
         self.nostr_failures.inc_by(failed);
+    }
+
+    /// `count` browser telemetry events were not logged.
+    pub fn telemetry_events_dropped(&self, count: usize) {
+        self.telemetry_dropped.inc_by(count as u64);
     }
 
     pub fn set_nostr_outbox_depth(&self, depth: u64) {
@@ -691,6 +707,7 @@ mod tests {
             "oracle_nostr_published_total",
             "oracle_nostr_publish_failures_total",
             "oracle_nostr_outbox_depth",
+            "oracle_telemetry_events_dropped_total",
         ] {
             assert!(text.contains(&format!("# TYPE {family} ")), "{family}");
         }

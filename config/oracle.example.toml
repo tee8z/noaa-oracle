@@ -110,3 +110,18 @@ shutdown_timeout = 25
 enabled = false
 relays = []
 # key_path = "./oracle_nostr_key.pem"
+
+# =============================================================================
+# Request logging and browser telemetry
+# =============================================================================
+# Proxies whose X-Request-Id and client address header are believed:
+# addresses or CIDRs. Empty trusts none, and the peer address is logged.
+# Line formats: docs/request-logging.md.
+[http_context]
+trusted_proxies = []
+client_ip_header = "X-Real-IP"
+
+# Pages load the telemetry beacon and POST /api/v1/telemetry logs its
+# events. Off by default.
+[telemetry]
+enabled = false

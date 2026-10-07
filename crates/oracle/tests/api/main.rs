@@ -9,6 +9,7 @@ mod lifecycle;
 mod lines_from_event;
 mod metrics;
 mod perf;
+mod request_context;
 mod ui_fragments;
 mod upload;
 
