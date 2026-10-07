@@ -62,7 +62,7 @@ hidden or the reader leaves the page. A failed batch is not retried.
 | `vitals` | `lcp`, `cls`, `inp` (longest interaction), sent when the reader leaves the page |
 | `click` | `el`, `id`, `track` (`data-track`), `text` (buttons and links only, at most 40 characters) |
 | `submit` | `form` (the form's id) |
-| `htmx` | `verb`, `path` (no query), `status`, `ms`, `rid` (the reply's `X-Request-Id`) |
+| `htmx` | `verb`, `path` (no query), `status`, `ms`, `rid` (the reply's `X-Request-Id`, logged as `hx_rid`) |
 | `js_error` | `msg`, `src` (file name), `line` |
 | `mark` | `name`, from `window.fdcMark(name)` |
 

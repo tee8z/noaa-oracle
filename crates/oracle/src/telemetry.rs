@@ -295,6 +295,9 @@ pub fn event_line(rid: Option<&str>, sid: &str, ip: &str, event: &UiEvent) -> St
         line.push_str(&format!(" t={t}"));
     }
     for (name, value) in &event.fields {
+        // An htmx event's own `rid` (its reply's id) is written as `hx_rid`, so `rid=` on
+        // the line stays the page's id, as on the coordinator's lines.
+        let name = if *name == "rid" { "hx_rid" } else { name };
         line.push_str(&format!(" {name}={}", log_value(value)));
     }
     line
@@ -532,7 +535,7 @@ mod tests {
             ),
             "ui_event site=4casttruth rid=0192f3a0-0000-7000-8000-0000000000aa \
              sid=AbCdEfGhIjKlMnOpQrStUv ip=203.0.113.9 ev=htmx page=/ t=1500 verb=GET \
-             path=/fragments/weather status=200 ms=41 rid=0192f3a0-0000-7000-8000-0000000000bb"
+             path=/fragments/weather status=200 ms=41 hx_rid=0192f3a0-0000-7000-8000-0000000000bb"
         );
         assert_eq!(
             event_line(None, SID, "-", &parsed.events[1]),
