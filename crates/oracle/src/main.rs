@@ -11,8 +11,8 @@ async fn main() -> anyhow::Result<()> {
         .level(log_level)
         .level_for("duckdb", log_level)
         .level_for("oracle", log_level)
-        .level_for("http_response", log_level)
-        .level_for("http_request", log_level)
+        .level_for("http", log_level)
+        .level_for("ui_event", log_level)
         .apply()?;
 
     let configuration = cli.configuration()?;

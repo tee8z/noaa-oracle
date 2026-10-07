@@ -169,6 +169,7 @@ impl FromRequest<Arc<AppState>> for Signed {
         if !claimed {
             return Err(AuthError::Replayed);
         }
+        crate::request_context::set_user(&event.pubkey);
         Ok(Self {
             pubkey: event.pubkey,
             body,

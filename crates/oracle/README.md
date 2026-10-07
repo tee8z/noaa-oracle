@@ -19,6 +19,7 @@ REST API, HTMX dashboard, and DLC attestation service. See the
 | `GET /oracle/pubkey`, `GET /oracle/npub` | Oracle identity |
 | `GET /oracle/events`, `POST /oracle/events`, `GET /oracle/events/{id}` | DLC events (writes require NIP-98 auth) |
 | `POST /oracle/events/{id}/entries`, `GET /oracle/events/{id}/entries/{entry}` | Entries |
+| `POST /api/v1/telemetry` | Browser events from the pages, when `telemetry.enabled` is on; 404 otherwise (see [request logging](../../docs/request-logging.md)) |
 | `POST /oracle/update` | Start one ETL pass (202); 409 if one is running, 503 during shutdown |
 
 ## Examples

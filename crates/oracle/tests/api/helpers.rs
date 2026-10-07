@@ -21,6 +21,7 @@ use oracle::{
     AppParts, AppState, Background, CreateEvent, Database, FileData, WeatherData, app,
     auth::AuthPolicy,
     oracle::{Clock, Oracle},
+    request_context::RequestSettings,
     setup_logger,
     sources::{NoaaWeather, Sources},
 };
@@ -98,6 +99,15 @@ pub async fn spawn_app(weather_db: Arc<dyn WeatherData>) -> TestApp {
 /// Like [`spawn_app`], but signatures are checked against `origin`; for
 /// tests that serve the router on a real port.
 pub async fn spawn_app_at(weather_db: Arc<dyn WeatherData>, origin: &str) -> TestApp {
+    spawn_app_with(weather_db, origin, RequestSettings::default()).await
+}
+
+/// Like [`spawn_app_at`], with trusted proxies or telemetry set.
+pub async fn spawn_app_with(
+    weather_db: Arc<dyn WeatherData>,
+    origin: &str,
+    settings: RequestSettings,
+) -> TestApp {
     init_logger();
     let directory = tempfile::tempdir().expect("temporary directory");
     let (database, writer) = Database::open(&directory.path().join("event_data"))
@@ -121,20 +131,23 @@ pub async fn spawn_app_at(weather_db: Arc<dyn WeatherData>, origin: &str) -> Tes
     let other_coordinator = Keys::generate();
     let uploader = Keys::generate();
     let weather_dir = directory.path().join("weather_data");
-    let state = Arc::new(AppState::new(AppParts {
-        remote_url: origin.into(),
-        weather_dir: weather_dir.clone(),
-        auth: AuthPolicy::new(
-            origin,
-            [coordinator.public_key(), other_coordinator.public_key()],
-            [uploader.public_key()],
-        ),
-        file_access: Arc::new(MockFileAccess::new()),
-        weather_db,
-        oracle: oracle.clone(),
-        database,
-        background: Background::new(),
-    }));
+    let state = Arc::new(
+        AppState::new(AppParts {
+            remote_url: origin.into(),
+            weather_dir: weather_dir.clone(),
+            auth: AuthPolicy::new(
+                origin,
+                [coordinator.public_key(), other_coordinator.public_key()],
+                [uploader.public_key()],
+            ),
+            file_access: Arc::new(MockFileAccess::new()),
+            weather_db,
+            oracle: oracle.clone(),
+            database,
+            background: Background::new(),
+        })
+        .with_request_settings(settings),
+    );
     TestApp {
         app: app(state.clone()),
         oracle,

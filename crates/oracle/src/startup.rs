@@ -19,6 +19,7 @@ use crate::{
     metrics::{self, Metrics},
     oracle::{Oracle, system_clock},
     publication::{PASS_ROWS, Publication, Publisher, PublishingKey, WebSocketTransport},
+    request_context::{self, PARENT_REQUEST_ID, REQUEST_ID, RequestSettings, SESSION_ID},
     routes::discovery::{DiscoveryForecasts, DiscoveryKey},
     routes::stations::ObservationKey,
     routes::ui::WeatherKey,
@@ -32,6 +33,7 @@ use crate::{
         update_data, upload, warm_caches, weather_handler,
     },
     sources::{NoaaWeather, Sources},
+    telemetry::{self, Limits},
     templates::{assets::serve_asset, fragments::WeatherDisplay},
     weather_data::{
         self, DEFAULT_DAYS, DEFAULT_WINDOW_HOURS, EligibleStation, Observation, PRECOMPUTED_DAYS,
@@ -45,7 +47,7 @@ use axum::{
     extract::{DefaultBodyLimit, Request},
     handler::Handler,
     http::{
-        Method, StatusCode,
+        HeaderName, Method, StatusCode,
         header::{ACCEPT, CONTENT_TYPE, RETRY_AFTER},
     },
     middleware::{self, Next},
@@ -236,6 +238,10 @@ pub struct AppState {
     /// How far the first preparation of forecast files got.
     preparation: watch::Sender<Preparation>,
     metrics: Metrics,
+    /// Trusted proxies, the client address header, and whether the
+    /// telemetry beacon is on.
+    request_settings: Arc<RequestSettings>,
+    telemetry_limits: Limits,
 }
 
 /// The first pass that prepares recent forecast files for queries. Until
@@ -369,7 +375,24 @@ impl AppState {
             files_added: tokio::sync::Notify::new(),
             preparation: watch::Sender::new(Preparation::Running),
             metrics: Metrics::new(),
+            request_settings: Arc::default(),
+            telemetry_limits: Limits::default(),
         }
+    }
+
+    /// Replaces the default request settings: no trusted proxies, the
+    /// client address from `X-Real-IP` once there are, telemetry off.
+    pub fn with_request_settings(mut self, settings: RequestSettings) -> Self {
+        self.request_settings = Arc::new(settings);
+        self
+    }
+
+    pub fn request_settings(&self) -> &RequestSettings {
+        &self.request_settings
+    }
+
+    pub(crate) fn telemetry_limits(&self) -> &Limits {
+        &self.telemetry_limits
     }
 
     /// Counters and gauges for the metrics listener. Kept up to date whether
@@ -1138,20 +1161,23 @@ async fn build_app_state(
     if configuration.uploaders.is_empty() {
         warn!("no uploader_pubkeys configured: nobody can upload data");
     }
-    let state = Arc::new(AppState::new(AppParts {
-        remote_url: configuration.remote_url.clone(),
-        weather_dir: configuration.weather_dir.clone(),
-        auth: AuthPolicy::new(
-            &configuration.remote_url,
-            configuration.coordinators.clone(),
-            configuration.uploaders.clone(),
-        ),
-        file_access,
-        weather_db,
-        oracle: Arc::new(oracle),
-        database,
-        background,
-    }));
+    let state = Arc::new(
+        AppState::new(AppParts {
+            remote_url: configuration.remote_url.clone(),
+            weather_dir: configuration.weather_dir.clone(),
+            auth: AuthPolicy::new(
+                &configuration.remote_url,
+                configuration.coordinators.clone(),
+                configuration.uploaders.clone(),
+            ),
+            file_access,
+            weather_db,
+            oracle: Arc::new(oracle),
+            database,
+            background,
+        })
+        .with_request_settings(configuration.request.clone()),
+    );
     Ok((state, nostr))
 }
 
@@ -1167,8 +1193,15 @@ pub fn app(app_state: Arc<AppState>) -> Router {
     let api_docs = ApiDoc::openapi();
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([ACCEPT, CONTENT_TYPE])
+        .allow_headers([
+            ACCEPT,
+            CONTENT_TYPE,
+            HeaderName::from_static(PARENT_REQUEST_ID),
+            HeaderName::from_static(SESSION_ID),
+        ])
+        .expose_headers([HeaderName::from_static(REQUEST_ID)])
         .allow_origin(Any);
+    let request_settings = app_state.request_settings.clone();
 
     // Pages and the fragments htmx swaps into them.
     let ui = Router::new()
@@ -1240,6 +1273,10 @@ pub fn app(app_state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/healthy", get(healthy))
+        .route(
+            "/api/v1/telemetry",
+            post(telemetry::telemetry.layer(DefaultBodyLimit::max(telemetry::MAX_BODY_BYTES))),
+        )
         // API routes
         .route("/files", get(files))
         .route(
@@ -1260,7 +1297,6 @@ pub fn app(app_state: Arc<AppState>) -> Router {
             get(get_event_entry),
         )
         .with_state(app_state)
-        .layer(middleware::from_fn(log_request))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .merge(docs_router(api_docs))
         .layer(cors)
@@ -1269,6 +1305,12 @@ pub fn app(app_state: Arc<AppState>) -> Router {
         // and are passed through, and Parquet files are compressed inside.
         .layer(CompressionLayer::new().compress_when(
             DefaultPredicate::new().and(NotForContentType::const_new("application/parquet")),
+        ))
+        // Outermost, so every line a request causes carries its id and
+        // every response, CORS and errors included, echoes it.
+        .layer(middleware::from_fn_with_state(
+            request_settings,
+            request_context::request_context,
         ))
 }
 
@@ -1309,27 +1351,6 @@ async fn admit_weather_request(
             busy("weather queries are slow right now; try again shortly")
         }
     }
-}
-
-async fn log_request(request: Request<Body>, next: Next) -> impl IntoResponse {
-    let started = std::time::Instant::now();
-    let method = request.method().clone();
-    let path = request
-        .uri()
-        .path_and_query()
-        .map(|p| p.as_str().to_owned())
-        .unwrap_or_default();
-    info!(target: "http_request", "new request, {} {}", method, path);
-
-    let response = next.run(request).await;
-    info!(
-        target: "http_response",
-        "response, code: {}, time: {:?}",
-        response.status().as_str(),
-        started.elapsed()
-    );
-
-    response
 }
 
 /// Runs the oracle until a termination signal arrives or a supervised task

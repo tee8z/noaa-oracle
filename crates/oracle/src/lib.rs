@@ -18,12 +18,14 @@ pub mod lines;
 pub mod metrics;
 pub mod oracle;
 pub mod publication;
+pub mod request_context;
 pub mod routes;
 pub mod scoring;
 pub mod signing;
 pub mod sources;
 mod startup;
 pub mod statement;
+pub mod telemetry;
 mod templates;
 pub mod weather_data;
 
