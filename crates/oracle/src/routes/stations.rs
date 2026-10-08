@@ -469,13 +469,12 @@ impl EligibleRequest {
     }
 }
 
-/// Stations whose reports would have sampled every window of
-/// `window_hours` on all but one in ten of the last `days` full UTC days (and always all but one), by the
-/// rule settlement applies, that reported within the last 3 hours, and
-/// whose newest forecast runs at least `window_hours` past now. Days on
-/// which most stations missed a window were collection outages and are not
-/// checked. Lists are judged again after each collection run and at least
-/// every 10 minutes; requests get the list judged last.
+/// Stations whose recent full UTC days and latest rolling competition window
+/// meet settlement's sampling rule, with a forecast through the window.
+/// All days must pass for histories under ten days; longer histories allow
+/// one imperfect day per ten. Collection outages remain missing evidence.
+/// Reports must be newer than 90 minutes and judgments newer than 20 minutes.
+/// Lists refresh after collection and every 10 minutes; expired entries are omitted.
 #[utoipa::path(
     get,
     path = "/stations/eligible",
@@ -493,7 +492,13 @@ pub async fn eligible_stations(
     let Query(req) = query.map_err(|rejection| AppError::InvalidRequest(rejection.body_text()))?;
     let (days, window_hours) = req.checked(audience.max_eligible_days())?;
     let stations = state.eligible_stations(days, window_hours).await?;
-    Ok(Json(stations.as_ref().clone()))
+    Ok(Json(
+        stations
+            .iter()
+            .filter(|station| station.current(window_hours, OffsetDateTime::now_utc()))
+            .cloned()
+            .collect(),
+    ))
 }
 
 #[cfg(test)]

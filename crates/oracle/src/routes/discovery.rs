@@ -201,7 +201,32 @@ pub async fn eligible_forecasts(
         })
         .await
         .map_err(|error| state.turned_away(error))?;
-    Ok(Json(answer.as_ref()).into_response())
+    // Discovery has its own stale-while-refresh cache: expire its evidence too.
+    let now = OffsetDateTime::now_utc();
+    let stations: Vec<_> = answer
+        .stations
+        .iter()
+        .filter(|station| station.current(hours, now))
+        .collect();
+    let allowed: HashSet<_> = stations
+        .iter()
+        .map(|station| station.station_id.as_str())
+        .collect();
+    let forecasts = answer
+        .forecasts
+        .iter()
+        .filter(|forecast| allowed.contains(forecast.station_id.as_str()))
+        .collect();
+    #[derive(Serialize)]
+    struct CurrentDiscovery<'a> {
+        stations: Vec<&'a EligibleStation>,
+        forecasts: Vec<&'a Forecast>,
+    }
+    Ok(Json(CurrentDiscovery {
+        stations,
+        forecasts,
+    })
+    .into_response())
 }
 
 #[cfg(test)]

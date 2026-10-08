@@ -474,7 +474,7 @@ impl WeatherData for CountedEligibility {
     async fn eligible_stations(
         &self,
         days: u32,
-        _: u32,
+        window_hours: u32,
         now: time::OffsetDateTime,
     ) -> Result<Vec<weather_data::Eligibility>, weather_data::Error> {
         self.judged.fetch_add(1, Ordering::SeqCst);
@@ -484,6 +484,10 @@ impl WeatherData for CountedEligibility {
             days_checked: days,
             last_report: now - time::Duration::minutes(10),
             forecast_through: Some(now + time::Duration::days(2)),
+            coverage_checked_at: now,
+            recent_window_hours: window_hours,
+            recent_window_clean: eligible,
+            max_report_gap_seconds: 3600,
             eligible,
         };
         Ok(vec![eligibility("KDEN", true), eligibility("KSAW", false)])
@@ -541,12 +545,15 @@ async fn eligible_stations_are_judged_once_per_query_and_validated() {
         fields,
         [
             "clean_days",
+            "coverage_checked_at",
             "days_checked",
             "forecast_through",
             "iata_id",
             "last_report",
             "latitude",
             "longitude",
+            "max_report_gap_seconds",
+            "recent_window_hours",
             "state",
             "station_id",
             "station_name"

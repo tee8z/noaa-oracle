@@ -38,10 +38,25 @@ their own with a smaller memory limit, and only the private listener, which serv
 operators, judges them. A cached list is judged again in the background
 after the next read or after 10 minutes, and requests get the previous list meanwhile.
 
-A judged day on which fewer than half of the stations were clean was a collection
-outage. It is not counted against any station, and `days_checked` leaves it out.
-Below 20 reporting stations every day counts. Event creation does not rely on these
-lists: settlement checks its own coverage.
+The default history must pass on all three days. Histories under ten days permit
+no failed days. Longer histories permit one failed day per ten days, rounded down.
+Widespread collection outages count as missing evidence; they do not reduce
+`days_checked`.
+
+The latest rolling window must also pass settlement's report sampling rule.
+This check includes today's reports and windows that cross midnight. It checks
+both all usable reports and the subset with usable temperatures. One fresh report
+after an outage cannot hide a gap inside that window.
+
+Reports must be newer than 90 minutes. Each station includes `coverage_checked_at`,
+`recent_window_hours`, and `max_report_gap_seconds`. The last field includes the
+rolling window's edges and measures usable temperature-report gaps. Clients can
+prefer stations that do not need settlement's missed-report allowance.
+
+Both endpoints remove entries whose coverage judgment reaches 20 minutes old,
+even if a background refresh fails. They also remove entries with expired reports
+or forecast extent. Discovery removes the corresponding forecasts from its response.
+These checks protect selection; settlement still checks the event's actual data.
 
 `oracle_eligible_stations` counts the default list and changes only when it is
 judged, not with request parameters.

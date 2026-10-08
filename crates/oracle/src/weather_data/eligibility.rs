@@ -43,21 +43,18 @@ pub const MAX_DAYS: u32 = 31;
 pub const DEFAULT_WINDOW_HOURS: u32 = 24;
 /// Longest window: one placed on a day must fit in it.
 pub const MAX_WINDOW_HOURS: u32 = 24;
-/// Imperfect days allowed among those checked: one in ten, and always at least one, so a
-/// single collector outage does not empty the list.
+/// Imperfect days allowed among those checked: one in ten, rounded down. Short histories must be clean every day. Missing
+/// collection data cannot establish that a station can be settled.
 fn allowed_imperfect_days(days_checked: u32) -> u32 {
-    (days_checked / 10).max(1)
+    days_checked / 10
 }
-/// A judged day on which fewer than half of the stations were clean was a
-/// gap in collection, not at the stations, and is not checked against
-/// them. Below this many stations one station's bad day cannot be told
-/// from an outage, so every day is checked.
-const OUTAGE_MIN_STATIONS: usize = 20;
 /// How long reports read ahead serve requests. Collection runs hourly and
 /// each run reads them again; past this the files are read per request.
 const TIMELINE_MAX_AGE: Duration = Duration::minutes(90);
 /// A station whose newest report is this old may have stopped reporting.
-const MAX_REPORT_AGE: Duration = Duration::hours(3);
+const MAX_REPORT_AGE: Duration = Duration::minutes(90);
+/// A cached eligibility judgment may serve briefly while it is refreshed.
+const MAX_JUDGMENT_AGE: Duration = Duration::minutes(20);
 /// Forecast issues this recent are read. A station whose newest issue is
 /// older has no forecast to open a competition with.
 const FORECAST_ISSUES: Duration = Duration::hours(6);
@@ -81,7 +78,12 @@ pub struct Eligibility {
     /// End of the last period of the station's newest forecast issue, if
     /// it has a recent one.
     pub forecast_through: Option<OffsetDateTime>,
-    /// Clean on enough days, reporting, and forecast past the window.
+    pub coverage_checked_at: OffsetDateTime,
+    pub recent_window_hours: u32,
+    pub recent_window_clean: bool,
+    /// Largest gap between usable temperature reports, including window edges.
+    pub max_report_gap_seconds: u64,
+    /// Clean on enough days and the latest rolling window, with a forecast.
     pub eligible: bool,
 }
 
@@ -103,6 +105,12 @@ pub struct EligibleStation {
     pub last_report: String,
     /// End of the newest forecast's last period (RFC3339).
     pub forecast_through: String,
+    /// When the rolling window ending now was checked (RFC3339).
+    pub coverage_checked_at: String,
+    /// Length of the rolling window checked with settlement's sampling rule.
+    pub recent_window_hours: u32,
+    /// Largest usable temperature-report gap in that window, including its edges.
+    pub max_report_gap_seconds: u64,
 }
 
 impl EligibleStation {
@@ -119,6 +127,28 @@ impl EligibleStation {
             days_checked: eligibility.days_checked,
             last_report: eligibility.last_report.format(&Rfc3339).ok()?,
             forecast_through: eligibility.forecast_through?.format(&Rfc3339).ok()?,
+            coverage_checked_at: eligibility.coverage_checked_at.format(&Rfc3339).ok()?,
+            recent_window_hours: eligibility.recent_window_hours,
+            max_report_gap_seconds: eligibility.max_report_gap_seconds,
+        })
+    }
+
+    /// Expire evidence even when a cache keeps serving while its refresh fails.
+    pub fn current(&self, window_hours: u32, now: OffsetDateTime) -> bool {
+        let parsed = || {
+            Some((
+                OffsetDateTime::parse(&self.coverage_checked_at, &Rfc3339).ok()?,
+                OffsetDateTime::parse(&self.last_report, &Rfc3339).ok()?,
+                OffsetDateTime::parse(&self.forecast_through, &Rfc3339).ok()?,
+            ))
+        };
+        parsed().is_some_and(|(checked, last, through)| {
+            self.recent_window_hours == window_hours
+                && checked <= now
+                && now - checked < MAX_JUDGMENT_AGE
+                && last <= now
+                && now - last < MAX_REPORT_AGE
+                && through >= now + Duration::hours(i64::from(window_hours))
         })
     }
 }
@@ -166,15 +196,25 @@ fn clean_day(reports: &[Report], day: OffsetDateTime, window_hours: u32) -> bool
     })
 }
 
-/// Which of the judged days were collection outages: days most stations
-/// missed, by each station's clean days in `clean`.
-fn outage_days(clean: &[Vec<bool>], days: usize) -> Vec<bool> {
-    if clean.len() < OUTAGE_MIN_STATIONS {
-        return vec![false; days];
+/// Apply the settlement rule to the latest rolling window, including today's
+/// reports and windows crossing midnight. A resumed report does not hide an outage.
+fn recent_window(reports: &[Report], start: OffsetDateTime, end: OffsetDateTime) -> (bool, u64) {
+    let reports = &reports
+        [reports.partition_point(|r| r.time < start)..reports.partition_point(|r| r.time < end)];
+    let sampled = precipitation::times_sample_window(reports.iter().map(|r| r.time), start, end)
+        && precipitation::times_sample_window(
+            reports.iter().filter(|r| r.temperature).map(|r| r.time),
+            start,
+            end,
+        );
+    let mut previous = start;
+    let mut max_gap = Duration::ZERO;
+    for report in reports.iter().filter(|r| r.temperature) {
+        max_gap = max_gap.max(report.time - previous);
+        previous = report.time;
     }
-    (0..days)
-        .map(|day| clean.iter().filter(|station| station[day]).count() * 2 < clean.len())
-        .collect()
+    max_gap = max_gap.max(end - previous);
+    (sampled, max_gap.whole_seconds().max(0) as u64)
 }
 
 /// The reports settlement reads and each station's forecast extent, from
@@ -243,33 +283,35 @@ fn judge(
             Some((station_id, reports, clean))
         })
         .collect();
-    let clean: Vec<Vec<bool>> = stations.iter().map(|(_, _, clean)| clean.clone()).collect();
-    let outages = outage_days(&clean, days.len());
-    let days_checked = outages.iter().filter(|outage| !**outage).count() as u32;
+    let days_checked = days.len() as u32;
     stations
         .into_iter()
         .filter_map(|(station_id, reports, clean)| {
+            let reports = &reports[..reports.partition_point(|report| report.time < now)];
             let last_report = reports.last()?.time;
-            let clean_days = clean
-                .iter()
-                .zip(&outages)
-                .filter(|(clean, outage)| **clean && !**outage)
-                .count() as u32;
+            let clean_days = clean.iter().filter(|clean| **clean).count() as u32;
             let forecast_through = timeline.forecasts.get(station_id).copied().flatten();
+            let (recent_window_clean, max_report_gap_seconds) =
+                recent_window(reports, now - Duration::hours(i64::from(window_hours)), now);
             Some(Eligibility {
-                eligible: eligible(
-                    clean_days,
-                    days_checked,
-                    last_report,
-                    forecast_through,
-                    window_hours,
-                    now,
-                ),
+                eligible: recent_window_clean
+                    && eligible(
+                        clean_days,
+                        days_checked,
+                        last_report,
+                        forecast_through,
+                        window_hours,
+                        now,
+                    ),
                 station_id: station_id.clone(),
                 clean_days,
                 days_checked,
                 last_report,
                 forecast_through,
+                coverage_checked_at: now,
+                recent_window_hours: window_hours,
+                recent_window_clean,
+                max_report_gap_seconds,
             })
         })
         .collect()
@@ -287,6 +329,7 @@ fn eligible(
 ) -> bool {
     days_checked > 0
         && clean_days + allowed_imperfect_days(days_checked) >= days_checked
+        && last_report <= now
         && now - last_report < MAX_REPORT_AGE
         && forecast_through
             .is_some_and(|through| through >= now + Duration::hours(i64::from(window_hours)))
@@ -545,7 +588,9 @@ mod tests {
         assert!(eligible(19, 20, recent, through, 24, NOW));
         assert!(eligible(27, 30, recent, through, 24, NOW));
         assert!(!eligible(26, 30, recent, through, 24, NOW));
-        assert!(eligible(2, 3, recent, through, 24, NOW));
+        assert!(!eligible(2, 3, recent, through, 24, NOW));
+        assert!(!eligible(0, 1, recent, through, 24, NOW));
+        assert!(eligible(3, 3, recent, through, 24, NOW));
         assert!(!eligible(1, 3, recent, through, 24, NOW));
         assert!(!eligible(30, 30, NOW - MAX_REPORT_AGE, through, 24, NOW));
         assert!(!eligible(30, 30, recent, through, 25, NOW));
@@ -626,6 +671,10 @@ mod tests {
                     days_checked: 5,
                     last_report,
                     forecast_through: Some(through),
+                    coverage_checked_at: NOW,
+                    recent_window_hours: 24,
+                    recent_window_clean: true,
+                    max_report_gap_seconds: 3600,
                     eligible: true,
                 },
                 Eligibility {
@@ -634,6 +683,10 @@ mod tests {
                     days_checked: 5,
                     last_report,
                     forecast_through: Some(through),
+                    coverage_checked_at: NOW,
+                    recent_window_hours: 24,
+                    recent_window_clean: false,
+                    max_report_gap_seconds: 10800,
                     eligible: false,
                 },
                 Eligibility {
@@ -642,6 +695,10 @@ mod tests {
                     days_checked: 5,
                     last_report,
                     forecast_through: None,
+                    coverage_checked_at: NOW,
+                    recent_window_hours: 24,
+                    recent_window_clean: true,
+                    max_report_gap_seconds: 3600,
                     eligible: false,
                 },
             ]
@@ -700,16 +757,12 @@ mod tests {
         let start = datetime!(2026-01-15 00:53 UTC);
         let reports = (0..stations)
             .map(|station| {
-                let reports = (0..5 * 24)
+                let reports = (0..5 * 24 + 12)
                     .filter(|hour| !missed(station, hour / 24).contains(&(hour % 24)))
                     .map(|hour| Report {
                         time: start + Duration::hours(hour),
                         temperature: true,
                     })
-                    .chain([Report {
-                        time: NOW - Duration::minutes(10),
-                        temperature: true,
-                    }])
                     .collect();
                 (format!("K{station:03}"), reports)
             })
@@ -727,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn days_the_whole_network_missed_are_not_held_against_stations() {
+    fn collection_outages_do_not_count_as_evidence_of_coverage() {
         // Every station misses 10:53 and 11:53 on the second day; station
         // 1 also misses them on the third, station 2 on the third and
         // fourth.
@@ -735,24 +788,104 @@ mod tests {
             (_, 1) | (1 | 2, 2) | (2, 3) => vec![10, 11],
             _ => vec![],
         };
-        let judged = judge(&network(OUTAGE_MIN_STATIONS, missed), 5, 24, NOW);
-        assert_eq!(judged.len(), OUTAGE_MIN_STATIONS);
-        assert!(judged.iter().all(|station| station.days_checked == 4));
-        let summary: Vec<_> = judged[..3]
-            .iter()
-            .map(|station| (station.clean_days, station.eligible))
-            .collect();
-        assert_eq!(summary, [(4, true), (3, true), (2, false)]);
-        assert!(judged[3..].iter().all(|station| station.eligible));
-
-        // Too few stations to tell an outage: the day counts against all.
-        let judged = judge(&network(OUTAGE_MIN_STATIONS - 1, missed), 5, 24, NOW);
+        let judged = judge(&network(20, missed), 5, 24, NOW);
+        assert_eq!(judged.len(), 20);
         assert!(judged.iter().all(|station| station.days_checked == 5));
         let summary: Vec<_> = judged[..3]
             .iter()
             .map(|station| (station.clean_days, station.eligible))
             .collect();
-        assert_eq!(summary, [(4, true), (3, false), (2, false)]);
+        assert_eq!(summary, [(4, false), (3, false), (2, false)]);
+        assert!(judged[3..].iter().all(|station| !station.eligible));
+
+        // The same evidence is required for a smaller station network.
+        let judged = judge(&network(20 - 1, missed), 5, 24, NOW);
+        assert!(judged.iter().all(|station| station.days_checked == 5));
+        let summary: Vec<_> = judged[..3]
+            .iter()
+            .map(|station| (station.clean_days, station.eligible))
+            .collect();
+        assert_eq!(summary, [(4, false), (3, false), (2, false)]);
+    }
+
+    #[test]
+    fn resumed_reports_do_not_hide_today_or_midnight_gaps() {
+        let mut timeline = network(1, |_, _| vec![]);
+        assert!(judge(&timeline, 3, 24, NOW)[0].eligible);
+        // Yesterday's midnight-to-midnight window and today's single fresh
+        // report are insufficient: the rolling window missed two reports.
+        timeline
+            .reports
+            .get_mut("K000")
+            .unwrap()
+            .retain(|r| !(r.time.date() == NOW.date() && [2, 3].contains(&r.time.hour())));
+        let judged = &judge(&timeline, 3, 24, NOW)[0];
+        assert_eq!(judged.clean_days, 3);
+        assert!(!judged.recent_window_clean);
+        assert!(!judged.eligible);
+        assert_eq!(judged.max_report_gap_seconds, 3 * 3600);
+
+        let mut timeline = network(1, |_, _| vec![]);
+        timeline.reports.get_mut("K000").unwrap().retain(|r| {
+            r.time != NOW.replace_time(time::macros::time!(0:53))
+                && r.time != NOW.replace_time(time::macros::time!(0:53)) - Duration::HOUR
+        });
+        let judged = &judge(&timeline, 3, 24, NOW)[0];
+        assert_eq!(judged.clean_days, 3);
+        assert!(!judged.eligible, "a gap across midnight must count");
+    }
+
+    #[test]
+    fn rolling_coverage_uses_temperature_quality_and_settlement_gap_tolerance() {
+        let mut timeline = network(1, |_, _| vec![]);
+        let missing = NOW.replace_time(time::macros::time!(8:53));
+        timeline
+            .reports
+            .get_mut("K000")
+            .unwrap()
+            .retain(|r| r.time != missing);
+        assert!(
+            judge(&timeline, 3, 24, NOW)[0].eligible,
+            "one missed hourly report is tolerated"
+        );
+        assert!(
+            !judge(&timeline, 3, 6, NOW)[0].eligible,
+            "short windows tolerate no missed report"
+        );
+        for report in timeline.reports.get_mut("K000").unwrap() {
+            if report.time == missing + Duration::HOUR {
+                report.temperature = false;
+            }
+        }
+        assert!(
+            !judge(&timeline, 3, 24, NOW)[0].eligible,
+            "unusable temperatures leave a gap"
+        );
+    }
+
+    #[test]
+    fn cached_station_evidence_expires_even_if_refresh_fails() {
+        let mut station = EligibleStation {
+            station_id: "KDEN".into(),
+            station_name: String::new(),
+            state: String::new(),
+            iata_id: String::new(),
+            latitude: 0.0,
+            longitude: 0.0,
+            clean_days: 3,
+            days_checked: 3,
+            last_report: (NOW - Duration::minutes(10)).format(&Rfc3339).unwrap(),
+            forecast_through: (NOW + Duration::days(2)).format(&Rfc3339).unwrap(),
+            coverage_checked_at: NOW.format(&Rfc3339).unwrap(),
+            recent_window_hours: 24,
+            max_report_gap_seconds: 3600,
+        };
+        assert!(station.current(24, NOW));
+        assert!(!station.current(12, NOW));
+        assert!(!station.current(24, NOW + MAX_JUDGMENT_AGE));
+        assert!(!station.current(24, NOW - Duration::SECOND));
+        station.last_report = (NOW - MAX_REPORT_AGE).format(&Rfc3339).unwrap();
+        assert!(!station.current(24, NOW));
     }
 
     /// Corrected publications replace old conflicts, but conflicts or rejected

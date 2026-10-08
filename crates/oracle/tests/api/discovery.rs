@@ -28,6 +28,10 @@ fn fixture(weather: &mut MockWeatherAccess, end: OffsetDateTime, count: usize) {
                     clean_days: 3,
                     days_checked: 3,
                     last_report: now,
+                    coverage_checked_at: now,
+                    recent_window_hours: hours,
+                    recent_window_clean: true,
+                    max_report_gap_seconds: 3600,
                     forecast_through: Some(if i == 1 { end - Duration::HOUR } else { end }),
                     eligible: i != 2,
                 })
@@ -173,6 +177,10 @@ async fn operators_may_ask_for_longer_histories() {
                 clean_days: 14,
                 days_checked: 14,
                 last_report: now,
+                coverage_checked_at: now,
+                recent_window_hours: hours,
+                recent_window_clean: true,
+                max_report_gap_seconds: 3600,
                 forecast_through: Some(end),
                 eligible: true,
             }])
