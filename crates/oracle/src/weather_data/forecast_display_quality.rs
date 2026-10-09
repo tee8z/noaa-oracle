@@ -26,11 +26,19 @@ pub struct ForecastRangeIssue {
 
 impl ForecastQuality {
     pub(super) fn extend(&mut self, other: Self) {
-        self.rejected_rows += other.rejected_rows;
-        self.unverified_rows += other.unverified_rows;
-        self.unavailable |= other.unavailable;
-        self.range_issues.extend(other.range_issues);
-        self.daily_counts.extend(other.daily_counts);
+        // Destructured so that a new field must be combined here too.
+        let Self {
+            rejected_rows,
+            unverified_rows,
+            unavailable,
+            range_issues,
+            daily_counts,
+        } = other;
+        self.rejected_rows += rejected_rows;
+        self.unverified_rows += unverified_rows;
+        self.unavailable |= unavailable;
+        self.range_issues.extend(range_issues);
+        self.daily_counts.extend(daily_counts);
     }
 
     pub fn unavailable() -> Self {

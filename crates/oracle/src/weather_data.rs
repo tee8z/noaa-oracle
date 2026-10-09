@@ -19,7 +19,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use duckdb::{
-    Connection,
+    Connection, Statement,
     arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray},
 };
 use log::debug;
@@ -1463,8 +1463,11 @@ impl WeatherAccess {
     }
 
     /// Runs `sql` on a new connection to the shared database off the async
-    /// runtime, and decodes the result there too. The query keeps its slot
-    /// until it finishes, even if its caller is cancelled.
+    /// runtime, and decodes the result there too. `decode` runs once per
+    /// Arrow batch as the batches stream in, so it must not depend on any
+    /// other batch; the values of every batch are returned in result order.
+    /// The query keeps its slot until it finishes, even if its caller is
+    /// cancelled.
     async fn query<T: Send + 'static>(
         &self,
         sql: String,
@@ -1473,13 +1476,16 @@ impl WeatherAccess {
         self.query_streaming(sql, false, move |_, batches| {
             let mut values = Vec::new();
             for batch in batches {
-                values.extend(decode(std::slice::from_ref(&batch))?);
+                values.extend(decode(std::slice::from_ref(&batch?))?);
             }
             Ok(values)
         })
         .await
     }
 
+    /// Runs `sql` as [`Self::query`] does, but reads the whole result and
+    /// closes it before `decode`, which may run further queries on the
+    /// connection.
     async fn query_with_connection<T: Send + 'static>(
         &self,
         sql: String,
@@ -1490,23 +1496,22 @@ impl WeatherAccess {
         tokio::task::spawn_blocking(move || {
             let _slot = slot;
             let connection = clone_query_connection(&database)?;
-            let mut statement = connection.prepare(&sql)?;
-            let batches: Vec<RecordBatch> = statement.query_arrow([])?.collect();
+            let batches = Batches::stream(&connection, &sql)?.collect::<Result<Vec<_>, _>>()?;
             decode(&connection, &batches)
         })
         .await?
     }
 
-    /// Consume and release Arrow batches as they arrive. Only decoded output
-    /// survives each iteration. An isolated database bounds long history reads.
-    /// Consume this iterator fully before another query on the connection.
+    /// Runs `sql` as [`Self::query`] does and hands `decode` the batches as
+    /// DuckDB produces them (see [`Batches`]), so only what `decode` keeps
+    /// outlives each batch. Sorts and window functions in `sql` still hold
+    /// their input while they run. `isolated` reads in a database of its
+    /// own (see [`LONG_READ_MEMORY_LIMIT`]), for long history reads.
     async fn query_streaming<T: Send + 'static>(
         &self,
         sql: String,
         isolated: bool,
-        decode: impl FnOnce(&Connection, &mut dyn Iterator<Item = RecordBatch>) -> Result<Vec<T>, Error>
-        + Send
-        + 'static,
+        decode: impl FnOnce(&Connection, Batches<'_>) -> Result<Vec<T>, Error> + Send + 'static,
     ) -> Result<Vec<T>, Error> {
         let slot = self.slot().await?;
         let database = self.database.clone();
@@ -1517,11 +1522,41 @@ impl WeatherAccess {
             } else {
                 clone_query_connection(&database)?
             };
-            let mut statement = connection.prepare(&sql)?;
-            let mut batches = statement.query_arrow([])?;
-            decode(&connection, &mut batches)
+            let batches = Batches::stream(&connection, &sql)?;
+            decode(&connection, batches)
         })
         .await?
+    }
+}
+
+/// The Arrow batches of a streaming query, fetched from DuckDB as they are
+/// read. DuckDB runs the query only a bounded buffer ahead of the reader
+/// instead of materializing the whole result first. Preparing or running
+/// another query on the connection cuts an unfinished stream short, so read
+/// it to the end or drop it first. Dropping it closes the result.
+struct Batches<'connection> {
+    statement: Statement<'connection>,
+}
+
+impl<'connection> Batches<'connection> {
+    fn stream(connection: &'connection Connection, sql: &str) -> Result<Self, Error> {
+        let mut statement = connection.prepare(sql)?;
+        // DuckDB's iterator over the result panics when a fetch fails, so
+        // `next` fetches with `step`, which returns the error instead.
+        let _ = statement.stream_arrow([])?;
+        Ok(Self { statement })
+    }
+}
+
+impl Iterator for Batches<'_> {
+    type Item = Result<RecordBatch, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.statement
+            .step()
+            .map(|array| array.map(|array| RecordBatch::from(&array)))
+            .map_err(Error::from)
+            .transpose()
     }
 }
 
@@ -1714,8 +1749,8 @@ impl WeatherData for WeatherAccess {
         let query_sql = forecasts_sql(&rows, req, calendar, window, &partial)?;
         let unit = req.temperature_unit;
         let mut result = self
-            .query_streaming(query_sql, false, move |_, batches| {
-                decode_forecast_stream(batches, &unit).map(|result| vec![result])
+            .query_streaming(query_sql, false, move |_, mut batches| {
+                decode_forecast_stream(&mut batches, &unit).map(|result| vec![result])
             })
             .await?;
         Ok(result.pop().unwrap_or_default())
@@ -2101,12 +2136,13 @@ fn skipped(kind: &str, row: usize) {
 }
 
 fn decode_forecast_stream(
-    batches: &mut dyn Iterator<Item = RecordBatch>,
+    batches: &mut dyn Iterator<Item = Result<RecordBatch, Error>>,
     unit: &TemperatureUnit,
 ) -> Result<(Vec<Forecast>, ForecastQuality), Error> {
     let mut forecasts = Vec::new();
     let mut quality = ForecastQuality::default();
     for batch in batches {
+        let batch = batch?;
         let batches = std::slice::from_ref(&batch);
         forecasts.extend(decode_forecasts(batches, unit)?);
         quality.extend(forecast_display_quality::decode(batches)?);
@@ -4189,9 +4225,41 @@ mod tests {
         "/../../e2e/fixtures/weather_data/2026-01-17/forecasts_2026-01-17T17:16:19.76658783Z.parquet"
     );
 
-    /// One period per row: station, begin, end, issue time, low, high, unit,
-    /// wind speed and direction, humidity max and min, PoP, QPF, snow,
-    /// snow ratio, ice.
+    /// DuckDB buffers about a megabyte of a streaming result ahead of the
+    /// reader, so the first million rows (eight megabytes) reach the decoder
+    /// before the row that raises the error is computed.
+    const FAILS_MID_STREAM: &str = "SELECT CASE WHEN i < 1000000 THEN i
+        ELSE error('failed mid-stream') END AS i FROM range(2000000) t(i)";
+
+    #[tokio::test]
+    async fn a_query_failing_mid_stream_returns_its_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let access = access(&directory);
+        let (decoded_rows, rows) = std::sync::mpsc::channel();
+        let streamed = access
+            .query(FAILS_MID_STREAM.into(), move |batches| {
+                decoded_rows
+                    .send(batches.iter().map(RecordBatch::num_rows).sum::<usize>())
+                    .unwrap();
+                Ok(Vec::<()>::new())
+            })
+            .await;
+        let error = streamed.expect_err("the failed fetch is returned");
+        assert!(
+            matches!(error, Error::Query(_)) && error.to_string().contains("failed mid-stream"),
+            "{error}"
+        );
+        assert!(
+            rows.try_iter().sum::<usize>() > 0,
+            "batches were decoded before the error"
+        );
+
+        let collected = access
+            .query_with_connection(FAILS_MID_STREAM.into(), |_, _| Ok(Vec::<()>::new()))
+            .await;
+        assert!(matches!(collected, Err(Error::Query(_))), "{collected:?}");
+    }
+
     #[test]
     fn streamed_forecasts_preserve_all_batches_and_quality() {
         let connection = Connection::open_in_memory().unwrap();
@@ -4209,14 +4277,16 @@ mod tests {
             NULL::VARCHAR AS min_temp_period, NULL::VARCHAR AS max_temp_period,
             NULL::VARCHAR AS humidity_min_period, NULL::VARCHAR AS humidity_max_period
             FROM range(10000) t(i)";
-        let mut statement = connection.prepare(sql).unwrap();
-        let batches: Vec<_> = statement.query_arrow([]).unwrap().collect();
+        let batches: Vec<_> = Batches::stream(&connection, sql)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
         assert!(batches.len() > 1);
         let unit = TemperatureUnit::Fahrenheit;
         let expected = decode_forecasts(&batches, &unit).unwrap();
         let mut expected_quality = forecast_display_quality::decode(&batches).unwrap();
         let (actual, mut quality) =
-            decode_forecast_stream(&mut batches.into_iter(), &unit).unwrap();
+            decode_forecast_stream(&mut batches.into_iter().map(Ok::<_, Error>), &unit).unwrap();
         assert_eq!(actual.len(), 10000);
         assert_same_forecasts(&expected, &actual, "streamed batches");
         assert_eq!(quality, expected_quality);
@@ -4228,6 +4298,9 @@ mod tests {
         assert_eq!(quality.unverified_rows, 10000);
     }
 
+    /// One period per row: station, begin, end, issue time, low, high, unit,
+    /// wind speed and direction, humidity max and min, PoP, QPF, snow,
+    /// snow ratio, ice.
     fn forecast_rows(rows: &str) -> String {
         format!(
             "SELECT station_id, begin_time, end_time, generated_at,

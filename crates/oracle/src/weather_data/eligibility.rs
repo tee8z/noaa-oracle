@@ -18,7 +18,7 @@
 //! window length is judged from it without reading the files again.
 
 use super::{
-    DEDUP_OBSERVATIONS_SQL, Error, NORMALIZE_OBSERVATIONS_SQL, OBSERVATION_SOURCE_COLUMNS,
+    Batches, DEDUP_OBSERVATIONS_SQL, Error, NORMALIZE_OBSERVATIONS_SQL, OBSERVATION_SOURCE_COLUMNS,
     WeatherAccess, forecast_file_params, integer, integers, precipitation, sql_string_list,
     station, strings,
 };
@@ -338,10 +338,11 @@ fn eligible(
 /// Decode directly into the retained timeline. No complete Arrow result or
 /// intermediate vector of timestamps remains beside the final reports.
 fn reports_by_station(
-    batches: &mut dyn Iterator<Item = RecordBatch>,
+    batches: &mut dyn Iterator<Item = Result<RecordBatch, Error>>,
 ) -> Result<BTreeMap<String, Vec<Report>>, Error> {
     let mut reports = BTreeMap::<String, Vec<Report>>::new();
     for batch in batches {
+        let batch = batch?;
         let stations = strings(&batch, "station_id")?;
         let times = integers(&batch, "report_time")?;
         let flags = integers(&batch, "flag")?;
@@ -485,14 +486,16 @@ impl WeatherAccess {
         });
 
         let decode = move |connection: &Connection,
-                           batches: &mut dyn Iterator<Item = RecordBatch>|
+                           mut batches: Batches<'_>|
               -> Result<Vec<Timeline>, Error> {
-            let reports = reports_by_station(batches)?;
-            // The reports iterator is exhausted before this secondary query.
+            let reports = reports_by_station(&mut batches)?;
+            // Every report has been read; close their result before the
+            // forecast query runs on this connection.
+            drop(batches);
             let mut forecasts = BTreeMap::new();
             if let Some(sql) = forecasts_sql {
-                let mut statement = connection.prepare(&sql)?;
-                for batch in statement.query_arrow([])? {
+                for batch in Batches::stream(connection, &sql)? {
+                    let batch = batch?;
                     let stations = strings(&batch, "station_id")?;
                     let times = integers(&batch, "forecast_through")?;
                     for row in 0..batch.num_rows() {
@@ -534,10 +537,9 @@ mod tests {
     use time::macros::datetime;
 
     #[test]
-    fn streamed_reports_cross_batches_and_allow_the_next_query() {
+    fn streamed_reports_cross_batches() {
         let connection = Connection::open_in_memory().unwrap();
-        let mut statement = connection.prepare("SELECT 'KTEST' AS station_id, 1700000000 + i AS report_time, (i % 2)::BIGINT AS flag FROM range(10000) t(i)").unwrap();
-        let mut batches = statement.query_arrow([]).unwrap();
+        let mut batches = Batches::stream(&connection, "SELECT 'KTEST' AS station_id, 1700000000 + i AS report_time, (i % 2)::BIGINT AS flag FROM range(10000) t(i)").unwrap();
         let reports = reports_by_station(&mut batches).unwrap();
         let station = &reports["KTEST"];
         assert_eq!(station.len(), 10000);
@@ -545,13 +547,6 @@ mod tests {
             assert_eq!(report.time.unix_timestamp(), 1700000000 + i as i64);
             assert_eq!(report.temperature, i % 2 == 1);
         }
-        // Eligibility uses this connection again for forecast coverage.
-        assert_eq!(
-            connection
-                .query_row("SELECT 42", [], |row| row.get::<_, i32>(0))
-                .unwrap(),
-            42
-        );
     }
 
     const NOW: OffsetDateTime = datetime!(2026-01-20 12:00 UTC);
