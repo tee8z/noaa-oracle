@@ -882,6 +882,224 @@ async fn a_pass_whose_lease_passed_to_another_process_while_it_waited_does_not_r
     bounded(runtime.run_until_stop()).await.unwrap();
 }
 
+/// An event on `location` whose observation window is open, so every pass
+/// reads it.
+fn open_event(location: &str) -> NewEvent {
+    let now = time::OffsetDateTime::now_utc();
+    NewEvent {
+        locations: vec![location.into()],
+        start_observation_date: now - time::Duration::hours(1),
+        end_observation_date: now + time::Duration::hours(1),
+        signing_date: now + time::Duration::hours(2),
+        ..event_data()
+    }
+}
+
+/// Weather data whose first forecast read announces that it started, then
+/// waits until `release` is notified. Records the stations whose forecasts
+/// and observations were read.
+#[derive(Default)]
+struct HeldRead {
+    started: Notify,
+    release: Notify,
+    forecasts: Mutex<Vec<String>>,
+    observations: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl WeatherData for HeldRead {
+    async fn forecasts_data(
+        &self,
+        _: &crate::routes::ForecastRequest,
+        _: Vec<String>,
+    ) -> Result<Vec<weather_data::Forecast>, weather_data::Error> {
+        Ok(vec![])
+    }
+    async fn forecast_assessment(
+        &self,
+        _: &crate::routes::ForecastRequest,
+        station_ids: Vec<String>,
+    ) -> Result<Vec<weather_data::ForecastAssessment>, weather_data::Error> {
+        let first = {
+            let mut forecasts = lock(&self.forecasts);
+            forecasts.extend(station_ids);
+            forecasts.len() == 1
+        };
+        if first {
+            self.started.notify_one();
+            self.release.notified().await;
+        }
+        Ok(vec![])
+    }
+    async fn observation_data(
+        &self,
+        _: &crate::routes::ObservationRequest,
+        station_ids: Vec<String>,
+    ) -> Result<Vec<weather_data::Observation>, weather_data::Error> {
+        lock(&self.observations).extend(station_ids);
+        Ok(vec![])
+    }
+    async fn daily_observations(
+        &self,
+        _: &crate::routes::ObservationRequest,
+        _: Vec<String>,
+    ) -> Result<Vec<weather_data::DailyObservation>, weather_data::Error> {
+        Ok(vec![])
+    }
+    async fn stations(&self) -> Result<Vec<Station>, weather_data::Error> {
+        Ok(vec![])
+    }
+}
+
+/// A pass whose lease renewal finds another process holding the lease stops
+/// between events: it finishes the event under way, reads no other, and
+/// reports the lease as not held.
+#[tokio::test]
+async fn a_pass_that_loses_its_lease_finishes_the_event_under_way_and_reads_no_other() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, database) = runtime(directory.path()).await;
+    let weather = Arc::new(HeldRead::default());
+    let state = app_state(
+        directory.path(),
+        &runtime,
+        database.clone(),
+        weather.clone(),
+    )
+    .await;
+    for location in ["KDEN", "KORD"] {
+        database.add_event(&open_event(location)).await.unwrap();
+    }
+
+    state.start_etl().unwrap();
+    bounded(weather.started.notified()).await;
+    let under_way = lock(&weather.forecasts).clone();
+    assert_eq!(under_way.len(), 1, "the pass reads one event at a time");
+    // Another process takes the lease while the pass reads that event.
+    database
+        .release_lease(ETL_LEASE, &state.instance)
+        .await
+        .unwrap();
+    assert!(
+        database
+            .take_lease(ETL_LEASE, "oracle-peer", ETL_LEASE_TTL)
+            .await
+            .unwrap()
+    );
+
+    // Only the clock moves while it is paused, up to the renewal: the
+    // database runs on real time, as its own timers need.
+    tokio::time::pause();
+    tokio::time::advance(ETL_LEASE_TTL / 3).await;
+    tokio::time::resume();
+    until(|| metric(&state, LEASE_HELD) == Some(0)).await;
+    assert_eq!(
+        state.etl_slot.available_permits(),
+        0,
+        "the event under way goes on"
+    );
+    assert_eq!(metric(&state, COMPLETED_PASSES), Some(0));
+
+    weather.release.notify_one();
+    bounded(state.wait_for_etl()).await;
+    assert_eq!(metric(&state, COMPLETED_PASSES), Some(1));
+    assert_eq!(
+        *lock(&weather.observations),
+        under_way,
+        "the event under way is read to the end"
+    );
+    assert_eq!(
+        *lock(&weather.forecasts),
+        under_way,
+        "no other event is read"
+    );
+    assert_eq!(metric(&state, LEASE_HELD), Some(0));
+    assert!(
+        !database
+            .take_lease(ETL_LEASE, &state.instance, ETL_LEASE_TTL)
+            .await
+            .unwrap(),
+        "the other process keeps the lease"
+    );
+    assert_eq!(state.heavy().free_turns(), heavy::HEAVY_TURNS as usize);
+
+    runtime.requested.cancel();
+    bounded(runtime.run_until_stop()).await.unwrap();
+}
+
+/// Shutdown ends cache warming's and the station list refresh's waits for a
+/// heavy turn and leaves no value marked as being refreshed: once the
+/// background tasks drain, the next read of each stale value asks for its
+/// refresh again.
+#[tokio::test]
+async fn shutdown_ends_waits_for_heavy_turns_without_leaving_a_refresh_marked() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, database) = runtime(directory.path()).await;
+    let weather = Arc::new(CountedEligibility::default());
+    let state = app_state(directory.path(), &runtime, database, weather.clone()).await;
+    let router = app(state.clone());
+    let kept = [
+        "/fragments/forecast/KDEN",
+        "/fragments/weather?stations=KDEN",
+    ];
+    for path in kept {
+        assert_eq!(status(&router, path).await, StatusCode::OK, "{path}");
+    }
+
+    // With every turn held, warming waits for one. Readers get the stale
+    // values, and the station list's refresh waits for a turn too.
+    let held = bounded(state.heavy().patient_every_turn()).await.unwrap();
+    state.new_data();
+    runtime.background.tasks.spawn({
+        let state = state.clone();
+        async move { warm_caches(&state).await }
+    });
+    for path in kept {
+        assert_eq!(status(&router, path).await, StatusCode::OK, "{path}");
+    }
+    assert!(state.stations.refreshing.load(Ordering::Acquire));
+    let observed = weather.observed.load(Ordering::SeqCst);
+    // Warming and the refresh get the chance to start waiting.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+
+    bounded(runtime.background.stop()).await;
+    assert_eq!(
+        weather.observed.load(Ordering::SeqCst),
+        observed,
+        "nothing was built"
+    );
+    assert!(
+        !state.stations.refreshing.load(Ordering::Acquire),
+        "the station list's refresh is not marked as running"
+    );
+    let details = lock(&state.forecast_cache).recent_keys(u64::MAX);
+    let views = state.recent_weather();
+    assert_eq!((details.len(), views.len()), (1, 1));
+    for key in details {
+        assert!(
+            matches!(
+                state.cached_forecast(&key),
+                Cached::Stale { refresh: true, .. }
+            ),
+            "{key}"
+        );
+    }
+    for key in views {
+        assert!(
+            matches!(
+                state.cached_weather(&key),
+                Cached::Stale { refresh: true, .. }
+            ),
+            "{key:?}"
+        );
+    }
+
+    drop(held);
+    runtime.requested.cancel();
+    bounded(runtime.run_until_stop()).await.unwrap();
+}
+
 #[tokio::test]
 async fn fixed_observation_windows_are_kept_until_new_data() {
     let directory = tempfile::tempdir().unwrap();
