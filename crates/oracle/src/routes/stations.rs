@@ -258,11 +258,22 @@ pub async fn observations(
             value: observations,
             refresh,
         } => {
+            // Rebuilt only on a heavy turn free now (see `crate::heavy`); a
+            // later request retries otherwise.
             if refresh {
-                let task_state = state.clone();
-                state.spawn(async move {
-                    let _ = build_observations(&task_state, key).await;
-                });
+                match state.heavy().try_turn() {
+                    Some(turn) => {
+                        let task_state = state.clone();
+                        state.spawn(async move {
+                            let _turn = turn;
+                            // Warming may have rebuilt it since the reader looked.
+                            if !matches!(task_state.cached_observations(&key), Cached::Fresh(_)) {
+                                let _ = build_observations(&task_state, key).await;
+                            }
+                        });
+                    }
+                    None => state.observations_refresh_failed(&key),
+                }
             }
             observations
         }
@@ -337,7 +348,11 @@ async fn build_observations(
     }
 }
 
-/// Observation aggregates rebuilt at once by the warmer.
+/// Observation aggregates the warmer rebuilds at once, each on a heavy turn
+/// of its own. An aggregate is a single query, so this is at most two query
+/// working sets, within [`HEAVY_TURNS`](crate::heavy::HEAVY_TURNS); forecast
+/// details and weather views run several queries each and are warmed one at
+/// a time.
 const WARM_CONCURRENCY: usize = 2;
 
 /// Rebuilds the observation aggregates asked for lately, so the next
