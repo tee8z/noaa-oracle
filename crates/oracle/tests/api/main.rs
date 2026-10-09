@@ -13,4 +13,5 @@ mod request_context;
 mod ui_fragments;
 mod upload;
 
+mod warming;
 mod window_compatibility;

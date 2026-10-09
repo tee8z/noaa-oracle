@@ -332,3 +332,83 @@ async fn weather_fragment_breakdown() {
         }
     }
 }
+
+/// Run this in a fresh process for each revision after preparation has been
+/// performed once. Both revisions must use the exact same public file snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs ORACLE_PERF_DATA; isolated warming memory comparison"]
+async fn warming_memory_on_real_data() {
+    let directory = std::env::var("ORACLE_PERF_DATA").expect("ORACLE_PERF_DATA");
+    let weather = Arc::new(WeatherAccess::with_derived_forecasts(
+        Arc::new(FileAccess::new(directory.clone())),
+        &std::path::Path::new(&directory).join("derived"),
+    ));
+    weather
+        .prepare_files(&tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+    if std::env::var_os("ORACLE_PERF_PREPARE_ONLY").is_some() {
+        return;
+    }
+    assert!(!weather.stations().await.unwrap().is_empty());
+    let test_app = spawn_app(weather).await;
+    log::set_max_level(log::LevelFilter::Error);
+    #[cfg(target_os = "linux")]
+    let (sampling, sampler) = {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let sampling = Arc::new(AtomicBool::new(true));
+        let active = sampling.clone();
+        let sampler = std::thread::spawn(move || {
+            let mut peak = 0;
+            while active.load(Ordering::Relaxed) {
+                let status = std::fs::read_to_string("/proc/self/status").unwrap();
+                let rss: u64 = status
+                    .lines()
+                    .find(|line| line.starts_with("VmRSS:"))
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                peak = peak.max(rss);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            peak
+        });
+        (sampling, sampler)
+    };
+    let started = Instant::now();
+    oracle::routes::warm_caches(&test_app.state).await;
+    println!("warming_seconds={:.3}", started.elapsed().as_secs_f64());
+    #[cfg(target_os = "linux")]
+    {
+        sampling.store(false, std::sync::atomic::Ordering::Relaxed);
+        println!("warming_peak_rss_kib={}", sampler.join().unwrap());
+    }
+    test_app.state.metrics().refresh(&test_app.state).await;
+    let metrics = test_app.state.metrics().encode();
+    let details = metrics
+        .lines()
+        .find(|line| line.starts_with("oracle_cache_entries{cache=\"forecast_details\"}"))
+        .expect("forecast cache metric");
+    assert_eq!(details.split_whitespace().last(), Some("90"), "{details}");
+    let weather = metrics
+        .lines()
+        .find(|line| line.starts_with("oracle_cache_entries{cache=\"weather\"}"))
+        .expect("weather cache metric");
+    assert_eq!(weather.split_whitespace().last(), Some("1"), "{weather}");
+    println!("{details}\n{weather}");
+    #[cfg(target_os = "linux")]
+    for line in std::fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+    {
+        if ["VmRSS:", "VmHWM:", "VmSwap:"]
+            .iter()
+            .any(|field| line.starts_with(field))
+        {
+            println!("{line}");
+        }
+    }
+}
