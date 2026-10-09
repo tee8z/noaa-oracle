@@ -87,8 +87,10 @@ budget shared by both listeners and the oracle's own passes:
 - Histories longer than 3 days run alone.
 - A processing pass (scoring and attestation), the preparation of new forecast files
   and the reading of eligibility reports after each collection run take every turn, so nothing heavy runs
-  beside them. Each waits for the heavy work already running, and work asked for
-  later waits behind it. A pass that has waited 2 minutes runs anyway. Cache warming
+  beside them. Each waits for the heavy work already running, however long that
+  takes, and work asked for later waits behind it; `oracle_pass_admission_wait_seconds`
+  reports the wait. File preparation takes every turn again for each file it copies
+  and for its folds, so a pass waits behind it for at most one of those. Cache warming
   takes a turn per value, so a processing pass waits for at most the values being
   built. Memory freed by heavy work is returned to the system before each pass,
   between the events a pass reads, and after each build.

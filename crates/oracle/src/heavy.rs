@@ -13,9 +13,13 @@
 //!   [`HEAVY_REQUEST_TIMEOUT`] gets 503, and the value is kept for the next
 //!   one.
 //! - Processing passes, file preparation and the reading of eligibility
-//!   reports take every turn, so nothing heavy runs beside them. They wait
-//!   for the work already running. Delays are logged every [`PASS_WAIT`];
-//!   a pass never bypasses this memory budget.
+//!   reports ([`Pass`]) take every turn, so nothing heavy runs beside them.
+//!   They wait for the work already running however long it takes and never
+//!   bypass this memory budget; delays are logged every [`PASS_WAIT`] and
+//!   exported as `oracle_pass_admission_wait_seconds`. File preparation
+//!   takes every turn for each file it copies and again for its folds,
+//!   giving them back in between, so a pass waits behind it for at most one
+//!   of those.
 //! - Cache warming takes one turn per value and waits as long as it must,
 //!   so a processing pass waits for at most the values being built.
 //! - A stale forecast detail, weather view or observation aggregate a
@@ -64,6 +68,27 @@ const RELEASE_SPACING: Duration = Duration::from_secs(10);
 /// Why heavy work was turned away.
 pub const NO_TURN: &str = "the oracle is busy with other heavy work; try again shortly";
 pub const STILL_WORKING: &str = "the answer is still being prepared; try again shortly";
+
+/// Background work that takes every turn (see the module documentation).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Pass {
+    Processing,
+    FilePreparation,
+    Eligibility,
+}
+
+impl Pass {
+    pub(crate) const ALL: [Self; 3] = [Self::Processing, Self::FilePreparation, Self::Eligibility];
+
+    /// How logs and the `pass` metric label name it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Processing => "processing",
+            Self::FilePreparation => "file_preparation",
+            Self::Eligibility => "eligibility",
+        }
+    }
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -181,19 +206,9 @@ impl HeavyWork {
         self.admission.turns.clone().acquire_owned().await.ok()
     }
 
-    /// Every turn, for a pass that should run alone, once the work holding
-    /// turns finishes; `None` if that takes longer than `wait`.
-    pub async fn every_turn(&self, wait: Duration) -> Option<OwnedSemaphorePermit> {
-        tokio::time::timeout(
-            wait,
-            self.admission.turns.clone().acquire_many_owned(HEAVY_TURNS),
-        )
-        .await
-        .ok()?
-        .ok()
-    }
-
-    /// Wait for exclusive background admission without losing FIFO position.
+    /// Every turn, for a pass that runs alone, once the work holding turns
+    /// finishes, however long that takes. The pass keeps its place while it
+    /// waits, so work asked for after it waits behind it.
     pub async fn patient_every_turn(&self) -> Option<OwnedSemaphorePermit> {
         self.admission
             .turns
@@ -488,7 +503,7 @@ mod tests {
         // The pass waits for the request already running ...
         let pass = tokio::spawn({
             let heavy = heavy.clone();
-            async move { heavy.every_turn(Duration::from_secs(4)).await }
+            async move { heavy.patient_every_turn().await }
         });
         bounded(async {
             while heavy.free_turns() > 0 {
@@ -511,18 +526,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pass_runs_anyway_when_heavy_work_outlasts_its_wait() {
-        let heavy = HeavyWork::new();
-        let _running = heavy.turn().await.unwrap();
-        assert!(heavy.every_turn(Duration::from_millis(20)).await.is_none());
-        // Giving up returned the turns it had gathered.
-        assert_eq!(heavy.free_turns(), HEAVY_TURNS as usize - 1);
-    }
-
-    #[tokio::test]
     async fn requests_beyond_the_queue_are_turned_away_at_once() {
         let heavy = Arc::new(HeavyWork::new());
-        let _all = heavy.every_turn(Duration::ZERO).await.unwrap();
+        let _all = heavy.patient_every_turn().await.unwrap();
         let waiting: Vec<_> = (0..QUEUED_HEAVY_WORK)
             .map(|_| {
                 let heavy = heavy.clone();
@@ -635,7 +641,7 @@ mod tests {
     async fn without_a_turn_a_build_is_turned_away_and_retried_later() {
         let heavy = Arc::new(HeavyWork::new());
         let kept = kept();
-        let all = heavy.every_turn(Duration::ZERO).await.unwrap();
+        let all = heavy.patient_every_turn().await.unwrap();
         // Fill the queue so the build cannot wait for a turn.
         let waiting: Vec<_> = (0..QUEUED_HEAVY_WORK)
             .map(|_| {
