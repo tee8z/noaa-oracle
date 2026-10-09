@@ -170,7 +170,6 @@ impl HeavyWork {
 
     /// Every turn, for a pass that should run alone, once the work holding
     /// turns finishes; `None` if that takes longer than `wait`.
-    #[cfg(test)]
     pub async fn every_turn(&self, wait: Duration) -> Option<OwnedSemaphorePermit> {
         tokio::time::timeout(
             wait,
