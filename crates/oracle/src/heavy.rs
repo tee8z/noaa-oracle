@@ -18,6 +18,12 @@
 //!   a pass never bypasses this memory budget.
 //! - Cache warming takes one turn per value and waits as long as it must,
 //!   so a processing pass waits for at most the values being built.
+//! - A stale forecast detail, weather view or observation aggregate a
+//!   reader finds is rebuilt in the background only on a turn free at that
+//!   moment ([`HeavyWork::try_turn`]). Readers can set off any number of
+//!   such refreshes, so none of them waits: without a free turn the reader
+//!   gets the stale value and a later reader tries again. The station list,
+//!   refreshed one at a time, waits for its turn like cache warming.
 
 use std::{
     collections::HashMap,
@@ -161,6 +167,13 @@ impl HeavyWork {
             Turns::One => self.turn().await,
             Turns::Every => self.every_turn_for_request().await,
         }
+    }
+
+    /// A turn free now, or `None`: for a refresh a reader set off. Released
+    /// turns go to the work waiting longest, so this never overtakes a pass
+    /// or a request that waits for a turn.
+    pub(crate) fn try_turn(&self) -> Option<OwnedSemaphorePermit> {
+        self.admission.turns.clone().try_acquire_owned().ok()
     }
 
     /// A turn for background work that can wait, whenever one is free.
@@ -414,6 +427,7 @@ pub fn release_freed_memory_now_and_then() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::poll;
     use std::sync::atomic::AtomicU32;
 
     const KEPT_FOR: Duration = Duration::from_secs(60);
@@ -446,6 +460,25 @@ mod tests {
         assert_eq!(heavy.free_turns(), 0);
         drop(all);
         assert_eq!(heavy.free_turns(), HEAVY_TURNS as usize);
+    }
+
+    #[tokio::test]
+    async fn a_refresh_takes_only_a_free_turn_and_never_one_a_pass_waits_for() {
+        let heavy = HeavyWork::new();
+        let refresh = heavy.try_turn().expect("a free turn");
+        let request = heavy.turn().await.unwrap();
+        assert!(heavy.try_turn().is_none(), "every turn is taken");
+        let pass = heavy.patient_every_turn();
+        tokio::pin!(pass);
+        assert!(poll!(pass.as_mut()).is_pending());
+        // A turn given back goes to the waiting pass, not to a refresh.
+        drop(refresh);
+        assert!(heavy.try_turn().is_none());
+        drop(request);
+        let all = bounded(&mut pass).await.unwrap();
+        assert!(heavy.try_turn().is_none());
+        drop(all);
+        assert!(heavy.try_turn().is_some());
     }
 
     #[tokio::test]

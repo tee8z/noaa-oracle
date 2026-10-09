@@ -143,8 +143,9 @@ impl WeatherKey {
 }
 
 /// Current weather for the stations and period, from the cache or built
-/// now. A stale copy is served while it is rebuilt in the background; only
-/// builds whose queries all succeeded are cached.
+/// now. A stale copy is served, and rebuilt in the background if a heavy
+/// turn is free (see [`crate::heavy`]); a later reader retries otherwise.
+/// Only builds whose queries all succeeded are cached.
 pub(super) async fn load_weather(
     state: &Arc<AppState>,
     station_ids: &[String],
@@ -157,14 +158,19 @@ pub(super) async fn load_weather(
         Cached::Fresh(weather) => weather,
         Cached::Stale { value, refresh } => {
             if refresh {
-                let task_state = state.clone();
-                state.spawn(async move {
-                    let Some(_turn) = task_state.background_turn().await else {
-                        task_state.weather_refresh_failed(&key);
-                        return;
-                    };
-                    refresh_weather(&task_state, key).await
-                });
+                match state.heavy().try_turn() {
+                    Some(turn) => {
+                        let task_state = state.clone();
+                        state.spawn(async move {
+                            let _turn = turn;
+                            // Warming may have rebuilt it since the reader looked.
+                            if !matches!(task_state.cached_weather(&key), Cached::Fresh(_)) {
+                                refresh_weather(&task_state, key).await;
+                            }
+                        });
+                    }
+                    None => state.weather_refresh_failed(&key),
+                }
             }
             value
         }

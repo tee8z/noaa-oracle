@@ -43,9 +43,9 @@ pub(super) enum ForecastError {
 }
 
 /// The station's forecast detail, from the cache or built now. A stale
-/// copy is served while it is rebuilt in the background. Only successful
-/// builds for stations in the data are cached, so neither an error nor an
-/// arbitrary path fills the cache.
+/// copy is served, and rebuilt in the background if a heavy turn is free
+/// (see [`crate::heavy`]). Only successful builds for stations in the data
+/// are cached, so neither an error nor an arbitrary path fills the cache.
 pub(super) async fn forecast_html(
     state: &Arc<AppState>,
     station_id: &str,
@@ -56,21 +56,7 @@ pub(super) async fn forecast_html(
         Cached::Fresh(html) => return Ok(html),
         Cached::Stale { value, refresh } => {
             if refresh {
-                let (task_state, station_id) = (state.clone(), station_id.to_owned());
-                state.spawn(async move {
-                    let Some(_turn) = task_state.background_turn().await else {
-                        task_state.forecast_refresh_failed(&key);
-                        return;
-                    };
-                    let generation = task_state.data_generation();
-                    match build(&task_state, &station_id, calendar, QuerySchedule::Serial).await {
-                        Ok(html) => task_state.cache_forecast(key, html, generation),
-                        Err(error) => {
-                            error!("refreshing the forecast detail for {station_id}: {error}");
-                            task_state.forecast_refresh_failed(&key);
-                        }
-                    }
-                });
+                refresh_forecast(state, key, station_id, calendar);
             }
             return Ok(value);
         }
@@ -91,6 +77,31 @@ pub(super) async fn forecast_html(
         state.cache_forecast(key, html.clone(), generation);
     }
     Ok(html)
+}
+
+/// Rebuilds a stale detail a reader found, in the background, on a heavy
+/// turn free now; without one the next reader tries again.
+fn refresh_forecast(state: &Arc<AppState>, key: String, station_id: &str, calendar: Calendar) {
+    let Some(turn) = state.heavy().try_turn() else {
+        state.forecast_refresh_failed(&key);
+        return;
+    };
+    let (task_state, station_id) = (state.clone(), station_id.to_owned());
+    state.spawn(async move {
+        let _turn = turn;
+        // Warming may have rebuilt it since the reader looked.
+        if matches!(task_state.cached_forecast(&key), Cached::Fresh(_)) {
+            return;
+        }
+        let generation = task_state.data_generation();
+        match build(&task_state, &station_id, calendar, QuerySchedule::Serial).await {
+            Ok(html) => task_state.cache_forecast(key, html, generation),
+            Err(error) => {
+                error!("refreshing the forecast detail for {station_id}: {error}");
+                task_state.forecast_refresh_failed(&key);
+            }
+        }
+    });
 }
 
 /// A station's detail differs by calendar and changes at the reader's
