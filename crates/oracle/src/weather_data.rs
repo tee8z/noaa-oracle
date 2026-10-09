@@ -256,7 +256,7 @@ const DATABASE_LIFETIME: std::time::Duration = std::time::Duration::from_secs(24
 const QUERY_MEMORY_LIMIT: &str = "1536MB";
 const QUERY_THREADS: usize = 2;
 /// Limits of the database an eligibility history longer than the days read
-/// ahead is read in (see [`WeatherAccess::query_alone`]). Thirty days of
+/// ahead is read in (see [`WeatherAccess::query_streaming`]). Thirty days of
 /// reports through the window functions that deduplicate and screen them
 /// filled the pool queries share and gigabytes beside it (October 2026).
 /// Alone, in a smaller pool with fewer threads, the read spills to disk
@@ -1468,10 +1468,16 @@ impl WeatherAccess {
     async fn query<T: Send + 'static>(
         &self,
         sql: String,
-        decode: impl FnOnce(&[RecordBatch]) -> Result<Vec<T>, Error> + Send + 'static,
+        mut decode: impl FnMut(&[RecordBatch]) -> Result<Vec<T>, Error> + Send + 'static,
     ) -> Result<Vec<T>, Error> {
-        self.query_with_connection(sql, move |_, batches| decode(batches))
-            .await
+        self.query_streaming(sql, false, move |_, batches| {
+            let mut values = Vec::new();
+            for batch in batches {
+                values.extend(decode(std::slice::from_ref(&batch))?);
+            }
+            Ok(values)
+        })
+        .await
     }
 
     async fn query_with_connection<T: Send + 'static>(
@@ -1491,22 +1497,29 @@ impl WeatherAccess {
         .await?
     }
 
-    /// Runs `sql` as [`Self::query_with_connection`] does, but in a
-    /// database of its own with [`LONG_READ_MEMORY_LIMIT`] and
-    /// [`LONG_READ_THREADS`], closed when it ends: for reads that would
-    /// otherwise crowd every other query out of the shared pool.
-    async fn query_alone<T: Send + 'static>(
+    /// Consume and release Arrow batches as they arrive. Only decoded output
+    /// survives each iteration. An isolated database bounds long history reads.
+    /// Consume this iterator fully before another query on the connection.
+    async fn query_streaming<T: Send + 'static>(
         &self,
         sql: String,
-        decode: impl FnOnce(&Connection, &[RecordBatch]) -> Result<Vec<T>, Error> + Send + 'static,
+        isolated: bool,
+        decode: impl FnOnce(&Connection, &mut dyn Iterator<Item = RecordBatch>) -> Result<Vec<T>, Error>
+        + Send
+        + 'static,
     ) -> Result<Vec<T>, Error> {
         let slot = self.slot().await?;
+        let database = self.database.clone();
         tokio::task::spawn_blocking(move || {
             let _slot = slot;
-            let connection = open_long_read_connection()?;
+            let connection = if isolated {
+                open_long_read_connection()?
+            } else {
+                clone_query_connection(&database)?
+            };
             let mut statement = connection.prepare(&sql)?;
-            let batches: Vec<RecordBatch> = statement.query_arrow([])?.collect();
-            decode(&connection, &batches)
+            let mut batches = statement.query_arrow([])?;
+            decode(&connection, &mut batches)
         })
         .await?
     }
@@ -1701,11 +1714,8 @@ impl WeatherData for WeatherAccess {
         let query_sql = forecasts_sql(&rows, req, calendar, window, &partial)?;
         let unit = req.temperature_unit;
         let mut result = self
-            .query(query_sql, move |batches| {
-                Ok(vec![(
-                    decode_forecasts(batches, &unit)?,
-                    forecast_display_quality::decode(batches)?,
-                )])
+            .query_streaming(query_sql, false, move |_, batches| {
+                decode_forecast_stream(batches, &unit).map(|result| vec![result])
             })
             .await?;
         Ok(result.pop().unwrap_or_default())
@@ -2088,6 +2098,20 @@ fn non_negative(value: Option<f64>) -> Option<f64> {
 
 fn skipped(kind: &str, row: usize) {
     debug!("skipping {kind} row {row}: missing station or temperature");
+}
+
+fn decode_forecast_stream(
+    batches: &mut dyn Iterator<Item = RecordBatch>,
+    unit: &TemperatureUnit,
+) -> Result<(Vec<Forecast>, ForecastQuality), Error> {
+    let mut forecasts = Vec::new();
+    let mut quality = ForecastQuality::default();
+    for batch in batches {
+        let batches = std::slice::from_ref(&batch);
+        forecasts.extend(decode_forecasts(batches, unit)?);
+        quality.extend(forecast_display_quality::decode(batches)?);
+    }
+    Ok((forecasts, quality))
 }
 
 fn decode_forecasts(
@@ -4168,6 +4192,42 @@ mod tests {
     /// One period per row: station, begin, end, issue time, low, high, unit,
     /// wind speed and direction, humidity max and min, PoP, QPF, snow,
     /// snow ratio, ice.
+    #[test]
+    fn streamed_forecasts_preserve_all_batches_and_quality() {
+        let connection = Connection::open_in_memory().unwrap();
+        let sql = "SELECT 'K' || i::VARCHAR AS station_id,
+            CASE WHEN i % 2 = 0 THEN '2026-01-17' ELSE '2026-01-18' END AS date,
+            '2026-01-17T00:00:00Z' AS start_time, '2026-01-18T00:00:00Z' AS end_time,
+            30::BIGINT AS temp_low, 40::BIGINT AS temp_high,
+            5::BIGINT AS wind_speed, 90::BIGINT AS wind_direction,
+            80::BIGINT AS humidity_max, 20::BIGINT AS humidity_min,
+            'fahrenheit' AS temperature_unit_code, 30::DOUBLE AS precip_chance,
+            0.1::DOUBLE AS rain_amt, 0.0::DOUBLE AS snow_amt, 0.0::DOUBLE AS ice_amt,
+            1::BIGINT AS rejected_rows, 2::BIGINT AS unverified_rows,
+            45::DOUBLE AS raw_temp_low, 40::DOUBLE AS raw_temp_high,
+            20::DOUBLE AS raw_humidity_min, 80::DOUBLE AS raw_humidity_max,
+            NULL::VARCHAR AS min_temp_period, NULL::VARCHAR AS max_temp_period,
+            NULL::VARCHAR AS humidity_min_period, NULL::VARCHAR AS humidity_max_period
+            FROM range(10000) t(i)";
+        let mut statement = connection.prepare(sql).unwrap();
+        let batches: Vec<_> = statement.query_arrow([]).unwrap().collect();
+        assert!(batches.len() > 1);
+        let unit = TemperatureUnit::Fahrenheit;
+        let expected = decode_forecasts(&batches, &unit).unwrap();
+        let mut expected_quality = forecast_display_quality::decode(&batches).unwrap();
+        let (actual, mut quality) =
+            decode_forecast_stream(&mut batches.into_iter(), &unit).unwrap();
+        assert_eq!(actual.len(), 10000);
+        assert_same_forecasts(&expected, &actual, "streamed batches");
+        assert_eq!(quality, expected_quality);
+        assert_eq!(quality.range_issues.len(), 10000);
+        quality.retain_days("2026-01-17", "2026-01-18");
+        expected_quality.retain_days("2026-01-17", "2026-01-18");
+        assert_eq!(quality, expected_quality);
+        assert_eq!(quality.rejected_rows, 5000);
+        assert_eq!(quality.unverified_rows, 10000);
+    }
+
     fn forecast_rows(rows: &str) -> String {
         format!(
             "SELECT station_id, begin_time, end_time, generated_at,

@@ -25,6 +25,14 @@ pub struct ForecastRangeIssue {
 }
 
 impl ForecastQuality {
+    pub(super) fn extend(&mut self, other: Self) {
+        self.rejected_rows += other.rejected_rows;
+        self.unverified_rows += other.unverified_rows;
+        self.unavailable |= other.unavailable;
+        self.range_issues.extend(other.range_issues);
+        self.daily_counts.extend(other.daily_counts);
+    }
+
     pub fn unavailable() -> Self {
         Self {
             unavailable: true,

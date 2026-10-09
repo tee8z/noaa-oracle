@@ -14,8 +14,8 @@
 //!   one.
 //! - Processing passes, file preparation and the reading of eligibility
 //!   reports take every turn, so nothing heavy runs beside them. They wait
-//!   for the work already running, at most [`PASS_WAIT`], and then run
-//!   anyway: a pass is never held back for long.
+//!   for the work already running. Delays are logged every [`PASS_WAIT`];
+//!   a pass never bypasses this memory budget.
 //! - Cache warming takes one turn per value and waits as long as it must,
 //!   so a processing pass waits for at most the values being built.
 
@@ -48,8 +48,7 @@ const HEAVY_WAIT: Duration = Duration::from_secs(10);
 /// Longest a request waits for heavy work to finish. The work goes on and
 /// its value is kept.
 pub const HEAVY_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-/// Longest a pass waits for the heavy work already running before it runs
-/// beside it.
+/// Interval between warnings while a pass waits for existing heavy work.
 pub const PASS_WAIT: Duration = Duration::from_secs(120);
 /// Seconds a turned away client is asked to wait before it retries.
 pub const RETRY_AFTER_SECONDS: u64 = 5;
@@ -179,6 +178,16 @@ impl HeavyWork {
         .await
         .ok()?
         .ok()
+    }
+
+    /// Wait for exclusive background admission without losing FIFO position.
+    pub async fn patient_every_turn(&self) -> Option<OwnedSemaphorePermit> {
+        self.admission
+            .turns
+            .clone()
+            .acquire_many_owned(HEAVY_TURNS)
+            .await
+            .ok()
     }
 
     /// Turns free now.
@@ -417,6 +426,26 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), future)
             .await
             .expect("test timed out")
+    }
+
+    #[tokio::test]
+    async fn exclusive_background_work_waits_and_blocks_later_warmers() {
+        let heavy = HeavyWork::new();
+        let running = heavy.turn().await.unwrap();
+        let exclusive = heavy.patient_every_turn();
+        tokio::pin!(exclusive);
+        // Poll but retain the same future after a diagnostic interval.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut exclusive)
+                .await
+                .is_err()
+        );
+        assert!(heavy.admission.turns.clone().try_acquire_owned().is_err());
+        drop(running);
+        let all = bounded(&mut exclusive).await.unwrap();
+        assert_eq!(heavy.free_turns(), 0);
+        drop(all);
+        assert_eq!(heavy.free_turns(), HEAVY_TURNS as usize);
     }
 
     #[tokio::test]

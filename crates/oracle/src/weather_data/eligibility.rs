@@ -335,19 +335,16 @@ fn eligible(
             .is_some_and(|through| through >= now + Duration::hours(i64::from(window_hours)))
 }
 
-/// Each station's instants, with the raw epoch seconds kept for ordering.
-type StationTimes = BTreeMap<String, Vec<(OffsetDateTime, Option<i64>)>>;
-
-/// Instants of an epoch-seconds column, by station.
-fn times_by_station(
-    batches: &[RecordBatch],
-    time_column: &'static str,
-) -> Result<StationTimes, Error> {
-    let mut by_station = BTreeMap::<String, Vec<_>>::new();
+/// Decode directly into the retained timeline. No complete Arrow result or
+/// intermediate vector of timestamps remains beside the final reports.
+fn reports_by_station(
+    batches: &mut dyn Iterator<Item = RecordBatch>,
+) -> Result<BTreeMap<String, Vec<Report>>, Error> {
+    let mut reports = BTreeMap::<String, Vec<Report>>::new();
     for batch in batches {
-        let stations = strings(batch, "station_id")?;
-        let times = integers(batch, time_column)?;
-        let flags = integers(batch, "flag")?;
+        let stations = strings(&batch, "station_id")?;
+        let times = integers(&batch, "report_time")?;
+        let flags = integers(&batch, "flag")?;
         for row in 0..batch.num_rows() {
             let (Some(station_id), Some(time)) = (
                 station(stations, row),
@@ -356,13 +353,13 @@ fn times_by_station(
             ) else {
                 continue;
             };
-            by_station
-                .entry(station_id)
-                .or_default()
-                .push((time, integer(flags, row)));
+            reports.entry(station_id).or_default().push(Report {
+                time,
+                temperature: integer(flags, row) == Some(1),
+            });
         }
     }
-    Ok(by_station)
+    Ok(reports)
 }
 
 impl WeatherAccess {
@@ -488,27 +485,27 @@ impl WeatherAccess {
         });
 
         let decode = move |connection: &Connection,
-                           batches: &[RecordBatch]|
+                           batches: &mut dyn Iterator<Item = RecordBatch>|
               -> Result<Vec<Timeline>, Error> {
-            let reports: BTreeMap<String, Vec<Report>> = times_by_station(batches, "report_time")?
-                .into_iter()
-                .map(|(station_id, rows)| {
-                    let reports: Vec<Report> = rows
-                        .into_iter()
-                        .map(|(time, flag)| Report {
-                            time,
-                            temperature: flag == Some(1),
-                        })
-                        .collect();
-                    (station_id, reports)
-                })
-                .collect();
+            let reports = reports_by_station(batches)?;
+            // The reports iterator is exhausted before this secondary query.
             let mut forecasts = BTreeMap::new();
             if let Some(sql) = forecasts_sql {
                 let mut statement = connection.prepare(&sql)?;
-                let batches: Vec<RecordBatch> = statement.query_arrow([])?.collect();
-                for (station_id, times) in times_by_station(&batches, "forecast_through")? {
-                    forecasts.insert(station_id, times.into_iter().map(|(time, _)| time).max());
+                for batch in statement.query_arrow([])? {
+                    let stations = strings(&batch, "station_id")?;
+                    let times = integers(&batch, "forecast_through")?;
+                    for row in 0..batch.num_rows() {
+                        if let (Some(station_id), Some(time)) = (
+                            station(stations, row),
+                            integer(times, row).and_then(|seconds| {
+                                OffsetDateTime::from_unix_timestamp(seconds).ok()
+                            }),
+                        ) {
+                            let latest = forecasts.entry(station_id).or_insert(None);
+                            *latest = (*latest).max(Some(time));
+                        }
+                    }
                 }
             }
             Ok(vec![Timeline {
@@ -521,12 +518,10 @@ impl WeatherAccess {
         // Weeks of reports through the window functions that deduplicate
         // and screen them filled the pool queries share and more beside it.
         // A history longer than the days read ahead is read in a smaller
-        // database of its own instead (see `query_alone`).
-        let mut timelines = if days > PRECOMPUTED_DAYS {
-            self.query_alone(reports_sql, decode).await?
-        } else {
-            self.query_with_connection(reports_sql, decode).await?
-        };
+        // database of its own instead (see `query_streaming`).
+        let mut timelines = self
+            .query_streaming(reports_sql, days > PRECOMPUTED_DAYS, decode)
+            .await?;
         Ok(timelines.pop().unwrap_or_else(empty))
     }
 }
@@ -537,6 +532,27 @@ mod tests {
     use crate::weather_data::open_connection;
     use std::sync::Arc;
     use time::macros::datetime;
+
+    #[test]
+    fn streamed_reports_cross_batches_and_allow_the_next_query() {
+        let connection = Connection::open_in_memory().unwrap();
+        let mut statement = connection.prepare("SELECT 'KTEST' AS station_id, 1700000000 + i AS report_time, (i % 2)::BIGINT AS flag FROM range(10000) t(i)").unwrap();
+        let mut batches = statement.query_arrow([]).unwrap();
+        let reports = reports_by_station(&mut batches).unwrap();
+        let station = &reports["KTEST"];
+        assert_eq!(station.len(), 10000);
+        for (i, report) in station.iter().enumerate() {
+            assert_eq!(report.time.unix_timestamp(), 1700000000 + i as i64);
+            assert_eq!(report.temperature, i % 2 == 1);
+        }
+        // Eligibility uses this connection again for forecast coverage.
+        assert_eq!(
+            connection
+                .query_row("SELECT 42", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            42
+        );
+    }
 
     const NOW: OffsetDateTime = datetime!(2026-01-20 12:00 UTC);
 
