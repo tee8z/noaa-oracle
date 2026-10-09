@@ -97,6 +97,8 @@ oxc = { version = "=0.151.0", default-features = false, features = ["codegen", "
 sha2 = "0.11"
 
 [dev-dependencies]
+# Paused time for tests of waits measured in minutes.
+tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 flate2 = "1.1"
 mockall = "0.15"

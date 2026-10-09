@@ -30,6 +30,11 @@
 //! (eligible lists, discovery, window planning) found no turn or was not
 //! done in time (see [`crate::heavy`]).
 //!
+//! `oracle_pass_admission_wait_seconds` gives how long each background pass
+//! that runs alone has waited for every heavy turn: the wait under way,
+//! updated every [`crate::heavy::PASS_WAIT`], or else the last one. File
+//! preparation waits once per file and once for its folds.
+//!
 //! `oracle_nostr_published_total` and `oracle_nostr_publish_failures_total`
 //! count deliveries of announcements and attestations to Nostr relays, one
 //! per event and relay; `oracle_nostr_outbox_depth` counts those still
@@ -61,6 +66,7 @@ use crate::{
     AppState,
     database::AwaitingAttestation,
     file_access::{FileKind, ParquetFileName},
+    heavy::Pass,
 };
 
 /// How long values read from the database and the weather directory are
@@ -92,6 +98,7 @@ pub struct Metrics {
     eligibility_reports: IntGauge,
     turned_away: IntCounter,
     heavy_turned_away: IntCounter,
+    pass_admission_wait: IntGaugeVec,
     resident_memory: IntGauge,
     cache_entries: IntGaugeVec,
     cache_bytes: IntGaugeVec,
@@ -222,6 +229,15 @@ impl Metrics {
                  or was not done within the request timeout",
             )
             .expect("valid metric"),
+            pass_admission_wait: IntGaugeVec::new(
+                Opts::new(
+                    "oracle_pass_admission_wait_seconds",
+                    "Seconds a background pass that runs alone has waited for every heavy \
+                     turn: the wait under way, updated every two minutes, or else the last one",
+                ),
+                &["pass"],
+            )
+            .expect("valid metric"),
             resident_memory: IntGauge::new(
                 "process_resident_memory_bytes",
                 "Resident memory size of the oracle process in bytes",
@@ -281,6 +297,11 @@ impl Metrics {
         for state in EVENT_STATES {
             metrics.events.with_label_values(&[state]);
         }
+        for pass in Pass::ALL {
+            metrics
+                .pass_admission_wait
+                .with_label_values(&[pass.name()]);
+        }
         let collectors: Vec<Box<dyn prometheus::core::Collector>> = vec![
             Box::new(build_info),
             Box::new(metrics.etl_runs.clone()),
@@ -302,6 +323,7 @@ impl Metrics {
             Box::new(metrics.eligibility_reports.clone()),
             Box::new(metrics.turned_away.clone()),
             Box::new(metrics.heavy_turned_away.clone()),
+            Box::new(metrics.pass_admission_wait.clone()),
             Box::new(metrics.resident_memory.clone()),
             Box::new(metrics.cache_entries.clone()),
             Box::new(metrics.cache_bytes.clone()),
@@ -359,6 +381,14 @@ impl Metrics {
     /// A request's heavy work found no turn or was not done in time.
     pub fn heavy_request_turned_away(&self) {
         self.heavy_turned_away.inc();
+    }
+
+    /// `pass` has waited `waited` for every heavy turn so far, or waited
+    /// that long before it got them.
+    pub(crate) fn set_pass_admission_wait(&self, pass: Pass, waited: Duration) {
+        self.pass_admission_wait
+            .with_label_values(&[pass.name()])
+            .set(i64::try_from(waited.as_secs()).unwrap_or(i64::MAX));
     }
 
     /// A publishing pass delivered `published` events to relays and failed
@@ -703,6 +733,7 @@ mod tests {
             "oracle_eligibility_reports",
             "oracle_weather_requests_turned_away_total",
             "oracle_heavy_requests_turned_away_total",
+            "oracle_pass_admission_wait_seconds",
             "process_resident_memory_bytes",
             "oracle_nostr_published_total",
             "oracle_nostr_publish_failures_total",
@@ -717,5 +748,6 @@ mod tests {
         )));
         assert!(text.contains("oracle_etl_runs_total{result=\"failed\"} 0"));
         assert!(text.contains("oracle_uploads_total{kind=\"forecasts\"} 0"));
+        assert!(text.contains("oracle_pass_admission_wait_seconds{pass=\"file_preparation\"} 0"));
     }
 }

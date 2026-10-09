@@ -14,7 +14,8 @@ use crate::{
     database::Database,
     file_access::{FileAccess, FileData, S3FileAccess},
     heavy::{
-        self, Admission, HEAVY_REQUEST_TIMEOUT, HeavyWork, Kept, PASS_WAIT, release_freed_memory,
+        self, Admission, HEAVY_REQUEST_TIMEOUT, HeavyWork, Kept, PASS_WAIT, Pass,
+        release_freed_memory,
     },
     metrics::{self, Metrics},
     oracle::{Oracle, system_clock},
@@ -54,6 +55,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
+use futures::FutureExt;
 use log::{error, info, warn};
 use std::{
     net::SocketAddr,
@@ -598,20 +600,28 @@ impl AppState {
 
     /// Wait for every heavy turn, preserving queue position across warnings.
     /// Shutdown cancels the wait; a delayed pass cannot bypass admission.
-    async fn pass_turns(&self, pass: &str) -> Result<OwnedSemaphorePermit, Stopping> {
+    async fn pass_turns(&self, pass: Pass) -> Result<OwnedSemaphorePermit, Stopping> {
         let turns = self.heavy.patient_every_turn();
         tokio::pin!(turns);
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
+        self.metrics.set_pass_admission_wait(pass, Duration::ZERO);
         let turns = loop {
             tokio::select! {
                 biased;
                 () = self.background.stopping.cancelled() => return Err(Stopping),
                 turns = &mut turns => break turns.ok_or(Stopping)?,
-                () = tokio::time::sleep(PASS_WAIT) => warn!(
-                    "{pass}: waiting {}s for exclusive heavy-work admission", started.elapsed().as_secs()
-                ),
+                () = tokio::time::sleep(PASS_WAIT) => {
+                    self.metrics.set_pass_admission_wait(pass, started.elapsed());
+                    warn!(
+                        "{}: waiting {}s for exclusive heavy-work admission",
+                        pass.name(),
+                        started.elapsed().as_secs()
+                    );
+                }
             }
         };
+        self.metrics
+            .set_pass_admission_wait(pass, started.elapsed());
         release_freed_memory();
         Ok(turns)
     }
@@ -959,32 +969,26 @@ impl AppState {
         let state = self.clone();
         self.background.tasks.spawn(async move {
             let _permit = permit;
-            match state
-                .database
-                .take_lease(ETL_LEASE, &state.instance, ETL_LEASE_TTL)
-                .await
-            {
-                Ok(true) => state.metrics.set_etl_lease_held(true),
-                Ok(false) => {
-                    state.metrics.set_etl_lease_held(false);
-                    info!("another oracle process runs processing; skipped {etl_process_id}");
-                    return;
-                }
-                Err(e) => {
-                    state.metrics.etl_failed();
-                    warn!("cannot take the processing lease; skipped {etl_process_id}: {e}");
-                    return;
-                }
+            if !state.etl_lease(etl_process_id).await {
+                return;
             }
             // Attestation runs alone: heavy requests, file preparation and
             // the reading of eligibility reports wait for it (see `heavy`).
-            let Ok(_turns) = state.pass_turns("processing").await else {
+            let Ok(_turns) = state.pass_turns(Pass::Processing).await else {
                 info!("shutting down; skipped processing {etl_process_id}");
                 return;
             };
+            // That wait has no limit, so the lease may have expired and
+            // passed to another process meanwhile.
+            if !state.etl_lease(etl_process_id).await {
+                return;
+            }
             let latest = metrics::latest_files(&state.weather_dir).await;
             state.oracle.set_latest_collection(latest.observation);
             info!("starting etl process: {}", etl_process_id);
+            // Shutdown stops the pass between events, and so does losing the
+            // lease: two processes never process at once.
+            let pass = state.background.stopping.child_token();
             // Keep the lease for as long as the pass runs.
             let renewal = async {
                 loop {
@@ -997,17 +1001,23 @@ impl AppState {
                         Ok(true) => state.metrics.set_etl_lease_held(true),
                         Ok(false) => {
                             state.metrics.set_etl_lease_held(false);
-                            warn!("another oracle process took the processing lease");
+                            warn!(
+                                "another oracle process took the processing lease; \
+                                 stopping etl process {etl_process_id}"
+                            );
+                            pass.cancel();
+                            return;
                         }
                         Err(e) => warn!("cannot renew the processing lease: {e}"),
                     }
                 }
             };
+            let etl = state.oracle.etl_data_until(etl_process_id, &pass);
+            tokio::pin!(etl);
+            // A pass that lost its lease finishes the event it is on.
             let result = tokio::select! {
-                result = state
-                    .oracle
-                    .etl_data_until(etl_process_id, &state.background.stopping) => result,
-                () = renewal => unreachable!("lease renewal never ends"),
+                result = &mut etl => result,
+                () = renewal => etl.await,
             };
             match result {
                 Ok(summary) => {
@@ -1032,6 +1042,31 @@ impl AppState {
             }
         });
         Ok(etl_process_id)
+    }
+
+    /// Takes or renews the processing lease for pass `etl_process_id`. False,
+    /// and logged, while another process holds it or when it cannot be taken.
+    async fn etl_lease(&self, etl_process_id: u64) -> bool {
+        match self
+            .database
+            .take_lease(ETL_LEASE, &self.instance, ETL_LEASE_TTL)
+            .await
+        {
+            Ok(true) => {
+                self.metrics.set_etl_lease_held(true);
+                true
+            }
+            Ok(false) => {
+                self.metrics.set_etl_lease_held(false);
+                info!("another oracle process runs processing; skipped {etl_process_id}");
+                false
+            }
+            Err(e) => {
+                self.metrics.etl_failed();
+                warn!("cannot take the processing lease; skipped {etl_process_id}: {e}");
+                false
+            }
+        }
     }
 
     /// Waits until the running ETL pass, if any, has finished.
@@ -1608,16 +1643,21 @@ impl Drop for ApplicationRuntime {
 fn spawn_file_preparation(state: &Arc<AppState>) {
     let state = state.clone();
     let stopping = state.background.stopping.clone();
+    // A copy, or the folds, takes a gigabyte or more: never beside a
+    // processing pass or other heavy work (see `heavy`). Each takes every
+    // turn anew, so a pass waiting behind preparation runs after the step
+    // under way.
+    let turns = {
+        let state = state.clone();
+        move || {
+            let state = state.clone();
+            async move { state.pass_turns(Pass::FilePreparation).await.ok() }.boxed()
+        }
+    };
     state.background.tasks.clone().spawn(async move {
         loop {
-            // Copies and folds take a gigabyte or more: never beside a
-            // processing pass or other heavy work (see `heavy`).
-            let Ok(turns) = state.pass_turns("file preparation").await else {
-                break;
-            };
             let started = std::time::Instant::now();
-            let result = state.weather_db.prepare_files(&stopping).await;
-            drop(turns);
+            let result = state.weather_db.prepare_files(&stopping, &turns).await;
             match &result {
                 Ok(0) => {}
                 Ok(made) => {
@@ -1701,7 +1741,7 @@ fn spawn_cache_warmer(state: &Arc<AppState>) {
 /// returns what the queries freed.
 async fn warm_everything(state: &Arc<AppState>) {
     {
-        let Ok(_turns) = state.pass_turns("eligibility").await else {
+        let Ok(_turns) = state.pass_turns(Pass::Eligibility).await else {
             return;
         };
         state.refresh_eligibility().await;

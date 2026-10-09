@@ -22,6 +22,7 @@ use duckdb::{
     Connection, Statement,
     arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray},
 };
+use futures::future::BoxFuture;
 use log::debug;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -30,7 +31,7 @@ use std::{
     time::Instant,
 };
 use time::{Duration, OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use utoipa::ToSchema;
 
@@ -443,6 +444,12 @@ pub struct ForecastAssessment {
     pub native_intervals: Vec<ForecastNativeInterval>,
 }
 
+/// Waits for the turns one step of [`WeatherData::prepare_files`] runs on:
+/// a copy, or the folds. A step holds them only while it runs, so work
+/// waiting for them gets them between steps. `None` stops the preparation.
+pub type PreparationTurns =
+    dyn Fn() -> BoxFuture<'static, Option<OwnedSemaphorePermit>> + Send + Sync;
+
 #[async_trait]
 pub trait WeatherData: Sync + Send {
     fn eligibility_cache_bytes(&self) -> usize {
@@ -589,10 +596,15 @@ pub trait WeatherData: Sync + Send {
     }
 
     /// Makes query-ready copies of recent forecast files that lack one and
-    /// drops old copies, stopping early when `stopping` is cancelled.
-    /// Returns how many copies were made.
-    async fn prepare_files(&self, stopping: &CancellationToken) -> Result<usize, Error> {
-        let _ = stopping;
+    /// drops old copies, stopping early when `stopping` is cancelled. Each
+    /// copy, and the folds, runs on turns from `turns`. Returns how many
+    /// copies were made.
+    async fn prepare_files(
+        &self,
+        stopping: &CancellationToken,
+        turns: &PreparationTurns,
+    ) -> Result<usize, Error> {
+        let _ = (stopping, turns);
         Ok(0)
     }
 }
@@ -2003,7 +2015,11 @@ impl WeatherData for WeatherAccess {
         self.read_ahead_reports(now).await
     }
 
-    async fn prepare_files(&self, stopping: &CancellationToken) -> Result<usize, Error> {
+    async fn prepare_files(
+        &self,
+        stopping: &CancellationToken,
+        turns: &PreparationTurns,
+    ) -> Result<usize, Error> {
         let Some(derived) = &self.derived else {
             return Ok(0);
         };
@@ -2033,6 +2049,9 @@ impl WeatherData for WeatherAccess {
             if stopping.is_cancelled() {
                 break;
             }
+            let Some(_turns) = turns().await else {
+                break;
+            };
             let slot = self.slot().await?;
             let source = self.file_access.build_file_path(&file);
             let derived = derived.clone();
@@ -2045,6 +2064,11 @@ impl WeatherData for WeatherAccess {
                 made += 1;
             }
         }
+        // Folding reads every copy; it and the pruning of old copies run on
+        // turns of their own.
+        let Some(_turns) = turns().await else {
+            return Ok(made);
+        };
         if let Some(folds) = &self.folds
             && !stopping.is_cancelled()
         {
@@ -5276,8 +5300,16 @@ mod tests {
             &Path::new(&directory).join("derived"),
         );
         let started = std::time::Instant::now();
+        // Nothing else runs here, so every step gets a turn at once.
+        let turns = Arc::new(Semaphore::new(1));
         prepared
-            .prepare_files(&CancellationToken::new())
+            .prepare_files(
+                &CancellationToken::new(),
+                &move || -> BoxFuture<'static, Option<OwnedSemaphorePermit>> {
+                    let turns = turns.clone();
+                    Box::pin(async move { turns.acquire_owned().await.ok() })
+                },
+            )
             .await
             .unwrap();
         println!(

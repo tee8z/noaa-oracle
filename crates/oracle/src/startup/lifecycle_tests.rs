@@ -289,24 +289,37 @@ async fn etl_runs_one_at_a_time_and_not_during_shutdown() {
     assert_eq!(state.start_etl(), Err(EtlRejected::ShuttingDown));
 }
 
-/// Weather data whose first preparation pass waits until `finish_first` is
-/// notified, then fails if `first_fails`; later passes succeed at once.
-/// Counts forecast queries.
+/// Weather data whose first preparation pass copies `files` files, each on
+/// the turns it is given and once `release` hands it a permit, then fails if
+/// `first_fails`; later passes succeed at once. Counts copies and forecast
+/// queries.
 struct HeldPreparation {
-    finish_first: Notify,
+    release: Semaphore,
+    files: usize,
     first_fails: bool,
     passes: AtomicUsize,
+    copied: AtomicUsize,
     forecast_queries: AtomicUsize,
 }
 
 impl HeldPreparation {
     fn new(first_fails: bool) -> Arc<Self> {
+        Self::copying(1, first_fails)
+    }
+
+    fn copying(files: usize, first_fails: bool) -> Arc<Self> {
         Arc::new(Self {
-            finish_first: Notify::new(),
+            release: Semaphore::new(0),
+            files,
             first_fails,
             passes: AtomicUsize::new(0),
+            copied: AtomicUsize::new(0),
             forecast_queries: AtomicUsize::new(0),
         })
+    }
+
+    fn copied(&self) -> usize {
+        self.copied.load(Ordering::SeqCst)
     }
 
     fn forecast_queries(&self) -> usize {
@@ -341,15 +354,25 @@ impl WeatherData for HeldPreparation {
     async fn stations(&self) -> Result<Vec<Station>, weather_data::Error> {
         Ok(vec![])
     }
-    async fn prepare_files(&self, _: &CancellationToken) -> Result<usize, weather_data::Error> {
+    async fn prepare_files(
+        &self,
+        _: &CancellationToken,
+        turns: &weather_data::PreparationTurns,
+    ) -> Result<usize, weather_data::Error> {
         if self.passes.fetch_add(1, Ordering::SeqCst) > 0 {
             return Ok(0);
         }
-        self.finish_first.notified().await;
+        for _ in 0..self.files {
+            let Some(_turns) = turns().await else {
+                return Ok(self.copied());
+            };
+            self.release.acquire().await.unwrap().forget();
+            self.copied.fetch_add(1, Ordering::SeqCst);
+        }
         if self.first_fails {
             Err(weather_data::Error::Io(std::io::Error::other("disk full")))
         } else {
-            Ok(1)
+            Ok(self.files)
         }
     }
 }
@@ -389,7 +412,7 @@ async fn the_cache_warmer_and_readiness_wait_for_the_first_preparation() {
     assert_eq!(status(&router, "/health").await, StatusCode::OK);
     assert_eq!(status(&router, "/healthy").await, StatusCode::OK);
 
-    weather.finish_first.notify_one();
+    weather.release.add_permits(1);
     wait_until(async || status(&router, "/ready").await == StatusCode::OK).await;
     wait_until(async || weather.forecast_queries() > 0).await;
 
@@ -412,7 +435,7 @@ async fn a_failed_first_preparation_warms_the_cache_but_is_not_ready() {
     spawn_file_preparation(&state);
     spawn_cache_warmer(&state);
 
-    weather.finish_first.notify_one();
+    weather.release.add_permits(1);
     // Queries still answer from the published files, so the warmer runs.
     wait_until(async || weather.forecast_queries() > 0).await;
     assert_eq!(
@@ -701,6 +724,158 @@ async fn a_processing_pass_waits_for_heavy_work_already_running() {
     weather.release.notify_one();
     assert_eq!(bounded(request).await.unwrap(), StatusCode::OK);
     bounded(state.wait_for_etl()).await;
+    assert_eq!(state.heavy().free_turns(), heavy::HEAVY_TURNS as usize);
+
+    runtime.requested.cancel();
+    bounded(runtime.run_until_stop()).await.unwrap();
+}
+
+const COMPLETED_PASSES: &str = "oracle_etl_runs_total{result=\"completed\"}";
+const LEASE_HELD: &str = "oracle_etl_lease_held";
+
+/// The value of `series` in the metrics, if it is there.
+fn metric(state: &AppState, series: &str) -> Option<i64> {
+    state
+        .metrics()
+        .encode()
+        .lines()
+        .find_map(|line| line.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
+}
+
+/// Lets the other tasks run until `condition` holds. Never sleeps, so time
+/// may be paused.
+async fn until(mut condition: impl FnMut() -> bool) {
+    bounded(async {
+        while !condition() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+}
+
+/// However long the heavy work already running lasts, a processing pass
+/// waits for it: past every warning it holds only the turn it gathered, and
+/// shutdown ends the wait with that turn given back and nothing processed.
+#[tokio::test]
+async fn a_processing_pass_waits_out_long_heavy_work_until_shutdown() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, database) = runtime(directory.path()).await;
+    let weather: Arc<dyn WeatherData> = Arc::new(WeatherAccess::new(Arc::new(NoFiles)));
+    let state = app_state(directory.path(), &runtime, database, weather).await;
+    let running = state.heavy().turn().await.unwrap();
+
+    state.start_etl().unwrap();
+    // The pass took the lease and gathered the free turn.
+    until(|| state.heavy().free_turns() == 0).await;
+
+    // Nothing but the pass waits on the clock now, so minutes can pass
+    // without sleeping.
+    tokio::time::pause();
+    tokio::time::advance(3 * PASS_WAIT).await;
+    let waited = "oracle_pass_admission_wait_seconds{pass=\"processing\"}";
+    let three_warnings = i64::try_from(3 * PASS_WAIT.as_secs()).unwrap();
+    until(|| metric(&state, waited).is_some_and(|seconds| seconds >= three_warnings)).await;
+    assert_eq!(
+        metric(&state, COMPLETED_PASSES),
+        Some(0),
+        "the pass must not run beside heavy work"
+    );
+    assert_eq!(state.heavy().free_turns(), 0);
+    assert_eq!(
+        state.etl_slot.available_permits(),
+        0,
+        "the pass still waits"
+    );
+
+    runtime.background.stopping.cancel();
+    bounded(state.wait_for_etl()).await;
+    assert_eq!(metric(&state, COMPLETED_PASSES), Some(0));
+    assert_eq!(
+        state.heavy().free_turns(),
+        heavy::HEAVY_TURNS as usize - 1,
+        "the turn the pass gathered is given back"
+    );
+
+    drop(running);
+    tokio::time::resume();
+    runtime.requested.cancel();
+    bounded(runtime.run_until_stop()).await.unwrap();
+}
+
+/// File preparation gives its turns back between files, so a processing
+/// pass that queued behind it runs once the copy under way ends, not after
+/// the last one.
+#[tokio::test]
+async fn a_processing_pass_runs_between_the_copies_of_file_preparation() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, database) = runtime(directory.path()).await;
+    let weather = HeldPreparation::copying(3, false);
+    let state = app_state(directory.path(), &runtime, database, weather.clone()).await;
+    spawn_file_preparation(&state);
+    // The first copy runs alone.
+    until(|| state.heavy().free_turns() == 0).await;
+
+    state.start_etl().unwrap();
+    // The pass took the lease and waits behind the copy.
+    until(|| metric(&state, LEASE_HELD) == Some(1)).await;
+    assert_eq!(metric(&state, COMPLETED_PASSES), Some(0));
+
+    weather.release.add_permits(1);
+    bounded(state.wait_for_etl()).await;
+    assert_eq!(metric(&state, COMPLETED_PASSES), Some(1));
+    assert_eq!(weather.copied(), 1, "the pass runs before the next copy");
+    // Preparation goes on with the next copy, alone again.
+    until(|| state.heavy().free_turns() == 0).await;
+
+    weather.release.add_permits(2);
+    until(|| state.files_prepared()).await;
+    assert_eq!(weather.copied(), 3);
+    assert_eq!(state.heavy().free_turns(), heavy::HEAVY_TURNS as usize);
+
+    runtime.requested.cancel();
+    bounded(runtime.run_until_stop()).await.unwrap();
+}
+
+/// A pass that waited for its turns while its lease passed to another
+/// process does not run once it has them: two processes never process at
+/// once.
+#[tokio::test]
+async fn a_pass_whose_lease_passed_to_another_process_while_it_waited_does_not_run() {
+    let directory = tempfile::tempdir().unwrap();
+    let (runtime, database) = runtime(directory.path()).await;
+    let weather: Arc<dyn WeatherData> = Arc::new(WeatherAccess::new(Arc::new(NoFiles)));
+    let state = app_state(directory.path(), &runtime, database.clone(), weather).await;
+    let running = state.heavy().patient_every_turn().await.unwrap();
+
+    state.start_etl().unwrap();
+    until(|| metric(&state, LEASE_HELD) == Some(1)).await;
+    // The lease runs out while the pass waits, and another process takes it.
+    database
+        .release_lease(ETL_LEASE, &state.instance)
+        .await
+        .unwrap();
+    assert!(
+        database
+            .take_lease(ETL_LEASE, "oracle-peer", ETL_LEASE_TTL)
+            .await
+            .unwrap()
+    );
+
+    drop(running);
+    bounded(state.wait_for_etl()).await;
+    assert_eq!(
+        metric(&state, COMPLETED_PASSES),
+        Some(0),
+        "the pass must not run"
+    );
+    assert_eq!(metric(&state, LEASE_HELD), Some(0));
+    assert!(
+        !database
+            .take_lease(ETL_LEASE, &state.instance, ETL_LEASE_TTL)
+            .await
+            .unwrap(),
+        "the other process keeps the lease"
+    );
     assert_eq!(state.heavy().free_turns(), heavy::HEAVY_TURNS as usize);
 
     runtime.requested.cancel();

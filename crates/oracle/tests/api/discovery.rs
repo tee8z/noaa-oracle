@@ -232,10 +232,7 @@ async fn new_questions_are_turned_away_while_heavy_work_is_busy() {
     let kept: Value = app.get_json(&url).await;
 
     let heavy = app.state.heavy().clone();
-    let pass = heavy
-        .every_turn(std::time::Duration::ZERO)
-        .await
-        .expect("every turn");
+    let pass = heavy.patient_every_turn().await.expect("every turn");
     let waiting: Vec<_> = (0..4)
         .map(|_| {
             let heavy = heavy.clone();

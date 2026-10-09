@@ -16,12 +16,15 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
+use futures::FutureExt;
 use oracle::{
     file_access::FileAccess,
+    heavy::HeavyWork,
     weather_data::{WeatherAccess, WeatherData},
 };
 use std::{sync::Arc, time::Instant};
 use time::{Duration, OffsetDateTime, Time, UtcOffset, format_description::well_known::Rfc3339};
+use tokio_util::sync::CancellationToken;
 
 pub(super) const AIRPORTS: &str = "KATL,KLAX,KORD,KDFW,KDEN,KJFK,KSFO,KSEA,KLAS,KMCO,KEWR,KMIA,KPHX,KIAH,\
         KBOS,KMSP,KFLL,KDTW,KPHL,KLGA,KBWI,KSLC,KDCA,KSAN,KTPA,KPDX,KSTL,KHNL,KBNA,KAUS,KMCI,\
@@ -42,6 +45,19 @@ fn at(time: OffsetDateTime) -> String {
     time.to_offset(UtcOffset::UTC).format(&Rfc3339).unwrap()
 }
 
+/// Makes copies and folds as the running oracle does, here with no other
+/// heavy work to wait for. Returns how many copies were made.
+async fn prepare(weather: &WeatherAccess) -> usize {
+    let heavy = Arc::new(HeavyWork::new());
+    weather
+        .prepare_files(&CancellationToken::new(), &move || {
+            let heavy = heavy.clone();
+            async move { heavy.patient_every_turn().await }.boxed()
+        })
+        .await
+        .unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs ORACLE_PERF_DATA"]
 async fn page_timings_on_real_data() {
@@ -52,10 +68,7 @@ async fn page_timings_on_real_data() {
         &std::path::Path::new(&directory).join("derived"),
     ));
     let preparing = Instant::now();
-    let copied = weather
-        .prepare_files(&tokio_util::sync::CancellationToken::new())
-        .await
-        .unwrap();
+    let copied = prepare(&weather).await;
     println!(
         "copies made: {copied}; copies and folds ready in {:.1}s",
         preparing.elapsed().as_secs_f64()
@@ -266,10 +279,7 @@ async fn weather_fragment_breakdown() {
         Arc::new(FileAccess::new(directory.clone())),
         &std::path::Path::new(&directory).join("derived"),
     ));
-    weather
-        .prepare_files(&tokio_util::sync::CancellationToken::new())
-        .await
-        .unwrap();
+    prepare(&weather).await;
     let ids: Vec<String> = AIRPORTS.split(',').map(str::to_string).collect();
     let now = OffsetDateTime::now_utc();
     for calendar in [
