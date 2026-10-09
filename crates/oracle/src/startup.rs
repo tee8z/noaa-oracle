@@ -596,22 +596,22 @@ impl AppState {
         }
     }
 
-    /// Every heavy turn, for `pass`, which should run alone: once the heavy
-    /// work already running ends, but after [`PASS_WAIT`] the pass runs
-    /// beside it (`Ok(None)`). Memory that work freed is returned first.
-    /// `Err` once shutdown has begun: the pass should not start.
-    async fn pass_turns(&self, pass: &str) -> Result<Option<OwnedSemaphorePermit>, Stopping> {
-        let turns = tokio::select! {
-            biased;
-            () = self.background.stopping.cancelled() => return Err(Stopping),
-            turns = self.heavy.every_turn(PASS_WAIT) => turns,
+    /// Wait for every heavy turn, preserving queue position across warnings.
+    /// Shutdown cancels the wait; a delayed pass cannot bypass admission.
+    async fn pass_turns(&self, pass: &str) -> Result<OwnedSemaphorePermit, Stopping> {
+        let turns = self.heavy.patient_every_turn();
+        tokio::pin!(turns);
+        let started = std::time::Instant::now();
+        let turns = loop {
+            tokio::select! {
+                biased;
+                () = self.background.stopping.cancelled() => return Err(Stopping),
+                turns = &mut turns => break turns.ok_or(Stopping)?,
+                () = tokio::time::sleep(PASS_WAIT) => warn!(
+                    "{pass}: waiting {}s for exclusive heavy-work admission", started.elapsed().as_secs()
+                ),
+            }
         };
-        if turns.is_none() {
-            warn!(
-                "{pass}: heavy work still running after {}s; running beside it",
-                PASS_WAIT.as_secs()
-            );
-        }
         release_freed_memory();
         Ok(turns)
     }
