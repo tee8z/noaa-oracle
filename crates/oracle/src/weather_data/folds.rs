@@ -325,7 +325,15 @@ impl Folds {
         }
         sources.sort_by(|a, b| a.name.cmp(&b.name));
 
-        let mut inputs = added_paths;
+        // Quarters were built first by fold_all. On a cold start, reduce the
+        // full day from those winners instead of retaining every hourly row
+        // again in the ordered aggregate. Its maximum is associative under
+        // DEDUPE_ORDER; only an exact set of source files can stand in here.
+        let mut inputs = if current.is_none() && span.quarter.is_none() {
+            self.initial_day_inputs(&copies)
+        } else {
+            added_paths
+        };
         if let Some(manifest) = &current {
             inputs.push(
                 self.root
@@ -374,6 +382,37 @@ impl Folds {
                 .and_then(|file| file.set_modified(SystemTime::now()));
         }
         Ok(true)
+    }
+
+    fn initial_day_inputs(&self, copies: &[(String, String)]) -> Vec<String> {
+        let mut quarters = BTreeMap::<Span, Vec<(&str, &str)>>::new();
+        let mut inputs = vec![];
+        for (name, path) in copies {
+            match ParquetFileName::parse(name) {
+                Ok(file) => quarters
+                    .entry(Span::quarter(&file))
+                    .or_default()
+                    .push((name, path)),
+                Err(_) => inputs.push(path.clone()),
+            }
+        }
+        for (quarter, copies) in quarters {
+            let names: HashSet<_> = copies.iter().map(|(name, _)| *name).collect();
+            let prepared = self.manifest(quarter).filter(|manifest| {
+                let covered: HashSet<_> = manifest
+                    .sources
+                    .iter()
+                    .map(|source| source.name.as_str())
+                    .collect();
+                covered == names
+            });
+            if let Some(manifest) = prepared {
+                inputs.push(self.root.join(manifest.file).to_string_lossy().into_owned());
+            } else {
+                inputs.extend(copies.into_iter().map(|(_, path)| path.to_owned()));
+            }
+        }
+        inputs
     }
 
     /// Deletes folds of days before `oldest`, idle folds of other versions,
@@ -524,4 +563,69 @@ fn fold_rows(connection: &Connection, inputs: &[String], scratch: &Path) -> Resu
             .replace('\'', "''")
     ))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_cold_day_uses_quarter_winners_only_for_the_exact_source_set() {
+        let directory = tempfile::tempdir().unwrap();
+        let folds = Folds::new(directory.path());
+        fs::create_dir_all(&folds.root).unwrap();
+        let first = "forecasts_2026-10-08T00:00:00Z.parquet";
+        let second = "forecasts_2026-10-08T01:00:00Z.parquet";
+        let later = "forecasts_2026-10-08T06:00:00Z.parquet";
+        let copies = vec![
+            (first.into(), "/copies/a".into()),
+            (second.into(), "/copies/b".into()),
+            (later.into(), "/copies/c".into()),
+        ];
+        let quarter = Span::quarter(&ParquetFileName::parse(first).unwrap());
+        let file = "2026-10-08T00-test.parquet";
+        let path = folds.root.join(file);
+        // Selection checks publication completeness; SQL equivalence is covered
+        // by forecasts_match_the_previous_query_from_files_copies_and_folds.
+        fs::write(&path, b"").unwrap();
+        let publish = |names: &[&str]| {
+            let manifest = Manifest {
+                file: file.into(),
+                sources: names
+                    .iter()
+                    .map(|name| Source {
+                        name: (*name).into(),
+                        first_issue: None,
+                        last_issue: None,
+                    })
+                    .collect(),
+            };
+            fs::write(
+                folds.manifest_path(quarter),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+        };
+        publish(&[first, second]);
+        assert_eq!(
+            folds.initial_day_inputs(&copies),
+            vec![path.to_string_lossy().into_owned(), "/copies/c".into()]
+        );
+        for names in [
+            vec![first],
+            vec![first, second, "forecasts_2026-10-08T02:00:00Z.parquet"],
+        ] {
+            publish(&names);
+            assert_eq!(
+                folds.initial_day_inputs(&copies),
+                vec!["/copies/a", "/copies/b", "/copies/c"]
+            );
+        }
+        publish(&[first, second]);
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            folds.initial_day_inputs(&copies),
+            vec!["/copies/a", "/copies/b", "/copies/c"]
+        );
+    }
 }
