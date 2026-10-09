@@ -353,10 +353,7 @@ async fn warming_memory_on_real_data() {
         Arc::new(FileAccess::new(directory.clone())),
         &std::path::Path::new(&directory).join("derived"),
     ));
-    weather
-        .prepare_files(&tokio_util::sync::CancellationToken::new())
-        .await
-        .unwrap();
+    prepare(&weather).await;
     if std::env::var_os("ORACLE_PERF_PREPARE_ONLY").is_some() {
         return;
     }
