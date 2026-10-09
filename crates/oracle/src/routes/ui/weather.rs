@@ -1,3 +1,4 @@
+use super::QuerySchedule;
 use std::{collections::HashMap, sync::Arc};
 
 use time::{Date, Duration, OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
@@ -157,13 +158,27 @@ pub(super) async fn load_weather(
         Cached::Stale { value, refresh } => {
             if refresh {
                 let task_state = state.clone();
-                state.spawn(async move { refresh_weather(&task_state, key).await });
+                state.spawn(async move {
+                    let Some(_turn) = task_state.background_turn().await else {
+                        task_state.weather_refresh_failed(&key);
+                        return;
+                    };
+                    refresh_weather(&task_state, key).await
+                });
             }
             value
         }
         Cached::Missing => {
             let generation = state.data_generation();
-            let (weather, complete) = build_weather(state, station_ids, start, end, calendar).await;
+            let (weather, complete) = build_weather(
+                state,
+                station_ids,
+                start,
+                end,
+                calendar,
+                QuerySchedule::Parallel,
+            )
+            .await;
             let weather = Arc::new(weather);
             if complete {
                 state.cache_weather(key, weather.clone(), generation);
@@ -177,8 +192,15 @@ pub(super) async fn load_weather(
 /// leaves the cached copy.
 pub(super) async fn refresh_weather(state: &Arc<AppState>, key: WeatherKey) {
     let generation = state.data_generation();
-    let (weather, complete) =
-        build_weather(state, &key.stations, key.start, key.end, key.calendar).await;
+    let (weather, complete) = build_weather(
+        state,
+        &key.stations,
+        key.start,
+        key.end,
+        key.calendar,
+        QuerySchedule::Serial,
+    )
+    .await;
     if complete {
         state.cache_weather(key, Arc::new(weather), generation);
     } else {
@@ -196,6 +218,7 @@ async fn build_weather(
     start: Option<OffsetDateTime>,
     end: Option<OffsetDateTime>,
     calendar: Calendar,
+    schedule: QuerySchedule,
 ) -> (Vec<WeatherDisplay>, bool) {
     let now = OffsetDateTime::now_utc();
     let selected = start.is_some() || end.is_some();
@@ -248,34 +271,40 @@ async fn build_weather(
         temperature_unit: TemperatureUnit::Fahrenheit,
     };
 
-    let (observations, recent, forecasts, stations) = tokio::join!(
-        state
-            .weather_db
-            .observation_data(&request, station_ids.to_vec()),
-        async {
-            if !selected {
-                Some(
-                    state
-                        .weather_db
-                        .observation_data(&recent_request, station_ids.to_vec())
-                        .await,
-                )
-            } else {
-                None
-            }
-        },
-        async {
-            if single_day {
+    let ((observations, recent), (forecasts, stations)) = schedule
+        .join(
+            schedule.join(
                 state
                     .weather_db
-                    .calendar_forecasts(&forecast_request, station_ids.to_vec(), calendar)
-                    .await
-            } else {
-                Ok(vec![])
-            }
-        },
-        state.stations(),
-    );
+                    .observation_data(&request, station_ids.to_vec()),
+                async {
+                    if !selected {
+                        Some(
+                            state
+                                .weather_db
+                                .observation_data(&recent_request, station_ids.to_vec())
+                                .await,
+                        )
+                    } else {
+                        None
+                    }
+                },
+            ),
+            schedule.join(
+                async {
+                    if single_day {
+                        state
+                            .weather_db
+                            .calendar_forecasts(&forecast_request, station_ids.to_vec(), calendar)
+                            .await
+                    } else {
+                        Ok(vec![])
+                    }
+                },
+                state.stations(),
+            ),
+        )
+        .await;
     let mut complete = true;
     let observations = observations.unwrap_or_else(|error| {
         log::error!("failed to read observations for the weather table: {error:#}");

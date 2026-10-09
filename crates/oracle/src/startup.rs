@@ -669,7 +669,18 @@ impl AppState {
         }
         let list = self.stations.clone();
         let weather_db = self.weather_db.clone();
+        let heavy = self.heavy.clone();
+        let stopping = self.background.stopping.clone();
         self.background.tasks.spawn(async move {
+            let turn = tokio::select! {
+                biased;
+                () = stopping.cancelled() => None,
+                turn = heavy.patient_turn() => turn,
+            };
+            let Some(_turn) = turn else {
+                list.refreshing.store(false, Ordering::Release);
+                return;
+            };
             list.stale.store(false, Ordering::Release);
             match weather_db.stations().await {
                 Ok(stations) => {

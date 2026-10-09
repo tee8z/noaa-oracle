@@ -6,6 +6,7 @@
 //! A query that fails or runs too long is logged and not cached; the reader
 //! gets an error with a retry instead of an empty table.
 
+use super::QuerySchedule;
 use std::{sync::Arc, time::Duration as StdDuration};
 
 use futures::stream::{self, StreamExt};
@@ -25,9 +26,9 @@ use crate::{
 /// with a retry. htmx itself gives up after 10 s.
 const FORECAST_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 
-/// Values the cache warmer builds at once. Each runs up to three queries;
-/// readers' queries share the same slots.
-const WARM_CONCURRENCY: usize = 2;
+/// One background value and one of its queries at a time. Public cache misses
+/// retain their existing parallel path and share the query slots.
+const WARM_CONCURRENCY: usize = 1;
 
 /// Calendars the default airports' forecast details are built in ahead of
 /// time: UTC and the newest readers' time zones.
@@ -57,8 +58,12 @@ pub(super) async fn forecast_html(
             if refresh {
                 let (task_state, station_id) = (state.clone(), station_id.to_owned());
                 state.spawn(async move {
+                    let Some(_turn) = task_state.background_turn().await else {
+                        task_state.forecast_refresh_failed(&key);
+                        return;
+                    };
                     let generation = task_state.data_generation();
-                    match build(&task_state, &station_id, calendar).await {
+                    match build(&task_state, &station_id, calendar, QuerySchedule::Serial).await {
                         Ok(html) => task_state.cache_forecast(key, html, generation),
                         Err(error) => {
                             error!("refreshing the forecast detail for {station_id}: {error}");
@@ -72,11 +77,15 @@ pub(super) async fn forecast_html(
         Cached::Missing => {}
     }
     let generation = state.data_generation();
-    let built =
-        match tokio::time::timeout(FORECAST_TIMEOUT, build(state, station_id, calendar)).await {
-            Ok(built) => built.map_err(ForecastError::from),
-            Err(_) => Err(ForecastError::TimedOut),
-        };
+    let built = match tokio::time::timeout(
+        FORECAST_TIMEOUT,
+        build(state, station_id, calendar, QuerySchedule::Parallel),
+    )
+    .await
+    {
+        Ok(built) => built.map_err(ForecastError::from),
+        Err(_) => Err(ForecastError::TimedOut),
+    };
     let html = built.inspect_err(|error| error!("forecast detail for {station_id}: {error}"))?;
     if state.is_known_station(station_id).await {
         state.cache_forecast(key, html.clone(), generation);
@@ -153,7 +162,7 @@ pub async fn warm_caches(state: &Arc<AppState>) {
             let Some(_turn) = state.background_turn().await else {
                 return;
             };
-            match build(state, &station_id, calendar).await {
+            match build(state, &station_id, calendar, QuerySchedule::Serial).await {
                 Ok(html) => {
                     let key = cache_key(&station_id, calendar, OffsetDateTime::now_utc());
                     state.cache_forecast(key, html, generation)
@@ -173,14 +182,17 @@ async fn build(
     state: &Arc<AppState>,
     station_id: &str,
     calendar: Calendar,
+    schedule: QuerySchedule,
 ) -> Result<String, weather_data::Error> {
     // Forecasts and comparison observations use complete calendar days.
     let now = OffsetDateTime::now_utc();
     let today = calendar.date_of(now);
-    let (coming, past) = tokio::try_join!(
-        coming_days(state, station_id, today, calendar),
-        past_week(state, station_id, today, now, calendar),
-    )?;
+    let (coming, past) = schedule
+        .try_join(
+            coming_days(state, station_id, today, calendar),
+            past_week(state, station_id, today, now, calendar, schedule),
+        )
+        .await?;
     Ok(forecast_detail(station_id, &past, &coming, &calendar.place()).into_string())
 }
 
@@ -224,6 +236,7 @@ async fn past_week(
     today: Date,
     now: OffsetDateTime,
     calendar: Calendar,
+    schedule: QuerySchedule,
 ) -> Result<Vec<ForecastComparison>, weather_data::Error> {
     let first = today - Duration::days(7);
     let (start, end) = (
@@ -245,14 +258,16 @@ async fn past_week(
         temperature_unit: TemperatureUnit::Fahrenheit,
     };
     let stations = vec![station_id.to_string()];
-    let (forecasts, observed) = tokio::try_join!(
-        state
-            .weather_db
-            .calendar_forecasts(&forecasts, stations.clone(), calendar),
-        state
-            .weather_db
-            .calendar_daily_observations(&observations, stations, calendar)
-    )?;
+    let (forecasts, observed) = schedule
+        .try_join(
+            state
+                .weather_db
+                .calendar_forecasts(&forecasts, stations.clone(), calendar),
+            state
+                .weather_db
+                .calendar_daily_observations(&observations, stations, calendar),
+        )
+        .await?;
     let (start, today) = (first.to_string(), today.to_string());
     let mut days: Vec<_> = forecasts
         .into_iter()
