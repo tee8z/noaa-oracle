@@ -111,6 +111,7 @@ A report holds an event only when those groups overlap the groups its enabled me
 A rain gauge (`PNO`) or present-weather sensor (`PWINO`) outage therefore holds rain and snow events but not temperature or wind events.
 The affected values of a flagged report never enter any aggregate; its other values do. Rain and snow totals are left out of settlement for events that do not score them.
 Every group applies, as before per-metric tags existed, when a report has no tags (files written before the column), an unknown or empty tag, missing provenance, or fails the oracle's own screening (units, physical bounds, temperature jumps, conflicting duplicates).
+The rain-amount bound is the exception: a negative or non-finite amount, or more than 5 in in one report, rejects the `precipitation` group only. The report's temperature, dewpoint and wind still count, and only events that score rain or snow are held.
 `GET /stations/observation-quality` takes an optional `metrics` list and counts every group without one.
 
 Reports from files that predate the daemon's quality fields (no `quality_status` or `raw_text`) were never checked.
