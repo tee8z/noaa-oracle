@@ -395,6 +395,58 @@ fn sampled(
     Ok(())
 }
 
+/// Whether every station's reports sample the event window. All of them are
+/// checked, so a block names each station short of the window, not only the
+/// first by id. A station without any report is named beside them; on its own
+/// it is left, as before, to the readings check that also holds settlement.
+fn every_station_sampled(
+    by_station: &BTreeMap<String, Vec<Report>>,
+    requirement: &coverage::Requirement,
+) -> Result<(), Error> {
+    let mut short = Vec::new();
+    for (station, reports) in by_station {
+        if let Err(error) = sampled(station, reports, requirement) {
+            short.push(error);
+        }
+    }
+    if short.is_empty() {
+        return Ok(());
+    }
+    let mut silent: Vec<&String> = requirement
+        .stations
+        .iter()
+        .filter(|station| !by_station.contains_key(*station))
+        .collect();
+    silent.sort();
+    silent.dedup();
+    for station in silent {
+        if let Err(error) = sampled(station, &[], requirement) {
+            short.push(error);
+        }
+    }
+    if short.len() == 1 {
+        return Err(short.remove(0));
+    }
+    let mut stations = Vec::new();
+    let mut reasons = Vec::new();
+    for error in short {
+        match error {
+            Error::ObservationCoverage {
+                stations: named,
+                reason,
+            } => {
+                reasons.push(format!("{}: {reason}", named.join(", ")));
+                stations.extend(named);
+            }
+            error => return Err(error),
+        }
+    }
+    Err(Error::ObservationCoverage {
+        stations,
+        reason: reasons.join("; "),
+    })
+}
+
 pub(super) fn apply(
     connection: &Connection,
     files: &[String],
@@ -445,9 +497,9 @@ pub(super) fn apply(
         });
     }
     let fixed_hours = super::shef::Evidence::read(connection, files)?;
+    every_station_sampled(&by_station, requirement)?;
     let mut measured = HashMap::new();
     for (station, reports) in by_station {
-        sampled(&station, &reports, requirement)?;
         let mut value = totals(&reports, requirement.start, requirement.end);
         let phase_known =
             phase_window(&reports, requirement.start, requirement.end).is_some_and(|phase| {
@@ -774,6 +826,68 @@ mod tests {
         assert!(sampled("KJFK", &reports[..6], &short).is_ok());
         reports[3].temperature = false;
         assert!(sampled("KJFK", &reports[..6], &short).is_err());
+    }
+
+    #[test]
+    fn a_block_names_every_station_short_of_the_window() {
+        let (start, end) = window(24);
+        let requirement = coverage::Requirement {
+            start,
+            end,
+            stations: vec!["KBFM".into(), "KECP".into(), "KGZH".into(), "KEGI".into()],
+            collected_after: end,
+            groups: super::super::quality_groups(&[]),
+            metrics: vec!["temp_high".into()],
+        };
+        // KBFM misses three reports in a row, KGZH's last report is seven
+        // hours before the end, KECP reports throughout and KEGI sends nothing.
+        let by_station = BTreeMap::from([
+            ("KBFM".to_string(), hourly(24, &[600, 660, 720])),
+            ("KECP".to_string(), hourly(24, &[])),
+            ("KGZH".to_string(), hourly(18, &[])),
+        ]);
+        let Err(Error::ObservationCoverage { stations, reason }) =
+            every_station_sampled(&by_station, &requirement)
+        else {
+            panic!("stations short of the window hold settlement");
+        };
+        assert_eq!(stations, ["KBFM", "KGZH", "KEGI"]);
+        assert!(reason.starts_with("KBFM: "), "{reason}");
+        assert!(reason.contains("a 240-minute gap"), "{reason}");
+        assert!(
+            reason.contains("; KGZH: ")
+                && reason.contains("the last report is 420 minutes before the window end"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("; KEGI: ") && reason.contains("no report inside the window"),
+            "{reason}"
+        );
+        assert!(!reason.contains("KECP"), "{reason}");
+
+        // One station short of the window is blocked as before.
+        let mut pair = requirement.clone();
+        pair.stations = vec!["KBFM".into(), "KECP".into()];
+        let one = BTreeMap::from([
+            ("KBFM".to_string(), hourly(24, &[600, 660, 720])),
+            ("KECP".to_string(), hourly(24, &[])),
+        ]);
+        let Err(Error::ObservationCoverage { stations, reason }) =
+            every_station_sampled(&one, &pair)
+        else {
+            panic!("KBFM is short of the window");
+        };
+        let Err(Error::ObservationCoverage { reason: alone, .. }) =
+            sampled("KBFM", &one["KBFM"], &pair)
+        else {
+            panic!("KBFM is short of the window");
+        };
+        assert_eq!(stations, ["KBFM"]);
+        assert_eq!(reason, alone);
+
+        // A station without any report is otherwise left to the readings check.
+        let quiet = BTreeMap::from([("KECP".to_string(), hourly(24, &[]))]);
+        assert!(every_station_sampled(&quiet, &requirement).is_ok());
     }
 
     #[test]
