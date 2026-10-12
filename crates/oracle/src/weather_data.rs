@@ -158,9 +158,12 @@ const NORMALIZE_OBSERVATIONS_SQL: &str = r#"
              OR COALESCE(dewpoint_value > temperature_value + 0.5 + 1e-6, false)
              OR COALESCE(wind_speed < 0 OR wind_speed > 500, false)
              OR COALESCE(wind_direction < 0 OR wind_direction > 360, false)
-             OR COALESCE(NOT isfinite(precip_in) OR precip_in < 0 OR precip_in > 5, false)
              OR COALESCE(ABS(temperature_value - previous_temperature) >= 15
                 AND generated_at::TIMESTAMPTZ - previous_time <= INTERVAL '2 hours', false)) AS qc_screened,
+            -- An implausible rain amount rejects that amount only. The
+            -- report's temperature, dewpoint and wind stand, as they do when
+            -- the daemon flags a precipitation problem.
+            COALESCE(NOT isfinite(precip_in) OR precip_in < 0 OR precip_in > 5, false) AS qc_precip_screened,
             (quality_status IS NOT NULL AND quality_status NOT IN ('validated', 'unverified')) AS qc_source_rejected,
             (quality_status IS DISTINCT FROM 'validated'
              OR validation_version IS DISTINCT FROM 'metar-consistency-v1'
@@ -168,12 +171,13 @@ const NORMALIZE_OBSERVATIONS_SQL: &str = r#"
              OR raw_text IS NULL OR trim(raw_text) = '') AS qc_unverified
         FROM contextual
     ), assessed AS (
-        SELECT * EXCLUDE (qc_source_rejected), qc_source_rejected OR qc_screened AS qc_rejected,
+        SELECT * EXCLUDE (qc_source_rejected),
+            qc_source_rejected OR qc_screened OR qc_precip_screened AS qc_rejected,
             -- Metric groups a flagged report's problems affect. The daemon
             -- tags its own problems in quality_metrics; the oracle's
             -- screening, missing provenance, and untagged or unknown tags
-            -- affect every group.
-            CASE
+            -- affect every group. The precipitation screen adds its group.
+            list_concat(CASE
                 WHEN NOT (qc_source_rejected OR qc_screened OR qc_unverified) THEN []::VARCHAR[]
                 WHEN qc_screened OR quality_metrics IS NULL
                     OR validation_version IS DISTINCT FROM 'metar-consistency-v1'
@@ -182,12 +186,13 @@ const NORMALIZE_OBSERVATIONS_SQL: &str = r#"
                                         string_split(quality_metrics, ','))
                     THEN ['temperature', 'dewpoint', 'wind', 'precipitation', 'present_weather']
                 ELSE string_split(quality_metrics, ',')
-            END AS qc_groups
+            END, CASE WHEN qc_precip_screened THEN ['precipitation'] ELSE []::VARCHAR[] END) AS qc_groups
         FROM screened
     ), usable AS (
-        -- Values of groups a rejection or unverified check affects, or of
-        -- any screened report. Settlement treats them as missing. Legacy
-        -- reports keep values; their counts hold settlement instead.
+        -- Values of groups a rejection or unverified check affects, of any
+        -- screened report, and rain amounts the precipitation screen
+        -- rejects. Settlement treats them as missing. Legacy reports keep
+        -- values; their counts hold settlement instead.
         SELECT *,
             NOT qc_screened AND NOT (quality_status IS NOT NULL AND qc_unverified
                 AND list_contains(qc_groups, 'temperature')) AS temperature_usable,
@@ -195,7 +200,7 @@ const NORMALIZE_OBSERVATIONS_SQL: &str = r#"
                 AND list_contains(qc_groups, 'dewpoint')) AS dewpoint_usable,
             NOT qc_screened AND NOT (quality_status IS NOT NULL AND qc_unverified
                 AND list_contains(qc_groups, 'wind')) AS wind_usable,
-            NOT qc_screened AND NOT (quality_status IS NOT NULL AND qc_unverified
+            NOT qc_screened AND NOT qc_precip_screened AND NOT (quality_status IS NOT NULL AND qc_unverified
                 AND list_contains(qc_groups, 'precipitation')) AS precip_usable
         FROM assessed
     )
@@ -3247,6 +3252,220 @@ mod tests {
                 .is_ok()
         );
         assert!(settle(&present_weather, &["rain_amt"]).await.is_err());
+    }
+
+    /// KVPS's routine reports inside a landfalling tropical storm, October
+    /// 2026, which the daemon validated. Two hours exceed the 5 in screen
+    /// (`P0613`, `P0586`); the 3- and 6-hour groups (`61238`, `60826`)
+    /// agree with the hourly amounts, and the temperatures fit the
+    /// neighbouring reports. The station sent no sustained wind (`M`):
+    /// `wind` is a SQL expression giving each report one, and `status` and
+    /// `tags` give each report the daemon's verdict.
+    fn kvps_storm_dir(wind: &str, status: &str, tags: &str) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        let day = directory.path().join("2026-10-10");
+        std::fs::create_dir_all(&day).unwrap();
+        let path = day.join("observations_2026-10-10T04:00:00Z.parquet");
+        let receipt = serde_json::json!({
+            "version":"awc-history-v1", "interval":"closed", "batches":[{
+                "station_ids":["KVPS"], "window_start":"2026-10-09T21:00:00Z",
+                "window_end":"2026-10-10T03:59:59Z", "requested_at":"2026-10-10T04:00:00Z",
+                "completed_at":"2026-10-10T04:01:00Z", "status":"complete",
+                "source_url":"https://aviationweather.gov/api/data/metar?ids=KVPS&format=xml",
+                "source_sha256":"a".repeat(64),"response_status":200,"response_count":5,"report_count":5,"error":null
+            }]
+        })
+        .to_string()
+        .replace('\'', "''");
+        open_connection()
+            .unwrap()
+            .execute_batch(&format!(
+                r#"
+            COPY (
+                SELECT 'KVPS' AS station_id, generated_at,
+                    temperature_value::DOUBLE AS temperature_value, 'celsius' AS temperature_unit_code,
+                    dewpoint_value::DOUBLE AS dewpoint_value, 'celsius' AS dewpoint_unit_code,
+                    'METAR' AS metar_type, raw_text,
+                    precip_in::DOUBLE AS precip_in, 'inches' AS precip_unit_code, wx_string,
+                    ({wind})::BIGINT AS wind_speed, 'knots' AS wind_speed_unit_code,
+                    'metar-consistency-v1' AS validation_version, quality_status,
+                    CASE WHEN quality_status = 'validated' THEN NULL ELSE 'flagged' END AS quality_reason,
+                    CASE WHEN quality_status = 'validated' THEN NULL ELSE ({tags}) END::VARCHAR AS quality_metrics
+                FROM (
+                    SELECT *, ({status}) AS quality_status
+                    FROM (VALUES
+                        ('2026-10-09T22:55:00Z', 20.4, 19.0, 1.99, '+RA BR', 'METAR KVPS 092255Z AUTO M 7/8SM +RA BR VV019 20/19 A2941 RMK AO2 PK WND 04056/37 LTG DSNT SE AND SW CIG 011 RWY20 PRESFR SLP965 P0199 T02040190 RVRNO FZRANO $'),
+                        ('2026-10-09T23:55:00Z', 19.7, 18.5, 4.51, '+RA BR', 'METAR KVPS 092355Z AUTO M 3/4SM +RA BR VV012 20/19 A2938 RMK AO2 PK WND 02067/14 LTG DSNT E-W PRESRR SLP955 P0451 60826 T01970185 10228 20196 57080 RVRNO FZRANO $'),
+                        ('2026-10-10T00:55:00Z', 18.6, 17.8, 6.13, '+RA FG', 'METAR KVPS 100055Z AUTO M 1/2SM +RA FG VV009 19/18 A2925 RMK AO2 PK WND 03062/54 LTG DSNT E AND SW-NW CIG 007 RWY20 PRESFR SLP911 P0613 T01860178 RVRNO FZRANO $'),
+                        ('2026-10-10T01:55:00Z', 18.5, 17.8, 5.86, '+RA SQ BR', 'METAR KVPS 100155Z AUTO M 1 7/8SM +RA BR SQ OVC010 19/18 A2918 RMK AO2 PK WND 36071/17 VIS 1 RWY20 LTG DSNT NW RAE0055RAB10 CIG 008 RWY20 PRESFR SLP887 P0586 T01850178 FZRANO $'),
+                        ('2026-10-10T02:55:00Z', 18.6, 17.1, 0.39, '-RA SQ', 'METAR KVPS 100255Z AUTO M 10SM -RA SQ FEW016 19/17 A2935 RMK AO2 PK WND 34056/0156 PRESRR SLP945 P0039 61238 T01860171 55008 FZRANO $')
+                    ) AS reports(generated_at, temperature_value, dewpoint_value, precip_in, wx_string, raw_text)
+                )
+            ) TO '{}' (FORMAT PARQUET, KV_METADATA {{observation_coverage:'{receipt}'}})
+        "#,
+                path.display()
+            ))
+            .unwrap();
+        directory
+    }
+
+    async fn settle_kvps(
+        directory: &tempfile::TempDir,
+        metrics: &[&str],
+    ) -> Result<Vec<SettlementObservation>, Error> {
+        let metrics: Vec<String> = metrics.iter().map(|m| m.to_string()).collect();
+        access(directory)
+            .settlement_observations(
+                &kvps_storm_request(),
+                vec!["KVPS".into()],
+                time::macros::datetime!(2026-10-10 02:15 UTC),
+                &metrics,
+            )
+            .await
+    }
+
+    fn kvps_storm_request() -> ObservationRequest {
+        ObservationRequest {
+            start: Some(time::macros::datetime!(2026-10-09 23:00 UTC)),
+            end: Some(time::macros::datetime!(2026-10-10 02:00 UTC)),
+            station_ids: "KVPS".into(),
+            temperature_unit: TemperatureUnit::Celsius,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_implausible_rain_amount_rejects_only_the_rain() {
+        let directory = kvps_storm_dir("NULL", "'validated'", "NULL");
+        let weather = access(&directory);
+        let request = kvps_storm_request();
+        for (metrics, rejected) in [
+            (&["temp_high", "temp_low"][..], 0),
+            (&["wind_speed", "wind_direction"][..], 0),
+            (&["humidity"][..], 0),
+            (&["rain_amt"][..], 2),
+            (&["snow_amt"][..], 2),
+            (&[][..], 2),
+        ] {
+            let metrics: Vec<String> = metrics.iter().map(|m| m.to_string()).collect();
+            let quality = weather
+                .observation_quality(&request, vec!["KVPS".into()], &metrics)
+                .await
+                .unwrap();
+            assert_eq!(
+                (quality.rejected_reports, quality.unverified_reports),
+                (rejected, 0),
+                "{metrics:?}"
+            );
+        }
+
+        let rows = settle_kvps(&directory, &["temp_high", "temp_low", "wind_speed"])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].temp_high, Some(19.7));
+        assert_eq!(
+            rows[0].temp_low,
+            Some(18.5),
+            "the low comes from the report with 5.86 in of rain"
+        );
+        assert_eq!(rows[0].wind_speed, None, "KVPS sent no sustained wind");
+        assert_eq!(rows[0].rain_amt, None, "unscored rain is not verified");
+        let humidity = settle_kvps(&directory, &["humidity"]).await.unwrap();
+        assert!(humidity[0].humidity.is_some());
+
+        // An event scoring rain or snow is still held for review.
+        for metrics in [
+            &["rain_amt"][..],
+            &["temp_high", "rain_amt"],
+            &["snow_amt"],
+            &[],
+        ] {
+            assert!(
+                matches!(
+                    settle_kvps(&directory, metrics).await,
+                    Err(Error::DataQuality {
+                        rejected_reports: 2,
+                        unverified_reports: 0
+                    })
+                ),
+                "{metrics:?}"
+            );
+        }
+
+        // Public observations keep the reports' temperatures and leave the
+        // rejected amounts out of the rain total.
+        let observed = weather
+            .observation_data(&request, request.station_ids())
+            .await
+            .unwrap();
+        assert_eq!(observed[0].temp_low, 18.5);
+        assert_eq!(observed[0].rain_amt, Some(4.51));
+
+        // A report's wind stands beside an implausible rain amount too.
+        let windy = kvps_storm_dir(
+            "CASE WHEN precip_in > 5 THEN 34 ELSE 12 END",
+            "'validated'",
+            "NULL",
+        );
+        let rows = settle_kvps(&windy, &["temp_high", "temp_low", "wind_speed"])
+            .await
+            .unwrap();
+        assert_eq!(rows[0].wind_speed, Some(34));
+    }
+
+    #[tokio::test]
+    async fn the_daemons_groups_still_apply_beside_an_implausible_rain_amount() {
+        // The daemon also flags the temperature of the 01:55 report.
+        let directory = kvps_storm_dir(
+            "NULL",
+            "CASE WHEN generated_at = '2026-10-10T01:55:00Z' THEN 'unverified' ELSE 'validated' END",
+            "'temperature'",
+        );
+        for (metrics, rejected) in [
+            (&["temp_high", "temp_low"][..], 1),
+            (&["wind_speed"][..], 0),
+            (&["rain_amt"][..], 2),
+        ] {
+            let metrics: Vec<String> = metrics.iter().map(|m| m.to_string()).collect();
+            let quality = access(&directory)
+                .observation_quality(&kvps_storm_request(), vec!["KVPS".into()], &metrics)
+                .await
+                .unwrap();
+            assert_eq!(quality.rejected_reports, rejected, "{metrics:?}");
+        }
+        assert!(matches!(
+            settle_kvps(&directory, &["temp_high", "temp_low"]).await,
+            Err(Error::DataQuality {
+                rejected_reports: 1,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn whole_report_screens_still_hold_every_event_beside_implausible_rain() {
+        // A sustained wind over 500 kt screens the whole report.
+        let directory = kvps_storm_dir(
+            "CASE WHEN precip_in > 5 THEN 600 ELSE 12 END",
+            "'validated'",
+            "NULL",
+        );
+        for metrics in [
+            &["temp_high", "temp_low"][..],
+            &["wind_speed"],
+            &["rain_amt"],
+        ] {
+            assert!(
+                matches!(
+                    settle_kvps(&directory, metrics).await,
+                    Err(Error::DataQuality {
+                        rejected_reports: 2,
+                        unverified_reports: 0
+                    })
+                ),
+                "{metrics:?}"
+            );
+        }
     }
 
     #[tokio::test]
