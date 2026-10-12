@@ -126,7 +126,7 @@ Use the reason to select the next action.
 |---|---|
 | `incomplete_readings` | Check every named station and metric against the requested interval. |
 | `data_quality` | Inspect rejected and unverified reports whose problems affect the event's metrics before publishing a reviewed correction. |
-| `source_unavailable` | Inspect the reported coverage, forecast, file, or query failure. |
+| `source_unavailable` | Inspect the reported coverage, forecast, file, or query failure. A coverage block names every station whose reports fall short of the window, each with its own reason. |
 | `processing_failed` | Inspect the event processing log and database writer health. |
 
 The next successful processing pass uses fresh validated readings and recomputes the result.
