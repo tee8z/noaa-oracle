@@ -28,7 +28,9 @@ use crate::{
     publication::{Publication, Stage},
     scoring::{self, NotUuidV7, PickRule, Scored, ScoringRules},
     signing::{AttestError, KeyError, SigningKey},
-    sources::{ObservationWindow, OutcomeSource, PlannedBaseline, Reading, SourceError, Sources},
+    sources::{
+        LineCuts, ObservationWindow, OutcomeSource, PlannedBaseline, Reading, SourceError, Sources,
+    },
     statement::Statement,
 };
 
@@ -1031,9 +1033,33 @@ impl Oracle {
         };
         let now = self.now();
         let signing_due = signing_due(event, now);
+        let lines = self.scoring_lines(event).await?;
         let readings = if signing_due {
+            // A line its reports already decide settles through an outage
+            // settlement does not otherwise tolerate.
+            let cuts: Vec<LineCuts> = match event.scoring_rules {
+                ScoringRules::Lines => lines
+                    .iter()
+                    .map(|line| {
+                        let band = line.band();
+                        LineCuts {
+                            target: line.target.clone(),
+                            metric: line.metric.clone(),
+                            lower: band.lower,
+                            upper: band.upper,
+                        }
+                    })
+                    .collect(),
+                ScoringRules::Fixed => Vec::new(),
+            };
             let readings = source
-                .settlement_readings(window, &event.locations, event.signing_date, &event.metrics)
+                .settlement_readings_with_lines(
+                    window,
+                    &event.locations,
+                    event.signing_date,
+                    &event.metrics,
+                    &cuts,
+                )
                 .await?;
             validate_settlement_readings(event, &readings)?;
             readings
@@ -1043,7 +1069,6 @@ impl Oracle {
         // Neither stale saved readings nor progress scores can pass the strict
         // gate. Validation finishes before replacing either stored value.
         let entries = self.db.event_entries(event.id).await?;
-        let lines = self.scoring_lines(event).await?;
         if signing_due {
             validate_lines(event, &lines)?;
         }

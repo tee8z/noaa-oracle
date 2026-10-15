@@ -17,6 +17,9 @@ pub(super) struct Requirement {
     pub groups: Vec<&'static str>,
     /// The event's metrics; none means every metric.
     pub metrics: Vec<String>,
+    /// Pairs whose line their surviving reports may decide through an
+    /// outage settlement does not otherwise tolerate.
+    pub decisive: Vec<super::Decisive>,
 }
 
 #[derive(Deserialize)]
@@ -47,6 +50,20 @@ struct Batch {
 impl Requirement {
     pub fn scores(&self, metric: &str) -> bool {
         self.metrics.is_empty() || self.metrics.iter().any(|scored| scored == metric)
+    }
+
+    /// The pair `station`/`metric` decides its line with `value`, in the
+    /// pair's temperature unit after `convert`.
+    pub fn decides(
+        &self,
+        station: &str,
+        metric: &str,
+        value: impl Fn(&super::Decisive) -> Option<f64>,
+    ) -> bool {
+        self.decisive
+            .iter()
+            .find(|pair| pair.station_id == station && pair.metric == metric)
+            .is_some_and(|pair| value(pair).is_some_and(|value| pair.decides(value)))
     }
 
     pub fn unavailable(&self, reason: impl Into<String>) -> Error {

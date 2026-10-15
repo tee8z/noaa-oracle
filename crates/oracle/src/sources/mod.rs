@@ -98,6 +98,17 @@ pub struct Reading {
     pub observed: Option<f64>,
 }
 
+/// Where an event's line for one metric at one target sits on the miss
+/// `observed - baseline`: Under below `lower`, Over above `upper`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LineCuts {
+    pub target: String,
+    /// A [`Metric::id`] of the source.
+    pub metric: String,
+    pub lower: f64,
+    pub upper: f64,
+}
+
 /// The baseline an event would settle against for one metric at one target,
 /// as the source can tell before the event exists. `value` is `None` when
 /// the source has none; `reason` then says why.
@@ -185,6 +196,23 @@ pub trait OutcomeSource: Send + Sync {
         Err(SourceError::SettlementBlocked(
             "this source has no verified settlement reader".into(),
         ))
+    }
+
+    /// [`Self::settlement_readings`] for an event scored against `lines`. A
+    /// pair whose reports leave a longer outage than settlement tolerates may
+    /// still settle when the value they give already decides its line: a
+    /// maximum past the upper cut, or a minimum past the lower one, which no
+    /// missing report can move back. Sources without the check ignore `lines`.
+    async fn settlement_readings_with_lines(
+        &self,
+        window: ObservationWindow,
+        targets: &[String],
+        required_collected_after: OffsetDateTime,
+        metrics: &[String],
+        _lines: &[LineCuts],
+    ) -> Result<Vec<Reading>, SourceError> {
+        self.settlement_readings(window, targets, required_collected_after, metrics)
+            .await
     }
 
     /// The baseline each of `targets` would settle against, per metric, if
