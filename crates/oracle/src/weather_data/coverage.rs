@@ -244,6 +244,7 @@ mod tests {
             stations: vec!["KPWM".into()],
             groups: super::super::quality_groups(&[]),
             metrics: vec![],
+            decisive: vec![],
         }
     }
 

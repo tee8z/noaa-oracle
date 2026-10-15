@@ -1008,16 +1008,16 @@ mod tests {
         let mut reports = hourly(24, &[]);
         reports[10].verified = false;
         reports[10].temperature = false;
-        assert!(sampled("KJFK", &reports, &requirement).is_ok());
+        assert!(sampled("KJFK", &reports, &requirement, None).is_ok());
         reports[16].verified = false;
         reports[16].temperature = false;
-        assert!(sampled("KJFK", &reports, &requirement).is_ok());
+        assert!(sampled("KJFK", &reports, &requirement, None).is_ok());
         for report in &mut reports[15..19] {
             report.verified = false;
             report.temperature = false;
         }
         let Err(Error::ObservationCoverage { stations, reason }) =
-            sampled("KJFK", &reports, &requirement)
+            sampled("KJFK", &reports, &requirement, None)
         else {
             panic!("five hours without a usable temperature hold settlement");
         };
@@ -1030,9 +1030,9 @@ mod tests {
         );
         let mut short = requirement.clone();
         short.end = start + Duration::hours(6);
-        assert!(sampled("KJFK", &reports[..6], &short).is_ok());
+        assert!(sampled("KJFK", &reports[..6], &short, None).is_ok());
         reports[3].temperature = false;
-        assert!(sampled("KJFK", &reports[..6], &short).is_err());
+        assert!(sampled("KJFK", &reports[..6], &short, None).is_err());
     }
 
     #[test]
@@ -1055,7 +1055,7 @@ mod tests {
             ("KGZH".to_string(), hourly(18, &[])),
         ]);
         let Err(Error::ObservationCoverage { stations, reason }) =
-            every_station_sampled(&by_station, &requirement)
+            every_station_sampled(&by_station, &requirement, &HashMap::new())
         else {
             panic!("stations short of the window hold settlement");
         };
@@ -1081,12 +1081,12 @@ mod tests {
             ("KECP".to_string(), hourly(24, &[])),
         ]);
         let Err(Error::ObservationCoverage { stations, reason }) =
-            every_station_sampled(&one, &pair)
+            every_station_sampled(&one, &pair, &HashMap::new())
         else {
             panic!("KBFM is short of the window");
         };
         let Err(Error::ObservationCoverage { reason: alone, .. }) =
-            sampled("KBFM", &one["KBFM"], &pair)
+            sampled("KBFM", &one["KBFM"], &pair, None)
         else {
             panic!("KBFM is short of the window");
         };
@@ -1095,7 +1095,7 @@ mod tests {
 
         // A station without any report is otherwise left to the readings check.
         let quiet = BTreeMap::from([("KECP".to_string(), hourly(24, &[]))]);
-        assert!(every_station_sampled(&quiet, &requirement).is_ok());
+        assert!(every_station_sampled(&quiet, &requirement, &HashMap::new()).is_ok());
     }
 
     #[test]
