@@ -97,9 +97,8 @@ enum Shortfall {
     LongGap { gap: Duration, limit: Duration },
     /// Gaps over 90 minutes that together cover more than the window tolerates.
     Outages { total: Duration, limit: Duration },
-    /// The last report is more than 90 minutes before the end of a window
-    /// too short to tolerate a gap.
-    Tail(Duration),
+    /// The last report is further before the window end than it tolerates.
+    Tail { gap: Duration, limit: Duration },
 }
 
 impl std::fmt::Display for Shortfall {
@@ -124,10 +123,11 @@ impl std::fmt::Display for Shortfall {
                 total.whole_minutes(),
                 limit.whole_minutes()
             ),
-            Self::Tail(gap) => write!(
+            Self::Tail { gap, limit } => write!(
                 f,
-                "the last report is {} minutes before the window end",
-                gap.whole_minutes()
+                "the last report is {} minutes before the window end, more than the {} minutes this window tolerates",
+                gap.whole_minutes(),
+                limit.whole_minutes()
             ),
         }
     }
@@ -163,15 +163,25 @@ fn report_gaps(
         }
         if !long {
             return Err(if tail {
-                Shortfall::Tail(gap)
+                Shortfall::Tail {
+                    gap,
+                    limit: MAX_REPORT_GAP,
+                }
             } else {
                 Shortfall::Gap(gap)
             });
         }
         if gap > longest {
-            return Err(Shortfall::LongGap {
-                gap,
-                limit: longest,
+            return Err(if tail {
+                Shortfall::Tail {
+                    gap,
+                    limit: longest,
+                }
+            } else {
+                Shortfall::LongGap {
+                    gap,
+                    limit: longest,
+                }
             });
         }
         missing += gap;
@@ -874,7 +884,10 @@ mod tests {
         );
         assert_eq!(
             sampling(hourly(6, &[300]).iter(), start, end),
-            Err(Shortfall::Tail(Duration::minutes(120)))
+            Err(Shortfall::Tail {
+                gap: Duration::minutes(120),
+                limit: Duration::minutes(90)
+            })
         );
         // A sensor that stops before the end of a long window, as KMYP's
         // wind did in freezing fog on 2026-10-15, is an outage like another.
@@ -886,7 +899,7 @@ mod tests {
         );
         assert_eq!(
             sampling(hourly(24, &[1200, 1260, 1320, 1380]).iter(), start, end),
-            Err(Shortfall::LongGap {
+            Err(Shortfall::Tail {
                 gap: Duration::minutes(300),
                 limit: Duration::minutes(240)
             })
@@ -898,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn one_unverified_temperature_in_a_long_window_is_tolerated_like_a_missing_report() {
+    fn unverified_temperatures_in_a_long_window_are_tolerated_like_missing_reports() {
         let (start, end) = window(24);
         let requirement = coverage::Requirement {
             start,
@@ -914,16 +927,21 @@ mod tests {
         assert!(sampled("KJFK", &reports, &requirement).is_ok());
         reports[16].verified = false;
         reports[16].temperature = false;
+        assert!(sampled("KJFK", &reports, &requirement).is_ok());
+        for report in &mut reports[15..19] {
+            report.verified = false;
+            report.temperature = false;
+        }
         let Err(Error::ObservationCoverage { stations, reason }) =
             sampled("KJFK", &reports, &requirement)
         else {
-            panic!("a second unverified temperature leaves a second gap");
+            panic!("five hours without a usable temperature hold settlement");
         };
         assert_eq!(stations, ["KJFK"]);
         assert!(reason.contains("KJFK/temp_high"), "{reason}");
-        assert!(reason.contains("2 unverified reports left out"), "{reason}");
+        assert!(reason.contains("5 unverified reports left out"), "{reason}");
         assert!(
-            reason.contains("a second long gap of 120 minutes"),
+            reason.contains("a 300-minute gap, longer than the 240 minutes"),
             "{reason}"
         );
         let mut short = requirement.clone();
@@ -944,10 +962,10 @@ mod tests {
             groups: super::super::quality_groups(&[]),
             metrics: vec!["temp_high".into()],
         };
-        // KBFM misses three reports in a row, KGZH's last report is seven
+        // KBFM misses four reports in a row, KGZH's last report is seven
         // hours before the end, KECP reports throughout and KEGI sends nothing.
         let by_station = BTreeMap::from([
-            ("KBFM".to_string(), hourly(24, &[600, 660, 720])),
+            ("KBFM".to_string(), hourly(24, &[600, 660, 720, 780])),
             ("KECP".to_string(), hourly(24, &[])),
             ("KGZH".to_string(), hourly(18, &[])),
         ]);
@@ -958,7 +976,7 @@ mod tests {
         };
         assert_eq!(stations, ["KBFM", "KGZH", "KEGI"]);
         assert!(reason.starts_with("KBFM: "), "{reason}");
-        assert!(reason.contains("a 240-minute gap"), "{reason}");
+        assert!(reason.contains("a 300-minute gap"), "{reason}");
         assert!(
             reason.contains("; KGZH: ")
                 && reason.contains("the last report is 420 minutes before the window end"),
@@ -974,7 +992,7 @@ mod tests {
         let mut pair = requirement.clone();
         pair.stations = vec!["KBFM".into(), "KECP".into()];
         let one = BTreeMap::from([
-            ("KBFM".to_string(), hourly(24, &[600, 660, 720])),
+            ("KBFM".to_string(), hourly(24, &[600, 660, 720, 780])),
             ("KECP".to_string(), hourly(24, &[])),
         ]);
         let Err(Error::ObservationCoverage { stations, reason }) =
