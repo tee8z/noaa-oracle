@@ -309,21 +309,25 @@
             export AWS_SECRET_ACCESS_KEY=''${AWS_SECRET_ACCESS_KEY:-test}
             export AWS_DEFAULT_REGION=''${AWS_DEFAULT_REGION:-us-west-2}
 
-            echo "NOAA Oracle Development Environment"
-            echo "  System: ${system}"
-            echo "  Rust: ${rustToolchain.version}"
-            echo "  DuckDB: ${duckdbVersion} (${duckdbArch})"
-            echo ""
-            echo "Commands:"
-            echo "  just build        - Build all crates"
-            echo "  just run-oracle   - Run oracle server"
-            echo "  just run-daemon   - Run data daemon"
-            echo "  just check        - Run fmt, clippy, tests, machete"
-            echo ""
-            echo "S3/Backup tools:"
-            echo "  nix run .#moto       - Start moto S3 server"
-            echo "  nix run .#litestream - Start litestream replication"
-            echo "  nix run .#restore    - Restore from litestream backup"
+            # Keep command output machine-readable for CI tooling such as
+            # rust-cache, cargo metadata, and rustup toolchain discovery.
+            if [ -t 1 ]; then
+              echo "NOAA Oracle Development Environment"
+              echo "  System: ${system}"
+              echo "  Rust: ${rustToolchain.version}"
+              echo "  DuckDB: ${duckdbVersion} (${duckdbArch})"
+              echo ""
+              echo "Commands:"
+              echo "  just build        - Build all crates"
+              echo "  just run-oracle   - Run oracle server"
+              echo "  just run-daemon   - Run data daemon"
+              echo "  just check        - Run fmt, clippy, tests, machete"
+              echo ""
+              echo "S3/Backup tools:"
+              echo "  nix run .#moto       - Start moto S3 server"
+              echo "  nix run .#litestream - Start litestream replication"
+              echo "  nix run .#restore    - Restore from litestream backup"
+            fi
           '';
 
           DUCKDB_LIB_DIR = "${duckdb-lib}/lib";
