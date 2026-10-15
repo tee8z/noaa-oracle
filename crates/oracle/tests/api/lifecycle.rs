@@ -981,9 +981,11 @@ async fn an_unverified_report_drops_out_of_the_metrics_it_affects() {
     assert_eq!((summary.failed, summary.attested), (0, 1));
     assert_attests(&app, &fetch(&app, event.id).await, &[0]);
 
-    // Without the two reports either side, the gap is three hours, more
-    // than one missed report leaves, and the block names it.
-    let (app, event) = app_with_published_observations(now, &[660, 690, 750, 780]).await;
+    // Without three hours of reports either side, the gap is four and a
+    // half hours, longer than a day-long window tolerates, and the block
+    // names it.
+    let (app, event) =
+        app_with_published_observations(now, &[600, 630, 660, 690, 750, 780, 810]).await;
     let entries = temperature_and_wind_picks(&event);
     assert_eq!(
         app.submit_entries(event.id, json!({"event_id": event.id, "entries": entries}))
@@ -1002,7 +1004,7 @@ async fn an_unverified_report_drops_out_of_the_metrics_it_affects() {
         "KORD/temp_high",
         "KORD/temp_low",
         "1 unverified reports",
-        "a 180-minute gap",
+        "a 270-minute gap",
     ] {
         assert!(block.message.contains(named), "{}", block.message);
     }

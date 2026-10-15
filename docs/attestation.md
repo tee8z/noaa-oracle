@@ -83,9 +83,11 @@ Choose event windows from compatible native ranges; a universal UTC-hour rule do
 
 Strict observed humidity is the maximum relative humidity calculated from each report's temperature and dewpoint using the Magnus formula.
 Its baseline is the maximum forecast humidity. Provisional display humidity still uses period temperature and dewpoint averages.
-Strict observations require usable reports without gaps exceeding 90 minutes, including the event boundaries.
-A window of 12 hours or longer tolerates one gap of up to 150 minutes, one missed hourly report, per station and per metric, but not before the window end.
-A tolerated gap adds no value for the missed hour; an accumulation across it stays unavailable.
+Strict observations require usable reports without gaps exceeding 90 minutes, including the event boundaries, in a window shorter than 12 hours.
+A window of 12 hours or longer tolerates sensor outages, per station and per metric, the window end included: each gap may last up to a sixth of the window (4 hours of a day), and gaps over 90 minutes may cover up to a quarter of it together (6 hours of a day).
+Small automated stations lose wind or temperature for a few hours in snow or freezing fog; over the stations competitions used in October 2026, 99.6% of day windows fell within these limits.
+A tolerated gap adds no value for the hours missed; an accumulation across it stays unavailable.
+Station selection keeps the stricter rule (one gap of up to 150 minutes, not before the window end), so the stations offered are ones whose recent windows settled without an outage.
 Optional wind, direction, and humidity values also need adequate reporting coverage.
 
 Rain accumulations use the previous routine report as their reset anchor, as described in the
