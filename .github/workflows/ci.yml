@@ -91,7 +91,7 @@ jobs:
       - name: Setup Nix cache
         uses: DeterminateSystems/magic-nix-cache-action@main
         with:
-          use-gha-cache: false
+          use-gha-cache: true
           use-flakehub: false
 
       - uses: Swatinem/rust-cache@v2
@@ -128,7 +128,7 @@ jobs:
       - name: Setup Nix cache
         uses: DeterminateSystems/magic-nix-cache-action@main
         with:
-          use-gha-cache: false
+          use-gha-cache: true
           use-flakehub: false
 
       - uses: Swatinem/rust-cache@v2
@@ -152,7 +152,7 @@ jobs:
       - name: Setup Nix cache
         uses: DeterminateSystems/magic-nix-cache-action@main
         with:
-          use-gha-cache: false
+          use-gha-cache: true
           use-flakehub: false
 
       - uses: Swatinem/rust-cache@v2
@@ -176,7 +176,7 @@ jobs:
       - name: Setup Nix cache
         uses: DeterminateSystems/magic-nix-cache-action@main
         with:
-          use-gha-cache: false
+          use-gha-cache: true
           use-flakehub: false
 
       - name: Run flake check
@@ -197,7 +197,7 @@ jobs:
       - name: Setup Nix cache
         uses: DeterminateSystems/magic-nix-cache-action@main
         with:
-          use-gha-cache: false
+          use-gha-cache: true
           use-flakehub: false
 
       - uses: Swatinem/rust-cache@v2
@@ -237,7 +237,7 @@ jobs:
       - name: Setup Nix cache
         uses: DeterminateSystems/magic-nix-cache-action@main
         with:
-          use-gha-cache: false
+          use-gha-cache: true
           use-flakehub: false
 
       - name: Download pre-built binaries
