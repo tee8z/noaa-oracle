@@ -538,6 +538,21 @@ pub trait WeatherData: Sync + Send {
     ) -> Result<Vec<SettlementObservation>, Error> {
         Err(Error::QualityUnavailable)
     }
+    /// [`Self::settlement_observations`], where each pair in `decisive`
+    /// whose usable reports leave a longer outage than settlement tolerates
+    /// keeps the value they give if that value decides its line (see
+    /// [`Decisive`]). Readers without the check ignore `decisive`.
+    async fn settlement_observations_deciding(
+        &self,
+        req: &ObservationRequest,
+        station_ids: Vec<String>,
+        required_collected_after: OffsetDateTime,
+        metrics: &[String],
+        _decisive: &[Decisive],
+    ) -> Result<Vec<SettlementObservation>, Error> {
+        self.settlement_observations(req, station_ids, required_collected_after, metrics)
+            .await
+    }
     /// Counts reports whose problems affect `metrics` (every metric when empty).
     async fn observation_quality(
         &self,
@@ -1791,6 +1806,24 @@ impl WeatherData for WeatherAccess {
         required_collected_after: OffsetDateTime,
         metrics: &[String],
     ) -> Result<Vec<SettlementObservation>, Error> {
+        self.settlement_observations_deciding(
+            req,
+            station_ids,
+            required_collected_after,
+            metrics,
+            &[],
+        )
+        .await
+    }
+
+    async fn settlement_observations_deciding(
+        &self,
+        req: &ObservationRequest,
+        station_ids: Vec<String>,
+        required_collected_after: OffsetDateTime,
+        metrics: &[String],
+        decisive: &[Decisive],
+    ) -> Result<Vec<SettlementObservation>, Error> {
         let coverage = coverage::Requirement {
             start: req.start.ok_or(Error::QualityUnavailable)?,
             end: req.end.ok_or(Error::QualityUnavailable)?,
@@ -1798,6 +1831,7 @@ impl WeatherData for WeatherAccess {
             collected_after: required_collected_after,
             groups: quality_groups(metrics),
             metrics: metrics.to_vec(),
+            decisive: decisive.to_vec(),
         };
         let point_request = ObservationRequest {
             start: req.start,
@@ -2563,6 +2597,40 @@ pub struct SettlementObservation {
     pub snow_amt: Option<f64>,
 }
 
+/// A station and metric whose line its surviving reports may already decide.
+/// When those reports leave a longer outage than settlement tolerates, the
+/// value they give still settles the pair if it falls past the line on the
+/// side the missing reports could only push it further: a maximum
+/// (`temp_high`, `wind_speed`) whose miss is above `upper` is Over, and a
+/// minimum (`temp_low`) whose miss is below `lower` is Under. A miss is
+/// `value - baseline`, in `unit` for temperatures and knots for wind, as
+/// lines score it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Decisive {
+    pub station_id: String,
+    pub metric: String,
+    pub baseline: f64,
+    pub lower: f64,
+    pub upper: f64,
+    pub unit: TemperatureUnit,
+}
+
+impl Decisive {
+    /// Whether `value`, the extreme of the reports there are, decides the
+    /// line however the missing reports read.
+    pub fn decides(&self, value: f64) -> bool {
+        if !value.is_finite() || !self.baseline.is_finite() {
+            return false;
+        }
+        let miss = value - self.baseline;
+        match self.metric.as_str() {
+            "temp_high" | "wind_speed" => miss > self.upper,
+            "temp_low" => miss < self.lower,
+            _ => false,
+        }
+    }
+}
+
 impl From<Observation> for SettlementObservation {
     fn from(observation: Observation) -> Self {
         Self {
@@ -3217,6 +3285,130 @@ mod tests {
                 &metrics,
             )
             .await
+    }
+
+    async fn settle_deciding(
+        directory: &tempfile::TempDir,
+        metrics: &[&str],
+        decisive: &[(&str, f64, f64, f64)],
+    ) -> Result<Vec<SettlementObservation>, Error> {
+        let request = ObservationRequest {
+            start: Some(time::macros::datetime!(2026-01-17 18:00 UTC)),
+            end: Some(time::macros::datetime!(2026-01-17 20:00 UTC)),
+            station_ids: "KORD".into(),
+            temperature_unit: TemperatureUnit::Celsius,
+        };
+        let metrics: Vec<String> = metrics.iter().map(|m| m.to_string()).collect();
+        let decisive: Vec<Decisive> = decisive
+            .iter()
+            .map(|(metric, baseline, lower, upper)| Decisive {
+                station_id: "KORD".into(),
+                metric: (*metric).into(),
+                baseline: *baseline,
+                lower: *lower,
+                upper: *upper,
+                unit: TemperatureUnit::Celsius,
+            })
+            .collect();
+        access(directory)
+            .settlement_observations_deciding(
+                &request,
+                vec!["KORD".into()],
+                time::macros::datetime!(2026-01-17 20:15 UTC),
+                &metrics,
+                &decisive,
+            )
+            .await
+    }
+
+    #[test]
+    fn only_a_value_past_the_line_on_the_missing_reports_side_decides_it() {
+        let pair = |metric: &str| Decisive {
+            station_id: "KORD".into(),
+            metric: metric.into(),
+            baseline: 10.0,
+            lower: -1.0,
+            upper: 2.0,
+            unit: TemperatureUnit::Fahrenheit,
+        };
+        // A maximum can only rise with the missing reports: above the upper
+        // cut it is Over whatever they read, and on the cut it is still Par.
+        for metric in ["temp_high", "wind_speed"] {
+            assert!(pair(metric).decides(12.5), "{metric}");
+            assert!(!pair(metric).decides(12.0), "{metric}");
+            assert!(!pair(metric).decides(8.0), "{metric}");
+        }
+        // A minimum can only fall: below the lower cut it is Under.
+        assert!(pair("temp_low").decides(8.5));
+        assert!(!pair("temp_low").decides(9.0));
+        assert!(!pair("temp_low").decides(13.0));
+        // Neither direction nor accumulation is bounded by missing reports.
+        for metric in ["wind_direction", "rain_amt", "humidity"] {
+            assert!(!pair(metric).decides(100.0), "{metric}");
+        }
+        assert!(!pair("temp_high").decides(f64::NAN));
+    }
+
+    /// The 19:00 report is flagged, so KORD's wind or temperature has only
+    /// the 18:00 report in the window: two hours without a usable value,
+    /// more than a two-hour window tolerates.
+    #[tokio::test]
+    async fn an_outage_settles_a_pair_whose_reports_already_decide_its_line() {
+        // The surviving wind, 8 knots, misses a 5-knot baseline by 3.
+        let wind = tagged_settlement_dir("unverified", Some("wind"));
+        let rows = settle_deciding(&wind, &["wind_speed"], &[("wind_speed", 5.0, 0.0, 2.0)])
+            .await
+            .unwrap();
+        assert_eq!(rows[0].wind_speed, Some(8), "above the upper cut: Over");
+        let rows = settle_deciding(&wind, &["wind_speed"], &[("wind_speed", 5.0, 0.0, 3.0)])
+            .await
+            .unwrap();
+        assert_eq!(rows[0].wind_speed, None, "on the cut: still undecided");
+        let rows = settle_deciding(&wind, &["wind_speed"], &[]).await.unwrap();
+        assert_eq!(
+            rows[0].wind_speed, None,
+            "without a line: missing as before"
+        );
+
+        // The surviving temperature, 11 °C, is both the high and the low.
+        let temperature = tagged_settlement_dir("unverified", Some("temperature,dewpoint"));
+        let rows = settle_deciding(
+            &temperature,
+            &["temp_high"],
+            &[("temp_high", 9.0, -1.0, 1.0)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows[0].temp_high, Some(11.0), "2 °C over a 1 °C cut");
+        assert!(
+            matches!(
+                settle_deciding(
+                    &temperature,
+                    &["temp_high"],
+                    &[("temp_high", 10.5, -1.0, 1.0)],
+                )
+                .await,
+                Err(Error::ObservationCoverage { .. })
+            ),
+            "half a degree over is Par so far, which the outage could change"
+        );
+        // Every scored temperature must be decided.
+        let both = ["temp_high", "temp_low"];
+        assert!(matches!(
+            settle_deciding(&temperature, &both, &[("temp_high", 9.0, -1.0, 1.0)]).await,
+            Err(Error::ObservationCoverage { .. })
+        ));
+        let rows = settle_deciding(
+            &temperature,
+            &both,
+            &[("temp_high", 9.0, -1.0, 1.0), ("temp_low", 12.0, -0.5, 1.0)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (rows[0].temp_high, rows[0].temp_low),
+            (Some(11.0), Some(11.0))
+        );
     }
 
     #[tokio::test]

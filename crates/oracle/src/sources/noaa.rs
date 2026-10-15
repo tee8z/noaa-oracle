@@ -8,8 +8,8 @@ use std::{collections::BTreeMap, sync::Arc};
 use time::{Date, Duration, OffsetDateTime, UtcOffset, macros::format_description};
 
 use super::{
-    Metric, ObservationWindow, OutcomeSource, ParRule, PlannedBaseline, Reading, SourceError,
-    SourceId,
+    LineCuts, Metric, ObservationWindow, OutcomeSource, ParRule, PlannedBaseline, Reading,
+    SourceError, SourceId,
 };
 use crate::{
     routes::{ForecastRequest, ObservationRequest, TemperatureUnit},
@@ -229,8 +229,28 @@ impl OutcomeSource for NoaaWeather {
         required_collected_after: OffsetDateTime,
         metrics: &[String],
     ) -> Result<Vec<Reading>, SourceError> {
-        self.load_readings(window, targets, Some((required_collected_after, metrics)))
-            .await
+        self.load_readings(
+            window,
+            targets,
+            Some((required_collected_after, metrics, &[])),
+        )
+        .await
+    }
+
+    async fn settlement_readings_with_lines(
+        &self,
+        window: ObservationWindow,
+        targets: &[String],
+        required_collected_after: OffsetDateTime,
+        metrics: &[String],
+        lines: &[LineCuts],
+    ) -> Result<Vec<Reading>, SourceError> {
+        self.load_readings(
+            window,
+            targets,
+            Some((required_collected_after, metrics, lines)),
+        )
+        .await
     }
 
     /// The whole-period baselines provisional readings show, which are the
@@ -280,7 +300,7 @@ impl NoaaWeather {
         &self,
         window: ObservationWindow,
         targets: &[String],
-        settlement: Option<(OffsetDateTime, &[String])>,
+        settlement: Option<(OffsetDateTime, &[String], &[LineCuts])>,
     ) -> Result<Vec<Reading>, SourceError> {
         if window.start >= window.end {
             return Ok(vec![]);
@@ -299,7 +319,7 @@ impl NoaaWeather {
             station_ids: targets.join(","),
             temperature_unit: TemperatureUnit::Fahrenheit,
         };
-        if let Some((cutoff, metrics)) = settlement {
+        if let Some((cutoff, metrics, lines)) = settlement {
             // The strict reader uses a half-open event window for point
             // values and also reads the ending accumulation report for rain.
             let observation_request = ObservationRequest {
@@ -318,9 +338,16 @@ impl NoaaWeather {
             if !missing.is_empty() {
                 return Err(SourceError::BaselineUnavailable(missing.join(", ")));
             }
+            let decisive = decisive(&forecasts, lines, observation_request.temperature_unit);
             let observations = self
                 .weather
-                .settlement_observations(&observation_request, targets.to_vec(), cutoff, metrics)
+                .settlement_observations_deciding(
+                    &observation_request,
+                    targets.to_vec(),
+                    cutoff,
+                    metrics,
+                    &decisive,
+                )
                 .await
                 .map_err(unavailable)?;
             // Strict forecasts already represent the full requested interval.
@@ -376,6 +403,35 @@ impl NoaaWeather {
             })
             .collect())
     }
+}
+
+/// The pairs whose line settlement may find decided through an outage: each
+/// line with its pair's single finite baseline, in `unit`.
+fn decisive(
+    forecasts: &[weather_data::SettlementValue],
+    lines: &[LineCuts],
+    unit: TemperatureUnit,
+) -> Vec<weather_data::Decisive> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let mut rows = forecasts
+                .iter()
+                .filter(|row| row.station_id == line.target && row.metric == line.metric);
+            let (Some(row), None) = (rows.next(), rows.next()) else {
+                return None;
+            };
+            let baseline = row.value.filter(|value| value.is_finite())?;
+            Some(weather_data::Decisive {
+                station_id: line.target.clone(),
+                metric: line.metric.clone(),
+                baseline,
+                lower: line.lower,
+                upper: line.upper,
+                unit,
+            })
+        })
+        .collect()
 }
 
 /// The `target/metric` pairs among `targets` and `metrics` that the

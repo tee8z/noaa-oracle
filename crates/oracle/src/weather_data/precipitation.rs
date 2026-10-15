@@ -410,12 +410,65 @@ fn apply_fixed_hours(value: &mut Totals, fixed_total: Option<f64>, phase_known: 
     value.ice = total.filter(|_| phase_known).map(|_| 0.0);
 }
 
+/// What the settlement query found for a station over the window, before
+/// coverage is judged: its highest and lowest usable temperature in the unit
+/// of `unit_code`, and its strongest usable wind in knots.
+#[derive(Debug, Default)]
+struct Extremes {
+    temp_high: Option<f64>,
+    temp_low: Option<f64>,
+    unit_code: String,
+    wind_speed: Option<i64>,
+}
+
+impl Extremes {
+    /// The value `pair` is judged on, in the pair's unit, as settlement
+    /// decodes it.
+    fn value(&self, pair: &super::Decisive) -> Option<f64> {
+        let temperature = |value: f64| super::convert(value, &self.unit_code, &pair.unit);
+        match pair.metric.as_str() {
+            "temp_high" => self.temp_high.map(temperature),
+            "temp_low" => self.temp_low.map(temperature),
+            "wind_speed" => super::within(self.wind_speed, 0..=500).map(|value| value as f64),
+            _ => None,
+        }
+    }
+}
+
+/// [`Extremes`] by station, from the settlement query's rows.
+fn extremes(batches: &[RecordBatch]) -> Result<HashMap<String, Extremes>, Error> {
+    let mut found = HashMap::new();
+    for batch in batches {
+        let stations = super::strings(batch, "station_id")?;
+        let temp_high = super::doubles(batch, "temp_high")?;
+        let temp_low = super::doubles(batch, "temp_low")?;
+        let unit_code = super::strings(batch, "temperature_unit_code")?;
+        let wind_speed = super::integers(batch, "wind_speed")?;
+        for row in 0..batch.num_rows() {
+            let Some(station) = super::text(stations, row) else {
+                continue;
+            };
+            found.insert(
+                station,
+                Extremes {
+                    temp_high: super::double(temp_high, row),
+                    temp_low: super::double(temp_low, row),
+                    unit_code: super::text(unit_code, row).unwrap_or_default(),
+                    wind_speed: super::integer(wind_speed, row),
+                },
+            );
+        }
+    }
+    Ok(found)
+}
+
 /// Whether a station's reports sample the event window, both all of them and
 /// those with a usable temperature when the event scores one.
 fn sampled(
     station: &str,
     reports: &[Report],
     requirement: &coverage::Requirement,
+    extremes: Option<&Extremes>,
 ) -> Result<(), Error> {
     if let Err(shortfall) = sampling(reports.iter(), requirement.start, requirement.end) {
         return Err(Error::ObservationCoverage {
@@ -441,6 +494,22 @@ fn sampled(
         requirement.start,
         requirement.end,
     ) {
+        // An outage cannot move a line the reports there are already
+        // decide: every scored temperature must be decided.
+        let decided = ["temp_high", "temp_low"]
+            .into_iter()
+            .filter(|metric| requirement.scores(metric))
+            .all(|metric| {
+                extremes.is_some_and(|found| {
+                    requirement.decides(station, metric, |pair| found.value(pair))
+                })
+            });
+        if decided {
+            log::info!(
+                "{station}: temperature reports leave a gap settlement does not tolerate ({shortfall}), but they already decide its lines"
+            );
+            return Ok(());
+        }
         let dropped = reports
             .iter()
             .filter(|row| {
@@ -465,10 +534,11 @@ fn sampled(
 fn every_station_sampled(
     by_station: &BTreeMap<String, Vec<Report>>,
     requirement: &coverage::Requirement,
+    extremes: &HashMap<String, Extremes>,
 ) -> Result<(), Error> {
     let mut short = Vec::new();
     for (station, reports) in by_station {
-        if let Err(error) = sampled(station, reports, requirement) {
+        if let Err(error) = sampled(station, reports, requirement, extremes.get(station)) {
             short.push(error);
         }
     }
@@ -483,7 +553,7 @@ fn every_station_sampled(
     silent.sort();
     silent.dedup();
     for station in silent {
-        if let Err(error) = sampled(station, &[], requirement) {
+        if let Err(error) = sampled(station, &[], requirement, None) {
             short.push(error);
         }
     }
@@ -560,7 +630,8 @@ pub(super) fn apply(
         });
     }
     let fixed_hours = super::shef::Evidence::read(connection, files)?;
-    every_station_sampled(&by_station, requirement)?;
+    let found = extremes(batches)?;
+    every_station_sampled(&by_station, requirement, &found)?;
     let mut measured = HashMap::new();
     for (station, reports) in by_station {
         let mut value = totals(&reports, requirement.start, requirement.end);
@@ -634,10 +705,22 @@ pub(super) fn apply(
             let old = super::integers(batch, name)?;
             let values: duckdb::arrow::array::Int64Array = (0..batch.num_rows())
                 .map(|row| {
-                    measured
-                        .get(stations.value(row))
-                        .filter(|value| complete(value))
-                        .and_then(|_| super::integer(old, row))
+                    let station = stations.value(row);
+                    let value = super::integer(old, row);
+                    let sampled = measured.get(station).is_some_and(complete);
+                    // The strongest wind of the reports there are can
+                    // already decide its line through an outage.
+                    let decided = !sampled
+                        && measured.contains_key(station)
+                        && requirement.decides(station, name, |_| {
+                            super::within(value, 0..=500).map(|value| value as f64)
+                        });
+                    if decided {
+                        log::info!(
+                            "{station}: wind reports leave a gap settlement does not tolerate, but already decide its line"
+                        );
+                    }
+                    value.filter(|_| sampled || decided)
                 })
                 .collect();
             columns[index] = Arc::new(values) as ArrayRef;
@@ -920,20 +1003,21 @@ mod tests {
             collected_after: end,
             groups: super::super::quality_groups(&[]),
             metrics: vec!["temp_high".into()],
+            decisive: vec![],
         };
         let mut reports = hourly(24, &[]);
         reports[10].verified = false;
         reports[10].temperature = false;
-        assert!(sampled("KJFK", &reports, &requirement).is_ok());
+        assert!(sampled("KJFK", &reports, &requirement, None).is_ok());
         reports[16].verified = false;
         reports[16].temperature = false;
-        assert!(sampled("KJFK", &reports, &requirement).is_ok());
+        assert!(sampled("KJFK", &reports, &requirement, None).is_ok());
         for report in &mut reports[15..19] {
             report.verified = false;
             report.temperature = false;
         }
         let Err(Error::ObservationCoverage { stations, reason }) =
-            sampled("KJFK", &reports, &requirement)
+            sampled("KJFK", &reports, &requirement, None)
         else {
             panic!("five hours without a usable temperature hold settlement");
         };
@@ -946,9 +1030,9 @@ mod tests {
         );
         let mut short = requirement.clone();
         short.end = start + Duration::hours(6);
-        assert!(sampled("KJFK", &reports[..6], &short).is_ok());
+        assert!(sampled("KJFK", &reports[..6], &short, None).is_ok());
         reports[3].temperature = false;
-        assert!(sampled("KJFK", &reports[..6], &short).is_err());
+        assert!(sampled("KJFK", &reports[..6], &short, None).is_err());
     }
 
     #[test]
@@ -961,6 +1045,7 @@ mod tests {
             collected_after: end,
             groups: super::super::quality_groups(&[]),
             metrics: vec!["temp_high".into()],
+            decisive: vec![],
         };
         // KBFM misses four reports in a row, KGZH's last report is seven
         // hours before the end, KECP reports throughout and KEGI sends nothing.
@@ -970,7 +1055,7 @@ mod tests {
             ("KGZH".to_string(), hourly(18, &[])),
         ]);
         let Err(Error::ObservationCoverage { stations, reason }) =
-            every_station_sampled(&by_station, &requirement)
+            every_station_sampled(&by_station, &requirement, &HashMap::new())
         else {
             panic!("stations short of the window hold settlement");
         };
@@ -996,12 +1081,12 @@ mod tests {
             ("KECP".to_string(), hourly(24, &[])),
         ]);
         let Err(Error::ObservationCoverage { stations, reason }) =
-            every_station_sampled(&one, &pair)
+            every_station_sampled(&one, &pair, &HashMap::new())
         else {
             panic!("KBFM is short of the window");
         };
         let Err(Error::ObservationCoverage { reason: alone, .. }) =
-            sampled("KBFM", &one["KBFM"], &pair)
+            sampled("KBFM", &one["KBFM"], &pair, None)
         else {
             panic!("KBFM is short of the window");
         };
@@ -1010,7 +1095,7 @@ mod tests {
 
         // A station without any report is otherwise left to the readings check.
         let quiet = BTreeMap::from([("KECP".to_string(), hourly(24, &[]))]);
-        assert!(every_station_sampled(&quiet, &requirement).is_ok());
+        assert!(every_station_sampled(&quiet, &requirement, &HashMap::new()).is_ok());
     }
 
     #[test]
