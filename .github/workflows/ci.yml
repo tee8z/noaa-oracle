@@ -88,12 +88,6 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
 
-      - name: Setup Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
-        with:
-          use-gha-cache: true
-          use-flakehub: false
-
       - uses: Swatinem/rust-cache@v2
         with:
           cmd-format: nix develop -c {0}
@@ -125,12 +119,6 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
 
-      - name: Setup Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
-        with:
-          use-gha-cache: true
-          use-flakehub: false
-
       - uses: Swatinem/rust-cache@v2
         with:
           cmd-format: nix develop -c {0}
@@ -148,12 +136,6 @@ jobs:
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
-
-      - name: Setup Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
-        with:
-          use-gha-cache: true
-          use-flakehub: false
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -173,6 +155,8 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
 
+      # Only the flake check builds substantial Nix outputs. One cache daemon
+      # avoids flooding GitHub's cache API from all six Nix jobs at once.
       - name: Setup Nix cache
         uses: DeterminateSystems/magic-nix-cache-action@main
         with:
@@ -193,12 +177,6 @@ jobs:
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
-
-      - name: Setup Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
-        with:
-          use-gha-cache: true
-          use-flakehub: false
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -233,12 +211,6 @@ jobs:
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
-
-      - name: Setup Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
-        with:
-          use-gha-cache: true
-          use-flakehub: false
 
       - name: Download pre-built binaries
         uses: actions/download-artifact@v4
