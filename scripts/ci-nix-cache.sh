@@ -19,7 +19,7 @@ mapfile -t derivations < <(nix path-info --derivation "$@")
 mapfile -t candidates < <(
   nix-store --query --requisites --include-outputs "${derivations[@]}" \
     | grep -v '\.drv$' \
-    | grep -Ev -- '-(source|vendor-registry|vendor-cargo-deps|nix-shell-env)$|/[a-z0-9]{32}-(cargo-src|cargo-package|rust)-$' \
+    | grep -Ev -- '-(source|vendor-registry|vendor-cargo-deps|nix-shell-env)$|/[a-z0-9]{32}-(cargo-src|cargo-package|rust)-' \
     | while read -r path; do [[ -e $path ]] && printf '%s\n' "$path"; done
 )
 [[ ${#candidates[@]} -gt 0 ]] || { echo "nothing to keep" >&2; exit 0; }
