@@ -14,7 +14,7 @@ The source reader and lifecycle gate perform separate checks.
 | Observation quality and archive readability | Hold settlement when reports with problems affecting the event's metrics are rejected or unverified, or when the archive is unreadable. |
 | Station collection coverage | Hold settlement when successful collection intervals leave a gap. |
 | Collection after the signing deadline | Hold settlement until a fresh successful request covers the event end. |
-| Observation reporting cadence | Hold settlement when usable reports leave a gap exceeding 90 minutes in a window shorter than 12 hours. A longer window tolerates gaps, its end included, of up to a sixth of it (4 hours of a day) while those over 90 minutes cover no more than a quarter of it (6 hours of a day). |
+| Observation reporting cadence | Hold settlement when usable reports leave a gap exceeding 90 minutes in a window shorter than 12 hours. A longer window tolerates gaps, its end included, of up to a sixth of it (4 hours of a day) while those over 90 minutes cover no more than a quarter of it (6 hours of a day). For an event scored against lines, a pair whose surviving reports already put its maximum above the upper cut, or its minimum below the lower cut, settles through any outage. |
 | Enabled station and metric pairs | Hold settlement when a baseline or observation is missing, duplicated, or nonfinite. |
 
 A successful empty source response can establish collection coverage. It does not establish a usable weather value.

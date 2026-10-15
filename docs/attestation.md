@@ -88,6 +88,11 @@ A window of 12 hours or longer tolerates sensor outages, per station and per met
 Small automated stations lose wind or temperature for a few hours in snow or freezing fog; over the stations competitions used in October 2026, 99.6% of day windows fell within these limits.
 A tolerated gap adds no value for the hours missed; an accumulation across it stays unavailable.
 Station selection keeps the stricter rule (one gap of up to 150 minutes, not before the window end), so the stations offered are ones whose recent windows settled without an outage.
+A pair of an event scored against lines whose usable reports leave a longer outage than these limits still settles when its line is already decided.
+Missing reports can only raise a maximum and lower a minimum, so a high temperature or strongest wind whose miss is already above the line's upper cut is Over, and a low temperature whose miss is already below the lower cut is Under, whatever the missing reports read.
+The value settled is the extreme of the reports there are; a miss on a cut is Par and stays undecided.
+A station's temperatures settle this way only when every scored temperature of it is decided.
+Events scored by the fixed rules still hold.
 Optional wind, direction, and humidity values also need adequate reporting coverage.
 
 Rain accumulations use the previous routine report as their reset anchor, as described in the
