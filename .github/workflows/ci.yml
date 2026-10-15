@@ -152,19 +152,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # One archive avoids a GitHub API request for every vendored crate.
+      # Nix still selects substitutes by their exact store paths.
+      - name: Restore Nix check outputs
+        id: nix-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/nix-check-cache
+          key: oracle-nix-check-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.lock', 'rust-toolchain.toml', 'scripts/ci-nix-cache.sh') }}
+          restore-keys: oracle-nix-check-${{ runner.os }}-${{ runner.arch }}-
+      - run: mkdir -p "$RUNNER_TEMP/nix-check-cache"
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
-
-      # Only the flake check builds substantial Nix outputs. One cache daemon
-      # avoids flooding GitHub's cache API from all six Nix jobs at once.
-      - name: Setup Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
         with:
-          use-gha-cache: true
-          use-flakehub: false
+          extra-conf: |
+            extra-substituters = file://${{ runner.temp }}/nix-check-cache?trusted=1
 
       - name: Run flake check
-        run: nix flake check
+        run: nix flake check --no-update-lock-file
+
+      - name: Retain compiled check dependencies and outputs
+        if: steps.nix-cache.outputs.cache-hit != 'true'
+        run: |
+          bash scripts/ci-nix-cache.sh save "$RUNNER_TEMP/nix-check-cache" \
+            .#checks.x86_64-linux.oracle .#checks.x86_64-linux.daemon \
+            .#checks.x86_64-linux.clippy .#checks.x86_64-linux.fmt
+      - uses: actions/cache/save@v4
+        if: steps.nix-cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/nix-check-cache
+          key: ${{ steps.nix-cache.outputs.cache-primary-key }}
 
   # API tests create in-process servers and can start immediately.
   e2e-test:
