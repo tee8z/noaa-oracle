@@ -3,10 +3,11 @@ const path = require("path");
 
 module.exports = defineConfig({
   testDir: "./tests",
-  fullyParallel: false,
+  // Tests use isolated browser contexts and only read the shared fixtures.
+  fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
-  workers: 1,
+  workers: process.env.CI ? 2 : 1,
   reporter: process.env.CI ? "github" : "list",
   timeout: 30000,
   use: {
