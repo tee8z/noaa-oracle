@@ -31,7 +31,8 @@ fn until_next_run(now: OffsetDateTime, interval: Duration) -> Duration {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let configuration = Cli::load()?.configuration()?;
+    let cli = Cli::load()?;
+    let configuration = cli.configuration()?;
     let logger = setup_logger(configuration.level);
 
     std::fs::create_dir_all(&configuration.data_dir)
@@ -76,6 +77,9 @@ async fn main() -> anyhow::Result<()> {
         &configuration.user_agent,
         rate_limiter,
     )?);
+    if let Some(hours) = cli.backfill_hours {
+        return daemon::backfill::run(&configuration, hours, fetcher, &publisher, &logger).await;
+    }
     let sources: Vec<Box<dyn Source>> = vec![
         Box::new(NoaaObservations::new(
             fetcher.clone(),

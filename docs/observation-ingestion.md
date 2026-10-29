@@ -83,3 +83,31 @@ The same pure parser in `noaa_oracle_core::shef` is used for ingestion and indep
 RR7 coverage is station-specific. The current discovery list and catalog permit KDSM, KMCI, and KMSP. KNYC currently lacks an explicit NYC catalog alias and remains unavailable. These sources do not make every ASOS station available. The oracle must require an exact, verified interval chain and usable phase evidence; a positive liquid-equivalent total does not itself prove liquid-only rainfall. Future planning must expose station capability and unresolved interval requirements before funding.
 
 For a bounded read-only probe, run `cargo run -p daemon --example audit_shef -- KMCI`. It collects only that station's RR7 history and prints the evidence manifest. It does not publish data or attest an outcome.
+
+## Recover an outage
+
+The explicit `--backfill-hours` flag collects and publishes observation history once, then exits.
+It accepts 1 through 96 hours and cannot be enabled through the configuration file or environment.
+The scheduled collector retains its normal four-hour window.
+
+Stop the scheduled collector before recovery so both processes do not consume the NOAA request budget simultaneously.
+Run the installed daemon with the usual configuration and signing-key access:
+
+```sh
+daemon --backfill-hours 96
+```
+
+Recovery requests at most four windows of 24 hours, newest first, with ten stations per initial batch.
+Each window retains the existing request, response-size, rate, and collection-time limits.
+Requests still split at the source result cap.
+The same validation code, original-response archives, signed uploads, and S3 archival apply.
+
+Filenames record the actual collection time; the coverage manifests identify the older requested intervals.
+Recovery does not backdate publication, create forecasts, prune files, or alter Oracle quality checks.
+Failed receipts remain visible, and unresolved retry intervals produce a nonzero exit after publication.
+A successful command confirms publication, not complete coverage for every station or event.
+Inspect the receipts and Oracle eligibility before declaring recovery complete.
+
+Restart the scheduled collector after the command exits, including after a failure.
+Old events retain their existing publication grace and expiry rules.
+Recovery does not reopen expired events or force an attestation.
