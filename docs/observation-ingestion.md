@@ -97,13 +97,22 @@ Run the installed daemon with the usual configuration and signing-key access:
 daemon --backfill-hours 96
 ```
 
-Recovery requests at most four windows of 24 hours, newest first, with ten stations per initial batch.
+Recovery requests at most sixteen windows of six hours, newest first, with 25 stations per initial batch.
 Each window retains the existing request, response-size, rate, and collection-time limits.
 Requests still split at the source result cap.
 The same validation code, original-response archives, signed uploads, and S3 archival apply.
 
+Day-sized requests can exhaust the shared evidence budget before the collector reaches every station.
+Smaller windows bound each collection, in addition to each individual request.
+Source failures can still leave gaps; inspect receipts after recovery.
+
+Recovery refreshes current forecasts and observations at startup, then between windows after 45 minutes without a refresh.
+These runs use the scheduled collector's source pipeline, timeout, validation, and request limiter.
+They run sequentially with history collection.
+The scheduled collector must remain stopped until recovery exits.
+
 Filenames record the actual collection time; the coverage manifests identify the older requested intervals.
-Recovery does not backdate publication, create forecasts, prune files, or alter Oracle quality checks.
+Recovery does not backdate publication, prune files, or alter Oracle quality checks.
 Failed receipts remain visible, and unresolved retry intervals produce a nonzero exit after publication.
 A successful command confirms publication, not complete coverage for every station or event.
 Inspect the receipts and Oracle eligibility before declaring recovery complete.

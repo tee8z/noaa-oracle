@@ -3,16 +3,13 @@ use daemon::{
     Cli, RateLimiter, S3Storage, XmlFetcher, keys,
     publish::Publisher,
     setup_logger,
-    source::{NoaaForecasts, NoaaObservations, Run, Source},
+    source::{NoaaForecasts, NoaaObservations, Source, run_source},
 };
 use slog::{Logger, error, info, warn};
 use std::{sync::Arc, time::Duration};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-
-/// A run that takes longer than this is abandoned and retried next tick.
-const RUN_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 
 /// Runs start this long past each interval of the clock (for the hourly
 /// interval, at :05, after stations file their routine reports at :51 to :56),
@@ -131,78 +128,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Collects one run from `source` and publishes it. A run that fails or
-/// times out leaves no files behind, so partial data is never published by
-/// a later retry.
-async fn run_source(
-    source: &dyn Source,
-    publisher: &Publisher,
-    data_dir: &std::path::Path,
-    logger: &Logger,
-) {
-    // One timestamp for the directory and every file name of the run.
-    let started_at = OffsetDateTime::now_utc();
-    let Ok(stamp) = started_at.format(&Rfc3339) else {
-        return;
-    };
-    let run = Run {
-        directory: data_dir.join(started_at.date().to_string()),
-        started_at,
-        stamp,
-    };
-    if let Err(error) = tokio::fs::create_dir_all(&run.directory).await {
-        error!(
-            logger,
-            "cannot create {}: {}",
-            run.directory.display(),
-            error
-        );
-        return;
-    }
-    let collected = tokio::time::timeout(RUN_TIMEOUT, source.collect(&run)).await;
-    let artifacts = match collected {
-        Ok(Ok(artifacts)) => artifacts,
-        Ok(Err(error)) => {
-            error!(logger, "{} run failed: {:#}", source.name(), error);
-            discard_run(&run).await;
-            return;
-        }
-        Err(_) => {
-            error!(
-                logger,
-                "{} run timed out after {:?}",
-                source.name(),
-                RUN_TIMEOUT
-            );
-            discard_run(&run).await;
-            return;
-        }
-    };
-    for artifact in &artifacts {
-        if let Err(error) = publisher.publish(artifact).await {
-            error!(
-                logger,
-                "publishing {} failed: {:#}",
-                artifact.name,
-                anyhow::Error::from(error)
-            );
-        }
-    }
-}
-
-/// Removes every file the run wrote.
-async fn discard_run(run: &Run) {
-    let Ok(mut entries) = tokio::fs::read_dir(&run.directory).await else {
-        return;
-    };
-    let suffix = format!("_{}.parquet", run.stamp);
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if entry.file_name().to_string_lossy().ends_with(&suffix) {
-            let _ = tokio::fs::remove_file(entry.path()).await;
-        }
-    }
-}
-
 async fn stop_on_signal(stop: CancellationToken, logger: Logger) {
     if let Err(error) = wait_for_stop_signal().await {
         error!(logger, "cannot listen for stop signals: {}", error);
@@ -229,6 +154,7 @@ async fn wait_for_stop_signal() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use time::format_description::well_known::Rfc3339;
 
     fn at(value: &str) -> OffsetDateTime {
         OffsetDateTime::parse(value, &Rfc3339).unwrap()
