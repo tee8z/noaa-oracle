@@ -121,6 +121,7 @@ fn metadata(path: &std::path::Path, name: &str) -> serde_json::Value {
 #[tokio::test]
 async fn keeps_all_routine_and_special_reports_and_archives_original_response() {
     let body = response(&[
+        report("KPWM", "METAR", "2026-09-24T15:30:00Z", "241530Z"),
         report("KPWM", "METAR", "2026-09-24T16:00:00Z", "241600Z"),
         report("KPWM", "SPECI", "2026-09-24T18:22:00Z", "241822Z"),
         report("KPWM", "METAR", "2026-09-24T19:00:00Z", "241900Z"),
@@ -135,14 +136,14 @@ async fn keeps_all_routine_and_special_reports_and_archives_original_response() 
     );
     let receipt = &history.coverage.batches[0];
     assert_eq!(receipt.status, "complete");
-    assert_eq!(receipt.response_count, 4);
+    assert_eq!(receipt.response_count, 5);
     assert_eq!(receipt.report_count, 3);
     assert_eq!(receipt.window_start, "2026-09-24T16:00:00Z");
     assert_eq!(receipt.window_end, "2026-09-24T19:00:00Z");
     let url = reqwest::Url::parse(&mock.urls.lock().unwrap()[0]).unwrap();
     let params: BTreeMap<_, _> = url.query_pairs().into_owned().collect();
     assert_eq!(params["date"], "2026-09-24T19:00:01Z");
-    assert!(params["hours"].parse::<f64>().unwrap() > 3.0);
+    assert_eq!(params["hours"], "4");
     let bytes = STANDARD
         .decode(&history.sources[&sha256_hex(body.as_bytes())].body)
         .unwrap();
@@ -164,6 +165,34 @@ async fn keeps_all_routine_and_special_reports_and_archives_original_response() 
         "complete"
     );
     assert!(metadata(&path, "observation_audit")["source_documents"][sha256_hex(body.as_bytes())]["body"].is_string());
+}
+
+#[test]
+fn whole_hour_requests_cover_both_closed_boundaries_after_splitting() {
+    let end = time("2026-10-28T23:57:05Z");
+    for (seconds, expected_hours) in [
+        (0, 1),
+        (1, 1),
+        (3598, 1),
+        (3599, 2),
+        (14400, 5),
+        (86400, 25),
+    ] {
+        let query = HistoryQuery {
+            stations: vec!["KJFK".into()],
+            start: end - Duration::seconds(seconds),
+            end,
+        };
+        let url = reqwest::Url::parse(&query.url().unwrap()).unwrap();
+        let params: BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+        let hours = params["hours"]
+            .parse::<u32>()
+            .expect("AWC-compatible whole hours");
+        assert_eq!(hours, expected_hours);
+        let requested_end = time(&params["date"]);
+        assert!(requested_end > query.end);
+        assert!(requested_end - Duration::hours(i64::from(hours)) < query.start);
+    }
 }
 
 #[tokio::test]

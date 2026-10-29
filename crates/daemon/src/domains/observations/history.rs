@@ -170,16 +170,18 @@ type Query = HistoryQuery;
 
 impl Query {
     fn url(&self) -> Result<String> {
-        // AWC documents hours/date, but not endpoint inclusivity. Query one
-        // extra second on each side and claim only the inner closed interval.
+        // AWC documents hours/date, but not endpoint inclusivity. Pad both
+        // boundaries, then round the requested span outward to whole hours:
+        // the live API rejects our former eight-decimal hours with HTTP 400.
+        // Response filtering still certifies only the inner closed interval.
         let date = (self.end + Duration::seconds(1)).format(&Rfc3339)?;
-        let hours = ((self.end - self.start).as_seconds_f64() + 2.0) / 3600.0;
+        let hours = (((self.end - self.start).as_seconds_f64() + 2.0) / 3600.0).ceil() as u64;
         let mut url = reqwest::Url::parse(HISTORY_SOURCE)?;
         url.query_pairs_mut()
             .append_pair("ids", &self.stations.join(","))
             .append_pair("format", "xml")
             .append_pair("date", &date)
-            .append_pair("hours", &format!("{hours:.8}"));
+            .append_pair("hours", &hours.to_string());
         Ok(url.to_string())
     }
 
