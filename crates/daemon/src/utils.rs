@@ -88,6 +88,12 @@ pub struct Cli {
     #[arg(long, env = "NOAA_DAEMON_OBSERVATION_BATCH_SIZE")]
     pub observation_batch_size: Option<usize>,
 
+    /// Collect and publish this many past hours once (1..96), then exit.
+    /// Run separately from the scheduled collector to share NOAA's rate budget.
+    #[arg(long)]
+    #[serde(skip)]
+    pub backfill_hours: Option<u32>,
+
     /// Days to keep published parquet files locally
     #[arg(long, env = "NOAA_DAEMON_RETENTION_DAYS")]
     pub retention_days: Option<u64>,
@@ -176,6 +182,7 @@ impl Cli {
                 .observation_history_hours
                 .or(file.observation_history_hours),
             observation_batch_size: cli.observation_batch_size.or(file.observation_batch_size),
+            backfill_hours: cli.backfill_hours,
             retention_days: cli.retention_days.or(file.retention_days),
             s3_bucket: cli.s3_bucket.or(file.s3_bucket),
             s3_endpoint: cli.s3_endpoint.or(file.s3_endpoint),
@@ -183,6 +190,14 @@ impl Cli {
     }
 
     pub fn configuration(&self) -> Result<Configuration, ConfigError> {
+        if self
+            .backfill_hours
+            .is_some_and(|hours| !(1..=96).contains(&hours))
+        {
+            return Err(ConfigError::ObservationHistory(
+                "backfill_hours must be between 1 and 96".into(),
+            ));
+        }
         let level = match self
             .level
             .as_deref()
@@ -694,6 +709,22 @@ mod tests {
                 .hours,
             4
         );
+    }
+
+    #[test]
+    fn backfill_is_explicit_bounded_and_does_not_change_regular_collection() {
+        for hours in [0, 97, u32::MAX] {
+            let cli = Cli {
+                backfill_hours: Some(hours),
+                ..Cli::default()
+            };
+            assert!(cli.configuration().is_err());
+        }
+        let cli = Cli::try_parse_from(["daemon", "--backfill-hours", "96"]).unwrap();
+        assert_eq!(cli.backfill_hours, Some(96));
+        assert_eq!(cli.configuration().unwrap().observation_history.hours, 4);
+        assert_eq!(Cli::default().backfill_hours, None);
+        assert!(toml::from_str::<Cli>("backfill_hours = 96").is_err());
     }
 
     #[test]

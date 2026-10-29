@@ -1,6 +1,7 @@
 //! NOAA data daemon: collects source data as parquet, publishes it to the
 //! oracle and S3, and keeps the local copy until it is published.
 
+pub mod backfill;
 mod coordinates;
 mod domains;
 pub mod keys;
