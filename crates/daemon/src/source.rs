@@ -17,11 +17,14 @@
 //!   the oracle must require continuous successful coverage before signing.
 
 use async_trait::async_trait;
-use slog::{Logger, info};
-use std::{path::PathBuf, sync::Arc};
-use time::OffsetDateTime;
+use slog::{Logger, error, info};
+use std::{path::PathBuf, sync::Arc, time::Duration};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::{ForecastService, ObservationService, XmlFetcher, get_coordinates, publish::Artifact};
+use crate::{
+    ForecastService, ObservationService, XmlFetcher, get_coordinates,
+    publish::{Artifact, Publisher},
+};
 
 /// One run: where to write and the timestamp every file of the run shares.
 pub struct Run {
@@ -183,5 +186,124 @@ impl Source for NoaaObservations {
             observed.skipped
         );
         Ok(vec![observations])
+    }
+}
+
+/// A run that takes longer than this is abandoned and retried next tick.
+const RUN_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+
+/// Collects one run from `source` and publishes it. A run that fails or
+/// times out leaves no files behind, so partial data is never published by
+/// a later retry.
+pub async fn run_source(
+    source: &dyn Source,
+    publisher: &Publisher,
+    data_dir: &std::path::Path,
+    logger: &Logger,
+) {
+    // One timestamp for the directory and every file name of the run.
+    let started_at = OffsetDateTime::now_utc();
+    let Ok(stamp) = started_at.format(&Rfc3339) else {
+        return;
+    };
+    let run = Run {
+        directory: data_dir.join(started_at.date().to_string()),
+        started_at,
+        stamp,
+    };
+    if let Err(error) = tokio::fs::create_dir_all(&run.directory).await {
+        error!(
+            logger,
+            "cannot create {}: {}",
+            run.directory.display(),
+            error
+        );
+        return;
+    }
+    let collected = tokio::time::timeout(RUN_TIMEOUT, source.collect(&run)).await;
+    let artifacts = match collected {
+        Ok(Ok(artifacts)) => artifacts,
+        Ok(Err(error)) => {
+            error!(logger, "{} run failed: {:#}", source.name(), error);
+            discard_run(&run).await;
+            return;
+        }
+        Err(_) => {
+            error!(
+                logger,
+                "{} run timed out after {:?}",
+                source.name(),
+                RUN_TIMEOUT
+            );
+            discard_run(&run).await;
+            return;
+        }
+    };
+    for artifact in &artifacts {
+        if let Err(error) = publisher.publish(artifact).await {
+            error!(
+                logger,
+                "publishing {} failed: {:#}",
+                artifact.name,
+                anyhow::Error::from(error)
+            );
+        }
+    }
+}
+
+/// Removes every file the run wrote.
+async fn discard_run(run: &Run) {
+    let Ok(mut entries) = tokio::fs::read_dir(&run.directory).await else {
+        return;
+    };
+    let suffix = format!("_{}.parquet", run.stamp);
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.file_name().to_string_lossy().ends_with(&suffix) {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct RejectedForecast;
+
+    #[async_trait]
+    impl Source for RejectedForecast {
+        fn name(&self) -> &'static str {
+            "rejected_forecast"
+        }
+
+        async fn collect(&self, run: &Run) -> anyhow::Result<Vec<Artifact>> {
+            // Forecast collection can write a file before its coverage check fails.
+            tokio::fs::write(run.artifact("forecasts").path, b"PAR1rejectedPAR1").await?;
+            anyhow::bail!("forecast coverage below its minimum")
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_collection_cannot_be_published_by_a_later_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let day = directory
+            .path()
+            .join(OffsetDateTime::now_utc().date().to_string());
+        std::fs::create_dir(&day).unwrap();
+        let existing = day.join("observations_2020-01-01T00:00:00Z.parquet");
+        std::fs::write(&existing, b"existing evidence").unwrap();
+        let logger = Logger::root(slog::Discard, slog::o!());
+        let publisher = Publisher::new(
+            reqwest::Url::parse("http://127.0.0.1:1").unwrap(),
+            nostr::key::Keys::generate(),
+            None,
+            logger.clone(),
+        )
+        .unwrap();
+
+        run_source(&RejectedForecast, &publisher, directory.path(), &logger).await;
+
+        assert_eq!(std::fs::read_dir(&day).unwrap().count(), 1);
+        assert_eq!(std::fs::read(existing).unwrap(), b"existing evidence");
     }
 }

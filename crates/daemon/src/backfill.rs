@@ -3,11 +3,15 @@
 
 use crate::{
     Configuration, HistoryConfig, ObservationService, XmlFetcher, get_coordinates_with_evidence,
-    publish::Publisher, source::Run,
+    publish::Publisher,
+    source::{NoaaForecasts, NoaaObservations, Run, Source, run_source},
 };
 use anyhow::{Context, Result, ensure};
 use slog::{Logger, info};
-use std::{sync::Arc, time::Duration as StdDuration};
+use std::{
+    sync::Arc,
+    time::{Duration as StdDuration, Instant},
+};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 #[derive(Debug, PartialEq)]
@@ -26,7 +30,7 @@ fn windows(end: OffsetDateTime, hours: u32) -> Result<Vec<Window>> {
     let mut end = end.replace_nanosecond(0)?;
     let mut result = Vec::new();
     while remaining > 0 {
-        let hours = remaining.min(24);
+        let hours = remaining.min(6);
         result.push(Window { end, hours });
         end -= Duration::hours(i64::from(hours));
         remaining -= hours;
@@ -34,7 +38,7 @@ fn windows(end: OffsetDateTime, hours: u32) -> Result<Vec<Window>> {
     Ok(result)
 }
 
-/// Publish up to four history windows, newest first. Each uses the normal
+/// Publish up to sixteen history windows, newest first. Each uses the normal
 /// per-request limits, source archives, quality checks, signatures, and S3 archive.
 /// Failed receipts stay visible; publication does not assert settlement coverage.
 pub async fn run(
@@ -46,9 +50,34 @@ pub async fn run(
 ) -> Result<()> {
     let plan = windows(OffsetDateTime::now_utc(), hours)?;
     let (stations, catalog) = get_coordinates_with_evidence(fetcher.clone()).await?;
-    let service = ObservationService::new(logger.clone(), fetcher);
+    let service = ObservationService::new(logger.clone(), fetcher.clone());
+    let live_sources: Vec<Box<dyn Source>> = vec![
+        Box::new(NoaaForecasts::new(
+            fetcher.clone(),
+            configuration.min_forecast_coverage,
+            logger.clone(),
+        )),
+        Box::new(NoaaObservations::new(
+            fetcher,
+            configuration.observation_history.clone(),
+            logger.clone(),
+        )),
+    ];
+    let mut live_refreshed: Option<Instant> = None;
     let mut incomplete = 0;
     for window in plan {
+        // Recovery can take hours. Refresh current data sequentially through
+        // the same sources and limiter, while the scheduled collector is paused.
+        if live_refreshed.is_none_or(|at| at.elapsed() >= StdDuration::from_secs(45 * 60)) {
+            info!(
+                logger,
+                "backfill: refreshing current forecasts and observations"
+            );
+            for source in &live_sources {
+                run_source(source.as_ref(), publisher, &configuration.data_dir, logger).await;
+            }
+            live_refreshed = Some(Instant::now());
+        }
         // The filename records the actual collection time, never a backdated issue.
         let started_at = OffsetDateTime::now_utc();
         let run = Run {
@@ -59,11 +88,12 @@ pub async fn run(
         tokio::fs::create_dir_all(&run.directory).await?;
         let artifact = run.artifact("observations");
         ensure!(!artifact.path.exists(), "backfill output already exists");
-        // Ten stations normally fit a full day below AWC's 400-report cap.
-        // The existing collector still splits capped responses and enforces budgets.
+        // Day-sized collections exhaust the shared evidence budget before
+        // reaching the whole catalog. Bound each pass, not just each request.
+        // The collector still splits capped responses and enforces its limits.
         let history = HistoryConfig {
             hours: window.hours,
-            batch_size: 10,
+            batch_size: 25,
         };
         let mut retry = Vec::new();
         info!(
@@ -115,14 +145,14 @@ mod tests {
     #[test]
     fn recovery_covers_the_requested_history_without_gaps_or_future_windows() {
         let now = datetime!(2026-10-29 00:35:12.123 UTC);
-        for hours in [1, 23, 24, 25, 72, 96] {
+        for hours in 1..=96 {
             let plan = windows(now, hours).unwrap();
-            assert!(plan.len() <= 4);
+            assert!(plan.len() <= 16);
             let newest = plan[0].end - Duration::seconds(1);
             assert!(newest < now);
             let mut previous_start = newest;
             for window in plan {
-                assert!((1..=24).contains(&window.hours));
+                assert!((1..=6).contains(&window.hours));
                 let end = window.end - Duration::seconds(1);
                 assert_eq!(end, previous_start);
                 previous_start = end - Duration::hours(i64::from(window.hours));
