@@ -219,11 +219,34 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install Playwright
+      - name: Install test dependencies
         working-directory: e2e
-        run: |
-          npm ci
-          npx playwright install chromium firefox webkit --with-deps
+        run: npm ci
+
+      - name: Get Playwright version
+        id: playwright-version
+        working-directory: e2e
+        run: echo "version=$(npm ls @playwright/test --json | jq -r '.dependencies["@playwright/test"].version')" >> "$GITHUB_OUTPUT"
+
+      # The browsers are ~500 MB; one slow download timed the job out.
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-ubuntu-24.04-${{ runner.arch }}-${{ steps.playwright-version.outputs.version }}
+
+      - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        working-directory: e2e
+        timeout-minutes: 8
+        run: npx playwright install chromium firefox webkit --with-deps
+
+      - name: Install Playwright system dependencies
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        working-directory: e2e
+        timeout-minutes: 8
+        run: npx playwright install-deps chromium firefox webkit
 
       - name: Build runtime libraries
         id: runtime-libs
