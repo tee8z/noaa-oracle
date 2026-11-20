@@ -1,0 +1,68 @@
+name: Nix
+
+# The flake's checks rebuild and test the workspace inside Nix, which takes
+# about ten minutes and repeats ci.yml's cargo jobs. They only find something
+# those miss when the Nix inputs change, so they run only then. Deployments use
+# the release packages, not the flake.
+on:
+  push:
+    branches: [master]
+    paths:
+      - flake.nix
+      - flake.lock
+      - Cargo.lock
+      - rust-toolchain.toml
+      - scripts/ci-nix-cache.sh
+      - .github/workflows/nix.yml
+  pull_request:
+    branches: [master]
+    paths:
+      - flake.nix
+      - flake.lock
+      - Cargo.lock
+      - rust-toolchain.toml
+      - scripts/ci-nix-cache.sh
+      - .github/workflows/nix.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nix-check:
+    name: Nix Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # One archive avoids a GitHub API request for every vendored crate.
+      # Nix still selects substitutes by their exact store paths.
+      - name: Restore Nix check outputs
+        id: nix-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/nix-check-cache
+          key: oracle-nix-check-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.lock', 'rust-toolchain.toml', 'scripts/ci-nix-cache.sh') }}
+          restore-keys: oracle-nix-check-${{ runner.os }}-${{ runner.arch }}-
+      - run: mkdir -p "$RUNNER_TEMP/nix-check-cache"
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            extra-substituters = file://${{ runner.temp }}/nix-check-cache?trusted=1
+
+      - name: Run flake check
+        run: nix flake check --no-update-lock-file
+
+      - name: Retain compiled check dependencies and outputs
+        if: steps.nix-cache.outputs.cache-hit != 'true'
+        run: |
+          bash scripts/ci-nix-cache.sh save "$RUNNER_TEMP/nix-check-cache" \
+            .#checks.x86_64-linux.oracle .#checks.x86_64-linux.daemon \
+            .#checks.x86_64-linux.clippy .#checks.x86_64-linux.fmt
+      - uses: actions/cache/save@v4
+        if: steps.nix-cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/nix-check-cache
+          key: ${{ steps.nix-cache.outputs.cache-primary-key }}
