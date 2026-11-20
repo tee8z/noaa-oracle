@@ -4,9 +4,10 @@ on:
   push:
     tags:
       - "v*.*.*"
-    # A push to master builds the release binaries to warm their caches (see
-    # prepare-release), so a tagged release, including a hotfix, compiles only
-    # the workspace's own crates.
+    # A push to master builds and packages the release binaries without
+    # publishing: it warms their caches (see prepare-release), so a tagged
+    # release, including a hotfix, compiles only the workspace's own crates,
+    # and its packages are what the home lab deploys from master.
     branches:
       - master
   workflow_dispatch:
@@ -189,8 +190,9 @@ jobs:
             }
           done
 
+      # Master builds package too: the home lab deploys master commits from
+      # these artifacts, the same packages a tagged release publishes.
       - name: Create release package
-        if: needs.prepare-release.outputs.warm != 'true'
         env:
           VERSION: ${{ needs.prepare-release.outputs.version }}
           ARCH: ${{ matrix.arch }}
@@ -198,7 +200,6 @@ jobs:
         run: bash .github/scripts/package-release.sh "$VERSION" "$ARCH" "target/$TARGET/release" "$RUNNER_TEMP/duckdb"
 
       - name: Upload release artifacts
-        if: needs.prepare-release.outputs.warm != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.arch }}-linux
