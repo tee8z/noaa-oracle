@@ -219,7 +219,8 @@ jobs:
   # Playwright UI tests (uses pre-built binaries and fixture data)
   ui-test:
     name: UI Tests
-    runs-on: ubuntu-latest
+    # Playwright's browsers do not support ubuntu-latest's 26.04 image yet.
+    runs-on: ubuntu-24.04
     needs: [build]
     if: "!contains(github.event.pull_request.labels.*.name, 'skip-e2e')"
     timeout-minutes: 15
