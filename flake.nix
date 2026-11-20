@@ -284,14 +284,33 @@
         '';
 
         # Development shell
+        rustShellInputs = buildDeps ++ [
+          pkgs.lld
+          pkgs.stdenv.cc.cc.lib  # Provides libstdc++ for DuckDB
+        ];
+        rustShellHook = ''
+          export DUCKDB_LIB_DIR="${duckdb-lib}/lib"
+          export LD_LIBRARY_PATH="${duckdb-lib}/lib:${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH"
+          export RUSTFLAGS="-C link-arg=-fuse-ld=lld"
+        '';
+
+        # CI's Rust jobs only build, lint and test, so they skip the editor,
+        # S3 and backup tools: every job downloads its shell from scratch.
+        ciShell = pkgs.mkShell {
+          buildInputs = rustShellInputs ++ [
+            (pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
+          ];
+          shellHook = rustShellHook;
+          DUCKDB_LIB_DIR = "${duckdb-lib}/lib";
+          SQLX_OFFLINE = "true";
+        };
+
         devShell = pkgs.mkShell {
-          buildInputs = buildDeps ++ [
+          buildInputs = rustShellInputs ++ [
             rustToolchain
             pkgs.just
             pkgs.cargo-edit
             pkgs.cargo-machete
-            pkgs.lld
-            pkgs.stdenv.cc.cc.lib  # Provides libstdc++ for DuckDB
             # S3 and backup tools
             moto-env
             pkgs.awscli2
@@ -299,11 +318,7 @@
             pkgs.sqlx-cli
           ];
 
-          shellHook = ''
-            export DUCKDB_LIB_DIR="${duckdb-lib}/lib"
-            export LD_LIBRARY_PATH="${duckdb-lib}/lib:${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH"
-            export RUSTFLAGS="-C link-arg=-fuse-ld=lld"
-
+          shellHook = rustShellHook + ''
             # Default AWS credentials for moto
             export AWS_ACCESS_KEY_ID=''${AWS_ACCESS_KEY_ID:-test}
             export AWS_SECRET_ACCESS_KEY=''${AWS_SECRET_ACCESS_KEY:-test}
@@ -379,6 +394,7 @@
         };
 
         devShells.default = devShell;
+        devShells.ci = ciShell;
 
         checks = {
           inherit oracle daemon;

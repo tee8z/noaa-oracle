@@ -90,11 +90,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          cmd-format: nix develop -c {0}
+          cmd-format: nix develop .#ci -c {0}
           key: nix-${{ hashFiles('flake.nix', 'flake.lock') }}
 
       - name: Build project
-        run: nix develop -c cargo build --workspace --locked
+        run: nix develop .#ci -c cargo build --workspace --locked
         env:
           RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
 
@@ -121,11 +121,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          cmd-format: nix develop -c {0}
+          cmd-format: nix develop .#ci -c {0}
           key: nix-${{ hashFiles('flake.nix', 'flake.lock') }}
 
       - name: Run Clippy
-        run: nix develop -c cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: nix develop .#ci -c cargo clippy --workspace --all-targets --locked -- -D warnings
 
   # Unit tests (needs Nix for DuckDB)
   test:
@@ -139,44 +139,23 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          cmd-format: nix develop -c {0}
+          cmd-format: nix develop .#ci -c {0}
           key: nix-${{ hashFiles('flake.nix', 'flake.lock') }}
 
+      # Includes the API tests (oracle/tests/api), which start in-process servers.
       - name: Run tests
-        run: nix develop -c cargo test --workspace --locked
+        run: nix develop .#ci -c cargo test --workspace --locked
 
-  # API tests create in-process servers and can start immediately.
-  e2e-test:
-    name: E2E Tests
-    runs-on: ubuntu-latest
-    if: "!contains(github.event.pull_request.labels.*.name, 'skip-e2e')"
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cmd-format: nix develop -c {0}
-          key: nix-${{ hashFiles('flake.nix', 'flake.lock') }}
-
-      - name: Run E2E tests
-        run: |
-          nix develop -c cargo test --package oracle --test api --locked
-        env:
-          RUST_LOG: debug
-
-      - name: Upload e2e logs on failure
+      - name: Upload test logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-logs-${{ github.run_id }}
+          name: test-logs-${{ github.run_id }}
           path: |
             logs/
             *.log
           retention-days: 7
+          if-no-files-found: ignore
 
   # Playwright UI tests (uses pre-built binaries and fixture data)
   ui-test:
