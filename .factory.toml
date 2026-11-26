@@ -1,0 +1,10 @@
+# What the factory runs to verify changes to this repository. It reads this file at
+# the base commit, so a change to it is reviewed by hand. The type supplies the gate.
+version = 2
+type = "rust-workspace"
+
+[stages.ui-unit]
+name = "UI unit tests"
+trigger = ["verification"]
+argv = ["nix", "develop", "--no-update-lock-file", "--command", "bash", "-c", "node --test e2e/unit/*.test.js"]
+hours = 1
